@@ -2053,9 +2053,12 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
         .show(root, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(
+                    // On `control_active`, like `panels::edit_bar`'s heading
+                    // above it and for the same reason: the accent on that fill
+                    // is 1.88:1 in MediaBog. See `Palette::active_ink`.
                     RichText::new("BRUSH TIP")
                         .size(text::TINY)
-                        .color(p.accent)
+                        .color(p.active_ink())
                         .strong(),
                 );
                 ui.add_space(4.0);
@@ -2076,7 +2079,12 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
                         )
                     })
                     .size(text::TINY)
-                    .color(p.text_dim),
+                    // `text`, not `text_dim`: the strip is filled
+                    // `control_active`, where `text_dim` is 1.43:1 in MediaBog
+                    // — and this sentence is the only thing that says what a
+                    // tip canvas is for. Same rank `panels::edit_bar` takes on
+                    // the identical fill.
+                    .color(p.text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controls::text_button(ui, p, "Use as tip", true, true)

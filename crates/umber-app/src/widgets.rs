@@ -6,6 +6,7 @@
 //! with via styling.
 
 use crate::icons::{self, Icon};
+use crate::theme::contrast::{self, Ink};
 use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
@@ -698,8 +699,12 @@ fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: 
 /// These are on screen on every frame of every document — see
 /// `ui::canvas_scrollbars` — so the track is left unpainted altogether: two
 /// permanent filled strips down the edges of a picture is the furniture that
-/// decision is against. The thumb's own ink went the other way for the same
-/// reason; see the note beside it.
+/// decision is against. The thumb is therefore the whole control, which is why
+/// its ink is [`theme::contrast`]'s derived one rather than a token: it has to
+/// read on any canvas pit somebody can author, and the marks that failed did so
+/// on a pit Umber ships. See the note beside it.
+///
+/// [`theme::contrast`]: crate::theme::contrast
 ///
 /// `live` is the caller's "a press in this strip is not mine" — the space-held
 /// canvas pan. The thumb is still painted and still lights under the pointer,
@@ -774,23 +779,33 @@ pub fn canvas_scrollbar(
     let panning = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
     let dragging = live && !panning && response.dragged_by(egui::PointerButton::Primary);
 
-    // `text_dim` idle, for `pen_cursor`'s reason and it is the same problem:
-    // this is a mark drawn over *artwork*, and `text_dim` is the one token
-    // that is a mid-grey in both themes, where the surfaces invert and most of
-    // the ink with them. `rail` was the obvious choice and is the slider
-    // *track* colour — a hair off the surface it sits on by design, which on
-    // the canvas backdrop is 1.31:1 in Graphite and 1.07:1 in Paper. Six levels
-    // per channel. That was survivable while a bar only appeared when the
-    // picture ran off the view, because its appearing was itself the signal;
-    // now that it is the standing answer to "can this be moved", a control
-    // nobody can see is the same lie as a control that does nothing.
-    let ink = if dragging {
-        p.text_strong
+    // Derived from the pit rather than taken off the type ramp, and the three
+    // ranks are where `text_strong`, `text_muted` and `text_dim` used to be.
+    //
+    // `rail` was the obvious choice and is the slider *track* colour — a hair
+    // off the surface it sits on by design, which on the canvas backdrop is
+    // 1.31:1 in Graphite and 1.06:1 in Paper. Six levels per channel. That was
+    // survivable while a bar only appeared when the picture ran off the view,
+    // because its appearing was itself the signal; now that it is the standing
+    // answer to "can this be moved", a control nobody can see is the same lie
+    // as a control that does nothing.
+    //
+    // `text_dim` replaced it, on the reasoning that this is a mark drawn over
+    // *artwork* and that `text_dim` is the one token that is a mid-grey
+    // whichever way a theme's surfaces run. **That is exactly what broke it**:
+    // a mid-grey ink on Krita's real 50% grey pit is 1.34:1, worse than the
+    // figure `rail` was thrown out at, and no token can do better because the
+    // problem is the pit and not the ramp. `theme::contrast` has the argument;
+    // what it buys here is a floor of 3:1 on any pit somebody can author, and
+    // three ranks that stay distinct even on a pit with only 5.32:1 in it.
+    let rank = if dragging {
+        Ink::Strong
     } else if response.hovered() {
-        p.text_muted
+        Ink::Muted
     } else {
-        p.text_dim
+        Ink::Dim
     };
+    let ink = contrast::ink_on(p.backdrop, rank);
     let inset = thumb_rect.shrink(2.0);
     ui.painter()
         .rect_filled(inset, inset.width().min(inset.height()) * 0.5, ink);
@@ -1646,10 +1661,26 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     brush_sample(painter, p, sample, row.brush, row.tip);
 
     // A dot marks the rows that are yours — the ones the browser will let you
-    // rename and delete.
+    // rename and delete. On a selected row it sits on `control_active`, where
+    // the accent is 1.88:1 in MediaBog, so it takes `active_ink` there; on
+    // every other row the accent reads against the panel and stays.
+    //
+    // **The cost is real and is the lesser of two.** In the four preset themes
+    // `active_ink` is `text_strong`, which is what the name beside it is
+    // already drawn in on a selected row — so the dot stops being a *colour*
+    // that says "yours" and becomes a bullet. It is still a mark in a place
+    // nothing else occupies, and a dot nobody can see says nothing at all,
+    // which is why legibility wins here. Carrying the meaning through would
+    // need a different shape or position rather than a different colour, and
+    // that is a design change rather than a contrast fix.
     let mut right = rect.right() - 7.0 - row.trailing;
     if row.user {
-        painter.circle_filled(pos2(right - 3.0, rect.center().y), 3.0, p.accent);
+        let dot = if row.selected {
+            p.active_ink()
+        } else {
+            p.accent
+        };
+        painter.circle_filled(pos2(right - 3.0, rect.center().y), 3.0, dot);
         right -= 12.0;
     }
 
@@ -1677,7 +1708,11 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
             Align2::LEFT_CENTER,
             elide(painter, row.detail, 9.5, width),
             FontId::proportional(9.5),
-            p.text_dim,
+            // The credit line steps up on the selected row for the reason the
+            // name above it does: that row is filled `control_active`, where
+            // `text_dim` is 1.43:1 in MediaBog. `text` is the dimmest rank that
+            // fill can carry.
+            if row.selected { p.text } else { p.text_dim },
         );
     }
 
@@ -2621,8 +2656,18 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     let pick = Rect::from_min_size(rect.left_top() + PICK_AT, Vec2::splat(PICK_HIT));
     let pick_response = ui.interact(pick, ui.id().with(("pick", key)), Sense::click());
     let box_rect = Rect::from_center_size(pick.center(), Vec2::splat(PICK_MARK));
+    // On the *active* row this whole column sits on `control_active`, so both
+    // states take the ink that reads on it rather than the one that reads on a
+    // panel: a filled box is 1.88:1 in MediaBog in the accent and an empty
+    // one's stroke is 1.43:1 in `text_dim`. The check inside the filled box is
+    // still `window`, which is the darkest surface either way round.
+    let (ticked, empty) = if active {
+        (p.active_ink(), p.text)
+    } else {
+        (p.accent, p.text_dim)
+    };
     if row.picked {
-        ui.painter().rect_filled(box_rect, 2.0, p.accent);
+        ui.painter().rect_filled(box_rect, 2.0, ticked);
         icons::draw(ui.painter(), box_rect.shrink(1.0), Icon::Check, p.window);
     } else {
         ui.painter().rect_stroke(
@@ -2631,7 +2676,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
             Stroke::new(
                 1.0,
                 if pick_response.hovered() {
-                    p.text_dim
+                    empty
                 } else {
                     p.border
                 },
@@ -2933,7 +2978,11 @@ pub fn tool_button(ui: &mut Ui, p: &Palette, icon: Icon, active: bool, tooltip: 
         painter.rect_filled(rect, metrics::RADIUS_LARGE, fill);
     }
 
-    let colour = if active { p.accent } else { p.text_muted };
+    // `active_ink` rather than the accent: this is the selected tool and it is
+    // on screen permanently, and the accent on `control_active` is 1.88:1 in
+    // MediaBog. Graphite and Paper still get the ochre, which is what the
+    // design draws; see `Palette::active_ink`.
+    let colour = if active { p.active_ink() } else { p.text_muted };
     icons::draw(painter, rect.shrink(7.0), icon, colour);
 
     response.on_hover_text(tooltip)
@@ -4337,6 +4386,116 @@ mod tests {
                     "pass {pass}: {id:?} was freed by the pass that drew it"
                 );
             }
+        }
+    }
+
+    /// Every colour one headless pass actually put down.
+    ///
+    /// Read off the **tessellated** vertices rather than the shapes, because a
+    /// shape is a dozen types with a stroke of three different shapes among
+    /// them, where a vertex is one field. A feathered edge contributes the same
+    /// colour at alpha zero, which is why only fully opaque vertices are kept:
+    /// what these tests ask is which ink a control *chose*, and a transparent
+    /// vertex is a rounded corner rather than a choice.
+    fn inks_drawn(ctx: &egui::Context, field: Vec2, add: impl FnMut(&mut Ui)) -> Vec<Color32> {
+        use egui::epaint::Primitive;
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), field)),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, add);
+        let mut seen = Vec::new();
+        for job in ctx.tessellate(output.shapes, output.pixels_per_point) {
+            if let Primitive::Mesh(mesh) = &job.primitive {
+                for vertex in &mesh.vertices {
+                    if vertex.color.a() == 255 && !seen.contains(&vertex.color) {
+                        seen.push(vertex.color);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    /// The selected tool is inked in [`Palette::active_ink`], in the theme
+    /// where that is the accent *and* in one where it is not.
+    ///
+    /// **A guard on the palette is not a guard on the control**, which is the
+    /// generalisable half of this. `theme`'s
+    /// `an_active_mark_reads_on_the_fill_it_is_drawn_on` measures `active_ink`
+    /// and cannot see whether anything calls it: revert this one line to
+    /// `p.accent` and every ratio it checks still passes, because the palette
+    /// did not move. So this measures the ink that reached the pass.
+    ///
+    /// Both themes, because a rule with two answers tested against one answer
+    /// is a rule nothing tests. Graphite must still draw the ochre — the fix
+    /// must not cost the design its selected tool — and MediaBog must not,
+    /// because the accent on its selection blue is 1.88:1.
+    #[test]
+    fn the_selected_tool_is_inked_in_what_reads_on_its_fill() {
+        use crate::theme::ThemeKind;
+
+        for kind in [ThemeKind::Graphite, ThemeKind::MediaBog] {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            // Twice: the first pass through a fresh context builds the font
+            // atlas, which is what the tooltip's galley wants.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen = inks_drawn(&ctx, vec2(200.0, 200.0), |ui| {
+                    tool_button(ui, &p, Icon::Brush, true, "Brush");
+                });
+            }
+            assert!(
+                seen.contains(&p.active_ink()),
+                "{kind:?}: the selected tool did not draw {:?}",
+                p.active_ink(),
+            );
+            if p.active_ink() != p.accent {
+                assert!(
+                    !seen.contains(&p.accent),
+                    "{kind:?}: the selected tool still draws the accent",
+                );
+            }
+        }
+    }
+
+    /// The canvas scrollbar's thumb reads against the pit it lies on, in every
+    /// theme — measured off the pass rather than off the palette.
+    ///
+    /// Same reason as the tool button above: `theme`'s
+    /// `a_mark_on_the_canvas_pit_reads_in_every_theme` measures
+    /// `contrast::ink_on` and would stay green with this widget reverted to
+    /// `text_dim`, which is the ink that reads 1.34:1 on Krita's pit. What it
+    /// asks is only that *some* opaque ink in the pass clears 3:1, so it is
+    /// indifferent to which rank the thumb is drawn at and to the thumb moving
+    /// — and it would still catch the revert, because `text_dim` is the only
+    /// thing this widget draws.
+    #[test]
+    fn the_scrollbar_thumb_reads_against_every_canvas_pit() {
+        use crate::theme::{ThemeKind, contrast};
+
+        for kind in ThemeKind::ALL {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            let span = ScrollSpan {
+                doc: 2048.0,
+                extent: 700.0,
+                centre: 700.0,
+            };
+            let seen = inks_drawn(&ctx, vec2(400.0, 400.0), |ui| {
+                let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(11.0, 300.0));
+                canvas_scrollbar(ui, &p, rect, span, true, true);
+            });
+            let best = seen
+                .iter()
+                .map(|ink| contrast::ratio(*ink, p.backdrop))
+                .fold(0.0f64, f64::max);
+            assert!(
+                best >= contrast::READABLE,
+                "{kind:?}: the thumb's best ink is {best:.2}:1 on the pit",
+            );
         }
     }
 }

@@ -2343,9 +2343,13 @@ fn history_row(ui: &mut Ui, p: &Palette, row: &HistoryRow) -> egui::Response {
     }
 
     // The marker is the cursor: filled and accented where the document stands,
-    // hollow behind it, and hollow and dim ahead of it.
+    // hollow behind it, and hollow and dim ahead of it. `ink` carries the dot,
+    // the icon and the label, so it is a row of small text as well as a mark —
+    // and the current row is the one drawn on `control_active`, where the
+    // accent is 1.88:1 in MediaBog. `active_ink` keeps the accent in the two
+    // themes it reads in and hands the presets their own selected-row ink.
     let ink = match (row.current, row.applied) {
-        (true, _) => p.accent,
+        (true, _) => p.active_ink(),
         (false, true) => p.text,
         (false, false) => p.text_dim.gamma_multiply(0.55),
     };
@@ -2837,12 +2841,22 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
         .show(root, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(
+                    // The strip is filled with `control_active`, so the heading
+                    // takes the ink that reads on it — 10.5 points of accent on
+                    // that fill is 1.88:1 in MediaBog. See `Palette::active_ink`.
                     egui::RichText::new("LAYOUT EDIT")
                         .size(text::TINY)
-                        .color(p.accent)
+                        .color(p.active_ink())
                         .strong(),
                 );
                 ui.add_space(4.0);
+                // `text` and not `text_dim`, on this strip and on the sentence
+                // below it, because the whole strip is filled `control_active`:
+                // `text_dim` on that fill is 1.43:1 in MediaBog, and two of the
+                // three links here are the only way out of the mode and the way
+                // to put a removed panel back. `text` is 2.60 at worst, which
+                // is the rank `theme`'s guard holds it to. Nothing on this fill
+                // may be dimmer than that.
                 ui.label(
                     egui::RichText::new(
                         "drag a panel by its header: a column re-docks it, a column's \
@@ -2850,10 +2864,10 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                          resize · the cross removes",
                     )
                     .size(text::TINY)
-                    .color(p.text_dim),
+                    .color(p.text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if edit_bar_link(ui, p.text, "Back to painting")
+                    if edit_bar_link(ui, p.text_strong, "Back to painting")
                         .on_hover_text("Leave layout edit mode")
                         .clicked()
                     {
@@ -2863,14 +2877,14 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                     // The way back from having removed one, next to the mode
                     // that removes them. The Window menu has it too, but that
                     // is two clicks away from the bar that explains the mode.
-                    if edit_bar_link(ui, p.text_dim, "Add a module")
+                    if edit_bar_link(ui, p.text, "Add a module")
                         .on_hover_text("Every module there is, and what each one does")
                         .clicked()
                     {
                         ed.ui.module_library_open = true;
                     }
                     ui.add_space(12.0);
-                    if edit_bar_link(ui, p.text_dim, "Reset layout")
+                    if edit_bar_link(ui, p.text, "Reset layout")
                         .on_hover_text("Put every panel back where it started")
                         .clicked()
                     {
@@ -3683,6 +3697,114 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         println!("wrote 3 shots to {}", dir.display());
+    }
+
+    /// The history list's current row is inked in [`Palette::active_ink`], in
+    /// the theme where that is the accent *and* in one where it is not.
+    ///
+    /// `widgets`' `the_selected_tool_is_inked_in_what_reads_on_its_fill` says
+    /// why this is measured off a pass rather than off the palette: the palette
+    /// guard cannot see whether anything calls the rule, and none of these six
+    /// call sites moves a colour. This closes the second of them. The row is
+    /// the worst of the six on paper — `ink` carries a dot, an icon *and* an
+    /// eleven-point label, so it is text on `control_active` rather than a
+    /// mark — which is why it is the one that got a guard next.
+    #[test]
+    fn the_current_history_row_is_inked_in_what_reads_on_its_fill() {
+        use crate::icons::Icon;
+        use crate::theme::{Palette, ThemeKind};
+        use egui::{Rect, pos2, vec2};
+
+        for kind in [ThemeKind::Graphite, ThemeKind::MediaBog] {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            let row = super::HistoryRow {
+                icon: Icon::Brush,
+                label: "Paint",
+                gap: None,
+                at: None,
+                applied: true,
+                current: true,
+                scroll_here: false,
+            };
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(264.0, 80.0))),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    super::history_row(ui, &p, &row);
+                });
+                seen.clear();
+                for job in ctx.tessellate(output.shapes, output.pixels_per_point) {
+                    if let egui::epaint::Primitive::Mesh(mesh) = &job.primitive {
+                        for vertex in &mesh.vertices {
+                            if vertex.color.a() == 255 && !seen.contains(&vertex.color) {
+                                seen.push(vertex.color);
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                seen.contains(&p.active_ink()),
+                "{kind:?}: the current row did not draw {:?}",
+                p.active_ink(),
+            );
+            if p.active_ink() != p.accent {
+                assert!(
+                    !seen.contains(&p.accent),
+                    "{kind:?}: the current row still draws the accent",
+                );
+            }
+        }
+    }
+
+    /// The tool rail with a tool selected, in every theme.
+    ///
+    /// The selected tool is `control_active` under [`Palette::active_ink`], and
+    /// that pairing appears in **no** other picture this crate writes: the
+    /// theme shots draw the Settings dialog, whose only `control_active` is the
+    /// Shortcuts page's armed row, and `layers_panel_preview` draws Graphite
+    /// alone. So a selection colour taken from another application — which is
+    /// the whole point of four of the six themes — was a thing nobody could
+    /// look at, and the accent on one of those fills reads 1.88:1 in MediaBog.
+    /// Six shots is what makes "does it still read as selected" a question
+    /// somebody can answer.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app tool_rail_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn tool_rail_preview() {
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::{ThemeKind, metrics};
+        use egui::vec2;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tool-rail");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        for kind in ThemeKind::ALL {
+            let mut ed = Editor::default();
+            ed.ui.theme = kind;
+            ed.ui.tool = crate::editor::Tool::Select;
+            let palette = ed.palette();
+            let field = vec2(metrics::TOOL_RAIL, 190.0);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                super::tools_body(root, &palette, &mut ed);
+            });
+            docshot::write_png(&dir.join(format!("{}.png", kind.id())), &image)
+                .expect("write the png");
+        }
+        println!("wrote {} shots to {}", ThemeKind::ALL.len(), dir.display());
     }
 
     /// The mark a drag puts on the list, at each nesting it can land at.

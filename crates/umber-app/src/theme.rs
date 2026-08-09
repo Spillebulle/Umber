@@ -188,6 +188,188 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
+/// Whether a mark can be seen on the surface it is drawn on, and an ink for one
+/// that has to be.
+///
+/// **This exists because a token cannot answer for a surface nobody chose.**
+/// Every other colour in this file is a pair somebody authored — this ink on
+/// that surface — and a guard measures the pair. Four marks are not like that:
+/// the canvas scrollbar thumb, the pen dot, the splash's supporting lines and
+/// the input strip's prompt all sit on [`Palette::backdrop`], which the theme
+/// editor lets anybody set to anything. (A fifth thing is drawn there — the
+/// input strip's own scribble, in `text_strong` — and it is not in the list
+/// because it needs nothing: it is the strongest ink there is and reads 3.47:1
+/// on the worst pit any theme ships.) They were drawn in `text_dim`, on the
+/// reasoning that it is the one token that is a mid-grey whichever way a
+/// theme's surfaces run — and that is exactly why it fails: a mid-grey ink on a
+/// mid-grey pit is 1.34:1, which is worse than the 1.31:1 `rail` was rejected
+/// at. Krita's real canvas surround is a flat 50% `#808080`, so this is a
+/// palette Umber ships rather than a hypothetical one.
+///
+/// So the ink is *derived from the surface* instead, and what a call site picks
+/// is how loudly the mark should speak rather than which grey it should be.
+///
+/// **Two of those four are as often over the picture as over the pit**, and
+/// that is worth saying because the derivation cannot see it: the pen dot
+/// follows the nib, which is usually over the document, and a scrollbar is
+/// drawn precisely when the document runs past the view. No opaque colour reads
+/// on arbitrary paint — that is what [`Palette::accent_underlay`] exists for,
+/// and it costs a second pass these small marks are not worth — so the question
+/// is only which surface to favour. Favouring the pit is right because it is
+/// the one surface that is *always* there and always known, and it is not paid
+/// for at the other end: swept over every artwork colour, the worst case
+/// **improves**, from 1.34:1 to 1.48 in Krita and from 1.15 to 1.66 in Paper.
+/// What moves against the change is the *common* case over a dark painting in a
+/// theme with a light pit — 7.10:1 to 1.48 in Krita — and nothing here can fix
+/// that without making the marks two-tone.
+pub mod contrast {
+    use egui::Color32;
+
+    /// The floor every derived ink clears: WCAG 1.4.11's non-text minimum.
+    ///
+    /// It is reachable on **every** surface there is, which is what makes it a
+    /// floor rather than a hope: the worst case is the colour where lightening
+    /// and darkening have equal room, and even there something reaches
+    /// 4.58:1. `every_surface_can_carry_a_readable_mark` measures it over a
+    /// sweep rather than taking the algebra's word for it.
+    pub const READABLE: f64 = 3.0;
+
+    /// How loudly a mark should read against whatever it is drawn on.
+    ///
+    /// Named for the three type ranks these stand in for at the call sites that
+    /// gave them up — a reader meeting `ink_on(p.backdrop, Ink::Dim)` should be
+    /// able to see at a glance that it is where `p.text_dim` used to be. What
+    /// they are *not* is those tokens: a rank here is a position between
+    /// [`READABLE`] and everything the surface has to give, so the same variant
+    /// is a light grey on one pit and a dark one on another.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Ink {
+        /// A mark that has to be visible and must not shout: the resting
+        /// scrollbar thumb, the pen dot, a supporting line of text.
+        Dim,
+        /// The same mark, lit — a thumb under the pointer.
+        Muted,
+        /// As far as the surface goes: a thumb being dragged.
+        Strong,
+    }
+
+    impl Ink {
+        /// Every rank, for the guards.
+        ///
+        /// `cfg(test)` because nothing that *draws* enumerates these: a call
+        /// site names the one rank it wants, so a list of them would be dead
+        /// weight in the binary. `every_rank_is_in_the_list` is the exhaustive
+        /// match that keeps it complete.
+        #[cfg(test)]
+        pub const ALL: [Ink; 3] = [Self::Dim, Self::Muted, Self::Strong];
+
+        /// Where between [`READABLE`] and [`headroom`] this rank sits, as an
+        /// exponent on the two.
+        ///
+        /// Geometric rather than linear, and that is the whole of why the dark
+        /// themes look as they did: contrast is a ratio, so the interval a
+        /// human reads as "one step brighter" is a factor and not a difference.
+        /// [`Ink::Dim`] at 0.30 lands Graphite's thumb at 5.29:1 against the
+        /// 5.36:1 `text_dim` gave it, while the same number on a 50% grey pit —
+        /// where there is only 5.32:1 to be had at all — still clears 3.
+        fn strength(self) -> f64 {
+            match self {
+                Self::Dim => 0.30,
+                Self::Muted => 0.65,
+                Self::Strong => 1.0,
+            }
+        }
+    }
+
+    /// sRGB byte to linear, WCAG's own piecewise curve.
+    fn channel(b: u8) -> f64 {
+        let c = b as f64 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// WCAG relative luminance.
+    pub fn luminance(c: Color32) -> f64 {
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+
+    /// The WCAG contrast ratio between two colours, `1.0` to `21.0`.
+    ///
+    /// The only reading of "can this be seen" here that is not somebody's
+    /// opinion — the crude channel sum the link marks are measured by answers a
+    /// different question and would pass mid-grey on mid-grey. **One
+    /// implementation, shared by the guards and by [`ink_on`]**, so a figure
+    /// quoted in a comment is the figure a test prints rather than one somebody
+    /// worked out beside the code.
+    pub fn ratio(a: Color32, b: Color32) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// The end of the lightness axis a mark on `surface` should head for, and
+    /// the contrast it reaches there.
+    ///
+    /// The greater of the two *ratios* and deliberately not the greater
+    /// luminance distance, which is a different answer: 50% grey is 0.216 of
+    /// the way up the luminance axis, so it is much further from white — and
+    /// black still gives it 5.32:1 against white's 3.95:1, because the `+0.05`
+    /// in the ratio is worth far more at the dark end. Reading the distance
+    /// would send Krita's thumb the wrong way and lose a third of its contrast.
+    fn headroom(surface: Color32) -> (Color32, f64) {
+        let l = luminance(surface);
+        let lighter = 1.05 / (l + 0.05);
+        let darker = (l + 0.05) / 0.05;
+        if lighter >= darker {
+            (Color32::WHITE, lighter)
+        } else {
+            (Color32::BLACK, darker)
+        }
+    }
+
+    /// An ink for a mark on `surface`, at least [`READABLE`] against it.
+    ///
+    /// The surface itself taken towards black or white, rather than a grey
+    /// chosen outright: a pit with a tint keeps it, which is what stops the
+    /// mark reading as a piece of some other theme laid over this one.
+    ///
+    /// Bisected rather than solved, because [`super::mix`] rounds to bytes and
+    /// the guarantee has to hold for the colour that is actually drawn. The
+    /// predicate is monotone in `t`, `hi` starts at the extreme — which reaches
+    /// the target exactly, `luminance(WHITE)` being exactly 1.0 and
+    /// `luminance(BLACK)` exactly 0.0 in `f64` — and `hi` is what comes back,
+    /// so the answer is never *under* the target. Fourteen halvings is finer
+    /// than a byte.
+    ///
+    /// **The cost is about ninety `powf` a call, not the "some forty a frame"
+    /// this comment first claimed**, because each halving asks [`ratio`], which
+    /// evaluates *both* luminances: 14 × 6, plus the three [`headroom`] takes
+    /// and the two in the target. The two canvas scrollbars and the pen dot are
+    /// the per-frame callers, so it is roughly 270 and some fifteen
+    /// microseconds — still nothing beside a frame, which is why the figure
+    /// being wrong did not matter and being *stated* wrong did. Hoisting the
+    /// surface's luminance out of the loop would halve it and would mean not
+    /// calling `ratio` here, which is the one thing this module is for.
+    pub fn ink_on(surface: Color32, rank: Ink) -> Color32 {
+        let (extreme, headroom) = headroom(surface);
+        // `headroom` is never below READABLE, so this is monotone in the rank
+        // and never asks for more than the surface can give.
+        let target = READABLE.powf(1.0 - rank.strength()) * headroom.powf(rank.strength());
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..14 {
+            let mid = 0.5 * (lo + hi);
+            if ratio(super::mix(surface, extreme, mid), surface) >= target {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        super::mix(surface, extreme, hi)
+    }
+}
+
 /// A named colour in a [`Palette`] — one row of the theme editor, and one line
 /// of a `.umbertheme` file.
 ///
@@ -437,6 +619,11 @@ pub struct Palette {
     pub control: Color32,
     pub control_hover: Color32,
     /// Selected tool / active pill.
+    ///
+    /// A *fill*, and the one control token that is. What goes on it is
+    /// [`Palette::active_ink`] or `text_strong`, never the accent directly:
+    /// the four preset themes take their selection colour from the application
+    /// they are named for, and the accent on those reads down to 1.88:1.
     pub control_active: Color32,
     pub text_strong: Color32,
     pub text: Color32,
@@ -682,12 +869,11 @@ impl Palette {
     /// the metric says. `#8FB8E6` is 95 away and 4.03:1 on chrome.
     ///
     /// **The canvas pit needs no deviation, and the light draft had one.**
-    /// `widgets.rs` inks the canvas scrollbar thumb and the pen dot in
-    /// `text_dim` over `backdrop`, so the light draft had to darken its pit
-    /// away from the mid grey to reach 2.70:1. Clip Studio's real pit is
-    /// `#2E2E2E` and the thumb reads **4.95:1** on it, so here the faithful
-    /// colour is also the one that passes and there is no trade to record.
-    /// Krita is the theme that still pays it; see there.
+    /// The four marks on `backdrop` were inked in `text_dim` then, so the light
+    /// draft had to darken its pit away from the mid grey to reach 2.70:1. Clip
+    /// Studio's real pit is `#2E2E2E` and every one of those marks is derived
+    /// from the pit now — see [`contrast`] — so nothing here is a trade either
+    /// way. Krita is where that argument was actually fought; see there.
     pub const fn shit_studio() -> Self {
         Self {
             accent: Color32::from_rgb(0x8F, 0xB8, 0xE6),
@@ -749,28 +935,25 @@ impl Palette {
 
     /// Krita's mid grey and its slate-blue selection.
     ///
-    /// `#474747` panels, `#414141` docker headers and `#383838` list wells are
-    /// all sampled. **The canvas pit is not**, and it is the one place this
-    /// theme knowingly departs from the application it is named for.
+    /// `#474747` panels, `#414141` docker headers, `#383838` list wells and the
+    /// flat 50% `#808080` canvas surround are all sampled. That surround is
+    /// lighter than Krita's own interface, and it is the thing that makes a
+    /// Krita window recognisable across a room.
     ///
-    /// Krita surrounds the page with a flat 50% `#808080` — lighter than its
-    /// own interface, which is the thing that makes a Krita window
-    /// recognisable across a room, and it was this palette's `backdrop` until
-    /// it was measured against what gets drawn on it. Three marks are drawn in
-    /// `text_dim` over `backdrop` and nothing else: the canvas scrollbar thumb,
-    /// the dot that replaces the cursor under a pen, and the splash's status
-    /// line. `widgets.rs` explains why — `text_dim` is the only ink that is a
-    /// mid-grey whichever way the surfaces run — and names the bar it rejected:
-    /// `rail` at **1.31:1**. A `#808080` pit puts the thumb at **1.34:1**,
-    /// worse than the value that argument threw out, and the pen dot with it.
-    /// No pit between the panels and 50% grey fixes it, because `text_dim` is
-    /// itself a mid-grey: the contrast is lowest exactly where the pit is.
-    /// So the pit is dark like every other theme's, at 5.11:1, and what carries
-    /// Krita here is its mid grey and its slate selection — which is what it
-    /// was asked for.
-    /// **The other repair is the better one and is not in this file**: draw
-    /// that thumb in something chosen against the backdrop rather than in
-    /// `text_dim`. Do that and this can go back to `#808080`.
+    /// **It shipped dark once, and the reason is worth keeping.** Four marks
+    /// are drawn on `backdrop` and nothing else — the canvas scrollbar thumb,
+    /// the dot that replaces the cursor under a pen, the splash's supporting
+    /// lines and the input strip's prompt — and every one of them was inked in
+    /// `text_dim`, on the reasoning that it is the only token that is a
+    /// mid-grey whichever way a theme's surfaces run. On a mid-grey pit that
+    /// reads **1.34:1**, worse than the 1.31:1 `rail` had already been
+    /// rejected at, and no pit between the panels and 50% grey helps, because
+    /// the ink is itself a mid-grey and the contrast is lowest exactly where
+    /// the pit was going. So this palette darkened its pit instead, and said
+    /// out loud that the repair belonged in the drawing rather than here.
+    /// It does: [`contrast::ink_on`] derives those four marks from whatever the
+    /// pit is, `a_mark_on_the_canvas_pit_reads_in_every_theme` holds them to
+    /// 3:1, and the grey is back.
     ///
     /// `control_active` is the measured selection fill; `accent` is the same
     /// slate blue lifted until it reads as ink on `#474747` *and* clears
@@ -784,7 +967,8 @@ impl Palette {
             warning: Color32::from_rgb(0xE0, 0x8A, 0x6E),
             warning_bg: Color32::from_rgb(0x3B, 0x29, 0x24),
             warning_border: Color32::from_rgb(0x71, 0x44, 0x39),
-            backdrop: Color32::from_rgb(0x26, 0x26, 0x26),
+            // Krita's own 50% grey, measured. See above for why it was dark.
+            backdrop: Color32::from_rgb(0x80, 0x80, 0x80),
             window: Color32::from_rgb(0x38, 0x38, 0x38),
             dock: Color32::from_rgb(0x41, 0x41, 0x41),
             chrome: Color32::from_rgb(0x47, 0x47, 0x47),
@@ -946,6 +1130,89 @@ impl Palette {
     /// because the number's origin is a file rather than this process.
     pub fn link_colour(&self, group: u8) -> Color32 {
         self.link_colours[group as usize % self.link_colours.len()]
+    }
+
+    /// The ink a mark takes on [`Palette::control_active`] — the accent where
+    /// it reads against that fill, and `text_strong` where it does not.
+    ///
+    /// **Both halves are live in the shipped themes, and that is the whole
+    /// reason it is a measurement rather than a token.** `control_active` is
+    /// the selected state, and Graphite and Paper tint it faintly towards the
+    /// accent, so the accent on it is 4.74:1 and 3.80:1 — an ochre mark on a
+    /// warm fill, which is what the design draws. The four preset themes take
+    /// their selection colour from the application they are named for, and
+    /// those are *saturated*: the accent on one reads 2.60:1 in Clip Studio's
+    /// slate, 2.27 in Photoshop's grey, 2.06 in Krita's blue and 1.88 in
+    /// MediBang's — under the 3:1 the accent is already held to on `control`,
+    /// and under it for all four accents in each, down to 1.24. (Not
+    /// *monotonically* worse, which this said first: Photoslop's Sage reads
+    /// 2.50 and its Steel 2.29, both above its authored 2.27. All three still
+    /// fail, which is what the rule turns on.)
+    ///
+    /// Neither fixed answer will do. Always-accent is the defect. Always-
+    /// `text_strong` would take the ochre off the default theme's tool rail,
+    /// its layout-edit strip and its history cursor to fix four themes that
+    /// were not the design — and it is unnecessary, because the preset themes'
+    /// own applications draw a near-white on those fills, so the fallback is
+    /// the faithful answer there rather than a compromise.
+    ///
+    /// **Two icon buttons on that fill are still not covered by this**, and
+    /// they are named rather than quietly left: `controls::icon_button` inks
+    /// `text_muted` at rest and `ui::icon_button` inks `text_dim`, which on
+    /// `control_active` are 1.94:1 and 1.43:1 in MediaBog. Both are shared
+    /// widgets drawn on half a dozen surfaces, so the fix is a surface they are
+    /// told about rather than a token swapped here, and that is a refactor
+    /// rather than a contrast repair. The armed shortcut row and the selected
+    /// modulation row are where they land.
+    ///
+    /// A per-theme table is the other alternative and cannot be kept true: the
+    /// accent is a preference on top of the theme, so it would be twenty-four
+    /// authored answers today, and the theme editor lets somebody set
+    /// `control_active` and `accent` to anything at all. `an_active_mark_reads_
+    /// on_the_fill_it_is_drawn_on` is the guard, and it drives *both* readings
+    /// — a rule with two answers that only ever takes one is a rule nothing
+    /// tests.
+    pub fn active_ink(&self) -> Color32 {
+        if contrast::ratio(self.accent, self.control_active) >= contrast::READABLE {
+            return self.accent;
+        }
+        if contrast::ratio(self.text_strong, self.control_active) >= contrast::READABLE {
+            return self.text_strong;
+        }
+        // A theme somebody wrote can put both of those on its own selection
+        // fill; nothing shipped reaches here. Without this the rule would rest
+        // on the same authorability argument its own docs use against a table
+        // and answer with a second *token*, which has no floor — where
+        // `contrast` exists precisely to give one on any surface at all.
+        contrast::ink_on(self.control_active, contrast::Ink::Strong)
+    }
+
+    /// What is drawn *under* the accent where a mark lies over the artwork:
+    /// the selection marquee, the transform box, its handles and the rotation
+    /// mark.
+    ///
+    /// Those are dark-then-light pairs, and the pair is the whole point — no
+    /// single opaque colour reads on a painting, so one of the two has to. It
+    /// used to be `backdrop`, on the reasoning that `backdrop` and `accent` are
+    /// "each dark in one theme and light in the other". **Krita's real canvas
+    /// surround is a 50% grey, so that stopped being true the moment this
+    /// palette was made faithful**: the pair's two halves came within 1.60:1 of
+    /// each other and the dark line read 1.00:1 against mid-grey paint.
+    ///
+    /// So it is derived from the *accent* rather than borrowed from a surface —
+    /// the far end of the lightness axis from whatever the accent is, which is
+    /// what "dark in one theme and light in the other" was reaching for. It is
+    /// better than `backdrop` was in **all** twenty-four theme-and-accent
+    /// pairs, not only in Krita's. `the_marquees_pair_reads_over_any_artwork`
+    /// is the guard, and it sweeps artwork rather than surfaces, because that
+    /// is what these marks lie on.
+    ///
+    /// It does **not** reach 3:1 on every artwork and cannot: a saturated
+    /// mid-luminance colour defeats any pair of one extreme and one mid tone,
+    /// and the worst here is Paper's 2.24. What a guard can hold is that it is
+    /// never worse than the token it replaced, which for Krita was 1.06.
+    pub fn accent_underlay(&self) -> Color32 {
+        contrast::ink_on(self.accent, contrast::Ink::Strong)
     }
 
     /// The theme in its authored accent.
@@ -1408,6 +1675,7 @@ fn style_from(style: &mut egui::Style, palette: &Palette) {
 
 #[cfg(test)]
 mod tests {
+    use super::contrast::Ink;
     use super::*;
 
     /// A link group is told apart from its neighbours by the colour of a 12-px
@@ -1617,10 +1885,9 @@ mod tests {
 
     /// A theme nobody can read is worse than no theme.
     ///
-    /// WCAG relative luminance, which is the only reading of "can this be
-    /// read" that is not somebody's opinion — the crude channel sum the link
-    /// marks are measured by answers a different question and would pass a
-    /// theme printing mid-grey on mid-grey.
+    /// Measured with [`contrast::ratio`], which is the same function
+    /// [`contrast::ink_on`] derives an ink with — so a figure quoted here is a
+    /// figure this test prints rather than one worked out beside it.
     ///
     /// It runs over all six rather than the four added, deliberately: a bound
     /// the shipped pair does not meet is a bound stated wrongly, and finding
@@ -1639,22 +1906,7 @@ mod tests {
     /// what caught MediaBog's selection blue at 2.85.
     #[test]
     fn text_reads_against_every_surface_it_is_drawn_on() {
-        // sRGB byte to linear, WCAG's own piecewise curve.
-        fn channel(b: u8) -> f64 {
-            let c = b as f64 / 255.0;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        fn luminance(c: Color32) -> f64 {
-            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
-        }
-        fn ratio(a: Color32, b: Color32) -> f64 {
-            let (x, y) = (luminance(a), luminance(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        }
+        use contrast::ratio;
 
         for kind in ThemeKind::ALL {
             let p = Palette::of(kind);
@@ -1705,14 +1957,17 @@ mod tests {
                 // the tokens egui is handed are only half the domain.
                 (p.text, "text", p.control, "control", 4.5),
                 (p.accent, "accent", p.control, "control", 3.0),
-                // Three marks are drawn in `text_dim` over the *canvas pit* and
-                // nowhere else: `widgets`'s canvas scrollbar thumb, `ui`'s pen
-                // dot, and `splash`'s status line. `widgets.rs` states the bar
-                // it rejected when it chose that ink — `rail`, at 1.31:1 — and
-                // 2.6 is what the palette it was written against actually
-                // reaches, which is Paper's 2.61. Krita's own 50% grey pit put
-                // the thumb at 1.34, under the number that argument threw out.
-                (p.text_dim, "text_dim", p.backdrop, "backdrop", 2.6),
+                // **There is no `text_dim` on `backdrop` row here any more, and
+                // that is a defect fixed rather than a bound dropped.** Nothing
+                // draws that pair: the four marks on the canvas pit take
+                // `contrast::ink_on` now, and `a_mark_on_the_canvas_pit_reads_
+                // in_every_theme` holds them to 3.0 — above the 2.6 this row
+                // carried, which was Paper's own reading and the most the
+                // token could promise. What forced it is that a *token* cannot
+                // answer for the pit at all: `text_dim` is a mid-grey, so on
+                // Krita's real 50% grey surround it is 1.34:1, worse than the
+                // 1.31:1 `rail` had already been rejected at. `contrast`'s
+                // module docs have the whole argument.
             ] {
                 let r = ratio(ink, surface);
                 assert!(
@@ -1724,18 +1979,46 @@ mod tests {
             // The accent is ink too — it is what a hyperlink is drawn in.
             let r = ratio(p.accent, p.chrome);
             assert!(r >= 3.0, "{kind:?}: the accent on chrome is {r:.2}:1");
-            // And a selected row has to be readable, which is the one place
-            // `control_active` is a background rather than a mark.
+            // And a selected row has to be readable. `control_active` is a
+            // *fill* at eleven sites — both mode strips, the layer, brush,
+            // history and stamp rows, the armed shortcut row, the tool button,
+            // the icon toggle and the modulation row — and `text_strong` is the
+            // primary ink on all of them.
             let r = ratio(p.text_strong, p.control_active);
             assert!(
                 r >= 3.0,
                 "{kind:?}: text_strong on control_active is {r:.2}:1",
+            );
+            // `text` is the *secondary* rank on those fills — the modulation
+            // list's range figure, `edit_bar`'s sentence and its two links,
+            // `tip_bar`'s sentence, a selected brush row's credit line, the
+            // capture hint's way out — and 2.59 is
+            // what this palette actually reaches rather than a round number,
+            // exactly as `text_dim` on `window` above. MediaBog's is 2.5976,
+            // and the figure is written to the place it fails at rather than
+            // rounded, because a bound rounded *up* is a bound that fails on
+            // the palette it was written for. Its selection blue is measured
+            // off MediBang and already deepened once so `text_strong` clears 3;
+            // a second rank on a fill that bright is not available without
+            // moving the theme further from the application it is named for. It
+            // used to be `text_dim` there, at 1.43:1, which is the defect this
+            // row exists to stop coming back.
+            let r = ratio(p.text, p.control_active);
+            assert!(
+                r >= 2.59,
+                "{kind:?}: text on control_active is {r:.3}:1, under 2.59:1",
             );
         }
     }
 
     /// Warning ink must contrast with the surface it is drawn on, in both
     /// themes — the whole point of the token is to be noticed.
+    ///
+    /// The channel sum first, which is the separation this was written to
+    /// measure, and then the ratio — because `controls::keycap` draws a
+    /// clashing chord as 10.5-point text in `warning` on `warning_bg`, and a
+    /// separation is not a reading. 4.5 is WCAG's own text floor and Paper's
+    /// 4.93 is the least any of the six reaches, so nothing shipped moves.
     #[test]
     fn warning_ink_contrasts_with_its_own_fill() {
         let luma = |c: Color32| c.r() as i32 + c.g() as i32 + c.b() as i32;
@@ -1745,7 +2028,251 @@ mod tests {
                 (luma(p.warning) - luma(p.warning_bg)).abs() > 200,
                 "{kind:?} warning ink is too close to its fill",
             );
+            let r = contrast::ratio(p.warning, p.warning_bg);
+            assert!(r >= 4.5, "{kind:?}: warning on warning_bg is {r:.2}:1");
         }
+    }
+
+    /// A mark on a selected row reads on the fill it is drawn on, in every
+    /// theme and under every accent.
+    ///
+    /// [`Palette::active_ink`] has two answers and this drives both, which is
+    /// the point: a test of a two-state reading that only ever meets one state
+    /// is testing the state it happens to like. Graphite and Paper answer with
+    /// the accent for all four accents, the four presets answer `text_strong`
+    /// for all four, and the split is asserted rather than merely covered — so
+    /// a change that quietly collapsed the rule to one branch fails here even
+    /// though every ratio would still pass.
+    ///
+    /// The floor is 3:1, the same one the accent on `control` is already held
+    /// to, because these are icons, dots and short labels on a fill rather than
+    /// body text.
+    #[test]
+    fn an_active_mark_reads_on_the_fill_it_is_drawn_on() {
+        for kind in ThemeKind::ALL {
+            for accent in Accent::ALL {
+                let p = Palette::with_accent(kind, accent);
+                let ink = p.active_ink();
+                let r = contrast::ratio(ink, p.control_active);
+                assert!(
+                    r >= contrast::READABLE,
+                    "{kind:?}/{accent:?}: the active mark is {r:.2}:1",
+                );
+                let took_accent = ink == p.accent;
+                // An exhaustive `match` and not a `matches!`, which this file
+                // has a rule against: a seventh theme has to be given an answer
+                // here rather than silently falling into the `false` arm.
+                let expected = match kind {
+                    ThemeKind::Graphite | ThemeKind::Paper => true,
+                    ThemeKind::Photoslop
+                    | ThemeKind::ShitStudio
+                    | ThemeKind::Krita
+                    | ThemeKind::MediaBog => false,
+                };
+                assert_eq!(
+                    took_accent, expected,
+                    "{kind:?}/{accent:?}: took the accent? {took_accent}",
+                );
+            }
+        }
+    }
+
+    /// The marquee's dark-then-light pair reads over *artwork*, which is the
+    /// only surface it is ever on.
+    ///
+    /// **The sweep is over paintings, not over palettes, and that is the whole
+    /// finding.** Every other guard in this file measures an ink against a
+    /// surface the theme names. The selection outline, the transform box, its
+    /// handles and the rotation mark lie over pixels somebody painted, so what
+    /// has to be true is that *one of the two passes* reads against any colour
+    /// at all — and no guard asked that, which is how the under-pass came to be
+    /// `backdrop` and how making Krita's palette faithful broke it: at
+    /// `#808080` the pair's two halves were 1.60:1 apart and the "dark" line
+    /// was 1.00:1 against mid-grey paint.
+    ///
+    /// Two bounds, and neither is 3:1, because 3:1 is not reachable here: a
+    /// saturated mid-luminance colour defeats any pair made of one extreme and
+    /// one mid tone, and the best any of the twenty-four theme-and-accent pairs
+    /// manages is Paper's **2.24**. So the floor is what the worst of them
+    /// actually reaches, exactly as `text_dim` on `window` is Paper's own
+    /// figure — and the second bound is the one that catches a regression
+    /// rather than a threshold: the pair must be at least as good as
+    /// `backdrop` gave it, in every theme, which is what Krita failed by a
+    /// factor of two.
+    #[test]
+    fn the_marquees_pair_reads_over_any_artwork() {
+        for kind in ThemeKind::ALL {
+            for accent in Accent::ALL {
+                let p = Palette::with_accent(kind, accent);
+                let under = p.accent_underlay();
+                // The underlay is an end of the axis, so it is one of two
+                // colours; asserting that is what says it is a *counterpart*
+                // rather than a second mid tone.
+                assert!(
+                    under == Color32::WHITE || under == Color32::BLACK,
+                    "{kind:?}/{accent:?}: the underlay is {under:?}",
+                );
+
+                let mut worst = (f64::MAX, Color32::BLACK);
+                let mut worst_backdrop = f64::MAX;
+                for r in 0..=255u8 {
+                    for g in (0..=255u8).step_by(15) {
+                        for b in (0..=255u8).step_by(15) {
+                            let art = Color32::from_rgb(r, g, b);
+                            let pair =
+                                contrast::ratio(p.accent, art).max(contrast::ratio(under, art));
+                            if pair < worst.0 {
+                                worst = (pair, art);
+                            }
+                            let was = contrast::ratio(p.accent, art)
+                                .max(contrast::ratio(p.backdrop, art));
+                            worst_backdrop = worst_backdrop.min(was);
+                        }
+                    }
+                }
+                let (seen, art) = worst;
+                assert!(
+                    seen >= 2.2,
+                    "{kind:?}/{accent:?}: the pair is {seen:.3}:1 on {art:?}",
+                );
+                assert!(
+                    seen >= worst_backdrop,
+                    "{kind:?}/{accent:?}: the underlay is {seen:.3}:1 where \
+                     `backdrop` was {worst_backdrop:.3}:1",
+                );
+            }
+        }
+    }
+
+    /// [`Ink::ALL`] holds every rank.
+    ///
+    /// An exhaustive `match` rather than a walk over the array, for the reason
+    /// this codebase states for every other `ALL`: a test that iterates the
+    /// list can only ever check what is already in it. The arms index the
+    /// array, so a short one is an out-of-bounds panic — which is not total
+    /// either, since an arm naming the wrong position still compiles, and the
+    /// comment says so rather than claiming the list cannot be forgotten.
+    #[test]
+    fn every_rank_is_in_the_list() {
+        for rank in Ink::ALL {
+            let at = match rank {
+                Ink::Dim => 0,
+                Ink::Muted => 1,
+                Ink::Strong => 2,
+            };
+            assert_eq!(Ink::ALL[at], rank);
+        }
+    }
+
+    /// Every surface there is can carry a mark at [`contrast::READABLE`].
+    ///
+    /// The claim [`contrast::ink_on`] rests on, and it is not obvious: a
+    /// surface can be too light for a light mark *and* too dark for a dark one
+    /// at the same time, so the question is what is left where the two meet.
+    /// The answer is 4.58:1, at a mid tone, and it is well clear of 3.
+    ///
+    /// **The sweep is over the domain the function has, not the six palettes
+    /// that use it** — the theme editor writes `backdrop` from a colour picker,
+    /// so any of the sixteen million is reachable, and a guard fed only the
+    /// shipped pits would be measuring the themes rather than the rule. Strided
+    /// on two channels to keep it under a second; the red axis is whole,
+    /// because it is the one the stride could hide a hole in.
+    #[test]
+    fn every_surface_can_carry_a_readable_mark() {
+        let mut worst = (f64::MAX, Color32::BLACK, Ink::Dim);
+        for r in 0..=255u8 {
+            for g in (0..=255u8).step_by(17) {
+                for b in (0..=255u8).step_by(17) {
+                    let surface = Color32::from_rgb(r, g, b);
+                    for rank in Ink::ALL {
+                        let seen = contrast::ratio(contrast::ink_on(surface, rank), surface);
+                        if seen < worst.0 {
+                            worst = (seen, surface, rank);
+                        }
+                    }
+                }
+            }
+        }
+        let (seen, surface, rank) = worst;
+        assert!(
+            seen >= contrast::READABLE,
+            "{rank:?} on {surface:?} is only {seen:.3}:1",
+        );
+    }
+
+    /// A rank is a step, not a name for a grey: each has to be stronger than
+    /// the one below it, and the strongest has to be everything the surface has
+    /// to give.
+    ///
+    /// The three ranks are the scrollbar thumb's idle, hovered and dragging
+    /// inks, and two of them landing on the same colour is a control that stops
+    /// answering the pointer. Over a sweep rather than the shipped pits for the
+    /// reason above, and it is a real risk rather than a formality: a mid-grey
+    /// surface has only 5.32:1 in it altogether, so the three ranks are packed
+    /// into a fifth of the room a near-black pit gives them.
+    ///
+    /// **This one strides all three axes**, unlike the floor above, and does
+    /// not inherit that test's "the red axis is whole" argument: three ranks
+    /// are three `ink_on` calls, so it is three times the work per surface.
+    /// What the stride can hide is a hole narrower than three levels of red,
+    /// and the only reading that rules one out is an exhaustive sweep, which
+    /// was run by hand over all 16.7 million surfaces and found none. Said
+    /// rather than implied, because a guard that borrows a neighbour's
+    /// justification is the failure this file has a section about.
+    #[test]
+    fn a_stronger_rank_is_a_stronger_mark() {
+        for r in (0..=255u8).step_by(3) {
+            for g in (0..=255u8).step_by(29) {
+                for b in (0..=255u8).step_by(31) {
+                    let surface = Color32::from_rgb(r, g, b);
+                    let seen: Vec<f64> = Ink::ALL
+                        .into_iter()
+                        .map(|rank| contrast::ratio(contrast::ink_on(surface, rank), surface))
+                        .collect();
+                    assert!(
+                        seen[0] < seen[1] && seen[1] < seen[2],
+                        "{surface:?}: the ranks read {seen:.2?}",
+                    );
+                    // The loudest rank is the end of the axis, so a mark being
+                    // dragged is as strong as this surface can make it.
+                    let strongest = contrast::ink_on(surface, Ink::Strong);
+                    assert!(
+                        strongest == Color32::WHITE || strongest == Color32::BLACK,
+                        "{surface:?}: the strongest mark is {strongest:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The four marks on the canvas pit, in every theme.
+    ///
+    /// The scrollbar thumb (three states), the pen dot, the splash's tagline,
+    /// status and adapter lines, and the input strip's "Drag here". The rule
+    /// above already guarantees the floor for *any* surface; what this adds is
+    /// the reading for the pits Umber actually ships, and the record that
+    /// Krita's own 50% grey is one of them — which is the palette the token
+    /// this replaced could not serve.
+    #[test]
+    fn a_mark_on_the_canvas_pit_reads_in_every_theme() {
+        for kind in ThemeKind::ALL {
+            let pit = Palette::of(kind).backdrop;
+            for rank in Ink::ALL {
+                let r = contrast::ratio(contrast::ink_on(pit, rank), pit);
+                assert!(
+                    r >= contrast::READABLE,
+                    "{kind:?}: an {rank:?} mark on the pit is {r:.2}:1",
+                );
+            }
+        }
+        // Krita's pit *is* the mid grey, and this is what says so: the theme is
+        // named for an application whose canvas surround is the most
+        // recognisable thing about it, and the palette darkened it to dodge a
+        // contrast problem that has now been fixed where it lived.
+        assert_eq!(
+            Palette::of(ThemeKind::Krita).backdrop,
+            Color32::from_rgb(0x80, 0x80, 0x80),
+        );
     }
 
     /// A picture of every theme, so a palette is judged by looking at it.

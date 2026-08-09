@@ -23,6 +23,7 @@ use crate::panels;
 use crate::shortcuts::{self, Action};
 use crate::syspick;
 use crate::tabs;
+use crate::theme::contrast::{self, Ink};
 use crate::theme::{Palette, metrics, text};
 use crate::tweaks::Tweak;
 use crate::widgets;
@@ -449,11 +450,16 @@ const ANT_FRAME_MS: u64 = 60;
 /// painting is being clipped.
 ///
 /// Two passes, dark then light, so the outline reads over both a white canvas
-/// and a black one. Neither colour is a literal: `backdrop` and `accent` are
-/// each dark in one theme and light in the other, which is what makes the pair
-/// work on any artwork. **Only the accent dashes move.** The dark line under
-/// them stays solid, so the pair still reads on any artwork at every instant of
-/// the animation rather than only when a dash happens to be over a dark pixel.
+/// and a black one. Neither colour is a literal, and the under-pass is
+/// [`Palette::accent_underlay`] rather than `backdrop`: that token was chosen
+/// because "`backdrop` and `accent` are each dark in one theme and light in the
+/// other", and Krita's canvas surround is a 50% grey, so the two halves came
+/// within 1.60:1 of each other and the dark line read 1.00:1 on mid-grey paint.
+/// The underlay is the far end of the lightness axis from the accent, which is
+/// what that sentence was reaching for. **Only the accent dashes move.** The
+/// line under them stays solid, so the pair still reads on any artwork at every
+/// instant of the animation rather than only when a dash happens to be over a
+/// dark pixel.
 fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
     if ed.selection.is_none() && ed.selection_draft.is_none() {
         return;
@@ -518,7 +524,7 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         // Segment by segment rather than one `Shape::line`, which would want
         // the points by value and so a copy of them per ring per frame.
         for pair in screen.windows(2) {
-            painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.backdrop));
+            painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.accent_underlay()));
         }
         dashes.clear();
         egui::Shape::dashed_line_many_with_offset(
@@ -611,18 +617,19 @@ fn transform_box(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
     let painter = ui.painter().with_clip_rect(rect);
     let quad = float.xf.quad();
     let corners: Vec<egui::Pos2> = quad.iter().copied().map(to_screen).collect();
+    // Two passes, dark then light, so the box reads over both a white canvas
+    // and a black one — the same trick the selection outline uses, and the
+    // under-pass is the same `accent_underlay`. It was `backdrop`; see there.
+    let under = p.accent_underlay();
     for i in 0..4 {
-        // Two passes, dark then light, so the box reads over both a white
-        // canvas and a black one — the same trick the selection outline uses,
-        // and neither colour is a literal.
         let (a, b) = (corners[i], corners[(i + 1) % 4]);
-        painter.line_segment([a, b], Stroke::new(2.0, p.backdrop));
+        painter.line_segment([a, b], Stroke::new(2.0, under));
         painter.line_segment([a, b], Stroke::new(1.0, p.accent));
     }
 
     for handle in umber_core::Handle::BOX {
         let at = to_screen(float.xf.handle_at(handle));
-        painter.circle_filled(at, 4.0, p.backdrop);
+        painter.circle_filled(at, 4.0, under);
         painter.circle_filled(at, 3.0, p.accent);
     }
 
@@ -671,8 +678,9 @@ fn rotate_mark(
     let centre = edge + away * (to + ROTATE_MARK * 0.5);
     let at = Rect::from_center_size(centre, vec2(ROTATE_MARK, ROTATE_MARK));
     // Dark under light, as the box's own outline is: the mark lies over the
-    // artwork and neither colour can be assumed to read against it.
-    icons::draw(painter, at.expand(1.0), Icon::Rotate, p.backdrop);
+    // artwork and neither colour can be assumed to read against it. The
+    // under-pass is `accent_underlay` for the reason the outline's is.
+    icons::draw(painter, at.expand(1.0), Icon::Rotate, p.accent_underlay());
     icons::draw(painter, at, Icon::Rotate, p.accent);
 }
 
@@ -1216,19 +1224,19 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
         return;
     };
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-    // `text_dim` is the palette's recessive ink, and it is the one token that
-    // is a mid-grey in *every* theme — the surfaces invert between the light
-    // ones and the dark ones and most of the ink with them, so anything
-    // stronger would be black on one and white on the other, over artwork that
-    // is neither.
-    //
-    // That it reads against the pit is now a bound rather than an observation:
-    // `theme`'s `text_reads_against_every_surface_it_is_drawn_on` holds
-    // `text_dim` on `backdrop` to 2.6:1 for every shipped theme, this being one
-    // of the three places that pair is drawn. Krita's own 50% grey canvas
-    // surround is a palette this refuses, and `Palette::krita` says so.
-    ui.painter()
-        .circle_filled(ed.to_points(at), metrics::PEN_DOT, p.text_dim);
+    // Derived from the pit, at the rank `text_dim` used to hold. That token was
+    // chosen for being the one ink that is a mid-grey in *every* theme — the
+    // surfaces invert between the light themes and the dark ones and most of
+    // the ink with them, so a fixed strong ink would be black on one and white
+    // on the other, over artwork that is neither. The flaw is the same reading
+    // read the other way: on a mid-grey pit a mid-grey dot is 1.34:1, which is
+    // a cursor nobody can find. `theme::contrast` has the argument, and
+    // `a_mark_on_the_canvas_pit_reads_in_every_theme` is the bound.
+    ui.painter().circle_filled(
+        ed.to_points(at),
+        metrics::PEN_DOT,
+        contrast::ink_on(p.backdrop, Ink::Dim),
+    );
 }
 
 /// A crosshair over the canvas while the eyedropper is in hand.
@@ -2807,6 +2815,17 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             .corner_radius(6)
             .inner_margin(Margin::symmetric(10, 6))
             .show(ui, |ui| {
+                // Both labels step up a rank on the selected row, because that
+                // row is the one drawn on `control_active` and the fills the
+                // preset themes take from their own applications are bright:
+                // `text` on MediaBog's selection blue is 2.60:1 and `text_dim`
+                // is 1.43:1. Every other selected row in this interface already
+                // inks its primary line `text_strong`; this one did not.
+                let (primary, secondary) = if selected {
+                    (p.text_strong, p.text)
+                } else {
+                    (p.text, p.text_dim)
+                };
                 ui.horizontal(|ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
@@ -2816,7 +2835,7 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                             entry.input.label()
                         ))
                         .size(text::TINY)
-                        .color(p.text),
+                        .color(primary),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, p, Icon::Trash, true, "Remove this input") {
@@ -2829,7 +2848,7 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                                 entry.target.format(entry.high)
                             ))
                             .size(text::TINY)
-                            .color(p.text_dim),
+                            .color(secondary),
                         );
                     });
                 });
@@ -4550,8 +4569,9 @@ mod tests {
     /// lies over the *canvas*, which is what the composite pass paints
     /// `backdrop` with, and the surfaces invert between Graphite and Paper so a
     /// shot of one says nothing about the other. Shooting the idle thumb on
-    /// `chrome` in Graphite alone is how an ink at 1.07:1 in Paper survived
-    /// being looked at.
+    /// `chrome` in Graphite alone is how an ink at 1.06:1 in Paper survived
+    /// being looked at. (1.07 here and in `widgets.rs` until `contrast::ratio`
+    /// was asked; `rail` on Paper's pit is 1.0589.)
     ///
     /// It takes **no `gputest::lock()`**, and that is decided rather than
     /// skipped — see the note in the body.
@@ -4600,6 +4620,11 @@ mod tests {
         for (theme, ink) in [
             (ThemeKind::Graphite, "graphite"),
             (ThemeKind::Paper, "paper"),
+            // Krita's pit is the 50% grey, which is the surface the token this
+            // thumb used to be inked with could say nothing on. A shot of the
+            // two extremes says nothing about the middle, which is exactly the
+            // mistake recorded above one level up.
+            (ThemeKind::Krita, "krita"),
         ] {
             for (name, zoom, centre) in [
                 ("1-zoomed-in", 1.0, middle),
