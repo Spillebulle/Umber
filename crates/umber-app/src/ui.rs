@@ -23,6 +23,7 @@ use crate::panels;
 use crate::shortcuts::{self, Action};
 use crate::tabs;
 use crate::theme::{Palette, metrics, text};
+use crate::tweaks::Tweak;
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use umber_core::{
@@ -1805,22 +1806,41 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 widgets::inline_slider(
                     ui,
                     p,
-                    "Size",
                     &mut ed.brush.size,
-                    Brush::MIN_SIZE..=400.0,
-                    true,
-                    |v| format!("{v:.0}"),
+                    &widgets::Rail {
+                        label: "Size",
+                        // The rail stops at `tweaks::SIZE_RAIL_TOP` and a size
+                        // does not: type 1500 and the brush is 1500 px across.
+                        // The two figures are `Tweak::span` and `Tweak::range`,
+                        // shared with the brush editor's own size rail so the
+                        // two cannot stop in different places.
+                        span: Tweak::Size.span(),
+                        limit: Tweak::Size.range(),
+                        log: true,
+                        snap: 0.0,
+                        deferred: false,
+                        // Bare, not `Tweak::Size.figure()`'s " px": the strip
+                        // is one unwrapped row of three rails and a unit on
+                        // each is nine points it cannot spare. The label is
+                        // directly beside it and says which setting it is.
+                        figure: widgets::Figure::new(1.0, "", 0),
+                    },
                 );
             }
             if room >= strip_budget::SIZE + strip_budget::OPACITY {
                 widgets::inline_slider(
                     ui,
                     p,
-                    "Opacity",
                     &mut ed.brush.opacity,
-                    0.0..=1.0,
-                    false,
-                    |v| format!("{:.0}", v * 100.0),
+                    &widgets::Rail {
+                        label: "Opacity",
+                        span: 0.0..=1.0,
+                        limit: 0.0..=1.0,
+                        log: false,
+                        snap: 0.0,
+                        deferred: false,
+                        figure: widgets::Figure::new(100.0, "", 0),
+                    },
                 );
             }
             if room >= strip_budget::SIZE + strip_budget::OPACITY + strip_budget::STABILISER {
@@ -1828,22 +1848,26 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 // It used to be a `widgets::chip` — a reading, with a tooltip
                 // saying to go to the brush editor to change it — which put the
                 // one setting a painter adjusts *while* drawing a line behind
-                // two clicks and a tab. `metrics::OPTIONS_STRIP` is 36 points,
-                // so `widgets::number_row`'s two stacked rows do not fit here
-                // and this figure cannot be typed; that is the strip's own
-                // trade and is why `inline_slider` is what the strip uses.
+                // two clicks and a tab.
                 //
                 // The range is the brush editor's own — 0.0..=0.95, where 1.0
                 // would be a stroke that never reaches the pen — so the two
-                // controls cannot disagree about what full stabilisation is.
+                // controls cannot disagree about what full stabilisation is,
+                // and it is the typed limit as well: a percentage rail whose
+                // hundred is not reachable is one whose hundred is not real.
                 widgets::inline_slider(
                     ui,
                     p,
-                    "Stabiliser",
                     &mut ed.brush.stabilization,
-                    0.0..=Brush::MAX_STABILIZATION,
-                    false,
-                    |v| format!("{:.0}", v * 100.0),
+                    &widgets::Rail {
+                        label: "Stabiliser",
+                        span: 0.0..=Brush::MAX_STABILIZATION,
+                        limit: 0.0..=Brush::MAX_STABILIZATION,
+                        log: false,
+                        snap: 0.0,
+                        deferred: false,
+                        figure: widgets::Figure::new(100.0, "", 0),
+                    },
                 );
             }
         } else if ed.ui.tool == Tool::Transform {
@@ -1887,11 +1911,16 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 widgets::inline_slider(
                     ui,
                     p,
-                    "Feather",
                     &mut ed.ui.selection_feather,
-                    0.0..=Selection::MAX_FEATHER,
-                    false,
-                    |v| format!("{v:.0}"),
+                    &widgets::Rail {
+                        label: "Feather",
+                        span: 0.0..=Selection::MAX_FEATHER,
+                        limit: 0.0..=Selection::MAX_FEATHER,
+                        log: false,
+                        snap: 0.0,
+                        deferred: false,
+                        figure: widgets::Figure::new(1.0, "", 0),
+                    },
                 );
             }
             ui.add_space(4.0);
@@ -2410,9 +2439,13 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             p,
             "Size",
             &mut ed.brush.size,
-            Brush::MIN_SIZE..=400.0,
+            // `Tweak::span`, shared with the tool options strip's size rail, so
+            // the two cannot stop in different places. It is not
+            // `Tweak::range`: that is what a size may *be*, and the difference
+            // is the whole of `tweaks::SIZE_RAIL_TOP`'s note.
+            Tweak::Size.span(),
             true,
-            |v| format!("{v:.0} px"),
+            |v| Tweak::Size.format(v),
         );
         // A tip *replaces* the procedural falloff rather than being multiplied
         // into it, so hardness has nothing left to shape. Drawn dead with the

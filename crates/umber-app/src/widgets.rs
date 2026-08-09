@@ -800,39 +800,19 @@ pub fn canvas_scrollbar(
     None
 }
 
-/// Compact label + rail + readout, laid out horizontally for the options strip.
-pub fn inline_slider(
-    ui: &mut Ui,
-    p: &Palette,
-    label: &str,
-    value: &mut f32,
-    range: RangeInclusive<f32>,
-    log: bool,
-    display: impl Fn(f32) -> String,
-) -> bool {
-    let (lo, hi) = (*range.start(), *range.end());
-    let log = log && lo > 0.0 && hi > lo;
-
-    ui.label(
-        egui::RichText::new(label)
-            .size(text::SMALL)
-            .color(p.text_dim),
-    );
-
-    let (row, response) = ui.allocate_exact_size(vec2(90.0, 16.0), Sense::click_and_drag());
-    let track = Rect::from_center_size(row.center(), vec2(row.width() - 10.0, 3.0));
-    let changed = drag_track(&response, track, value, lo, hi, log, 0.0);
-    paint_track(ui.painter(), p, track, to_t(*value, lo, hi, log), 10.0);
-
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(display(*value))
-            .monospace()
-            .size(text::TINY)
-            .color(p.text),
-    );
-
-    changed
+/// The rail the tool options strip draws: label, rail and typable figure, all
+/// on one line.
+///
+/// **It is [`typed_row`] laid out differently, and not a second control.** The
+/// strip is `metrics::OPTIONS_STRIP`'s 36 points, which [`number_row`]'s two
+/// stacked rows do not fit — so until this existed the strip's figures could
+/// not be typed at all, and the way that was nearly fixed was by writing a
+/// second field beside [`number_field`]. Two implementations of "type it or
+/// drag it" is how the two end up disagreeing about what Escape does, so both
+/// shapes go through [`typed_rail`]: one field, one parse, one clamp, one snap
+/// suppression, one Escape.
+pub fn inline_slider(ui: &mut Ui, p: &Palette, value: &mut f32, rail: &Rail<'_>) -> bool {
+    typed_rail(ui, p, value, rail, RailShape::Inline)
 }
 
 /// A rail with no label or readout, for rows that supply their own.
@@ -886,6 +866,162 @@ fn snapped(value: f32, step: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
+/// How a number reads out and how a line typed into its field reads back.
+///
+/// The **one** statement of that pair, which is what makes them exact inverses
+/// by construction rather than by agreement: one scale and one suffix serve
+/// both directions, so a call site cannot hand a parser that disagrees with its
+/// own formatter. `docimport::srgb`'s pair is held to the same standard on a
+/// much larger thing.
+///
+/// Every number is in the **value's own units** and none of them is in the
+/// readout's — see [`NumberRow`]'s note, which is where that rule was first
+/// written down.
+#[derive(Clone, Copy, Debug)]
+pub struct Figure<'a> {
+    /// How many of the readout's units one of the value's is: 1.0 where the
+    /// readout is in the value's own units, 100.0 where a fraction around 1 is
+    /// shown and typed as a percentage.
+    pub per_unit: f32,
+    /// What follows the figure in the readout — and only there. A field being
+    /// typed into starts from the bare number; see [`Figure::bare`].
+    pub suffix: &'a str,
+    /// Places after the point, in the readout and in what a field starts from.
+    pub decimals: usize,
+    /// The word a zero reads as, for a setting whose zero means "off" — the
+    /// airbrush rate is the one that has one. Empty is no such word, which is
+    /// every other figure in Umber.
+    ///
+    /// It is part of the *readout*, so [`Figure::parse`] accepts it back: a
+    /// field that showed "off" and refused it as a line to type would be a
+    /// readout its own control could not reproduce.
+    pub zero: &'a str,
+}
+
+impl<'a> Figure<'a> {
+    /// A figure with no word for zero, which is all but one of them.
+    pub const fn new(per_unit: f32, suffix: &'a str, decimals: usize) -> Self {
+        Self {
+            per_unit,
+            suffix,
+            decimals,
+            zero: "",
+        }
+    }
+
+    /// The readout: the figure in the units it is shown in, and its suffix.
+    pub fn format(&self, value: f32) -> String {
+        if self.reads_as_zero(value) {
+            return self.zero.to_owned();
+        }
+        format!("{}{}", self.bare(value), self.suffix)
+    }
+
+    /// The same figure with nothing after it.
+    ///
+    /// What a field starts from, so the suffix is never something to delete
+    /// before typing and never something to retype after.
+    pub fn bare(&self, value: f32) -> String {
+        if self.reads_as_zero(value) {
+            return self.zero.to_owned();
+        }
+        let shown = value * self.per_unit;
+        let decimals = self.decimals;
+        format!("{shown:.decimals$}")
+    }
+
+    /// What a typed line means, or `None` where it means nothing — in which
+    /// case the value is left exactly as it was.
+    ///
+    /// The suffix is accepted and not required. Somebody who selects the whole
+    /// field and types "90" means ninety degrees, and somebody who pastes
+    /// "90°" back in means the same.
+    pub fn parse(&self, text: &str) -> Option<f32> {
+        let text = text.trim();
+        if !self.zero.is_empty() && text.eq_ignore_ascii_case(self.zero) {
+            return Some(0.0);
+        }
+        let text = text.strip_suffix(self.suffix).unwrap_or(text).trim();
+        let typed: f32 = text.parse().ok()?;
+        if !typed.is_finite() {
+            return None;
+        }
+        Some(typed / self.per_unit)
+    }
+
+    /// `value <= 0.0` rather than `== 0.0`, matching what the airbrush readout
+    /// has always said: a rate of 0.4 rounds to "0" at no decimals and is still
+    /// a rate nobody set on purpose, and a rail that starts at zero cannot
+    /// produce a negative.
+    fn reads_as_zero(&self, value: f32) -> bool {
+        !self.zero.is_empty() && value <= 0.0
+    }
+}
+
+/// Everything a rail whose figure can be typed needs to know.
+///
+/// One struct for both shapes — [`typed_row`]'s two stacked lines and
+/// [`inline_slider`]'s one — because the two differ only in where the parts are
+/// put. Plain fields rather than a builder, for [`NumberRow`]'s reason.
+pub struct Rail<'a> {
+    pub label: &'a str,
+    /// What the rail lays out, which is **not** a bound on the value.
+    ///
+    /// `tweaks::Tweak::range`'s rule, and [`track_value`] is where it is
+    /// enforced for the drag. A value past either end pins the knob there and a
+    /// stationary tap writes nothing.
+    pub span: RangeInclusive<f32>,
+    /// What a *typed* figure is held to.
+    ///
+    /// Usually the same as [`Rail::span`] and deliberately wider where the
+    /// value may legally leave the rail: the brush size rail stops at 1000 px
+    /// and `Brush::MAX_SIZE` is 2000, so typing 1500 means 1500. **This is one
+    /// rule with two data**, not two rules — "a typed figure is clamped to what
+    /// the value may actually be, and snapped to nothing" — which is why
+    /// [`NumberRow`] can go on passing its own span here and get exactly the
+    /// behaviour it always had.
+    pub limit: RangeInclusive<f32>,
+    /// Whether the rail is laid out logarithmically. Ignored unless the span is
+    /// wholly positive, exactly as [`slider_row`] ignores it.
+    pub log: bool,
+    /// The multiple a drag lands on. Zero for a rail that snaps to nothing.
+    ///
+    /// A *typed* figure is never snapped — that is the whole reason the field
+    /// is there — and Alt held during a drag gives the free travel back.
+    pub snap: f32,
+    /// Hand the value back only when the drag ends, for the one case where the
+    /// rail is drawn *inside* the thing it changes: the interface scale.
+    /// Applying that per frame rescales the dialog under the pointer, which
+    /// moves the track, which changes the value the pointer is now over — so
+    /// the knob runs away from the cursor and the setting is impossible to land
+    /// on. Every other rail in Umber changes something it is not part of, and
+    /// those want the immediate answer; this is not a better default, it is a
+    /// different situation.
+    ///
+    /// The in-progress figure lives in egui's temporary store rather than in
+    /// the caller. It has to: the caller reads its copy back out of the thing
+    /// being set, which by construction has not been set yet, so a caller-held
+    /// value would snap back to the old scale on the very next frame.
+    ///
+    /// A typed figure is applied at once either way — the pointer is nowhere
+    /// near the track, so there is nothing to run away from.
+    pub deferred: bool,
+    pub figure: Figure<'a>,
+}
+
+/// Where a typable rail puts its three parts.
+///
+/// A layout and nothing else: every rule about what a drag, a tap, a typed line
+/// or Escape means is [`typed_rail`]'s and is the same for both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RailShape {
+    /// Label and figure on one line, rail beneath. A panel body's shape, and
+    /// [`slider_row`]'s.
+    Stacked,
+    /// Label, rail and figure across one line, for a strip 36 points tall.
+    Inline,
+}
+
 /// How a [`number_row`] reads its figure, writes it back, and lands on a
 /// multiple.
 ///
@@ -899,6 +1035,12 @@ fn snapped(value: f32, step: f32, lo: f32, hi: f32) -> f32 {
 /// readout's: `snap: 45.0` for an angle in degrees, `snap: 0.25` for a scale
 /// shown as 25%. One set of units through the whole struct is what stops a call
 /// site being right about its range and wrong about its step.
+///
+/// It is [`Rail`]'s two call sites' shape, kept because they are somebody
+/// else's files: [`NumberRow::rail`] is the whole of the adaptation, and it
+/// passes `range` as *both* the span and the typed limit, because for an angle
+/// and for the interface scale the rail's span **is** the whole of what the
+/// value may be.
 pub struct NumberRow<'a> {
     pub label: &'a str,
     pub range: RangeInclusive<f32>,
@@ -935,43 +1077,109 @@ pub struct NumberRow<'a> {
     pub deferred: bool,
 }
 
-impl NumberRow<'_> {
+impl<'a> NumberRow<'a> {
+    /// The readout's rule, which is [`Figure`]'s and not a second copy of it.
+    pub fn figure(&self) -> Figure<'a> {
+        Figure::new(self.per_unit, self.suffix, self.decimals)
+    }
+
+    /// This row as the rail [`typed_rail`] draws.
+    fn rail(&self) -> Rail<'a> {
+        Rail {
+            label: self.label,
+            span: self.range.clone(),
+            // The span again: see [`Rail::limit`]. Both of this row's call
+            // sites state a range that is the whole of what their value may be.
+            limit: self.range.clone(),
+            // Deliberately linear. A logarithmic rail with a snap would have a
+            // pull that changed width as it travelled, which is a control that
+            // feels broken rather than one that feels helpful.
+            log: false,
+            snap: self.snap,
+            deferred: self.deferred,
+            figure: self.figure(),
+        }
+    }
+
     /// The readout: the figure in the units it is shown in, and its suffix.
+    ///
+    /// These three are [`Figure`]'s now and are kept here because a call site
+    /// that *states* a row is the call site that tests it —
+    /// `colorpicker`'s angle is read back through the row it is drawn with, and
+    /// `settings`' scale through `scale_row`. Nothing on the drawing path calls
+    /// them any more, which is what the allow is admitting: the readout's rule
+    /// belongs to `Figure` and is reached through [`NumberRow::figure`].
+    #[allow(dead_code)]
     pub fn format(&self, value: f32) -> String {
-        format!("{}{}", self.bare(value), self.suffix)
+        self.figure().format(value)
     }
 
     /// The same figure with nothing after it.
-    ///
-    /// What a field starts from, so the suffix is never something to delete
-    /// before typing and never something to retype after.
+    #[allow(dead_code)]
     pub fn bare(&self, value: f32) -> String {
-        let shown = value * self.per_unit;
-        let decimals = self.decimals;
-        format!("{shown:.decimals$}")
+        self.figure().bare(value)
     }
 
-    /// What a typed line means, or `None` where it means nothing — in which
-    /// case the value is left exactly as it was.
-    ///
-    /// The exact inverse of [`NumberRow::bare`] by construction rather than by
-    /// agreement: one scale and one suffix serve both directions, so a call
-    /// site cannot hand this a parser that disagrees with its own formatter.
-    /// That is the same argument `docimport::srgb`'s pair is held to, on a
-    /// much smaller thing.
-    ///
-    /// The suffix is accepted and not required. Somebody who selects the whole
-    /// field and types "90" means ninety degrees, and somebody who pastes
-    /// "90°" back in means the same.
+    /// What a typed line means, or `None` where it means nothing.
+    #[allow(dead_code)]
     pub fn parse(&self, text: &str) -> Option<f32> {
-        let text = text.trim();
-        let text = text.strip_suffix(self.suffix).unwrap_or(text).trim();
-        let typed: f32 = text.parse().ok()?;
-        if !typed.is_finite() {
-            return None;
-        }
-        Some(typed / self.per_unit)
+        self.figure().parse(text)
     }
+}
+
+/// What a field that has just been let go of means, or `None` where it means
+/// "leave the value exactly as it was".
+///
+/// Three refusals and one rule, and every one of the three was a bug somewhere
+/// in this interface before it was one here:
+///
+/// - **Escape is not a blur.** egui's default `EventFilter` has
+///   `escape: false`, so `Focus::begin_pass` drops the caret before a
+///   `TextEdit` ever sees the key; the field then sees an ordinary blur and
+///   would *apply* whatever the buffer held. So the key is read off the
+///   context, and it abandons.
+/// - **A field applies what was typed, not what it holds.** The buffer is
+///   seeded from [`Figure::bare`] when focus is gained, so a blur with nothing
+///   typed hands back a *rounded* reading of the value — and writing that is a
+///   silent edit made by clicking a number and clicking away. A size of 24.7
+///   shown as "25" would become 25. Unchanged text is therefore no answer at
+///   all, which is the "gate the write on somebody having actually typed" rule
+///   stated where it can be tested.
+/// - **A line that means nothing leaves the value alone**, rather than
+///   resolving to zero.
+///
+/// And the rule: a typed figure is **clamped to [`Rail::limit`] and snapped to
+/// nothing**. The point of typing it is to say something the rail cannot.
+fn typed_value(text: &str, value: f32, escaped: bool, rail: &Rail<'_>) -> Option<f32> {
+    if escaped {
+        return None;
+    }
+    if text.trim() == rail.figure.bare(value) {
+        return None;
+    }
+    let typed = rail.figure.parse(text)?;
+    Some(typed.clamp(*rail.limit.start(), *rail.limit.end()))
+}
+
+/// How much room the figure needs, from the widest one the rail can show.
+///
+/// Never from the one showing: a field that grew as a drag took the number from
+/// one digit to four would creep leftwards under the very pointer aiming at it.
+/// The *span*'s ends rather than the limit's, because the limit is only ever
+/// reached by typing and a field wide enough for a number nobody drags to would
+/// be dead space on every rail that has one.
+fn figure_width(ui: &Ui, p: &Palette, rail: &Rail<'_>) -> f32 {
+    let font = FontId::monospace(text::TINY);
+    let painter = ui.painter();
+    let measure = |v: f32| {
+        painter
+            // A digit's worth of room past the readout, so a caret at the end
+            // of the text has somewhere to be.
+            .layout_no_wrap(format!("{}0", rail.figure.format(v)), font.clone(), p.text)
+            .size()
+            .x
+    };
+    measure(*rail.span.start()).max(measure(*rail.span.end()))
 }
 
 /// [`slider_row`] with a figure that can be typed, and a rail that lands on
@@ -1005,9 +1213,39 @@ impl NumberRow<'_> {
 /// flag, which belongs to the shortcut recorder: a second writer would hand
 /// dispatch back to the canvas while a chord was still being listened for.
 pub fn number_row(ui: &mut Ui, p: &Palette, value: &mut f32, row: NumberRow<'_>) -> bool {
-    let id = ui.id().with(("number-row", row.label));
+    typed_rail(ui, p, value, &row.rail(), RailShape::Stacked)
+}
+
+/// [`slider_row`]'s shape with a figure that can be typed.
+///
+/// The panel-body half of the pair [`inline_slider`] is the strip half of. Take
+/// this where a rail has a line to itself and the value is one somebody may
+/// want to state exactly; take `slider_row` where the readout is a reading
+/// rather than a control.
+pub fn typed_row(ui: &mut Ui, p: &Palette, value: &mut f32, rail: &Rail<'_>) -> bool {
+    typed_rail(ui, p, value, rail, RailShape::Stacked)
+}
+
+/// The one rail whose figure can be typed, in either of its two shapes.
+///
+/// Returns true when the value changed. There is deliberately no second one:
+/// the field, what a typed line means, what Escape does and what a drag lands
+/// on are stated here once, and [`RailShape`] only decides where the three
+/// parts are put.
+fn typed_rail(
+    ui: &mut Ui,
+    p: &Palette,
+    value: &mut f32,
+    rail: &Rail<'_>,
+    shape: RailShape,
+) -> bool {
+    // The id the field's focus and the deferred drag both hang off. Spelled
+    // `number-row` still, because it is the same control under a wider name and
+    // a rename here is a caret that moves house for nothing.
+    let id = ui.id().with(("number-row", rail.label));
     let held_id = id.with("held");
-    let (lo, hi) = (*row.range.start(), *row.range.end());
+    let (lo, hi) = (*rail.span.start(), *rail.span.end());
+    let log = rail.log && lo > 0.0 && hi > lo;
 
     // What the rail is showing. That is the value itself, except part-way
     // through a deferred drag, when it is the figure the pointer is over and
@@ -1015,78 +1253,107 @@ pub fn number_row(ui: &mut Ui, p: &Palette, value: &mut f32, row: NumberRow<'_>)
     let mut shown = ui
         .ctx()
         .data(|d| d.get_temp::<f32>(held_id))
-        .filter(|_| row.deferred)
+        .filter(|_| rail.deferred)
         .unwrap_or(*value);
 
+    // Alt gives the snap back. The modifier is read here rather than off the
+    // drag's start because a hand that finds itself two degrees off can reach
+    // for it mid-sweep, which is when it is actually wanted.
+    let free = ui.input(|i| i.modifiers.alt);
+    let snap = if free { 0.0 } else { rail.snap };
+
     let mut typed = None;
-    let rail = ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.y = 6.0;
+    let track_response = match shape {
+        RailShape::Stacked => {
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
 
-        // A panel squeezed to its minimum can leave nothing here at all, and a
-        // negative width makes a `Rect` whose max is left of its min.
-        let width = ui.available_width().max(MIN_TRACK);
+                // A panel squeezed to its minimum can leave nothing here at
+                // all, and a negative width makes a `Rect` whose max is left of
+                // its min.
+                let width = ui.available_width().max(MIN_TRACK);
 
-        // The header is a rail's height rather than [`slider_row`]'s line of
-        // text: a caret needs somewhere to stand, and a field clipped to the
-        // cap height of its own glyphs looks like a mistake.
-        let (header, _) = ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::hover());
-        ui.painter().text(
-            header.left_center(),
-            Align2::LEFT_CENTER,
-            row.label,
-            FontId::proportional(text::SMALL),
-            p.text_dim,
-        );
-        typed = number_field(ui, p, header, id, shown, &row);
+                // The header is a rail's height rather than [`slider_row`]'s
+                // line of text: a caret needs somewhere to stand, and a field
+                // clipped to the cap height of its own glyphs looks like a
+                // mistake.
+                let (header, _) =
+                    ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::hover());
+                ui.painter().text(
+                    header.left_center(),
+                    Align2::LEFT_CENTER,
+                    rail.label,
+                    FontId::proportional(text::SMALL),
+                    p.text_dim,
+                );
+                let room =
+                    figure_width(ui, p, rail).clamp(MIN_TRACK, header.width().max(MIN_TRACK));
+                let field =
+                    Rect::from_min_max(pos2(header.right() - room, header.top()), header.max);
+                typed = number_field(ui, p, field, id, shown, rail);
 
-        let (track_row, response) =
-            ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::click_and_drag());
-        let track = Rect::from_center_size(
-            track_row.center(),
-            vec2(
-                (track_row.width() - metrics::SLIDER_KNOB).max(MIN_TRACK),
-                metrics::SLIDER_RAIL,
-            ),
-        );
-
-        // Alt gives the snap back. The modifier is read here rather than off
-        // the drag's start because a hand that finds itself two degrees off can
-        // reach for it mid-sweep, which is when it is actually wanted.
-        let free = ui.input(|i| i.modifiers.alt);
-        drag_track(
-            &response,
-            track,
-            &mut shown,
-            lo,
-            hi,
-            false,
-            if free { 0.0 } else { row.snap },
-        );
-        paint_track(
-            ui.painter(),
-            p,
-            track,
-            to_t(shown, lo, hi, false),
-            metrics::SLIDER_KNOB,
-        );
-
-        // Built only while the pointer is actually over the rail: this is a
-        // panel body, drawn every frame, and a `format!` for a tooltip nobody
-        // is looking at is an allocation per frame for nothing.
-        if row.snap > 0.0 && response.hovered() {
-            return response.on_hover_text(format!(
-                "Lands on each {}. Hold Alt for anything in between, or type the figure above.",
-                row.format(row.snap)
-            ));
+                let (track_row, response) = ui
+                    .allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::click_and_drag());
+                let track = Rect::from_center_size(
+                    track_row.center(),
+                    vec2(
+                        (track_row.width() - metrics::SLIDER_KNOB).max(MIN_TRACK),
+                        metrics::SLIDER_RAIL,
+                    ),
+                );
+                drag_track(&response, track, &mut shown, lo, hi, log, snap);
+                paint_track(
+                    ui.painter(),
+                    p,
+                    track,
+                    to_t(shown, lo, hi, log),
+                    metrics::SLIDER_KNOB,
+                );
+                response
+            })
+            .inner
         }
-        response
-    });
+        RailShape::Inline => {
+            ui.label(
+                egui::RichText::new(rail.label)
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+            let (row, response) =
+                ui.allocate_exact_size(vec2(90.0, metrics::SLIDER_ROW), Sense::click_and_drag());
+            let track = Rect::from_center_size(
+                row.center(),
+                vec2((row.width() - 10.0).max(MIN_TRACK), metrics::SLIDER_RAIL),
+            );
+            drag_track(&response, track, &mut shown, lo, hi, log, snap);
+            paint_track(ui.painter(), p, track, to_t(shown, lo, hi, log), 10.0);
+
+            ui.add_space(4.0);
+            let room = figure_width(ui, p, rail);
+            let (field, _) =
+                ui.allocate_exact_size(vec2(room, metrics::SLIDER_ROW), Sense::hover());
+            typed = number_field(ui, p, field, id, shown, rail);
+            response
+        }
+    };
+
+    // Built only while the pointer is actually over the rail: these are drawn
+    // every frame, and a `format!` for a tooltip nobody is looking at is an
+    // allocation per frame for nothing.
+    let track_response = if rail.snap > 0.0 && track_response.hovered() {
+        track_response.on_hover_text(format!(
+            "Lands on each {}. Hold Alt for anything in between, or type the figure.",
+            rail.figure.format(rail.snap)
+        ))
+    } else {
+        track_response
+    };
 
     // A typed figure ends any deferral with it: whatever the rail was holding
-    // was abandoned the moment somebody said what they actually wanted.
+    // was abandoned the moment somebody said what they actually wanted. It is
+    // already clamped to `rail.limit` and deliberately not to the span.
     if let Some(figure) = typed {
         ui.ctx().data_mut(|d| d.remove::<f32>(held_id));
-        let figure = figure.clamp(lo, hi);
         if figure != *value {
             *value = figure;
             return true;
@@ -1095,7 +1362,7 @@ pub fn number_row(ui: &mut Ui, p: &Palette, value: &mut f32, row: NumberRow<'_>)
     }
 
     // Still held, and the caller asked not to be told until it is let go.
-    if row.deferred && rail.inner.is_pointer_button_down_on() {
+    if rail.deferred && track_response.is_pointer_button_down_on() {
         ui.ctx().data_mut(|d| d.insert_temp(held_id, shown));
         return false;
     }
@@ -1108,11 +1375,12 @@ pub fn number_row(ui: &mut Ui, p: &Palette, value: &mut f32, row: NumberRow<'_>)
     }
 }
 
-/// The figure at the right of a [`number_row`]'s header, as a field.
+/// The figure on a typable rail, as a field.
 ///
 /// Returns what was typed, on the one frame it is committed — Enter, or the
-/// focus going elsewhere. Escape abandons it, which is what egui's own
-/// `DragValue` does and therefore what a keyboard already expects here.
+/// focus going elsewhere — already clamped to [`Rail::limit`]. What that
+/// commit *means* is [`typed_value`]'s and is stated there, so it can be tested
+/// without a window; this is the plumbing round it.
 ///
 /// The text entry itself is egui's, for the reason `controls::search_field`
 /// gives: caret, selection, IME and clipboard are not worth reimplementing to
@@ -1122,33 +1390,14 @@ pub fn number_row(ui: &mut Ui, p: &Palette, value: &mut f32, row: NumberRow<'_>)
 fn number_field(
     ui: &mut Ui,
     p: &Palette,
-    header: Rect,
+    rect: Rect,
     id: egui::Id,
     value: f32,
-    row: &NumberRow<'_>,
+    rail: &Rail<'_>,
 ) -> Option<f32> {
     let edit_id = id.with("field");
     let buffer_id = id.with("typed");
     let font = FontId::monospace(text::TINY);
-
-    // Sized from the widest figure the range can produce, never from the one
-    // showing. A field that grew as a drag took the number from one digit to
-    // three would creep leftwards under the very pointer aiming at it.
-    let width = {
-        let painter = ui.painter();
-        let measure = |v: f32| {
-            painter
-                // A digit's worth of room past the readout, so a caret at the
-                // end of the text has somewhere to be.
-                .layout_no_wrap(format!("{}0", row.format(v)), font.clone(), p.text)
-                .size()
-                .x
-        };
-        measure(*row.range.start())
-            .max(measure(*row.range.end()))
-            .clamp(MIN_TRACK, header.width().max(MIN_TRACK))
-    };
-    let rect = Rect::from_min_max(pos2(header.right() - width, header.top()), header.max);
 
     // A figure that can be typed into has to look like one. Painted before the
     // field rather than from its response — a fill added afterwards would be
@@ -1162,7 +1411,7 @@ fn number_field(
 
     let held: Option<String> = ui.ctx().data(|d| d.get_temp(buffer_id));
     let editing = held.is_some();
-    let mut text = held.unwrap_or_else(|| row.format(value));
+    let mut text = held.unwrap_or_else(|| rail.figure.format(value));
 
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -1184,8 +1433,9 @@ fn number_field(
     if edit.gained_focus() {
         // Start from the bare figure, whole and selected: the first keystroke
         // then replaces it, which is what somebody who clicked a number and
-        // typed "90" meant.
-        text = row.bare(value);
+        // typed "90" meant. It is also the reading `typed_value` compares
+        // against to decide whether anything was typed at all.
+        text = rail.figure.bare(value);
         let mut state = egui::TextEdit::load_state(child.ctx(), edit_id).unwrap_or_default();
         state
             .cursor
@@ -1204,10 +1454,11 @@ fn number_field(
         return None;
     }
     child.ctx().data_mut(|d| d.remove::<String>(buffer_id));
-    if child.input(|i| i.key_pressed(egui::Key::Escape)) {
-        return None;
-    }
-    row.parse(&text)
+    // Off the context rather than off the response: egui's default
+    // `EventFilter` has `escape: false`, so the caret is already gone by the
+    // time the field is drawn and the widget never sees the key.
+    let escaped = child.input(|i| i.key_pressed(egui::Key::Escape));
+    typed_value(&text, value, escaped, rail)
 }
 
 /// A read-only bordered pill showing a name and its value.

@@ -52,11 +52,12 @@
 //! invited a *click*, and it answered only to a hold — a control whose whole
 //! affordance pointed at the one gesture it ignored.
 //!
-//! Nothing went with it. [`widgets::slider_row`] is a drag in its own right and
+//! Nothing went with it. [`widgets::typed_row`] is a drag in its own right and
 //! covers the same range; what the grip bought was travel, not reach, and the
-//! rail is wider now that it has the row to itself. The lesson worth keeping is
-//! that a second control for a value the panel already has must not look like a
-//! control for something else.
+//! rail is wider now that it has the row to itself — and its figure can be
+//! typed, which is the exactness a longer travel was standing in for. The
+//! lesson worth keeping is that a second control for a value the panel already
+//! has must not look like a control for something else.
 
 use crate::editor::Editor;
 use crate::shortcuts::Action;
@@ -93,6 +94,17 @@ pub const STEP_PX: f32 = 20.0;
 /// The same floor `ui::brush_editor_tip`'s Roundness row uses, and the same
 /// reciprocal: `Brush::dab_ratio` is long-over-short, so the two are inverses.
 const MIN_ROUNDNESS: f32 = 0.05;
+
+/// Where the **size rail** stops, which is not where a brush size stops.
+///
+/// `Brush::MAX_SIZE` is 2000 and this is 400: the rail is a hand's instrument
+/// and the value's bound is the engine's, which is the distinction
+/// [`Tweak::range`] has always drawn and [`Tweak::span`] now names on the other
+/// side. Typing 1500 into either size rail means 1500.
+///
+/// One constant rather than two literals, because two rails for one setting
+/// that stop in different places is a control that disagrees with itself.
+pub const SIZE_RAIL_TOP: f32 = 400.0;
 
 /// A brush setting a painter changes without meaning to change the brush.
 ///
@@ -155,11 +167,13 @@ impl Tweak {
         }
     }
 
-    /// What the setting may be set to.
+    /// What the setting may be set to — by a shortcut, by a drag on the canvas,
+    /// or by typing the figure.
     ///
-    /// Size's is the *whole* range rather than the 400 the two rails stop at:
-    /// the size shortcut has always clamped at `Brush::MAX_SIZE` and a rail's
-    /// span is not a bound on the value.
+    /// Size's is the *whole* range rather than the [`SIZE_RAIL_TOP`] its two
+    /// rails stop at: the size shortcut has always clamped at `Brush::MAX_SIZE`
+    /// and a rail's span is not a bound on the value. [`Tweak::span`] is the
+    /// other side of that sentence.
     pub fn range(self) -> RangeInclusive<f32> {
         match self {
             Self::Size => Brush::MIN_SIZE..=Brush::MAX_SIZE,
@@ -176,6 +190,20 @@ impl Tweak {
         }
     }
 
+    /// What the **rail** covers, which is not what the value may be.
+    ///
+    /// The same for every setting but Size, whose rail stops at
+    /// [`SIZE_RAIL_TOP`] while `Brush::MAX_SIZE` is twice that. A rail cannot
+    /// express a value past its own end — `widgets::track_value` pins the knob
+    /// there and refuses a stationary tap — so the two figures have to be two
+    /// figures, and the second is what a typed one is held to.
+    pub fn span(self) -> RangeInclusive<f32> {
+        match self {
+            Self::Size => Brush::MIN_SIZE..=SIZE_RAIL_TOP,
+            _ => self.range(),
+        }
+    }
+
     /// Whether the rail — and the drag — is logarithmic.
     ///
     /// The same two the brush editor draws logarithmically, for the same
@@ -186,20 +214,28 @@ impl Tweak {
         matches!(self, Self::Size | Self::Spacing)
     }
 
+    /// How the setting reads out, and how a line typed into its field reads
+    /// back.
+    ///
+    /// One statement of the pair rather than a formatter here and a parser
+    /// somewhere else — see `widgets::Figure`. The airbrush is the one setting
+    /// in Umber whose zero is a word rather than a number, and "off" is
+    /// therefore a line the field accepts as well as one it shows.
+    pub fn figure(self) -> widgets::Figure<'static> {
+        match self {
+            Self::Size => widgets::Figure::new(1.0, " px", 0),
+            Self::Angle => widgets::Figure::new(1.0, "°", 0),
+            Self::AirbrushRate => widgets::Figure {
+                zero: "off",
+                ..widgets::Figure::new(1.0, "/s", 0)
+            },
+            _ => widgets::Figure::new(100.0, "%", 0),
+        }
+    }
+
     /// The readout, in the setting's own units.
     pub fn format(self, value: f32) -> String {
-        match self {
-            Self::Size => format!("{value:.0} px"),
-            Self::Angle => format!("{value:.0}°"),
-            Self::AirbrushRate => {
-                if value <= 0.0 {
-                    "off".to_string()
-                } else {
-                    format!("{value:.0}/s")
-                }
-            }
-            _ => format!("{:.0}%", value * 100.0),
-        }
+        self.figure().format(value)
     }
 
     /// What the brush in hand currently says.
@@ -396,28 +432,40 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     ui.add_space(6.0);
 }
 
-/// One setting: the rail, and the grip beside it.
-/// The rail takes the whole line, and there is no second control beside it.
+/// One setting: the rail, with its figure as a field.
 ///
+/// The rail takes the whole line, and there is no second control beside it.
 /// There used to be a hold-and-drag grip on the right of every row, three dots
 /// in a column, offering the same value over a longer travel. It came off
 /// because of what it *looked* like: three dots at the end of a row is a menu
 /// everywhere else in this interface and everywhere else on the desktop, so it
 /// was clicked rather than held — and a click did nothing at all, which reads
-/// as a broken control rather than as a control being held wrong. Nothing was
-/// lost with it. `widgets::slider_row` covers the same range and is a drag in
-/// its own right; what the grip bought was travel, not reach, and the rail is
-/// wider now that it has the row to itself.
+/// as a broken control rather than as a control being held wrong. What the grip
+/// bought was travel, not reach; the rail is wider now that it has the row to
+/// itself, and the figure beside it can be typed, which is the reach a longer
+/// travel was standing in for.
+///
+/// `widgets::typed_row` rather than `widgets::slider_row`, and the same rail
+/// the tool options strip draws — see `widgets::inline_slider`, which is that
+/// one on a single line.
 fn row(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
     let mut value = tweak.value(&ed.brush);
-    if widgets::slider_row(
+    if widgets::typed_row(
         ui,
         p,
-        tweak.label(),
         &mut value,
-        tweak.range(),
-        tweak.log(),
-        |v| tweak.format(v),
+        &widgets::Rail {
+            label: tweak.label(),
+            span: tweak.span(),
+            // What a typed figure is held to. The same as the span for all six
+            // of `Tweak::PANEL`; Size is the one that differs and it is not
+            // drawn here, because the options strip already has it.
+            limit: tweak.range(),
+            log: tweak.log(),
+            snap: 0.0,
+            deferred: false,
+            figure: tweak.figure(),
+        },
     ) {
         tweak.apply(&mut ed.brush, value);
     }
