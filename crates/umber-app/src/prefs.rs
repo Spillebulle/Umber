@@ -126,6 +126,15 @@ pub struct Prefs {
     /// works in sliders should not be handed the wheel again every morning.
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
+    /// Whether the wheel's triangle has its white and black corners the other
+    /// way round.
+    ///
+    /// Kept for the reason [`Prefs::wheel_rotates`] is, and more strongly:
+    /// which corner is light is what somebody's hand already knows from another
+    /// application, so it is set once on the first day and never again. Absent
+    /// from a file written before the setting existed, which reads as off — the
+    /// arrangement those builds drew.
+    pub wheel_mirrored: bool,
     /// Which relation the Harmony picker mode shows. Kept for the reason
     /// [`Prefs::picker`] is: it is a way of working, not something to choose
     /// again every morning.
@@ -194,6 +203,8 @@ impl Default for Prefs {
             wheel_rotates: true,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
+            // Off is what every build before the swap existed drew.
+            wheel_mirrored: false,
             harmony: Harmony::default(),
             wheel_angles: WheelAngles::default(),
             save_history: true,
@@ -388,6 +399,7 @@ pub fn to_text(prefs: &Prefs) -> String {
         "wheel_shape = {}\n",
         wheel_shape_id(prefs.wheel_shape)
     ));
+    out.push_str(&format!("wheel_mirrored = {}\n", prefs.wheel_mirrored));
     out.push_str(&format!("harmony = {}\n", harmony_id(prefs.harmony)));
     for shape in WheelShape::ALL {
         out.push_str(&format!(
@@ -518,6 +530,11 @@ pub fn from_text(text: &str) -> Prefs {
             "wheel_shape" => {
                 if let Some(v) = wheel_shape_from_id(value) {
                     prefs.wheel_shape = v;
+                }
+            }
+            "wheel_mirrored" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.wheel_mirrored = v;
                 }
             }
             "harmony" => {
@@ -741,7 +758,12 @@ fn harmony_id(harmony: Harmony) -> &'static str {
         Harmony::Analogous => "analogous",
         Harmony::Triad => "triad",
         Harmony::SplitComplementary => "split-complementary",
+        // Bare, and it stays bare although the label no longer is: this is what
+        // every preferences file written before the rectangle existed says, and
+        // the square is what it meant. Renaming it to match the new label would
+        // silently move an artist's setting back to the default.
         Harmony::Tetrad => "tetrad",
+        Harmony::RectangleTetrad => "tetrad-rectangle",
     }
 }
 
@@ -824,6 +846,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         wheel_rotates: ed.ui.wheel_rotates,
         picker: ed.ui.picker,
         wheel_shape: ed.ui.wheel_shape,
+        wheel_mirrored: ed.ui.wheel_mirrored,
         harmony: ed.ui.harmony,
         wheel_angles: ed.ui.wheel_angles,
         save_history: ed.ui.save_history,
@@ -904,6 +927,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.wheel_rotates = prefs.wheel_rotates;
     ed.ui.picker = prefs.picker;
     ed.ui.wheel_shape = prefs.wheel_shape;
+    ed.ui.wheel_mirrored = prefs.wheel_mirrored;
     ed.ui.harmony = prefs.harmony;
     ed.ui.wheel_angles = prefs.wheel_angles;
     ed.ui.save_history = prefs.save_history;
@@ -1118,6 +1142,15 @@ mod tests {
             from_text("harmony = Split complementary\n").harmony,
             Harmony::default(),
             "a bad id keeps the default"
+        );
+        // The square tetrad's id stayed bare when its *label* gained the word
+        // "(square)". A file written before the rectangle relation existed says
+        // `tetrad` and meant the square one, so this is the whole of what stops
+        // that setting quietly reverting to the default on the next launch.
+        assert_eq!(from_text("harmony = tetrad\n").harmony, Harmony::Tetrad);
+        assert_eq!(
+            from_text("harmony = tetrad-rectangle\n").harmony,
+            Harmony::RectangleTetrad
         );
     }
 
@@ -1419,9 +1452,12 @@ mod tests {
             check_updates: false,
             update_notice_seen: true,
             wheel_rotates: false,
-            harmony: Harmony::Tetrad,
+            harmony: Harmony::RectangleTetrad,
             picker: PickerMode::Sliders,
             wheel_shape: WheelShape::Square,
+            // Not the default, or this test cannot tell "written and read back"
+            // from "never written at all".
+            wheel_mirrored: true,
             wheel_angles: turned(30.0, 200.0),
             save_history: false,
             font_folder: Some(PathBuf::from("/home/painter/type/My Foundry")),

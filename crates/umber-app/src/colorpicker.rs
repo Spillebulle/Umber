@@ -99,6 +99,27 @@ impl WheelShape {
     fn follows_hue(self, rotate: bool) -> bool {
         rotate && matches!(self, Self::Triangle)
     }
+
+    /// Whether exchanging the light and dark corners means anything here.
+    ///
+    /// The triangle alone. Its three corners *are* the hue, white and black, so
+    /// which of the two is on which side is a real arrangement — and a
+    /// different one in every application, which is the whole reason the
+    /// control exists. A square's axes are a saturation and a value, with no
+    /// corner standing for either, so there is nothing there to exchange: the
+    /// row is not drawn rather than drawn disabled, exactly as "Rotate with
+    /// hue" is not drawn for the square and for the same reason.
+    ///
+    /// A `match` rather than a `matches!`, unlike [`Self::follows_hue`] above
+    /// it: a third centre has to be a *decision* about whether it has corners
+    /// to swap, and `matches!` would quietly answer "no" for one nobody had
+    /// thought about.
+    fn can_swap_ends(self) -> bool {
+        match self {
+            Self::Triangle => true,
+            Self::Square => false,
+        }
+    }
 }
 
 /// The angle each wheel centre is held at, in degrees from its neutral pose.
@@ -290,7 +311,13 @@ impl Hub {
 /// the shape is. The square is the largest that fits inside the ring —
 /// inscribed in the circle, so turning it cannot take it outside and its size
 /// is the same at every angle.
-fn hub_of(shape: WheelShape, centre: Pos2, inner: f32, base: f32) -> Hub {
+///
+/// `mirrored` is the triangle's alone and the square arm ignores it — see
+/// [`WheelShape::can_swap_ends`]. It is a parameter rather than something read
+/// off a setting in here for the reason `base` is one: this function is what
+/// both the hit test and the paint call, so anything that moves a corner has to
+/// arrive through it or the two can disagree about where that corner is.
+fn hub_of(shape: WheelShape, centre: Pos2, inner: f32, base: f32, mirrored: bool) -> Hub {
     match shape {
         WheelShape::Square => Hub::Field(
             centre,
@@ -299,7 +326,7 @@ fn hub_of(shape: WheelShape, centre: Pos2, inner: f32, base: f32) -> Hub {
         ),
         WheelShape::Triangle => {
             let (hue_pt, white_pt, black_pt) =
-                triangle_corners(centre, (inner - 3.0).max(1.0), base);
+                triangle_corners(centre, (inner - 3.0).max(1.0), base, mirrored);
             Hub::Triangle(hue_pt, white_pt, black_pt)
         }
     }
@@ -327,12 +354,13 @@ pub fn show(
     mode: PickerMode,
     shape: &mut WheelShape,
     rotate: &mut bool,
+    mirrored: &mut bool,
     angles: &mut WheelAngles,
     harmony: &mut Harmony,
     hsv: &mut Hsv,
 ) -> bool {
     match mode {
-        PickerMode::Wheel => wheel(ui, p, shape, rotate, angles, hsv),
+        PickerMode::Wheel => wheel(ui, p, shape, rotate, mirrored, angles, hsv),
         PickerMode::Square => square(ui, p, hsv),
         PickerMode::Sliders => sliders(ui, p, hsv),
         PickerMode::Harmony => harmony_wheel(ui, p, harmony, hsv),
@@ -344,11 +372,17 @@ pub fn show(
 ///
 /// The New document and Export dialogs each want the Colour panel's own slider
 /// mode so the two mix a colour the same way, and neither has anywhere for the
-/// wheel's shape, spin, angle or harmony to live — a dialog must not be able to
-/// turn the picker in the panel behind it. Both used to declare four throwaway
-/// locals and call [`show`], which is the same block written twice and one more
-/// place to edit every time this signature grows. It is the same `sliders` the
-/// mode draws, so the two cannot diverge.
+/// wheel's shape, spin, swap, angle or harmony to live — a dialog that drew no
+/// control for a setting must not be able to change it, because a change nobody
+/// can see made where nobody can undo it is not a control at all. Both used to
+/// declare four throwaway locals and call [`show`], which is the same block
+/// written twice and one more place to edit every time this signature grows. It
+/// is the same `sliders` the mode draws, so the two cannot diverge.
+///
+/// The theme editor's token picker is deliberately *not* one of these: it draws
+/// the whole picker, mode switch and all, so every one of those settings has
+/// somewhere to live and is visible where it was changed. There is one colour
+/// picker in Umber and it is set up once — see `settings::token_picker`.
 pub fn show_sliders(ui: &mut Ui, p: &Palette, hsv: &mut Hsv) -> bool {
     sliders(ui, p, hsv)
 }
@@ -629,6 +663,7 @@ fn wheel(
     p: &Palette,
     shape: &mut WheelShape,
     rotate: &mut bool,
+    mirrored: &mut bool,
     angles: &mut WheelAngles,
     hsv: &mut Hsv,
 ) -> bool {
@@ -675,6 +710,7 @@ fn wheel(
             centre,
             inner,
             wheel_base(*shape, *rotate, *angles, hsv.h),
+            *mirrored,
         ),
     );
 
@@ -696,7 +732,12 @@ fn wheel(
     // turns on the frame the ring is dragged rather than a frame behind the
     // marker that turned it.
     let base = wheel_base(*shape, *rotate, *angles, hsv.h);
-    changed |= hub_field(ui, hub_of(*shape, centre, inner, base), aimed.centre(), hsv);
+    changed |= hub_field(
+        ui,
+        hub_of(*shape, centre, inner, base, *mirrored),
+        aimed.centre(),
+        hsv,
+    );
 
     ui.add_space(8.0);
 
@@ -720,6 +761,33 @@ fn wheel(
     // control here would be asking which of the two shapes it refers to.
     if *shape == WheelShape::Triangle {
         crate::widgets::toggle_row(ui, p, "Rotate with hue", rotate);
+    }
+
+    // Which of the two lower corners is white and which is black.
+    //
+    // Every application that draws this triangle picks one and does not say
+    // which, so somebody arriving from another one reaches for the tint they
+    // want and finds the shade — a mistake that is invisible until the stroke
+    // is down, because both arrangements look equally right.
+    //
+    // The **label is what it does, not what it is**. Geometrically this is a
+    // mirror of the triangle about the axis through the hue corner; because the
+    // shape is equilateral and that axis runs through one corner, the outline
+    // does not move and the only visible effect is that white and black change
+    // places. "Mirror" would be true and would leave somebody guessing which of
+    // the three corners it turned about.
+    //
+    // Separate from the Angle rail rather than folded into it, and that is the
+    // whole reason it had to exist: the rail turns all three corners together,
+    // so no angle whatever reaches the mirrored arrangement. Rotation gives
+    // three of the six ways to label the corners and reflection gives the other
+    // three; the pair reaches all of them, which is why neither control needs
+    // to grow.
+    //
+    // Triangle only — see `WheelShape::can_swap_ends` — and not drawn at all
+    // for the square, like the row above it.
+    if shape.can_swap_ends() {
+        crate::widgets::toggle_row(ui, p, "Swap white and black", mirrored);
     }
 
     // The angle the shape is held at, when the hue is not deciding it.
@@ -991,13 +1059,25 @@ fn sv_triangle(
 /// The triangle's three corners, in the order the rest of this file reads them:
 /// full hue, white, black.
 ///
-/// Its own function because it is the whole of what the angle changes, and
-/// everything else about the triangle — the hit test, the mesh, the marker — is
-/// derived from these three points. Testing it without a `Ui` is therefore
-/// testing the feature. [`Hub`] is what carries them from here to both.
-fn triangle_corners(centre: Pos2, radius: f32, base: f32) -> (Pos2, Pos2, Pos2) {
+/// Its own function because it is the whole of what the angle and the swap
+/// change, and everything else about the triangle — the hit test, the mesh, the
+/// marker — is derived from these three points. Testing it without a `Ui` is
+/// therefore testing the feature. [`Hub`] is what carries them from here to
+/// both.
+///
+/// `mirrored` exchanges the white and black corners, which is what the Swap
+/// white and black control asks for. It is spelled as running the corners the
+/// other way round the circle rather than as two `if`s over the returned
+/// points, because that is what it *is*: a reflection about the axis through
+/// the hue corner. That the outline is unmoved and only two roles change hands
+/// then falls out of the arithmetic instead of being a property somebody has to
+/// keep true — and it composes with `base` for free, so the angle rail and the
+/// swap together reach all six arrangements of the three corners rather than
+/// three each.
+fn triangle_corners(centre: Pos2, radius: f32, base: f32, mirrored: bool) -> (Pos2, Pos2, Pos2) {
+    let step = if mirrored { -1.0 } else { 1.0 };
     let corner = |k: f32| {
-        let a = base + k * std::f32::consts::TAU / 3.0;
+        let a = base + step * k * std::f32::consts::TAU / 3.0;
         centre + vec2(a.cos(), a.sin()) * radius
     };
     (corner(0.0), corner(1.0), corner(2.0))
@@ -1346,7 +1426,11 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
     // it, so the two modes cannot end up with differently sized centres. Built
     // before the ring is read because the press is judged against it, and it
     // does not move when the hue does.
-    let hub = hub_of(WheelShape::Square, centre, inner, 0.0);
+    // `false` for the swap: this centre is the square, which has no corners to
+    // exchange, and `hub_of` ignores it there. Stated rather than threaded from
+    // a setting, because this mode draws no triangle and so has no control for
+    // one.
+    let hub = hub_of(WheelShape::Square, centre, inner, 0.0, false);
     let aimed = wheel_aim(ui, id, &response, centre, inner, outer, hub);
 
     if let WheelAim::Ring(pos) = aimed {
@@ -1360,8 +1444,26 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
 
     ui.add_space(8.0);
 
-    // Which relation. A dropdown rather than a segmented control: five names,
-    // the longest of them "Split complementary", in a panel 264 px wide.
+    // Which relation. A dropdown rather than a segmented control: six names,
+    // the longest of them "Tetrad (rectangle)", in a panel 264 px wide.
+    //
+    // With a caption over it, which is the one thing this row was missing.
+    // `widgets::dropdown` draws no fill — see its own docs — so a trigger alone
+    // on a line, with nothing before it, is a word and a chevron on the panel's
+    // own background, and it was being read as a *caption saying which relation
+    // had been drawn* rather than as the control that picks one. Reported: an
+    // artist asking for a triad and a tetrad, both of which were already in
+    // this menu. The mode switch above has a leading mark and reads as a
+    // control because of it; a harmony has no glyph to hand, so the label goes
+    // above instead of beside — beside would cost the width "Split
+    // complementary" needs, and `Dropdown` elides a label it cannot fit, which
+    // would trade one unreadable control for another.
+    ui.label(
+        egui::RichText::new("Relation")
+            .size(crate::theme::text::TINY)
+            .color(p.text_dim),
+    );
+    ui.add_space(2.0);
     let mut picked = *harmony;
     crate::widgets::dropdown(
         ui,
@@ -1595,7 +1697,12 @@ mod tests {
         angles: WheelAngles,
         hue: f32,
     ) -> (Pos2, Pos2, Pos2) {
-        triangle_corners(CENTRE, RADIUS, wheel_base(shape, rotate, angles, hue))
+        triangle_corners(
+            CENTRE,
+            RADIUS,
+            wheel_base(shape, rotate, angles, hue),
+            false,
+        )
     }
 
     /// The ring the widest wheel the picker will draw actually has.
@@ -1613,7 +1720,13 @@ mod tests {
     fn hub_at(shape: WheelShape, degrees: f32) -> Hub {
         let mut angles = WheelAngles::default();
         angles.set(shape, degrees);
-        hub_of(shape, CENTRE, INNER, wheel_base(shape, false, angles, 0.0))
+        hub_of(
+            shape,
+            CENTRE,
+            INNER,
+            wheel_base(shape, false, angles, 0.0),
+            false,
+        )
     }
 
     /// A point on the hue ring, at a given fraction across the band.
@@ -1658,6 +1771,11 @@ mod tests {
     struct Wheel {
         shape: WheelShape,
         rotate: bool,
+        /// The Swap white and black setting, carried here so a test can drive
+        /// the swapped triangle through the same dispatch the picker uses
+        /// rather than through `triangle_corners` alone. `new` leaves it off,
+        /// which is what every test written before the setting existed assumes.
+        mirrored: bool,
         angles: WheelAngles,
         held: Option<Aim>,
         hsv: Hsv,
@@ -1668,6 +1786,7 @@ mod tests {
             Self {
                 shape,
                 rotate,
+                mirrored: false,
                 angles: WheelAngles::default(),
                 held: None,
                 hsv,
@@ -1680,6 +1799,7 @@ mod tests {
                 CENTRE,
                 INNER,
                 wheel_base(self.shape, self.rotate, self.angles, self.hsv.h),
+                self.mirrored,
             )
         }
 
@@ -2246,6 +2366,7 @@ mod tests {
         struct Picker {
             shape: WheelShape,
             rotate: bool,
+            mirrored: bool,
             angles: WheelAngles,
             harmony: Harmony,
             hsv: Hsv,
@@ -2268,6 +2389,7 @@ mod tests {
                     PickerMode::Wheel,
                     &mut picker.shape,
                     &mut picker.rotate,
+                    &mut picker.mirrored,
                     &mut picker.angles,
                     &mut picker.harmony,
                     &mut picker.hsv,
@@ -2300,6 +2422,7 @@ mod tests {
                 let mut picker = Picker {
                     shape: WheelShape::Triangle,
                     rotate: true,
+                    mirrored: false,
                     angles: WheelAngles::default(),
                     harmony: Harmony::Complementary,
                     hsv: Hsv::new(210.0, 0.4, 0.6),
@@ -2670,11 +2793,19 @@ mod tests {
     /// does, correctly, because its normal is radial — moves an equilateral
     /// triangle's edges by only half of one, and half a pixel of fade is what
     /// left the diagonals visibly stepped.
+    ///
+    /// Over both swap states as well as several angles: swapping reverses the
+    /// order the three corners come back in, so the edges the loop below walks
+    /// are traversed the other way round and `skirt_corner`'s outward direction
+    /// is the one thing that could have depended on the winding.
     #[test]
     fn the_triangles_skirt_is_one_feather_wide_along_every_edge() {
         let f = 1.0;
-        for degrees in [0.0_f32, 17.0, 45.0, 120.0, 271.0, 359.0] {
-            let (a, b, c) = triangle_corners(CENTRE, RADIUS, degrees.to_radians());
+        for (degrees, mirrored) in [0.0_f32, 17.0, 45.0, 120.0, 271.0, 359.0]
+            .into_iter()
+            .flat_map(|d| [(d, false), (d, true)])
+        {
+            let (a, b, c) = triangle_corners(CENTRE, RADIUS, degrees.to_radians(), mirrored);
             let inner = [a, b, c];
             let centroid = pos2(
                 inner.iter().map(|p| p.x).sum::<f32>() / 3.0,
@@ -2693,13 +2824,17 @@ mod tests {
                     let across = (dir.x * d.y - dir.y * d.x).abs() / dir.length();
                     assert!(
                         (across - f).abs() < 1e-3,
-                        "edge {i}-{j} at {degrees}° is feathered over {across}, not {f}"
+                        "edge {i}-{j} at {degrees}° (mirrored {mirrored}) is \
+                         feathered over {across}, not {f}"
                     );
                 }
                 // And outside, not folded back over the gradient.
                 let out = outer[i] - centroid;
                 let inn = inner[i] - centroid;
-                assert!(out.length() > inn.length(), "corner {i} folded inwards");
+                assert!(
+                    out.length() > inn.length(),
+                    "corner {i} folded inwards (mirrored {mirrored})"
+                );
             }
         }
     }

@@ -173,6 +173,15 @@ pub struct UiState {
     /// Whether the wheel's triangle turns to follow the hue. Meaningless for the
     /// square, which has no corner that is the hue to keep beside the marker.
     pub wheel_rotates: bool,
+    /// Whether the wheel's triangle has its white and black corners the other
+    /// way round.
+    ///
+    /// A preference rather than something the session forgets, and that is the
+    /// point of it: which corner is light is an arrangement somebody arrives
+    /// with from another application, sets once, and never thinks about again.
+    /// Meaningless for the square, which has no corner standing for either —
+    /// see `WheelShape::can_swap_ends`.
+    pub wheel_mirrored: bool,
     /// How far each wheel centre is turned from its neutral pose, when the hue
     /// is not deciding it. One angle per shape — see [`WheelAngles`].
     pub wheel_angles: WheelAngles,
@@ -256,6 +265,9 @@ impl Default for UiState {
             wheel_shape: WheelShape::Triangle,
             // What the picker has always done, and what the design draws.
             wheel_rotates: true,
+            // Off is the arrangement every build before the swap existed drew,
+            // which is also what a preferences file written by one supplies.
+            wheel_mirrored: false,
             // Zero is the pose every build before the angle existed drew.
             wheel_angles: WheelAngles::default(),
             harmony: Harmony::default(),
