@@ -81,6 +81,7 @@ use egui::{
 use umber_core::palette::{
     self, GPL_EXTENSION, Palette as ColourPalette, PaletteError, PaletteLibrary,
 };
+use umber_core::palimport;
 use umber_core::{Hsv, Swatch};
 
 use crate::controls;
@@ -139,6 +140,96 @@ struct Naming {
     focus: bool,
 }
 
+/// What a palette made out of pasted text is called before anybody renames it.
+const PASTED_NAME: &str = "Pasted colours";
+
+/// How a refusal about the pasted text names it. A phrase and not a path,
+/// because there is no file and a made-up filename in an error message is one
+/// somebody would go looking for.
+const PASTE_SOURCE: &str = "The pasted text";
+
+/// The most text the paste field will hold on to.
+///
+/// **Much smaller than `palimport::MAX_FILE_BYTES`, and for a different
+/// reason.** That bound is on the *parse*, which is linear and cheap; this one
+/// is on `egui::TextEdit::multiline`, which lays out the whole string and does
+/// not virtualise, so a multi-megabyte paste is unbounded layout work on every
+/// frame the galley cache misses — before the parse ever gets to say "too
+/// large". A palette of `MAX_SWATCHES` colours is about eighty kilobytes of
+/// text, so a quarter of a megabyte is generous for anything that is actually a
+/// palette and is a size egui handles without noticing.
+const MAX_PASTE_BYTES: usize = 256 * 1024;
+
+/// How many lines of the pasted text are on screen at once.
+///
+/// A palette is a handful of colours, so five lines shows a whole Coolors link
+/// or the top of a block of CSS and leaves the list of palettes room to be the
+/// thing this modal is mostly for.
+const PASTE_ROWS: usize = 5;
+
+/// Roughly what the paste pane costs, taken off the list's own height so the
+/// modal does not grow past the window when it opens.
+const PASTE_BLOCK: f32 = 150.0;
+
+/// Text somebody pasted, and what Umber found in it.
+///
+/// The colours are held rather than re-derived at the click, so the readout and
+/// what the button will do cannot disagree — and so that the parse runs once
+/// per edit rather than once per frame. `MAX_FILE_BYTES` of text through the
+/// scanner sixty times a second is the thing that would make.
+#[derive(Clone, Default)]
+struct Pasting {
+    text: String,
+    found: Vec<Swatch>,
+    losses: palimport::Losses,
+    /// Why the text was refused whole, if it was. Separate from "nothing was
+    /// found", which is not an error: an empty field is the ordinary state of a
+    /// field nobody has typed in yet.
+    refusal: Option<String>,
+    /// Consumed on the first frame, exactly as [`Renaming`]'s is.
+    focus: bool,
+}
+
+impl Pasting {
+    /// Read the text again. Called from the one place the text can change.
+    ///
+    /// It **cuts** the text at [`MAX_PASTE_BYTES`] rather than only refusing
+    /// it, and says so. Refusing alone would leave the field holding megabytes
+    /// that `TextEdit` re-lays out for as long as the pane is open; cutting
+    /// bounds every frame after the one that accepted the paste, which is the
+    /// most that can be done from this side of egui. The cut is at a character
+    /// boundary, or the `String` would not be one.
+    fn reread(&mut self) {
+        if self.text.len() > MAX_PASTE_BYTES {
+            let cut = (0..=MAX_PASTE_BYTES)
+                .rev()
+                .find(|at| self.text.is_char_boundary(*at))
+                .unwrap_or(0);
+            self.text.truncate(cut);
+            self.found.clear();
+            self.losses = palimport::Losses::default();
+            self.refusal = Some(format!(
+                "That is more text than a palette can be, so it was cut at {} \
+                 kB. Paste a list of colours rather than a whole file.",
+                MAX_PASTE_BYTES / 1024
+            ));
+            return;
+        }
+        match palimport::text::parse(&self.text, PASTE_SOURCE) {
+            Ok((found, losses)) => {
+                self.found = found;
+                self.losses = losses;
+                self.refusal = None;
+            }
+            Err(e) => {
+                self.found.clear();
+                self.losses = palimport::Losses::default();
+                self.refusal = Some(e.to_string());
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct State {
     store: Store,
@@ -148,6 +239,8 @@ struct State {
     renaming: Option<Renaming>,
     /// The colour whose name is being typed, if any.
     naming: Option<Naming>,
+    /// The paste pane, while it is open.
+    pasting: Option<Pasting>,
     /// The id of the palette whose Delete has been pressed once. Deleting a
     /// palette cannot be undone — the history covers painting only — so it
     /// asks.
@@ -235,6 +328,7 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         library_open: false,
         renaming: None,
         naming: None,
+        pasting: None,
         confirming: None,
     };
     state.settle_selection();
@@ -1016,8 +1110,9 @@ fn empty_library(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
         ui,
         p,
         "No palettes yet. Make one and it fills with the colours you save into \
-         it, or bring one in. Umber reads and writes GIMP's .gpl, which GIMP, \
-         Krita, Inkscape and Aseprite all read.",
+         it, or bring one in. Umber writes GIMP's .gpl, which GIMP, Krita, \
+         Inkscape and Aseprite all read, and it opens palettes from Coolors, \
+         Lospec, Adobe Color, Photoshop and Paint.NET.",
     );
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1026,6 +1121,19 @@ fn empty_library(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
         }
         if controls::text_button(ui, p, "Import…", false, true).clicked() {
             import(state, ed);
+        }
+        // Straight into the library with the pane open, rather than a second
+        // paste field in the panel. There is one of this control, in the modal
+        // where making a palette already lives.
+        if controls::text_button(ui, p, "Paste…", false, true)
+            .on_hover_text("Paste hex codes, a Coolors link or a block of CSS")
+            .clicked()
+        {
+            state.library_open = true;
+            state.pasting = Some(Pasting {
+                focus: true,
+                ..Pasting::default()
+            });
         }
     });
 }
@@ -1112,6 +1220,158 @@ fn keep_harmony(state: &mut State, ed: &mut Editor) {
     });
 }
 
+/// Make a palette out of whatever was pasted.
+///
+/// The colours are the ones the readout was drawn from, not a fresh parse of
+/// the field: re-reading here would let the button add a palette the line above
+/// it did not describe, which is the lying control this codebase refuses
+/// everywhere.
+///
+/// Through [`PaletteLibrary::adopt`] — the same door an imported file goes
+/// through — so a paste lands as a new file with a name nothing else is called,
+/// rather than quietly replacing whatever happens to be called "Pasted
+/// colours" already.
+fn add_pasted(state: &mut State, ed: &mut Editor) {
+    let Some(pasting) = state.pasting.clone() else {
+        return;
+    };
+    if pasting.found.is_empty() {
+        return;
+    }
+    let mut palette = ColourPalette::new(PASTED_NAME);
+    palette.swatches = pasting.found;
+    let Some(id) = write(state, ed, "Could not save the palette", |library| {
+        library.adopt(palette)
+    }) else {
+        return;
+    };
+    state.selected = Some(id);
+    state.pasting = None;
+    // Named once, after the fact, and only where something was actually lost.
+    // The pane already showed these while the text sat there; the notice is for
+    // somebody who pressed the button without reading it.
+    if pasting.losses.any() {
+        ed.notice = Some(Notice {
+            title: "Added, with notes".to_owned(),
+            lines: pasting.losses.sentences(),
+        });
+    }
+}
+
+/// The field somebody pastes into, and what Umber makes of it.
+///
+/// **A field rather than a button that reads the clipboard**, and that is
+/// decided rather than lazy. `arboard` is already here for the canvas, so a
+/// one-click "paste colours" was available — and it would have been a control
+/// that reaches into the system clipboard and makes a file out of whatever it
+/// found, with nothing on screen between the two. A field shows what is about
+/// to be read, can be corrected, takes a link typed by hand as happily as one
+/// pasted, and needs no clipboard code at all: `egui-winit`'s `clipboard`
+/// feature already maps Ctrl+V into a `TextEdit`. It also keeps `sysclip`'s
+/// standing rule free — no test here can touch the real clipboard, because
+/// nothing here reads one.
+///
+/// It needs no `shortcuts::set_capturing`: `ui::draw` calls
+/// `shortcuts::set_typing(ctx.text_edit_focused())` once for the whole
+/// interface and a real `TextEdit` is covered by it.
+fn paste_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
+    let Some(pasting) = state.pasting.as_mut() else {
+        return;
+    };
+    // What the pane decided this frame, collected because acting on it needs
+    // the state the field is borrowing. The same arrangement `naming_field`
+    // keeps.
+    let mut add = false;
+    let mut close = false;
+
+    Frame::NONE
+        .fill(p.window)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(metrics::RADIUS_LARGE)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            controls::note(
+                ui,
+                p,
+                "Paste a list of hex codes, a Coolors link, a block of CSS, or \
+                 anything else with colours in it. Umber reads #RRGGBB, #RGB, \
+                 0xRRGGBB and rgb(...), and takes a name from the line where \
+                 there is one.",
+            );
+            ui.add_space(6.0);
+            let field = ui.add(
+                egui::TextEdit::multiline(&mut pasting.text)
+                    .desired_width(ui.available_width())
+                    .desired_rows(PASTE_ROWS)
+                    .hint_text("#10121c, #2c1e31, #6b2643")
+                    .font(egui::FontId::monospace(text::SMALL)),
+            );
+            if pasting.focus {
+                field.request_focus();
+                pasting.focus = false;
+            }
+            // Once per edit, never once per frame: the text may be megabytes
+            // and this walks all of it.
+            if field.changed() {
+                pasting.reread();
+            }
+
+            ui.add_space(6.0);
+            match (&pasting.refusal, pasting.found.len()) {
+                (Some(why), _) => controls::note(ui, p, why),
+                (None, 0) if pasting.text.trim().is_empty() => {}
+                // Not a failure and not phrased as one: an artist who has
+                // pasted the wrong thing needs to know what would have worked.
+                (None, 0) => controls::note(
+                    ui,
+                    p,
+                    "No colours in that yet. A list like #10121c, #2c1e31 works, \
+                     and so does a link such as coolors.co/10121c-2c1e31.",
+                ),
+                (None, count) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{count} colour{} found",
+                            if count == 1 { "" } else { "s" }
+                        ))
+                        .size(text::SMALL)
+                        .color(p.text_strong),
+                    );
+                    // Said here rather than only after the fact, so a loss can
+                    // be reconsidered while the text is still on screen.
+                    for sentence in pasting.losses.sentences() {
+                        controls::note(ui, p, &sentence);
+                    }
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let ready = pasting.refusal.is_none() && !pasting.found.is_empty();
+                if controls::text_button(ui, p, "Add as a palette", true, ready)
+                    .on_hover_text(if ready {
+                        "Put these colours in your library as a new palette"
+                    } else {
+                        "Paste something with colours in it first"
+                    })
+                    .clicked()
+                {
+                    add = true;
+                }
+                if controls::text_button(ui, p, "Cancel", false, true).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        state.pasting = None;
+    }
+    if add {
+        add_pasted(state, ed);
+    }
+}
+
 fn new_palette(state: &mut State, ed: &mut Editor) {
     if let Some(id) = write(state, ed, "Could not make a palette", |library| {
         library.create("My palette")
@@ -1122,23 +1382,35 @@ fn new_palette(state: &mut State, ed: &mut Editor) {
     }
 }
 
-/// Bring in one or more `.gpl` files.
+/// Bring in one or more palette files, in any format Umber reads.
 ///
 /// Several at once because a palette collection *is* a folder of them, which is
 /// the same reason the brush importer takes several files.
+///
+/// The filter list is built from [`palimport::Format::ALL`] rather than typed
+/// here, so a format added to the model reaches this dialog and cannot be a
+/// reader nobody can get a file to. One combined filter first, because the
+/// ordinary case is "show me my palettes" and not "I know this one is an
+/// `.ase`"; the per-format rows are under it for somebody sorting a folder of
+/// mixed files.
 fn import(state: &mut State, ed: &mut Editor) {
     if !state.writable() {
         return;
     }
-    let Some(paths) = rfd::FileDialog::new()
+    let every: Vec<&str> = palimport::Format::ALL
+        .iter()
+        .map(|format| format.extension())
+        .collect();
+    let mut dialog = rfd::FileDialog::new()
         .set_title("Import palettes")
-        .add_filter("GIMP palette", &[GPL_EXTENSION])
-        // Deliberately present and deliberately last: picking the wrong kind of
-        // file gives a sentence naming it and the reason, which is a better
-        // answer than a picker that refuses to show the file at all.
-        .add_filter("All files", &["*"])
-        .pick_files()
-    else {
+        .add_filter("Palettes", &every);
+    for format in palimport::Format::ALL {
+        dialog = dialog.add_filter(format.label(), &[format.extension()]);
+    }
+    // Deliberately present and deliberately last: picking the wrong kind of
+    // file gives a sentence naming it and the reason, which is a better
+    // answer than a picker that refuses to show the file at all.
+    let Some(paths) = dialog.add_filter("All files", &["*"]).pick_files() else {
         return;
     };
 
@@ -1149,17 +1421,19 @@ fn import(state: &mut State, ed: &mut Editor) {
             return;
         };
         match Arc::make_mut(library).import(path) {
-            Ok((id, skipped)) => {
-                if skipped > 0 {
-                    // An import that loses something says so. Every reader in
-                    // the wild skips a line it cannot parse, so this is a note
-                    // rather than a refusal — but a silent one would be the
-                    // artist wondering where three colours went.
-                    lines.push(format!(
-                        "{}: {skipped} line{} were not colours and were skipped.",
-                        file_label(path),
-                        if skipped == 1 { "" } else { "s" }
-                    ));
+            Ok((id, losses)) => {
+                // An import that loses something says so, and the sentences are
+                // the model's rather than this file's — one statement of what a
+                // dropped colour space or a skipped entry reads as, wherever it
+                // is reported. Named with the file only where there were
+                // several, since with one the prefix is the same word on every
+                // line.
+                for sentence in losses.sentences() {
+                    lines.push(if paths.len() > 1 {
+                        format!("{}: {sentence}", file_label(path))
+                    } else {
+                        sentence
+                    });
                 }
                 added = Some(id);
             }
@@ -1261,7 +1535,15 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
     let available = root.ctx().content_rect().size();
     let [full_width, full_height] = metrics::PALETTE_LIBRARY;
     let w = full_width.min(available.x - 48.0).max(280.0);
-    let h = full_height.min(available.y - 220.0).max(120.0);
+    let mut h = full_height.min(available.y - 220.0).max(120.0);
+    // The pane goes *above* the list, so its room comes out of the list's
+    // rather than out of the window's. A modal that grew by a hundred and fifty
+    // points when a control opened would push its own Close mark off the
+    // bottom, which is the corner `brushlib::browser`'s clamp exists to keep
+    // reachable.
+    if state.pasting.is_some() {
+        h = (h - PASTE_BLOCK).max(80.0);
+    }
 
     let response = egui::Modal::new(Id::new("palette-library-modal"))
         .frame(
@@ -1286,13 +1568,21 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                     }
                 });
             });
+            // The list of extensions is `readable_formats()`'s and not a second
+            // hand-written one twenty lines from the Import tooltip that calls
+            // it: a seventh format would otherwise update one and not the
+            // other, and this is the copy an artist reads.
             controls::note(
                 ui,
                 p,
-                "Every palette is one .gpl file in a folder of its own. That is \
-                 the format GIMP, Krita, Inkscape and Aseprite all read, so \
-                 importing is bringing a file in and exporting is taking one \
-                 out.",
+                &format!(
+                    "Every palette is kept as one .gpl file in a folder of its \
+                     own, which is the format GIMP, Krita, Inkscape and \
+                     Aseprite all read. Import takes {}, so a palette from \
+                     Coolors, Lospec, Adobe Color, Photoshop or Paint.NET \
+                     comes straight in.",
+                    palimport::readable_formats()
+                ),
             );
             ui.add_space(10.0);
 
@@ -1320,7 +1610,10 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 }
                 if controls::text_button(ui, p, "Import…", false, can_make)
                     .on_hover_text(if can_make {
-                        "Bring a .gpl palette into your library".to_owned()
+                        format!(
+                            "Bring a palette file into your library. Umber reads {}.",
+                            palimport::readable_formats()
+                        )
                     } else if !state.writable() {
                         state.why_not().to_owned()
                     } else {
@@ -1332,6 +1625,28 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                     .clicked()
                 {
                     import(&mut state, ed);
+                }
+                // The commonest palette in the world is a list of hex codes
+                // somebody copied off a page, and no file format reaches it.
+                // See `paste_pane` for why this opens a field rather than
+                // reading the clipboard on the spot.
+                if controls::text_button(ui, p, "Paste colours…", false, can_make)
+                    .on_hover_text(if can_make {
+                        "Paste hex codes, a Coolors link or a block of CSS".to_owned()
+                    } else if !state.writable() {
+                        state.why_not().to_owned()
+                    } else {
+                        format!(
+                            "Your library already holds {} palettes",
+                            palette::MAX_PALETTES
+                        )
+                    })
+                    .clicked()
+                {
+                    state.pasting = Some(Pasting {
+                        focus: true,
+                        ..Pasting::default()
+                    });
                 }
                 if let Some(dir) = state.library().map(|library| library.dir().to_path_buf()) {
                     ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1349,6 +1664,11 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 controls::note(ui, p, state.why_not());
             }
 
+            if state.pasting.is_some() {
+                paste_pane(ui, p, ed, &mut state);
+                ui.add_space(8.0);
+            }
+
             egui::ScrollArea::vertical()
                 .id_salt("palette-library-list")
                 .auto_shrink([false, false])
@@ -1364,6 +1684,11 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
         // modal is raised, over whichever palette happened to be selected then.
         state.renaming = None;
         state.confirming = None;
+        // And the paste pane goes with them, for the reason `forget_gesture`
+        // gives about the naming field: the widget stops being drawn, so egui
+        // drops its focus without it ever reporting `lost_focus`, and text left
+        // in it would come back beside a readout nobody could see it produce.
+        state.pasting = None;
     }
     store(root.ctx(), state);
 }
@@ -1655,7 +1980,7 @@ mod tests {
     /// different palette. It is pure state and needs no window.
     #[test]
     fn the_palette_in_front_is_a_name_and_never_a_position() {
-        let dir = std::env::temp_dir().join("umber-palette-settle");
+        let dir = std::env::temp_dir().join(format!("umber-palette-settle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut library = PaletteLibrary::load_from(&dir);
         // Named so the sorted order is a, b, c.
@@ -1669,6 +1994,7 @@ mod tests {
             library_open: false,
             renaming: None,
             naming: None,
+            pasting: None,
             confirming: None,
         };
         // Nothing selected takes the first, so a library with palettes in it
@@ -1701,6 +2027,151 @@ mod tests {
         state.settle_selection();
         assert_eq!(state.selected, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The paste, end to end: what the readout says is what the button adds.
+    ///
+    /// **No test here may touch the real clipboard** — a CI runner may have no
+    /// display server, and grabbing somebody's clipboard on their own machine
+    /// is hostile. That rule is free here rather than obeyed here, because the
+    /// pane is a field: nothing on this path reads a clipboard at all. See
+    /// `paste_pane` for why it was built that way.
+    #[test]
+    fn what_was_pasted_is_what_lands_in_the_library() {
+        let dir = std::env::temp_dir().join(format!("umber-palette-paste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let library = PaletteLibrary::load_from(&dir);
+        let mut ed = Editor::default();
+        let mut state = State {
+            store: Store::Ready(Arc::new(library)),
+            selected: None,
+            library_open: true,
+            renaming: None,
+            naming: None,
+            pasting: None,
+            confirming: None,
+        };
+
+        // A Coolors link, which is how a palette actually travels between two
+        // people, pasted into a sentence the way one arrives in a chat window.
+        let mut pasting = Pasting {
+            text: "try https://coolors.co/10121c-2c1e31-6b2643".to_owned(),
+            ..Pasting::default()
+        };
+        pasting.reread();
+        assert_eq!(pasting.found.len(), 3, "the readout's own number");
+        assert!(pasting.refusal.is_none());
+        assert!(!pasting.losses.any(), "an opaque paste loses nothing");
+        state.pasting = Some(pasting);
+
+        add_pasted(&mut state, &mut ed);
+        assert!(state.pasting.is_none(), "the pane closes once it is used");
+        let palette = state.current().expect("selected on the spot");
+        assert_eq!(palette.name, PASTED_NAME);
+        assert_eq!(
+            palette.swatches,
+            vec![
+                Swatch::new([0x10, 0x12, 0x1c]),
+                Swatch::new([0x2c, 0x1e, 0x31]),
+                Swatch::new([0x6b, 0x26, 0x43]),
+            ]
+        );
+        // It reached the disk, which is the whole shape of a directory of
+        // `.gpl` files: there is no separate save.
+        let reopened = PaletteLibrary::load_from(&dir);
+        assert_eq!(reopened.palettes().len(), 1);
+        assert_eq!(reopened.palettes()[0].swatches, palette.swatches);
+
+        // A second paste lands **beside** the first rather than replacing the
+        // palette already called "Pasted colours" — `adopt`'s rule, and the one
+        // an artist pasting twice in a row would otherwise lose work to.
+        let mut again = Pasting {
+            text: "#CC7722".to_owned(),
+            ..Pasting::default()
+        };
+        again.reread();
+        state.pasting = Some(again);
+        add_pasted(&mut state, &mut ed);
+        let library = state.library().expect("still there");
+        assert_eq!(library.palettes().len(), 2);
+        assert_eq!(library.palettes()[0].swatches.len(), 3);
+        assert_eq!(library.palettes()[1].swatches.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pane with nothing usable in it adds nothing, and the button that would
+    /// have done it is dead rather than live and refusing. Three states, and
+    /// none of them may write a file: an empty palette in the list is one the
+    /// artist has to go and delete.
+    #[test]
+    fn a_paste_with_no_colours_in_it_writes_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("umber-palette-paste-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ed = Editor::default();
+        let mut state = State {
+            store: Store::Ready(Arc::new(PaletteLibrary::load_from(&dir))),
+            selected: None,
+            library_open: true,
+            renaming: None,
+            naming: None,
+            pasting: None,
+            confirming: None,
+        };
+        for text in ["", "   ", "just some words about a facade"] {
+            let mut pasting = Pasting {
+                text: text.to_owned(),
+                ..Pasting::default()
+            };
+            pasting.reread();
+            assert!(pasting.found.is_empty(), "{text:?}");
+            assert!(pasting.refusal.is_none(), "nothing typed is not an error");
+            state.pasting = Some(pasting);
+            add_pasted(&mut state, &mut ed);
+            assert!(state.pasting.is_some(), "{text:?}: the pane stayed open");
+            assert!(
+                state.library().expect("there").is_empty(),
+                "{text:?}: it wrote a palette anyway"
+            );
+        }
+        // Past what a palette holds is a refusal with a sentence, not a
+        // truncation, and the pane says so rather than adding four thousand and
+        // ninety-six of five thousand.
+        let mut huge = Pasting::default();
+        for n in 0..=umber_core::palette::MAX_SWATCHES {
+            huge.text.push_str(&format!("#{:06x}\n", n % 0xffffff));
+        }
+        huge.reread();
+        assert!(huge.found.is_empty());
+        let why = huge.refusal.expect("a sentence");
+        assert!(why.starts_with(PASTE_SOURCE), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loss is named where it happened and nowhere else. Pasting opaque
+    /// colours must raise nothing at all — a notice shown every time is one
+    /// nobody reads, which costs the losses that matter.
+    #[test]
+    fn a_paste_names_what_it_lost_and_stays_quiet_otherwise() {
+        let mut opaque = Pasting {
+            text: "#10121cff\n#2c1e31\n".to_owned(),
+            ..Pasting::default()
+        };
+        opaque.reread();
+        assert!(opaque.losses.sentences().is_empty());
+
+        let mut faded = Pasting {
+            text: "#10121c80\nrgba(1, 2, 3, 0.5)\n".to_owned(),
+            ..Pasting::default()
+        };
+        faded.reread();
+        assert_eq!(faded.losses.transparency, 2);
+        assert_eq!(faded.losses.sentences().len(), 1);
+        // Drawn in a pane over somebody's canvas, so held to the interface's
+        // own rule about how a string reads.
+        for sentence in faded.losses.sentences() {
+            assert!(!sentence.contains('—'), "{sentence}");
+        }
     }
 
     /// A library in a directory of its own, with two palettes in it, for the
@@ -1762,22 +2233,28 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/palette-module");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        for (name, open, empty, naming, dragging) in [
-            ("1-panel", false, false, false, false),
-            ("2-panel-empty", false, true, false, false),
-            ("3-library", true, false, false, false),
+        for (name, open, empty, naming, dragging, pasting) in [
+            ("1-panel", false, false, false, false, false),
+            ("2-panel-empty", false, true, false, false, false),
+            ("3-library", true, false, false, false, false),
             // The naming field, which is the one piece of this module whose
             // size is decided by a `TextEdit` sharing a line with a chip. A
             // field that overran the panel would look exactly like a field that
             // fitted, in every assertion anybody could write about it.
-            ("4-naming", false, false, true, false),
+            ("4-naming", false, false, true, false, false),
             // A drag in flight, which is the only way anybody looks at the drop
             // ring. `the_drop_ring_covers_no_colour_and_reaches_no_neighbour`
             // pins the geometry and can say nothing about whether the mark
             // reads as "the colour lands here" beside the solid accent outline
             // that means "this is the colour in hand" — which is the whole
             // argument for it being dashed and square.
-            ("5-dragging", false, false, false, true),
+            ("5-dragging", false, false, false, true, false),
+            // The paste pane, which is a multiline field, a readout whose
+            // height depends on what was found, and a button strip, stacked
+            // above a list whose own height it just took a slice out of.
+            // Nothing anybody can assert about a `TextEdit` says whether that
+            // stack still fits in the modal.
+            ("6-pasting", true, false, false, false, true),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
@@ -1795,6 +2272,7 @@ mod tests {
                 library_open: open,
                 renaming: None,
                 naming: None,
+                pasting: None,
                 confirming: None,
             };
             seed.settle_selection();
@@ -1819,6 +2297,19 @@ mod tests {
                     // of.
                     focus: false,
                 });
+            }
+            if pasting {
+                let mut typed = Pasting {
+                    text: "https://coolors.co/10121c-2c1e31-6b2643\n#ac2847\n\
+                           --warm-ochre: #cc772280;"
+                        .to_owned(),
+                    // Never asked for in a shot, for the reason the naming
+                    // field's is not.
+                    focus: false,
+                    ..Pasting::default()
+                };
+                typed.reread();
+                seed.pasting = Some(typed);
             }
 
             // Carrying the second colour, aiming at the seventh. Seeded through
@@ -1860,7 +2351,7 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 5 shots to {}", dir.display());
+        println!("wrote the shots to {}", dir.display());
     }
 
     /// A palette laid out in fours reads as fours where there is room, and a
@@ -2025,7 +2516,7 @@ mod tests {
     /// is the division CLAUDE.md draws everywhere else.
     #[test]
     fn a_naming_field_whose_colour_moved_under_it_names_nothing() {
-        let dir = std::env::temp_dir().join("umber-palette-naming");
+        let dir = std::env::temp_dir().join(format!("umber-palette-naming-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut library = PaletteLibrary::load_from(&dir);
         let id = library.create("Ochres").expect("made");
@@ -2041,6 +2532,7 @@ mod tests {
             library_open: false,
             renaming: None,
             naming: None,
+            pasting: None,
             confirming: None,
         };
         state.naming = naming_for(&state, 1);
@@ -2083,7 +2575,8 @@ mod tests {
     /// failure the whole disabled-with-a-reason arrangement exists to avoid.
     #[test]
     fn a_dead_adding_mark_gives_the_reason_it_is_dead() {
-        let dir = std::env::temp_dir().join("umber-palette-reasons");
+        let dir =
+            std::env::temp_dir().join(format!("umber-palette-reasons-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut library = PaletteLibrary::load_from(&dir);
         let id = library.create("Ochres").expect("made");
@@ -2094,6 +2587,7 @@ mod tests {
             library_open: false,
             renaming: None,
             naming: None,
+            pasting: None,
             confirming: None,
         };
         // Nowhere to write beats everything, and the wording is the library's

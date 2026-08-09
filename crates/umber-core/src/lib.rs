@@ -26,6 +26,7 @@ pub mod input;
 pub mod layer;
 pub mod overlay;
 pub mod palette;
+pub mod palimport;
 mod pattern_table;
 pub mod preset;
 pub mod preview;

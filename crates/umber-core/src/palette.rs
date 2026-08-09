@@ -82,6 +82,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::color::Color;
+use crate::palimport::Losses;
 use crate::preset::unique_name;
 
 /// The extension every palette file carries, and the only one the library
@@ -117,11 +118,41 @@ pub const UNTITLED: &str = "Untitled palette";
 pub enum PaletteError {
     /// The file does not begin with `GIMP Palette`.
     NotAPalette(PathBuf),
+    /// Where the colours came from, as a sentence names it: a path, or a phrase
+    /// like "the pasted text".
+    ///
+    /// A `String` rather than a [`PathBuf`] because [`crate::palimport`] reads
+    /// text that came off no file at all, and a synthetic path in an error
+    /// message is a filename the artist would go looking for.
     TooManySwatches {
-        path: PathBuf,
+        source: String,
         found: usize,
         max: usize,
     },
+    /// A file whose format Umber knows and whose bytes do not hold to it.
+    ///
+    /// `what` is the reader's own sentence — where in the file it stopped and
+    /// why — because "this file is broken" sends nobody anywhere.
+    Malformed {
+        source: String,
+        what: String,
+    },
+    /// Larger than [`crate::palimport::MAX_FILE_BYTES`], refused before it is
+    /// read rather than after.
+    TooLarge {
+        source: String,
+        len: u64,
+        max: u64,
+    },
+    /// Held to its format and carried no colours.
+    ///
+    /// **Not** what an empty `.gpl` produces — see [`read_gpl`], which accepts
+    /// one deliberately because [`PaletteLibrary::create`] writes one.
+    NoColours {
+        source: String,
+    },
+    /// A file whose extension names no format Umber reads.
+    UnknownFormat(PathBuf),
     /// The library already holds as many palettes as it will read back.
     Full {
         max: usize,
@@ -143,10 +174,29 @@ impl fmt::Display for PaletteError {
                 "{} is not a GIMP palette. The first line has to be “{GPL_HEADER}”.",
                 path.display()
             ),
-            Self::TooManySwatches { path, found, max } => write!(
+            Self::TooManySwatches { source, found, max } => write!(
                 f,
-                "{} holds {found} colours, and Umber reads at most {max} in one palette",
-                path.display()
+                "{source} holds {found} colours, and Umber reads at most {max} in one palette"
+            ),
+            Self::Malformed { source, what } => write!(f, "{source}: {what}"),
+            // "is 4 MB, and Umber reads palettes up to 4 MB" is what whole-MB
+            // rounding produced one byte over the limit: a refusal that
+            // contradicts itself. Say only the limit, which is the half that
+            // tells somebody anything.
+            Self::TooLarge { source, len, max } => write!(
+                f,
+                "{source} is {len} bytes, which is more than the {} MB Umber \
+                 reads a palette up to",
+                max / (1024 * 1024)
+            ),
+            Self::NoColours { source } => {
+                write!(f, "{source} holds no colours")
+            }
+            Self::UnknownFormat(path) => write!(
+                f,
+                "{} is not a palette Umber reads. It reads {}.",
+                path.display(),
+                crate::palimport::readable_formats()
             ),
             Self::Full { max } => write!(
                 f,
@@ -422,7 +472,7 @@ impl Palette {
 /// and it is the whole reason the two are separate: a *palette* with no name
 /// falls back to something a reader can show, where a *colour* with no name is
 /// the ordinary case.
-fn clean_line(text: &str) -> String {
+pub(crate) fn clean_line(text: &str) -> String {
     let cleaned: String = text
         .chars()
         .map(|c| if c.is_control() || c == '\t' { ' ' } else { c })
@@ -495,7 +545,7 @@ pub fn read_gpl(text: &str, path: &Path) -> Result<GplRead, PaletteError> {
             Some(swatch) => {
                 if palette.swatches.len() >= MAX_SWATCHES {
                     return Err(PaletteError::TooManySwatches {
-                        path: path.to_path_buf(),
+                        source: path.display().to_string(),
                         found: palette.swatches.len() + 1,
                         max: MAX_SWATCHES,
                     });
@@ -557,7 +607,12 @@ fn parse_entry(line: &str) -> Option<Swatch> {
     }
     Some(Swatch {
         rgb,
-        name: rest.trim().to_owned(),
+        // Through the writer's own rule, exactly as [`Palette::name_swatch`] is
+        // and for the same reason. This reader was the one place a name reached
+        // the field uncleaned: `"Black\tish"` out of somebody else's `.gpl`
+        // would show with its tab in the panel and come back as `"Black ish"`
+        // after a save, so what was held was not what a round trip gave back.
+        name: clean_line(rest),
     })
 }
 
@@ -671,11 +726,8 @@ impl PaletteLibrary {
 
     /// Read one file, taking its id from the filename.
     fn read_file(path: &Path) -> Result<Palette, PaletteError> {
-        let text = fs::read_to_string(path).map_err(|source| PaletteError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mut palette = read_gpl(&text, path)?.palette;
+        let bytes = crate::palimport::read_bytes(path)?;
+        let mut palette = read_gpl(&crate::palimport::as_text(&bytes), path)?.palette;
         palette.id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -816,23 +868,27 @@ impl PaletteLibrary {
         Ok(())
     }
 
-    /// Read a `.gpl` from anywhere and put a copy in the library.
+    /// Read a palette file from anywhere and put a copy in the library.
     ///
-    /// Returns the new id and how many lines the file lost on the way in — see
-    /// [`GplRead::skipped`].
-    pub fn import(&mut self, path: &Path) -> Result<(String, usize), PaletteError> {
-        let text = fs::read_to_string(path).map_err(|source| PaletteError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let read = read_gpl(&text, path)?;
-        let mut palette = read.palette;
-        // A name already in the library gets a number, rather than the import
-        // quietly replacing a palette the artist built.
+    /// Every format [`crate::palimport::Format`] names, not only `.gpl` — the
+    /// conversion happens on the way in, so the library stays a directory of
+    /// `.gpl` and there is still one storage decoder. Returns the new id and
+    /// what the file lost on the way through.
+    pub fn import(&mut self, path: &Path) -> Result<(String, Losses), PaletteError> {
+        let read = crate::palimport::read_file(path)?;
+        Ok((self.adopt(read.palette)?, read.losses))
+    }
+
+    /// Put a palette that came from somewhere else into the library.
+    ///
+    /// The one door for that, so an import off a file and a paste out of a chat
+    /// message land the same way: a **new** file every time, and a name nothing
+    /// else is called, rather than the incoming palette quietly replacing one
+    /// the artist built because the two happen to share a name.
+    pub fn adopt(&mut self, mut palette: Palette) -> Result<String, PaletteError> {
         palette.name = self.free_name(&palette.name);
         palette.id = String::new();
-        let id = self.save(palette)?;
-        Ok((id, read.skipped))
+        self.save(palette)
     }
 
     /// Write one palette out to a path of the caller's choosing.
@@ -1492,9 +1548,9 @@ mod tests {
             "GIMP Palette\nName: Ochres\n#\n9 9 9\nnonsense\n",
         )
         .unwrap();
-        let (imported, skipped) = library.import(&incoming).expect("read");
+        let (imported, losses) = library.import(&incoming).expect("read");
         assert_ne!(imported, mine);
-        assert_eq!(skipped, 1, "the import says what it dropped");
+        assert_eq!(losses.skipped, 1, "the import says what it dropped");
         assert_eq!(library.palettes().len(), 2);
         assert_eq!(library.get(&mine).expect("untouched").swatches, vec![]);
         assert_eq!(
