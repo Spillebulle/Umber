@@ -380,13 +380,13 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         },
     ) {
         state.editing = !state.editing;
-        // Whatever gesture was in flight is abandoned with the mode. A drag
-        // left in the store cannot act — `swatchdrag::Drag::palette` guards
-        // that — but an open naming field would come back on the next frame
-        // editing was switched on, over a colour nobody was naming.
-        if !state.editing {
-            forget_gesture(ui.ctx(), &mut state);
-        }
+        // **Whatever was in flight is abandoned by the *body*, not here.** The
+        // header is drawn first, so clearing an open naming field at this line
+        // would take it off screen before it had been drawn this frame — and a
+        // `TextEdit` that is not drawn never reports `lost_focus`, so the name
+        // somebody had typed would go nowhere. This press is "a click
+        // elsewhere", which this module's own rule says keeps what was typed.
+        // `panel` settles it one call after `naming_field`.
     }
 
     if icon_button(
@@ -448,15 +448,6 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         return;
     }
 
-    // Editing off is one more place the grid stops offering a gesture, so it is
-    // one more place a gesture in flight has to be abandoned — the same rule the
-    // two early returns above already follow, and the reason the header's own
-    // toggle calls this as well. Both, because the mode can also arrive off from
-    // a `State` egui rebuilt while a drag sat in the store beside it.
-    if !state.editing {
-        forget_gesture(ui.ctx(), &mut state);
-    }
-
     let act = swatch_grid(ui, p, ed, &state);
 
     // **The field is settled before the grid's click lands, and that ordering
@@ -470,6 +461,18 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // below reach for it, so `Act::Name` opens on the next colour, `Act::Remove`
     // takes one away, and neither costs the name that was in the field.
     naming_field(ui, p, ed, &mut state);
+
+    // Editing off is one more place the grid stops offering a gesture, so it is
+    // one more place a gesture in flight has to be abandoned — the same rule the
+    // two early returns above follow. **After the field rather than before it**,
+    // which is the same ordering the paragraph above argues for one step
+    // earlier: the press that turned the mode off is a click elsewhere, so the
+    // field gets its frame, reports the focus it lost and commits what was
+    // typed, and this then clears the slot it has already emptied. Before, it
+    // would have thrown the name away.
+    if !state.editing {
+        forget_gesture(ui.ctx(), &mut state);
+    }
 
     match act {
         Some(Act::Take(index)) => {
