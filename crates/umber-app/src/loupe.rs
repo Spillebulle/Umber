@@ -324,22 +324,54 @@ mod tests {
         //
         // Swept rather than argued, and over positions *outside* the view as
         // well: that is the outside-the-window case, where the answer comes
-        // from the clamp rather than from one of the four candidates, and it is
-        // the half the four-candidate reasoning says nothing about.
+        // from the clamp rather than from one of the eight candidates, and it
+        // is the half the eight-candidate reasoning says nothing about.
+        //
+        // **And over small views, which is where this sweep was blind.**
+        // Dropping the clearance test from the clamp — leaving `place` to
+        // answer the nearest legal position however close that lands — walked
+        // through an earlier version of this untouched, because a view 1280 by
+        // 800 only ever reaches the clamp for a pointer far outside it, where
+        // the distance is large for reasons that have nothing to do with the
+        // check. The views that exercise it are the ones barely larger than the
+        // circle: a window dragged short, or an interface scaled up. That is
+        // CLAUDE.md's rule about a guard's inputs spanning the contract its
+        // comment states, and it cost two minutes with the line deleted.
+        let views = [
+            VIEW,
+            View {
+                min: Vec2::ZERO,
+                max: Vec2::splat(2.0 * RADIUS + 6.0),
+            },
+            View {
+                min: Vec2::ZERO,
+                max: Vec2::new(2.0 * (RADIUS + CLEARANCE) - 4.0, 300.0),
+            },
+            View {
+                min: Vec2::new(-90.0, -40.0),
+                max: Vec2::new(140.0, 96.0),
+            },
+        ];
         for ppp in [0.5f32, 0.75, 1.0, 1.5, 2.0, 3.0] {
             let half_block = (CELLS as f32 * 0.5) / ppp;
-            for x in (-400..1700).step_by(37) {
-                for y in (-400..1200).step_by(41) {
-                    let pointer = Vec2::new(x as f32, y as f32);
-                    let Some(at) = place(pointer, VIEW, RADIUS) else {
-                        continue;
-                    };
-                    let clear = at.distance(pointer) - RADIUS;
-                    assert!(
-                        clear > half_block,
-                        "at {pointer:?} scale {ppp}: {clear} of clearance \
-                         against a half-block of {half_block}"
-                    );
+            for view in views {
+                let (lo, hi) = (view.min - Vec2::splat(200.0), view.max + Vec2::splat(200.0));
+                let mut x = lo.x;
+                while x <= hi.x {
+                    let mut y = lo.y;
+                    while y <= hi.y {
+                        let pointer = Vec2::new(x, y);
+                        y += 7.0;
+                        let Some(at) = place(pointer, view, RADIUS) else {
+                            continue;
+                        };
+                        let clear = at.distance(pointer) - RADIUS;
+                        assert!(
+                            clear > half_block,
+                            "at {pointer:?} in {view:?} at scale {ppp}: {clear}                              of clearance against a half-block of {half_block}"
+                        );
+                    }
+                    x += 5.0;
                 }
             }
         }
