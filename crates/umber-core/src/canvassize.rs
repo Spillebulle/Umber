@@ -227,9 +227,16 @@ impl Sheet {
     ///
     /// The resolution field is bounded by this while a sheet is in hand, so
     /// asking for A3 at 2400 dpi is unreachable rather than refused after the
-    /// fact. Never below [`Document::MIN_DPI`]: a sheet that cannot be made at
-    /// any resolution is not offered at all, so this is never the number a
-    /// caller acts on in that case.
+    /// fact.
+    ///
+    /// **It is clamped at [`Document::MIN_DPI`] and no caller filters on it**,
+    /// so on a device too small to hold the sheet at *any* resolution this
+    /// answers 1 and the caller acts on it. That is unreachable rather than
+    /// guarded: `downlevel_defaults` floors `max_texture_dimension_2d` at 2048,
+    /// where A3 at one dot per inch is 12 × 17. What saves it if it ever is
+    /// reachable is [`CanvasLimit::clamp`] at the far end of the dialog, not
+    /// anything here — an earlier draft of this sentence claimed such a sheet
+    /// "is not offered at all", and nothing anywhere declines to offer one.
     pub fn max_dpi(self, limit: CanvasLimit) -> u32 {
         let (_, long) = self.size().inches();
         // `round(long × dpi) <= max` iff `long × dpi < max + 0.5`, so this is
@@ -518,13 +525,18 @@ impl Aspect {
                     .iter()
                     .any(|&up| sheet.pixels(dpi, up) == size)
             }),
-            // Built the way [`choose`] builds it and compared whole, rather
-            // than tested edge by edge: that is what makes the round trip
-            // structural, and it settles the long axis at the same time, so
-            // 16:9 cannot hold a 9:16 canvas and collapse the two rows into
-            // one.
+            // Either edge derived from the other, which is both directions
+            // this module can produce a size in: [`choose`] drives from the
+            // long edge and [`LockedShape`] drives from whichever one was
+            // typed. Stating it symmetrically is what makes the round trip
+            // structural rather than a coincidence of rounding — and it still
+            // rejects the transpose, because deriving 1920 from 1080 at 16:9
+            // gives 608 and deriving it the other way gives 3413.
             _ => match self.ratio() {
-                Some((w, h)) => shaped(size.x.max(size.y), w, h) == size,
+                Some((w, h)) => {
+                    u64::from(size.y) == scaled(size.x, w, h)
+                        || u64::from(size.x) == scaled(size.y, h, w)
+                }
                 None => false,
             },
         }
@@ -584,7 +596,11 @@ fn sheet_at(size: UVec2, dpi: u32) -> Option<(Sheet, Orientation)> {
 /// `no_sheet_reads_as_a_screen_shape` measures.
 pub fn read(size: UVec2, dpi: u32) -> Reading {
     for aspect in Aspect::ALL {
-        if aspect == Aspect::Paper || aspect == Aspect::Custom {
+        // Driven off `ratio()`, which is an exhaustive match, rather than off a
+        // list of the two shapes that have none. A shape added later cannot then
+        // be run through the fixed-ratio branch by default; it has to state
+        // whether it is a ratio, which is a compile error until somebody does.
+        if aspect.ratio().is_none() {
             continue;
         }
         if aspect.holds(size, dpi) {
@@ -685,15 +701,89 @@ fn shaped(long: u32, w: u32, h: u32) -> UVec2 {
     }
 }
 
-/// `long × short_part / long_part`, rounded half up, in integers.
+/// `value × to / from`, rounded half up, in integers.
 ///
-/// Integer arithmetic rather than `f64` so there is no question about what the
-/// exact halves do: 5000 at 16:9 is 2812.5, and a float rounding mode is one
-/// more thing that could differ between two builds of the same number.
+/// **The one piece of ratio arithmetic in Umber.** [`shaped`], [`Aspect::holds`]
+/// and [`LockedShape`] all go through it, which is what stops the strip's
+/// honesty resting on two roundings agreeing: the lock used to derive its edge
+/// in `f32` in the dialog while `holds` judged the answer with this, and they
+/// agreed everywhere only by the accident that `1608 / (16/9)` in `f32` lands
+/// exactly on `904.5`.
+///
+/// Integer rather than float so there is no question about what the exact
+/// halves do: 5000 at 16:9 is 2812.5, and a rounding mode is one more thing
+/// that could differ between two builds of the same number.
+fn scaled(value: u32, from: u32, to: u32) -> u64 {
+    let from = u64::from(from.max(1));
+    (u64::from(value) * u64::from(to) + from / 2) / from
+}
+
+/// `long × short_part / long_part`, never past `long` and never zero.
 fn derive(long: u32, short_part: u32, long_part: u32) -> u32 {
-    let long_part = u64::from(long_part.max(1));
-    let value = (u64::from(long) * u64::from(short_part) + long_part / 2) / long_part;
-    value.clamp(1, u64::from(long)) as u32
+    scaled(long, long_part, short_part).clamp(1, u64::from(long)) as u32
+}
+
+/// The shape a "Lock aspect ratio" holds.
+///
+/// A pair of whole numbers compared only as a ratio, **captured** rather than
+/// recomputed from the fields each time — recomputing lets a rounded edge feed
+/// back, so a locked 16:9 stops being 16:9 after a few nudges. It lives here
+/// rather than in the dialog because it is the same ratio arithmetic
+/// [`Aspect::holds`] judges the result with, and the two being one function is
+/// what lets a nudged edge stay on the shape the strip is claiming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockedShape {
+    w: u32,
+    h: u32,
+}
+
+impl Default for LockedShape {
+    fn default() -> Self {
+        Self { w: 1, h: 1 }
+    }
+}
+
+impl LockedShape {
+    /// The shape a canvas of this size has.
+    ///
+    /// Zero on either axis reads as square: a field on its way to a number
+    /// passes through nothing, and a lock is arithmetic that gets handed
+    /// whatever the field holds.
+    pub fn of(width: u32, height: u32) -> Self {
+        if width == 0 || height == 0 {
+            Self::default()
+        } else {
+            Self {
+                w: width,
+                h: height,
+            }
+        }
+    }
+
+    /// The **exact** shape of a fixed ratio, for the shapes that have one.
+    ///
+    /// Not the same as `of` on the size that ratio produced: a 5000 square
+    /// becomes 5000 × 2813, whose own ratio is 1.7775 rather than 16:9's
+    /// 1.7778, and a lock holding *that* drives the next nudge a pixel off the
+    /// shape it is meant to be holding.
+    pub fn of_aspect(aspect: Aspect) -> Option<Self> {
+        aspect.ratio().map(|(w, h)| Self { w, h })
+    }
+
+    /// The height that keeps this shape at `width`, and the width that keeps it
+    /// at `height`.
+    ///
+    /// Clamped to a canvas that can exist, at both ends: an extreme shape and a
+    /// large edge would otherwise drive the other one past what the device
+    /// holds, or a very tall one round it down to nothing — and a canvas with no
+    /// pixels in it is a validation error rather than a small picture.
+    pub fn height_for(self, width: u32, limit: CanvasLimit) -> u32 {
+        limit.clamp_edge(scaled(width, self.w, self.h))
+    }
+
+    pub fn width_for(self, height: u32, limit: CanvasLimit) -> u32 {
+        limit.clamp_edge(scaled(height, self.h, self.w))
+    }
 }
 
 // ---------------------------------------------------------------------- bound
@@ -752,6 +842,12 @@ impl CanvasLimit {
 
     pub fn permits(self, size: UVec2) -> bool {
         size.x >= 1 && size.y >= 1 && size.x <= self.max_edge && size.y <= self.max_edge
+    }
+
+    /// One edge brought inside the bound, from arithmetic that may have
+    /// overflowed a `u32`'s worth of pixels on the way.
+    pub fn clamp_edge(self, edge: u64) -> u32 {
+        edge.clamp(1, u64::from(self.max_edge)) as u32
     }
 
     /// `size` brought inside the bound.
@@ -846,6 +942,14 @@ mod tests {
         // which is exactly 1/72 inch, and those figures were fixed decades
         // before this file: A4 is 595 x 842 and Letter is 612 x 792. Any
         // rounding rule that disagreed with them would be wrong.
+        //
+        // **A6 is the one row where the authority is not unanimous**, and it is
+        // named rather than quietly matched: 105 mm is 297.638 points, so
+        // rounding gives 298 and Ghostscript's own table floors it to 297 —
+        // while rounding every other entry, including A5's 419.53 up to 420.
+        // One rule applied uniformly beats matching a table that is not
+        // uniform with itself, so 298 is deliberate and is the only figure here
+        // taken from this code rather than from outside it.
         let points = [
             (Sheet::A3, 842, 1191),
             (Sheet::A4, 595, 842),
@@ -956,6 +1060,17 @@ mod tests {
                 Sheet::Tabloid => Sheet::ALL[6],
             };
             assert_eq!(named, *sheet, "position {i}");
+        }
+    }
+
+    #[test]
+    fn every_orientation_is_in_all() {
+        for (i, up) in Orientation::ALL.iter().enumerate() {
+            let named = match up {
+                Orientation::Portrait => Orientation::ALL[0],
+                Orientation::Landscape => Orientation::ALL[1],
+            };
+            assert_eq!(named, *up, "position {i}");
         }
     }
 
@@ -1110,6 +1225,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_locked_edge_stays_on_the_shape_the_strip_is_claiming() {
+        // The whole reason `LockedShape` is here rather than in the dialog. A
+        // canvas 1601 pixels wide *cannot* be exactly 16:9, so if the lock's
+        // rounding and `holds`' rounding were two different pieces of code the
+        // row of sizes would appear and vanish once per pixel as an edge was
+        // dragged.
+        //
+        // Swept over every edge rather than one convenient width. The earlier
+        // guard used 1600, where 1600 x 9 / 16 is exactly 900 and no rounding
+        // mode is exercised at all; the widths that decide this are the ones
+        // landing on a half, which is 6% of the domain at 16:9 and 25% at 4:3.
+        let limit = CanvasLimit::UNKNOWN;
+        for aspect in Aspect::ALL {
+            let Some(shape) = LockedShape::of_aspect(aspect) else {
+                continue;
+            };
+            for edge in (1..=4000).chain([9999, 12345, Document::MAX_EDGE]) {
+                // Skip only where the *bound* bit, never where the arithmetic
+                // did. Saturation is its own case and is asserted below; if it
+                // were folded in here it could hide a real rounding
+                // disagreement at the top of the range.
+                let by_width = UVec2::new(edge, shape.height_for(edge, limit));
+                if by_width.y < limit.max_edge() {
+                    assert!(
+                        aspect.holds(by_width, 72),
+                        "{}: width {edge} gave {by_width}",
+                        aspect.label()
+                    );
+                }
+                let by_height = UVec2::new(shape.width_for(edge, limit), edge);
+                if by_height.x < limit.max_edge() {
+                    assert!(
+                        aspect.holds(by_height, 72),
+                        "{}: height {edge} gave {by_height}",
+                        aspect.label()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lock_that_saturates_stops_being_the_shape_and_says_so() {
+        // The one case the sweep above excludes, and it is not a defect: a 4:3
+        // canvas 12345 pixels tall wants to be 16460 wide, the bound pins it at
+        // 16384, and 16384 x 12345 is genuinely not 4:3 any more. What matters
+        // is that nothing pretends otherwise — the strip settles to Custom
+        // rather than lighting 4:3 over a canvas that has stopped being it.
+        let limit = CanvasLimit::UNKNOWN;
+        let shape = LockedShape::of_aspect(Aspect::Standard).expect("4:3 is a ratio");
+        let width = shape.width_for(12345, limit);
+        assert_eq!(width, Document::MAX_EDGE);
+        let size = UVec2::new(width, 12345);
+        assert!(!Aspect::Standard.holds(size, 72));
+        assert_eq!(settle(Aspect::Standard, size, 72).aspect, Aspect::Custom);
+    }
+
+    #[test]
+    fn a_lock_can_never_ask_for_a_canvas_that_cannot_exist() {
+        // The lock computes where the fields clamp, so an extreme shape and a
+        // large edge could drive the other one past the bound, or a very tall
+        // one round it down to nothing.
+        for limit in [CanvasLimit::UNKNOWN, CanvasLimit::of_device(4096)] {
+            let top = limit.max_edge();
+            for shape in [
+                LockedShape::of(1, 100_000),
+                LockedShape::of(100_000, 1),
+                LockedShape::of(0, 0),
+                LockedShape::of(1920, 1080),
+            ] {
+                for edge in [1u32, 37, 4096, top, Document::MAX_EDGE] {
+                    let h = shape.height_for(edge, limit);
+                    let w = shape.width_for(edge, limit);
+                    assert!((1..=top).contains(&h), "{shape:?} {edge} -> {h}");
+                    assert!((1..=top).contains(&w), "{shape:?} {edge} -> {w}");
+                }
+            }
+        }
+        // A field passing through nothing on its way to a number must not make
+        // the lock divide by it.
+        assert_eq!(LockedShape::of(100, 0), LockedShape::default());
+        assert_eq!(
+            LockedShape::default().height_for(700, CanvasLimit::UNKNOWN),
+            700
+        );
     }
 
     #[test]

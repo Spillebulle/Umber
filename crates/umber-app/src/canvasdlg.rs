@@ -22,7 +22,7 @@
 
 use egui::{Rect, Sense, Stroke, StrokeKind, Ui, Vec2, vec2};
 use glam::UVec2;
-use umber_core::canvassize::{self, Aspect, CanvasLimit, Chosen, Orientation, Sheet};
+use umber_core::canvassize::{self, Aspect, CanvasLimit, Chosen, LockedShape, Orientation, Sheet};
 use umber_core::{Anchor, Background, Color, Document, Hsv, Unit, document};
 
 use crate::colorpicker;
@@ -76,11 +76,11 @@ pub struct CanvasForm {
     height: u32,
     /// Changing one edge drives the other.
     lock: bool,
-    /// Width over height, captured when the lock was switched on rather than
-    /// recomputed from the fields. Recomputing would make the ratio drift a
-    /// little with every rounded edge, so a locked 16:9 would stop being 16:9
-    /// after a few nudges.
-    lock_ratio: f32,
+    /// The shape it holds. The arithmetic is [`LockedShape`]'s, in `umber-core`,
+    /// because it is the same rounding [`Aspect::holds`] judges the result with
+    /// and two copies of it is how a nudged edge falls off the shape the strip
+    /// is claiming.
+    lock_shape: LockedShape,
     /// Which set of sizes is on offer. Stored rather than derived every frame,
     /// because it is a choice — and kept honest by [`canvassize::settle`], which
     /// moves it the moment the size stops belonging to it.
@@ -128,7 +128,7 @@ impl CanvasForm {
             width: doc.size.x,
             height: doc.size.y,
             lock: false,
-            lock_ratio: ratio_of(doc.size.x, doc.size.y),
+            lock_shape: LockedShape::of(doc.size.x, doc.size.y),
             aspect: reading.aspect,
             sheet: reading.sheet,
             orientation: reading.orientation.unwrap_or_default(),
@@ -185,9 +185,9 @@ impl CanvasForm {
         let size = self.limit.clamp(size);
         self.width = size.x;
         self.height = size.y;
-        // A size states a shape, so it also states the ratio a lock would hold.
+        // A size states a shape, so it also states what a lock would hold.
         // Leaving the old one behind would make the next nudge undo the choice.
-        self.lock_ratio = ratio_of(size.x, size.y);
+        self.lock_shape = LockedShape::of(size.x, size.y);
     }
 
     /// Apply a shape the painter has just picked.
@@ -210,8 +210,8 @@ impl CanvasForm {
                 // holding — which `canvassize::settle` would then correctly
                 // report as Custom, taking the row of sizes off the screen
                 // under the hand that was dragging.
-                if let Some((w, h)) = aspect.ratio() {
-                    self.lock_ratio = w as f32 / h as f32;
+                if let Some(exact) = LockedShape::of_aspect(aspect) {
+                    self.lock_shape = exact;
                 }
                 self.lock = true;
             }
@@ -293,44 +293,6 @@ impl CanvasForm {
     }
 }
 
-/// Width over height, guarded so a lock can never divide by zero.
-fn ratio_of(width: u32, height: u32) -> f32 {
-    if height == 0 {
-        1.0
-    } else {
-        width as f32 / height as f32
-    }
-}
-
-/// The height that keeps `ratio` at `width`, and the width that keeps it at
-/// `height`.
-///
-/// Rounded and clamped to a canvas that can exist. Deliberately driven from the
-/// *stored* ratio rather than from the other field: computing it fresh each time
-/// would let a rounded edge feed back into the ratio, so a locked 16:9 would
-/// stop being 16:9 after a few nudges.
-fn locked_height(width: u32, ratio: f32, limit: CanvasLimit) -> u32 {
-    edge(width as f32 / ratio.max(f32::MIN_POSITIVE), limit)
-}
-
-fn locked_width(height: u32, ratio: f32, limit: CanvasLimit) -> u32 {
-    edge(height as f32 * ratio, limit)
-}
-
-/// A float that came out of a ratio, as a canvas edge that can exist.
-///
-/// `clamp` rather than a cast: an absurd ratio overflows to infinity, and
-/// `inf as u32` is a saturating cast in Rust but `NaN as u32` is zero — a canvas
-/// with no pixels in it, which is a validation error rather than a small
-/// picture. So infinity clamps to the largest canvas this machine holds and NaN
-/// falls back to the smallest.
-fn edge(value: f32, limit: CanvasLimit) -> u32 {
-    if value.is_nan() {
-        return 1;
-    }
-    value.round().clamp(1.0, limit.max_edge() as f32) as u32
-}
-
 /// Draw whichever canvas dialog is open.
 pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
     let Some(which) = ed.canvas_form.open else {
@@ -346,8 +308,14 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
     // sit outside the scrolling part — the settings dialog's shape, and for the
     // settings dialog's reason: a control that has scrolled out of reach is a
     // control that is not there, and the one that matters most here is Cancel.
+    //
+    // The floor is the chrome itself rather than a comfortable minimum. A
+    // 200 point floor read as generous and was the one thing that could still
+    // overrun the window: at 300 points it asked for 200 of body under 150 of
+    // furniture. What is below the floor is a window too small to hold the
+    // buttons at all, where there is nothing left to give.
     const CHROME: f32 = 150.0;
-    let body_height = (root.ctx().content_rect().height() - CHROME).max(200.0);
+    let body_height = (root.ctx().content_rect().height() - CHROME).max(60.0);
 
     let modal = egui::Modal::new(egui::Id::new("canvas-settings"))
         .frame(tabs::dialog_frame(p))
@@ -510,8 +478,12 @@ fn size_choices(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) -> bool {
         aspect => {
             caption(ui, p, "Size");
             ui.add_space(6.0);
+            // Which one is lit is the model's answer, not a comparison written
+            // out again here. `settle` keeps the shape while it holds the size,
+            // so this is `read` restricted to the row actually on screen.
+            let lit = canvassize::settle(aspect, form.size(), form.dpi).preset;
             ui.horizontal_wrapped(|ui| {
-                for preset in aspect.presets() {
+                for (i, preset) in aspect.presets().iter().enumerate() {
                     // A size this machine cannot hold is not drawn. A control
                     // that lights up promising a canvas the device will refuse
                     // is worse than one that is simply absent, and the sentence
@@ -519,8 +491,7 @@ fn size_choices(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) -> bool {
                     if !form.limit.permits(preset.size()) {
                         continue;
                     }
-                    let selected = form.size() == preset.size();
-                    if tabs::button(ui, p, preset.label, selected) {
+                    if tabs::button(ui, p, preset.label, lit == Some(i)) {
                         form.sheet = None;
                         form.set_size(preset.size());
                     }
@@ -576,13 +547,13 @@ fn size_fields(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
     let mut typed = false;
     if number_row(ui, p, "Width", &mut form.width, "px", edges.clone()) {
         if form.lock {
-            form.height = locked_height(form.width, form.lock_ratio, form.limit);
+            form.height = form.lock_shape.height_for(form.width, form.limit);
         }
         typed = true;
     }
     if number_row(ui, p, "Height", &mut form.height, "px", edges) {
         if form.lock {
-            form.width = locked_width(form.height, form.lock_ratio, form.limit);
+            form.width = form.lock_shape.width_for(form.height, form.limit);
         }
         typed = true;
     }
@@ -596,7 +567,7 @@ fn size_fields(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
     if form.lock && !was {
         // Captured on the way in, so the lock holds the shape the canvas has
         // right now rather than one it had earlier.
-        form.lock_ratio = ratio_of(form.width, form.height);
+        form.lock_shape = LockedShape::of(form.width, form.height);
     }
 
     ui.add_space(8.0);
@@ -848,61 +819,12 @@ mod tests {
         CanvasForm::seeded(doc)
     }
 
-    #[test]
-    fn a_locked_edge_keeps_the_shape_it_was_locked_at() {
-        let limit = CanvasLimit::UNKNOWN;
-        let ratio = ratio_of(1920, 1080);
-        assert_eq!(locked_height(960, ratio, limit), 540);
-        assert_eq!(locked_width(540, ratio, limit), 960);
-        // A4 at 300 dpi, halved.
-        let a4 = ratio_of(2480, 3508);
-        assert_eq!(locked_height(1240, a4, limit), 1754);
-    }
-
-    #[test]
-    fn a_locked_ratio_does_not_wander_as_an_edge_is_nudged() {
-        // The reason the ratio is captured rather than recomputed: driving the
-        // other edge from a freshly divided pair lets rounding feed back, and a
-        // locked 16:9 stops being 16:9 after a few nudges.
-        let ratio = ratio_of(1920, 1080);
-        let mut width = 1920;
-        for _ in 0..200 {
-            width += 1;
-            let height = locked_height(width, ratio, CanvasLimit::UNKNOWN);
-            let drift = (width as f32 / height as f32) - ratio;
-            assert!(drift.abs() < 0.01, "{width}x{height} drifted by {drift}");
-        }
-    }
-
-    #[test]
-    fn a_locked_edge_can_never_ask_for_a_canvas_that_cannot_exist() {
-        // The fields clamp, but the lock computes — so a very wide ratio and a
-        // large edge could otherwise drive the other one past the limit, or a
-        // very tall one round it down to nothing. Driven at two limits, because
-        // the bound is the *device's* and a sweep against the format's alone
-        // would never see the smaller one.
-        for limit in [CanvasLimit::UNKNOWN, CanvasLimit::of_device(4096)] {
-            let top = limit.max_edge();
-            for ratio in [1e-6, 0.01, 1.0, 100.0, 1e6] {
-                for edge in [1u32, 37, 4096, top] {
-                    let h = locked_height(edge, ratio, limit);
-                    let w = locked_width(edge, ratio, limit);
-                    assert!((1..=top).contains(&h), "{ratio} {edge} {h}");
-                    assert!((1..=top).contains(&w), "{ratio} {edge} {w}");
-                }
-            }
-        }
-        // A document with no height cannot happen, but the ratio is arithmetic
-        // and arithmetic gets handed whatever the fields hold. A ratio of zero
-        // divides to infinity, which is the largest canvas rather than — as an
-        // unguarded cast through NaN would give — one with no pixels in it.
-        assert_eq!(ratio_of(100, 0), 1.0);
-        assert_eq!(
-            locked_height(100, 0.0, CanvasLimit::UNKNOWN),
-            Document::MAX_EDGE
-        );
-        assert_eq!(locked_width(100, f32::NAN, CanvasLimit::UNKNOWN), 1);
-    }
+    // The lock's own arithmetic is `LockedShape`'s and is guarded there:
+    // `a_locked_edge_stays_on_the_shape_the_strip_is_claiming` sweeps every
+    // edge, and `a_lock_can_never_ask_for_a_canvas_that_cannot_exist` sweeps
+    // the bound. What this file has left to prove is that the dialog *uses*
+    // it, which is `a_typed_edge_under_a_lock_keeps_the_shape_the_strip_claims`
+    // below.
 
     #[test]
     fn a_form_seeded_from_a_document_describes_that_document() {
@@ -1014,17 +936,32 @@ mod tests {
     #[test]
     fn a_typed_edge_under_a_lock_keeps_the_shape_the_strip_claims() {
         // The synergy that makes the strip honest while an edge is dragged: the
-        // shape arms the lock, the lock holds the ratio, and `settle` therefore
-        // finds the shape still holding.
+        // shape arms the lock **at the exact ratio**, the lock holds it, and
+        // `settle` therefore finds the shape still holding.
+        //
+        // Swept rather than tried at one width. 1600 was the whole of the first
+        // version of this and it is the one number that proves least: 1600 x 9
+        // is exactly 14400, so nothing rounds. The widths that decide it are
+        // those landing on a half, and the ones that would have failed under the
+        // old `f32` lock are those where a *rounded* stored ratio drifts — which
+        // is why the shape is armed from `LockedShape::of_aspect` and not from
+        // the 1000 x 563 the choice produced.
         let mut form = form_of(Document::new(1000, 1000));
         form.pick_aspect(Aspect::Wide);
         assert!(form.lock, "a shape arms the lock");
         assert_eq!(form.size(), UVec2::new(1000, 563));
 
-        form.width = 1600;
-        form.height = locked_height(form.width, form.lock_ratio, form.limit);
-        form.note_typed_size();
-        assert_eq!(form.aspect, Aspect::Wide, "still 16:9, so still on 16:9");
+        for width in 1000..1200 {
+            form.width = width;
+            form.height = form.lock_shape.height_for(form.width, form.limit);
+            form.note_typed_size();
+            assert_eq!(
+                form.aspect,
+                Aspect::Wide,
+                "{width} x {} left 16:9",
+                form.height
+            );
+        }
     }
 
     #[test]
@@ -1043,10 +980,16 @@ mod tests {
     // ----------------------------------------------------------------- bounds
 
     #[test]
-    fn no_control_can_ask_for_a_canvas_the_device_refuses() {
-        // Every route into the size, driven against a device that stops at
+    fn no_route_into_the_size_can_ask_for_a_canvas_the_device_refuses() {
+        // Every route the *form* offers, driven against a device that stops at
         // 4096: the shapes, the sheets at every offered resolution, and the
-        // presets that are still drawn.
+        // sizes that are still on offer.
+        //
+        // It is named for the form and not for the controls, because it
+        // restates the panel's own "is this size permitted" filter inside the
+        // loop below and therefore cannot see that filter removed. What can is
+        // `the_dialog_does_not_draw_a_size_this_machine_cannot_hold`, which
+        // reads the labels egui actually drew.
         let limit = CanvasLimit::of_device(4096);
         let mut form = form_of(Document::new(4096, 4096));
         form.limit = limit;
@@ -1087,9 +1030,15 @@ mod tests {
     }
 
     #[test]
-    fn the_resolution_field_cannot_take_a_sheet_past_the_device() {
-        // A3 at 2400 dpi is 28063 x 39685. The field's own range is what makes
-        // that unreachable, so this pins the range rather than the arithmetic.
+    fn a_sheet_bounds_the_resolution_and_a_pixel_size_does_not() {
+        // The *reading* the resolution controls are built from. What the
+        // controls then do with it is
+        // `the_dialog_does_not_offer_a_resolution_the_sheet_in_hand_cannot_reach`
+        // — this one deliberately claims nothing about the panel, because an
+        // earlier version of it did and could not see the field's range widened
+        // back to `MAX_DPI`.
+        //
+        // A3 at 2400 dpi is 28063 x 39685.
         let mut form = form_of(Document::default());
         form.limit = CanvasLimit::of_device(8192);
         form.pick_aspect(Aspect::Paper);
@@ -1115,8 +1064,14 @@ mod tests {
     }
 
     /// Draw whichever dialog is open into a window `height` points tall, and
-    /// answer how tall the modal came out.
-    fn drawn_height(ed: &mut Editor, height: f32) -> f32 {
+    /// answer how tall the modal came out along with every word it drew.
+    ///
+    /// The labels are what make a *panel* guard possible at all. Which sizes
+    /// the dialog offers is a filter inside `show`, and a test that restated
+    /// the filter would only ever agree with itself — reading the text back out
+    /// of egui's own output is the one way to ask what was actually put on the
+    /// screen.
+    fn drawn(ed: &mut Editor, height: f32) -> (f32, Vec<String>) {
         use crate::theme::{Palette, ThemeKind};
         use egui::{Rect, pos2, vec2};
 
@@ -1129,15 +1084,41 @@ mod tests {
         // Twice: the first pass through a fresh context builds the font atlas,
         // and a modal laid out against a half-built one is not the height it
         // settles at. The same reason `panels.rs`'s measurements run twice.
+        let mut words = Vec::new();
         for _ in 0..2 {
             let mut out = Outcome::default();
-            let _ = ctx.run_ui(input.clone(), |ui| {
+            let output = ctx.run_ui(input.clone(), |ui| {
                 show(ui, &palette, ed, &mut out);
             });
+            words.clear();
+            collect_text(&output.shapes, &mut words);
         }
-        ctx.memory(|m| m.area_rect(modal_id()))
+        let tall = ctx
+            .memory(|m| m.area_rect(modal_id()))
             .map(|r| r.height())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (tall, words)
+    }
+
+    fn collect_text(shapes: &[egui::epaint::ClippedShape], into: &mut Vec<String>) {
+        fn walk(shape: &egui::Shape, into: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => into.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(inner) => {
+                    for shape in inner {
+                        walk(shape, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in shapes {
+            walk(&clipped.shape, into);
+        }
+    }
+
+    fn drawn_height(ed: &mut Editor, height: f32) -> f32 {
+        drawn(ed, height).0
     }
 
     #[test]
@@ -1192,6 +1173,70 @@ mod tests {
         ed.canvas_form.dpi = 72;
         let _ = drawn_height(&mut ed, 900.0);
         assert_eq!(ed.canvas_form.size(), before);
+    }
+
+    #[test]
+    fn the_dialog_does_not_draw_a_size_this_machine_cannot_hold() {
+        // The panel half of the bound, and it has to read what was *drawn*. The
+        // model-level version of this test restated the dialog's own filter
+        // inside the test and could not see it removed at all: the button would
+        // still be there, clicking it would still hand back 4096 square because
+        // `set_size` clamps, and every assertion would still pass.
+        let mut ed = Editor::default();
+        ed.canvas_form.open(Dialog::New, Document::new(1000, 1000));
+        ed.canvas_form.pick_aspect(Aspect::Square);
+
+        let (_, roomy) = drawn(&mut ed, 900.0);
+        assert!(roomy.iter().any(|w| w == "16384"), "{roomy:?}");
+        assert!(roomy.iter().any(|w| w == "12000"), "{roomy:?}");
+        // And the sentence is absent when nothing is missing, or it would be a
+        // notice every machine gets about nothing.
+        assert!(!roomy.iter().any(|w| w.contains("pixels on a side")));
+
+        ed.canvas_form.set_device_limit(4096);
+        let (_, bounded) = drawn(&mut ed, 900.0);
+        assert!(!bounded.iter().any(|w| w == "16384"), "{bounded:?}");
+        assert!(!bounded.iter().any(|w| w == "12000"), "{bounded:?}");
+        assert!(!bounded.iter().any(|w| w == "5000"), "{bounded:?}");
+        assert!(
+            bounded.iter().any(|w| w == "2000"),
+            "the sizes that do fit must still be there: {bounded:?}"
+        );
+        assert!(
+            bounded.iter().any(|w| w.contains("4096 pixels on a side")),
+            "nothing said why the row is short: {bounded:?}"
+        );
+    }
+
+    #[test]
+    fn the_dialog_does_not_offer_a_resolution_the_sheet_in_hand_cannot_reach() {
+        // The other half, and the same trap: the previous version of this test
+        // called `form.max_dpi()` and asserted about the number, which says
+        // nothing about whether the strip is filtered by it or the field is
+        // ranged by it. Widening the field back to `MAX_DPI` left it green.
+        //
+        // A3 at 600 dpi is 7016 x 9921, so on a machine that stops at 8192 the
+        // 600 cell has to go. It has to stay everywhere else, including for A3
+        // on an ordinary machine, or this would pass by simply never offering
+        // 600 at all.
+        let mut ed = Editor::default();
+        ed.canvas_form.open(Dialog::New, Document::new(1000, 1000));
+        ed.canvas_form.pick_aspect(Aspect::Paper);
+        ed.canvas_form.sheet = Some(Sheet::A3);
+        ed.canvas_form.apply_sheet();
+
+        let (_, roomy) = drawn(&mut ed, 900.0);
+        assert!(roomy.iter().any(|w| w == "600"), "{roomy:?}");
+
+        ed.canvas_form.set_device_limit(8192);
+        let (_, bounded) = drawn(&mut ed, 900.0);
+        assert!(!bounded.iter().any(|w| w == "600"), "{bounded:?}");
+        assert!(bounded.iter().any(|w| w == "300"), "{bounded:?}");
+        assert!(
+            ed.canvas_form.limit.permits(ed.canvas_form.size()),
+            "{}",
+            ed.canvas_form.size()
+        );
     }
 
     #[test]
