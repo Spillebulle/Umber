@@ -693,7 +693,13 @@ impl Palette {
             dock: Color32::from_rgb(0x41, 0x41, 0x41),
             chrome: Color32::from_rgb(0x47, 0x47, 0x47),
             border: Color32::from_rgb(0x57, 0x57, 0x57),
-            popover: Color32::from_rgb(0x3F, 0x3F, 0x3F),
+            // Darker than the dock column rather than two units off it, which
+            // is what the measured `#3F3F3F` was: a menu dropped over a docked
+            // panel has to be told from it by more than its own hairline. Krita
+            // draws its menus darker than its dockers, so this is the faithful
+            // direction as well as the legible one. MediaBog's had the same
+            // defect and worse — see its `popover`.
+            popover: Color32::from_rgb(0x3A, 0x3A, 0x3A),
             popover_border: Color32::from_rgb(0x5C, 0x5C, 0x5C),
             control: Color32::from_rgb(0x52, 0x52, 0x52),
             control_hover: Color32::from_rgb(0x5E, 0x5E, 0x5E),
