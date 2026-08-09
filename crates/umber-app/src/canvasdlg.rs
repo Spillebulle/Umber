@@ -395,6 +395,23 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
                     }
                 });
 
+            // A sheet is a physical size, so its pixels follow the resolution.
+            // Reconciled once at the foot of the body rather than beside each
+            // control that can move that resolution — the quick-pick, the field,
+            // and whatever is added next to them — because that is the invariant
+            // that gets forgotten at the third call site. It runs before the
+            // buttons, so what Apply reads is never a canvas that stopped
+            // matching the sheet it is filed under, and it is the exact identity
+            // whenever no sheet is in hand.
+            //
+            // Without it: A4 chosen at 300 and then set to 600 keeps 2480 × 3508
+            // and is a 105 × 148 millimetre card wearing A4's name.
+            // `a_resolution_typed_into_the_dialog_moves_the_paper_it_is_holding`
+            // is the guard, and it drives the dialog rather than the form,
+            // because a guard on `apply_sheet` cannot see whether the panel
+            // calls it.
+            form.apply_sheet();
+
             ui.add_space(16.0);
             // Inside a `horizontal`. A bare `right_to_left` takes the whole of
             // the remaining height of the `Ui` it is in, because the align is
@@ -659,25 +676,21 @@ fn resolution(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
         let mut dpi = form.dpi;
         if widgets::segmented(ui, p, &mut dpi, offered) {
             form.dpi = dpi;
-            form.apply_sheet();
         }
         ui.add_space(6.0);
     }
 
-    if number_row(
+    // Neither control re-derives the size itself: the one reconciliation at the
+    // foot of `show` does, for both of them and for whatever is added beside
+    // them.
+    number_row(
         ui,
         p,
         "Pixels per inch",
         &mut form.dpi,
         "dpi",
         Document::MIN_DPI as u32..=top,
-    ) {
-        // A sheet is a physical size, so its pixels follow the resolution. This
-        // is the half that makes the paper presets mean anything: without it,
-        // A4 chosen at 300 and then set to 600 would keep 2480 × 3508 and be a
-        // 105 × 148 millimetre card wearing A4's name.
-        form.apply_sheet();
-    }
+    );
 }
 
 fn background_fields(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
@@ -1147,6 +1160,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_resolution_typed_into_the_dialog_moves_the_paper_it_is_holding() {
+        // The panel half of the paper rule, and it has to be the panel: a guard
+        // on `apply_sheet` cannot see whether the dialog calls it, which is
+        // exactly the shape that let a reverted call site leave 1,485 tests
+        // green elsewhere in this codebase.
+        //
+        // Setting the field is all a resolution control does. Everything after
+        // that belongs to `show`.
+        let mut ed = Editor::default();
+        ed.canvas_form.open(Dialog::New, Document::new(1000, 1000));
+        ed.canvas_form.pick_aspect(Aspect::Paper);
+        assert_eq!(ed.canvas_form.size(), UVec2::new(2480, 3508));
+
+        ed.canvas_form.dpi = 600;
+        let _ = drawn_height(&mut ed, 900.0);
+        assert_eq!(
+            ed.canvas_form.size(),
+            UVec2::new(4961, 7016),
+            "the dialog kept A4's 300 dpi pixels at 600 dpi"
+        );
+        assert_eq!(ed.canvas_form.document().dpi, 600.0);
+
+        // And a canvas with no sheet behind it is untouched by the same pass,
+        // which is what makes the reconciliation safe to run unconditionally.
+        ed.canvas_form.pick_aspect(Aspect::Wide);
+        let before = ed.canvas_form.size();
+        ed.canvas_form.dpi = 72;
+        let _ = drawn_height(&mut ed, 900.0);
+        assert_eq!(ed.canvas_form.size(), before);
     }
 
     #[test]
