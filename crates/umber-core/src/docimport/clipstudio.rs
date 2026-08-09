@@ -92,7 +92,7 @@ use super::blend::{self, Fidelity};
 use super::{
     ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, srgb,
 };
-use crate::csblocks::{self, BLOCK, Bitmap, Blocks, Fill, Packing};
+use crate::csblocks::{self, BLOCK, Bitmap, Fill, Packing};
 use crate::document::Background;
 use crate::layer::LayerStack;
 use crate::sqlite::{Database, Table, Value};
@@ -664,16 +664,18 @@ fn clean_name(raw: &str, folder: bool) -> String {
 // Pixels
 // ---------------------------------------------------------------------------
 
-/// Read the bitmap an `Offscreen` names, whatever it is going to be used for.
+/// What an `Offscreen` names: the shape of its bitmap, how its bytes are
+/// packed, and the blob its blocks are in.
 ///
-/// Returns the blocks in grid order beside what the `Attribute` said, or a
-/// sentence saying why not — which becomes the reason a layer or a mask was
-/// refused. Nothing here allocates from a figure the file chose alone.
-fn read_bitmap(
+/// The blob rather than the blocks, because [`csblocks::for_each_block`] hands
+/// them over one at a time — a whole grid of decompressed blocks is 1.3 GB on
+/// the largest canvas an import will accept, and every one of them can be a
+/// hundred-byte zlib stream.
+fn read_bitmap<'a>(
     attribute: &[u8],
     chunk: &[u8],
-    container: &Container<'_>,
-) -> Result<(Bitmap, Packing, Blocks), String> {
+    container: &'a Container<'a>,
+) -> Result<(Bitmap, Packing, &'a [u8]), String> {
     let bitmap = csblocks::parse_attribute(attribute, ImportedDocument::MAX_DIMENSION)
         .ok_or_else(|| "Umber could not read the shape of its bitmap".to_string())?;
     let packing = bitmap
@@ -683,12 +685,7 @@ fn read_bitmap(
         .external
         .get(chunk)
         .ok_or_else(|| "the file does not hold its pixels".to_string())?;
-    let blocks = csblocks::blocks(data, packing)
-        .ok_or_else(|| "its pixels could not be decompressed".to_string())?;
-    if blocks.len() != bitmap.columns * bitmap.rows {
-        return Err("its bitmap holds a different number of blocks than it claims".to_string());
-    }
-    Ok((bitmap, packing, blocks))
+    Ok((bitmap, packing, data))
 }
 
 /// A layer's colour, canvas-sized, straight-alpha sRGB, ready for
@@ -701,7 +698,7 @@ fn colour(
     origin: (i64, i64),
     canvas: UVec2,
 ) -> Result<Vec<u8>, String> {
-    let (bitmap, packing, blocks) = read_bitmap(attribute, chunk, container)?;
+    let (bitmap, packing, data) = read_bitmap(attribute, chunk, container)?;
     if packing.first != 1 || !matches!(packing.second, 1 | 4) {
         return Err(format!(
             "its pixels are packed {} and {} channels at a time, which Umber cannot read",
@@ -718,34 +715,39 @@ fn colour(
     }
 
     let mut out = vec![0u8; canvas.x as usize * canvas.y as usize * 4];
-    for (index, block) in blocks.iter().enumerate() {
-        let Some(block) = block else { continue };
-        let (column, row) = (index % bitmap.columns, index / bitmap.columns);
-        for y in 0..BLOCK {
-            let Some(dst_y) = canvas_at(origin.1, row, y, canvas.y) else {
-                continue;
-            };
-            for x in 0..BLOCK {
-                let Some(dst_x) = canvas_at(origin.0, column, x, canvas.x) else {
+    csblocks::for_each_block(
+        data,
+        packing,
+        bitmap.columns * bitmap.rows,
+        |index, block| {
+            let (column, row) = (index % bitmap.columns, index / bitmap.columns);
+            for y in 0..BLOCK {
+                let Some(dst_y) = canvas_at(origin.1, row, y, canvas.y) else {
                     continue;
                 };
-                let i = y * BLOCK + x;
-                // **The alpha plane comes first, then the colour interleaved.**
-                // Four bytes at a time it is B, G, R and one nothing reads; one
-                // byte at a time it is grey.
-                let alpha = block[i];
-                let at = csblocks::PLANE + i * packing.second;
-                let (r, g, b) = if packing.second == 4 {
-                    (block[at + 2], block[at + 1], block[at])
-                } else {
-                    let v = block[at];
-                    (v, v, v)
-                };
-                let px = (dst_y * canvas.x as usize + dst_x) * 4;
-                out[px..px + 4].copy_from_slice(&[r, g, b, alpha]);
+                for x in 0..BLOCK {
+                    let Some(dst_x) = canvas_at(origin.0, column, x, canvas.x) else {
+                        continue;
+                    };
+                    let i = y * BLOCK + x;
+                    // **The alpha plane comes first, then the colour interleaved.**
+                    // Four bytes at a time it is B, G, R and one nothing reads; one
+                    // byte at a time it is grey.
+                    let alpha = block[i];
+                    let at = csblocks::PLANE + i * packing.second;
+                    let (r, g, b) = if packing.second == 4 {
+                        (block[at + 2], block[at + 1], block[at])
+                    } else {
+                        let v = block[at];
+                        (v, v, v)
+                    };
+                    let px = (dst_y * canvas.x as usize + dst_x) * 4;
+                    out[px..px + 4].copy_from_slice(&[r, g, b, alpha]);
+                }
             }
-        }
-    }
+        },
+    )
+    .ok_or_else(|| "its pixels could not be read".to_string())?;
     srgb::encode_buffer(&mut out);
     Ok(out)
 }
@@ -760,7 +762,7 @@ fn coverage(
     origin: (i64, i64),
     canvas: UVec2,
 ) -> Result<Vec<u8>, String> {
-    let (bitmap, packing, blocks) = read_bitmap(attribute, chunk, container)?;
+    let (bitmap, packing, data) = read_bitmap(attribute, chunk, container)?;
     if packing.first != 1 || packing.second != 0 {
         return Err("its mask is not a single channel".to_string());
     }
@@ -776,21 +778,26 @@ fn coverage(
     };
 
     let mut out = vec![default; canvas.x as usize * canvas.y as usize];
-    for (index, block) in blocks.iter().enumerate() {
-        let Some(block) = block else { continue };
-        let (column, row) = (index % bitmap.columns, index / bitmap.columns);
-        for y in 0..BLOCK {
-            let Some(dst_y) = canvas_at(origin.1, row, y, canvas.y) else {
-                continue;
-            };
-            for x in 0..BLOCK {
-                let Some(dst_x) = canvas_at(origin.0, column, x, canvas.x) else {
+    csblocks::for_each_block(
+        data,
+        packing,
+        bitmap.columns * bitmap.rows,
+        |index, block| {
+            let (column, row) = (index % bitmap.columns, index / bitmap.columns);
+            for y in 0..BLOCK {
+                let Some(dst_y) = canvas_at(origin.1, row, y, canvas.y) else {
                     continue;
                 };
-                out[dst_y * canvas.x as usize + dst_x] = block[y * BLOCK + x];
+                for x in 0..BLOCK {
+                    let Some(dst_x) = canvas_at(origin.0, column, x, canvas.x) else {
+                        continue;
+                    };
+                    out[dst_y * canvas.x as usize + dst_x] = block[y * BLOCK + x];
+                }
             }
-        }
-    }
+        },
+    )
+    .ok_or_else(|| "its mask could not be read".to_string())?;
     Ok(out)
 }
 

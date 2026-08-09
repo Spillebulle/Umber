@@ -265,26 +265,44 @@ fn init_fill(attribute: &[u8], head: usize) -> Fill {
     }
 }
 
-/// Every block of one bitmap, in grid order, `None` for one not stored.
-pub(crate) type Blocks = Vec<Option<Vec<u8>>>;
-
-/// Every block of a `BlockData` blob, in grid order.
+/// Walk a `BlockData` blob, handing each **stored** block to `f` in grid order.
 ///
-/// An inner `None` is a block Clip Studio did not store — the ordinary state of
-/// an untouched corner of a layer. An outer `None` is a block this reader could
-/// not make sense of, and takes the whole bitmap with it rather than leaving a
-/// hole somebody would read as the artist's own transparency.
-pub(crate) fn blocks(blob: &[u8], packing: Packing) -> Option<Blocks> {
-    let mut out = Vec::new();
+/// A callback rather than a `Vec` of blocks, and that is a bound rather than a
+/// style: a whole grid of decompressed blocks is `columns × rows × 320 KB`,
+/// which on the largest canvas an import will accept is 1.3 GB — and every one
+/// of those can be a hundred-byte zlib stream, so a 400 KB file would ask for
+/// all of it. One block is live at a time here, so the amplification a hostile
+/// file can reach is one block.
+///
+/// `expected` is how many blocks the `Attribute`'s grid says there are.
+/// `None` is returned for a blob that does not hold exactly that many, or one
+/// whose block this reader could not make sense of — which takes the whole
+/// bitmap rather than leaving a hole somebody would read as the artist's own
+/// transparency.
+pub(crate) fn for_each_block(
+    blob: &[u8],
+    packing: Packing,
+    expected: usize,
+    mut f: impl FnMut(usize, &[u8]),
+) -> Option<()> {
+    let mut seen = 0usize;
     let mut at = 0usize;
     while let Some(chunk) = record(blob, at) {
         at = chunk.end;
         if chunk.name != "BlockDataBeginChunk" {
             continue;
         }
-        out.push(decode_block(chunk.payload, Some(packing))?);
+        // Counted before the decode, so a blob naming a million blocks costs
+        // one inflate rather than a million.
+        if seen >= expected {
+            return None;
+        }
+        if let Some(block) = decode_block(chunk.payload, Some(packing))? {
+            f(seen, &block);
+        }
+        seen += 1;
     }
-    Some(out)
+    (seen == expected).then_some(())
 }
 
 /// `[u32 index][u32 uncompressed bytes][u32 block width][u32 block height]
@@ -570,7 +588,8 @@ mod tests {
     }
 
     /// The grid, the packing and the blocks come back off a blob the fixture
-    /// wrote, in order, with the absent one still absent.
+    /// wrote, in order, with the absent one still absent — and a blob whose
+    /// block count does not match the grid takes the whole bitmap.
     #[test]
     fn a_block_data_blob_reads_back_block_for_block() {
         let bitmap = parse_attribute(&fixture::attribute(300, 300, MASK, None), 16384)
@@ -582,8 +601,15 @@ mod tests {
             .map(|i| (i != 2).then(|| vec![(i * 17) as u8; packing.block_len()]))
             .collect();
         let blob = fixture::block_data(&written, packing);
-        let read = blocks(&blob, packing).expect("the blocks");
+
+        let mut read: Vec<Option<Vec<u8>>> = vec![None; 4];
+        for_each_block(&blob, packing, 4, |i, block| read[i] = Some(block.to_vec()))
+            .expect("the blocks");
         assert_eq!(read, written);
+
+        // The grid and the blob have to agree about how many there are.
+        assert!(for_each_block(&blob, packing, 3, |_, _| {}).is_none());
+        assert!(for_each_block(&blob, packing, 5, |_, _| {}).is_none());
     }
 
     /// A block whose declared size disagrees with the bitmap's stated packing
@@ -627,7 +653,7 @@ mod tests {
             let _ = record(&bytes, 0);
             let _ = decode_block(&bytes, None);
             let _ = field(&bytes, 0);
-            let _ = blocks(&bytes, COLOUR);
+            let _ = for_each_block(&bytes, COLOUR, 4, |_, _| {});
         }
     }
 }
