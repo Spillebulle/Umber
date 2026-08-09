@@ -53,7 +53,9 @@
 //!
 //! # Nothing is shipped
 //!
-//! Graphite and Paper are compiled in and are not entries in this library, for
+//! All six of [`ThemeKind::ALL`] are compiled in and none is an entry in this
+//! library — the design's Graphite and Paper, and the four drawn from other
+//! applications' interfaces — for
 //! the reason `umber_core::palette`'s module docs give in full: anything the
 //! user decides about a shipped item cannot be written where the shipped item
 //! is, because an update replaces it wholesale and the choice vanishes
