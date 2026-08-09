@@ -26,7 +26,7 @@
 use crate::autosave;
 use crate::colorpicker::{PickerMode, WheelAngles, WheelShape};
 use crate::editor::Editor;
-use crate::shortcuts::{self, Action, Binding, Chord};
+use crate::shortcuts::{self, Action, Binding};
 use crate::theme::{Accent, ThemeKind};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -87,10 +87,14 @@ pub const UNDO_BUDGET_LADDER: [u32; 10] = [64, 128, 256, 512, 1024, 2048, 4096, 
 
 /// A number of megabytes as the history counts bytes.
 ///
-/// Saturating rather than plain, because [`MAX_UNDO_BUDGET_MB`] is 32768 and
-/// `32768 << 20` does not fit a 32-bit `usize`. Every target Umber ships is
-/// 64-bit, so this cannot fire today; it is one word against a build for a
-/// target where the arithmetic would panic in debug and wrap in release.
+/// **Every target Umber ships is 64-bit**, and this is written to say so rather
+/// than to work on one that is not: [`MAX_UNDO_BUDGET_MB`] is 32768 and
+/// `32768 << 20` does not fit a 32-bit `usize`, so on such a target the plain
+/// multiply panics in debug and wraps in release. Saturating turns that into a
+/// budget of `usize::MAX`, which is *unbounded* — the opposite of what this
+/// function is for, and the honest reading is that it is a legible failure
+/// rather than a fixed one. A 32-bit build would need the ceiling lowered, not
+/// this line changed.
 pub fn undo_budget_bytes(megabytes: u32) -> usize {
     (megabytes as usize).saturating_mul(1024 * 1024)
 }
@@ -437,23 +441,10 @@ pub fn to_text(prefs: &Prefs) -> String {
 
     // Only actions that differ from the factory table are written. An action
     // left out keeps its defaults, which is what lets a later version add a
-    // shortcut and have it arrive bound rather than blank.
+    // shortcut and have it arrive bound rather than blank — which is exactly
+    // what a keymap must *not* do, and is the whole of `shortcut_lines`' flag.
     out.push('\n');
-    for action in Action::ALL {
-        if shortcuts::is_default(&prefs.shortcuts, action) {
-            continue;
-        }
-        let chords = shortcuts::chords_for(&prefs.shortcuts, action);
-        if chords.is_empty() {
-            // An action with no chord is how "the user cleared this" is said —
-            // distinct from "the file predates this action", which is silence.
-            out.push_str(&format!("shortcut = {}\n", action.id()));
-            continue;
-        }
-        for chord in chords {
-            out.push_str(&format!("shortcut = {} {}\n", action.id(), chord.id()));
-        }
-    }
+    out.push_str(&shortcuts::shortcut_lines(&prefs.shortcuts, false));
     out
 }
 
@@ -622,59 +613,26 @@ pub fn from_text(text: &str) -> Prefs {
 
 /// Merge the file's `shortcut` lines over the factory table.
 ///
-/// An action the file mentions is fully described by the file — including
-/// "mentioned with no chord", which means the user deliberately unbound it. An
-/// action the file never mentions keeps its defaults.
+/// The tolerance — what a mentioned action means, what a chord that will not
+/// parse costs, what silence means, and why the result is ordered by
+/// [`Action::ALL`] — is [`shortcuts::merge`]'s and is documented there. This is
+/// the tokenising half, and it is all that differs between the two readers of
+/// this format: here the general `key = value` reader above has already split
+/// the line, so what is left is a bare `<Command> [<Key>]` pair.
 ///
-/// A line whose chord does not parse disqualifies its action from being treated
-/// as mentioned at all, so corruption restores a shortcut rather than removing
-/// one. Losing a binding to a stray byte and having no way to tell would be the
-/// worse failure.
-///
-/// The result is ordered by [`Action::ALL`] whatever order the file used. That
-/// matters because `resolve_in` gives a chord held twice to whichever binding
-/// comes first: with file order, editing an unrelated line could change which
-/// of two clashing commands runs. Ordering by the action list makes the winner
-/// the one the settings page lists first, which is also the one its warning
-/// names.
+/// The counters `merge` returns are dropped. A preferences file is not an
+/// interchange format and there is nowhere to report them to; a keymap is, and
+/// `settings::import_keymap` reads every one of them.
 fn parse_shortcuts(lines: &[&str]) -> Vec<Binding> {
-    let mut mentioned: Vec<Action> = Vec::new();
-    let mut broken: Vec<Action> = Vec::new();
-    let mut custom: Vec<Binding> = Vec::new();
-
+    let mut observed: Vec<(Action, Option<&str>)> = Vec::new();
     for line in lines {
         let mut parts = line.split_whitespace();
         let Some(action) = parts.next().and_then(Action::from_id) else {
             continue;
         };
-        if !mentioned.contains(&action) {
-            mentioned.push(action);
-        }
-        let Some(chord_id) = parts.next() else {
-            continue; // Deliberately unbound.
-        };
-        match Chord::from_id(chord_id) {
-            Some(chord) => custom.push(Binding::new(action, chord)),
-            None => {
-                if !broken.contains(&action) {
-                    broken.push(action);
-                }
-            }
-        }
+        observed.push((action, parts.next()));
     }
-    mentioned.retain(|a| !broken.contains(a));
-
-    let defaults = shortcuts::defaults();
-    let mut out = Vec::with_capacity(defaults.len());
-    for action in Action::ALL {
-        let source = if mentioned.contains(&action) {
-            &custom
-        } else {
-            &defaults
-        };
-        out.extend(source.iter().copied().filter(|b| b.action == action));
-    }
-    out
+    shortcuts::merge(&observed, &shortcuts::defaults()).bindings
 }
 
 /// Parse a number and clamp it into range.
@@ -1024,6 +982,9 @@ pub(crate) fn prefs_lock() -> MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
+    // Only the tests name a `Chord` now: the reader hands chord ids to
+    // `shortcuts::merge` as text and never builds one itself.
+    use crate::shortcuts::Chord;
     use winit::keyboard::KeyCode;
 
     fn turned(triangle: f32, square: f32) -> WheelAngles {

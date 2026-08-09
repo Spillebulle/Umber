@@ -131,29 +131,7 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
     if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::InputAndPen {
         ed.input.end_probe();
     }
-    // Nothing the Themes pane was in the middle of may outlive the page it was
-    // started on. Same rule, and the same place, as ending the pressure probe
-    // above; two things depend on it and both were bugs:
-    //
-    // - a "Delete?" still armed when somebody walks away to Shortcuts and back
-    //   is a control that takes a theme on the next click, for a question they
-    //   answered a page ago.
-    // - **Escape does not abandon a field**, whatever a text editor's habits
-    //   suggest: egui's `TextEdit` handles no `Key::Escape` at all, and
-    //   `egui::Modal` consumes it to close the dialog. So a half-typed name, or
-    //   a hex that says `rebeccapurple`, is left in the buffer with the field
-    //   never drawn again — and reopening the page shows a readout the chip
-    //   beside it disagrees with, whose *next* blur applies the rename the user
-    //   thought they had cancelled.
-    if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::Themes {
-        forget_themes_edit(&ctx);
-    }
-    // And the undo budget's figure, for exactly the same reason: it is a field
-    // inside this modal, so Escape shuts the dialog rather than reaching the
-    // caret, and a buffer left standing would be applied by the next blur.
-    if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::General {
-        forget_budget_edit(&ctx);
-    }
+    forget_absent_panes(&ctx, ed.ui.settings_open.then_some(ed.ui.settings_tab));
 
     if !ed.ui.settings_open {
         // Closing the dialog while a field was listening would otherwise leave
@@ -710,18 +688,38 @@ pub(crate) fn scale_row() -> widgets::NumberRow<'static> {
 /// is about what goes in a *file*, and this is about what a running session
 /// holds. They are both "the undo history" and they trade different things.
 ///
-/// **This row is deliberately not a [`widgets::number_row`], and the ladder is
-/// why rather than taste.** That widget's rail is linear by construction, and
-/// this figure spans 512:1 — on the 320-point row below, a linear rail puts the
-/// shipped 512 MB four pixels from the left end, so every budget anybody
-/// actually uses lives in the first six per cent of the travel. The rungs are
-/// *doublings*, which are evenly spaced in the logarithm and not in the value,
-/// so [`widgets::NumberRow::snap`] could not produce them even on a logarithmic
-/// rail: it lands on multiples of a number. What is shared instead is the field
-/// — [`inset_field`], the same dressed `TextEdit` the theme editor and the
-/// Colour panel's hex readout use — and the rule the recorded defect gives, that
-/// a field applies what was **typed** and that Escape is not a blur. See
-/// [`budget_field`].
+/// **This row is not a [`widgets::number_row`], and the blocker is the unit
+/// rather than the rail.** Three things were in the way and only the third is
+/// load-bearing, which is worth saying because the first two invite the wrong
+/// fix:
+///
+/// - *The rail is linear.* True, and one field away from not being: `slider_row`
+///   already takes `log`, and `drag_track`, `to_t` and `Span` all carry it —
+///   `number_row` simply passes the literal `false`. So "linear by construction"
+///   would be an overstatement.
+/// - *The rungs are doublings.* [`widgets::NumberRow::snap`] lands on multiples
+///   of a number, so it could not produce them even on a logarithmic rail; a
+///   snap would have to become a *ratio* under `log`. Also fixable.
+/// - **The unit changes with the magnitude, and that one `NumberRow` cannot
+///   express at all.** Its readout is `value * per_unit` at fixed `decimals`
+///   with a fixed `suffix`, and this row must say "512 MB" at one end and
+///   "32 GB" at the other. That is deliberate rather than a gap:
+///   `NumberRow::parse`'s exact-inverse property holds "by construction rather
+///   than by agreement: one scale and one suffix serve both directions".
+///
+/// So the trade this row makes is a **structural** guarantee for a **tested**
+/// one — `a_budget_typed_back_is_the_budget_that_was_shown` does the work
+/// `NumberRow` gets for free from having one arithmetic. That is the sentence
+/// the next person needs, and it is the reason to be wary of adding a third
+/// magnitude-dependent readout without solving it properly.
+///
+/// What is shared is the *dressing*, [`inset_field`]. What is **not** shared and
+/// should be is the caret-and-buffer machine: [`budget_field`] is about
+/// twenty-eight lines of `widgets::number_field` copied, and the copy has
+/// already diverged — the "apply only what was typed" gate lives here and not
+/// there. Lifting that machine out of `number_field`, units-agnostic, would
+/// leave this row ten lines and put the gate in one place; it is a `widgets`
+/// change and is recorded rather than made.
 fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     controls::section(ui, p, "Undo memory");
 
@@ -729,7 +727,10 @@ fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     // necessarily a rung: a figure hand-edited into the preferences file, or
     // typed into the field below, is honoured rather than snapped.
     let held = (ed.history.budget_bytes() / (1024 * 1024)) as u32;
-    let mut chosen = None;
+    // Two slots rather than one, because the precedence between them is a rule
+    // and a shared accumulator makes it whichever writer happens to run second.
+    let mut typed = None;
+    let mut railed = None;
 
     ui.scope(|ui| {
         ui.set_max_width(320.0);
@@ -738,48 +739,44 @@ fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         // rail's height rather than a line of text's, because a caret needs
         // somewhere to stand. `number_row`'s own geometry, for the row it would
         // be if the rungs were multiples of one number.
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let width = ui.available_width().max(widgets::MIN_TRACK);
-            let (header, _) =
-                ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::hover());
-            ui.painter().text(
-                header.left_center(),
-                Align2::LEFT_CENTER,
-                "Keep up to",
-                FontId::proportional(text::SMALL),
-                p.text_dim,
-            );
-            chosen = budget_field(ui, p, header, held);
-        });
+        let width = ui.available_width().max(widgets::MIN_TRACK);
+        let (header, _) = ui.allocate_exact_size(vec2(width, BUDGET_LINE), Sense::hover());
+        ui.painter().text(
+            header.left_center(),
+            Align2::LEFT_CENTER,
+            "Keep up to",
+            FontId::proportional(text::SMALL),
+            p.text_dim,
+        );
+        typed = budget_field(ui, p, header, held);
 
         // The rail. `slider_row` is the settings page's rail and draws its own
         // header, which this row has already drawn — hence the empty label and
         // the empty readout. Nothing in `widgets` exposes that rail alone at
-        // this size; `bare_slider` is the layer list's knobless one.
+        // this size; `bare_slider` is the layer list's knobless one, and the
+        // cost of borrowing this one is a blank strip where its header would
+        // have gone. Lifting the rail out of `slider_row` and `number_row`,
+        // which state it twice already, is the fix and it lives in `widgets`.
         //
         // The position is continuous in ladder space, so the knob sits where a
         // typed figure actually is rather than at the rung nearest it, and a
         // drag lands on a rung because the answer is rounded back to one.
-        let last = (prefs::UNDO_BUDGET_LADDER.len() - 1) as f32;
         let mut position = budget_position(held);
-        if widgets::slider_row(ui, p, "", &mut position, 0.0..=last, false, |_| {
+        if widgets::slider_row(ui, p, "", &mut position, 0.0..=last_rung(), false, |_| {
             String::new()
         }) {
-            let rung =
-                prefs::UNDO_BUDGET_LADDER[ladder_index(position, prefs::UNDO_BUDGET_LADDER.len())];
-            // A typed figure wins over the rail on the frame it lands, because
-            // the click that puts the pointer on the rail is the same click that
-            // blurs the field: taking the rail's answer would discard what was
-            // typed, in the one gesture where the two arrive together. A second
-            // click on the rail does what it says.
-            if rung != held && chosen.is_none() {
-                chosen = Some(rung);
-            }
+            railed = Some(
+                prefs::UNDO_BUDGET_LADDER[ladder_index(position, prefs::UNDO_BUDGET_LADDER.len())],
+            );
         }
     });
 
-    if let Some(megabytes) = chosen
+    // A typed figure wins over the rail on the frame it lands, because the click
+    // that puts the pointer on the rail is the same click that blurs the field:
+    // taking the rail's answer would discard what was typed, in the one gesture
+    // where the two arrive together. A second click on the rail does what it
+    // says.
+    if let Some(megabytes) = typed.or(railed)
         && megabytes != held
     {
         // The one door, so the document being edited, the ones parked in other
@@ -814,6 +811,50 @@ fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 /// in it: the readout is at most "32 GB", and somebody may well type "32768".
 const BUDGET_FIELD: f32 = 48.0;
 
+/// The height of the line the label and the figure share.
+///
+/// **Not `metrics::SLIDER_ROW`, and that was measured rather than eyeballed.**
+/// The field is drawn into this line through a child ui, and **a child ui
+/// allocates nothing in its parent** — so a field taller than its slot paints
+/// over whatever is under it instead of pushing anything down, which is a defect
+/// no layout test in this file can see and which nobody here can look at.
+/// `inset_field` is a bordered well with a margin of its own where
+/// `widgets::number_field` is a bare `TextEdit` at `Margin::ZERO`, and at
+/// `text::TINY` it comes to **18.22 points** against `SLIDER_ROW`'s 16. So the
+/// line is 20, which is that with room for a face whose metrics differ, and
+/// `the_budget_field_fits_the_line_it_is_drawn_into` fails the build if it ever
+/// stops being enough.
+const BUDGET_LINE: f32 = 20.0;
+
+/// Abandon whatever a pane that is **not in front** was part way through.
+///
+/// One gate over every pane rather than an `if` beside each, because these are
+/// the same rule twice already and the third field this dialog grows would need
+/// a third `if` with nothing forcing it — the "forgotten at the sixth call site"
+/// failure, written out in advance. `showing` is `None` when the dialog is shut,
+/// which forgets everything.
+///
+/// The rule itself: **Escape is not a blur inside this modal.** `egui::TextEdit`
+/// handles no `Key::Escape` at all and `egui::Modal` consumes it to close the
+/// dialog, so a pane walked away from is simply never drawn again, `lost_focus`
+/// is never observed, and anything half typed sits in its buffer to be applied
+/// by the *next* blur — a rename or a budget nobody asked for, minutes later,
+/// from a field they thought they had cancelled. Two things already depended on
+/// it and both were bugs; the Themes pane's "Delete?" staying armed across a
+/// walk to Shortcuts and back is the third.
+///
+/// The pressure probe answers to the same rule and is **not** here, because
+/// ending it needs `Editor` rather than the context. It stays beside its own
+/// reason in [`show`].
+fn forget_absent_panes(ctx: &egui::Context, showing: Option<SettingsTab>) {
+    if showing != Some(SettingsTab::Themes) {
+        forget_themes_edit(ctx);
+    }
+    if showing != Some(SettingsTab::General) {
+        forget_budget_edit(ctx);
+    }
+}
+
 /// Where the buffer of a budget being typed lives.
 ///
 /// In egui's temporary store rather than on `Editor`, for [`number_row`]'s
@@ -847,11 +888,13 @@ fn forget_budget_edit(ctx: &egui::Context) {
 /// what its buffer happens to hold, and that a buffer only exists while somebody
 /// is actually editing.
 ///
-/// The unit is the one the readout was showing. Selecting "8 GB" and typing "16"
-/// means sixteen gigabytes; selecting "512 MB" and typing "256" means two
-/// hundred and fifty-six megabytes; and a unit written out wins over both. The
-/// tooltip says so, because a bare figure is otherwise ambiguous in exactly the
-/// direction that costs a gigabyte.
+/// The unit is the one the readout was showing, and the field **opens on the
+/// readout including its unit** so that it is on screen while somebody types
+/// over it. Selecting "8 GB" and typing "16" means sixteen gigabytes; selecting
+/// "512 MB" and typing "256" means two hundred and fifty-six megabytes; and a
+/// unit written out wins over both. The tooltip says so as well, but the cue
+/// that matters is the one in the field: a bare figure is otherwise ambiguous in
+/// exactly the direction that costs a gigabyte.
 fn budget_field(ui: &mut egui::Ui, p: &Palette, header: Rect, held: u32) -> Option<u32> {
     let field_id = egui::Id::new("settings-undo-budget-field");
     let buffer_id = budget_buffer_id();
@@ -879,10 +922,18 @@ fn budget_field(ui: &mut egui::Ui, p: &Palette, header: Rect, held: u32) -> Opti
     );
 
     if field.gained_focus() {
-        // Start from the bare figure, whole and selected, so the first keystroke
-        // replaces it — which is what somebody who clicked a number and typed
-        // "16" meant. The suffix is never something to delete before typing.
-        text = budget_bare(held);
+        // Whole and selected, so the first keystroke replaces it — which is what
+        // somebody who clicked a number and typed "16" meant.
+        //
+        // **With the unit, unlike `widgets::number_field`, and that difference
+        // is the whole of why.** There the unit is fixed by the `NumberRow`, so
+        // dropping the suffix costs nothing and saves a deletion. Here it is a
+        // function of the value, and it is the only thing on screen saying which
+        // unit a bare figure will be read in. Opening "1 GB" as "1" and typing
+        // "512" meaning megabytes gave 512 GB, clamped to the 32 GB ceiling: a
+        // thirty-two-fold miss on a memory setting, from the control whose job
+        // is to say what it set.
+        text = budget_label(held);
         let mut state = egui::TextEdit::load_state(child.ctx(), field_id).unwrap_or_default();
         state
             .cursor
@@ -937,6 +988,14 @@ fn committed_budget(text: &str, held: u32) -> Option<u32> {
 /// gigabytes.
 const GIGABYTE: u32 = 1024;
 
+/// The far end of the budget rail, which is the last rung's own position.
+///
+/// Named because the rail's span and [`budget_position`]'s clamp are the same
+/// number and would otherwise be written twice.
+fn last_rung() -> f32 {
+    (prefs::UNDO_BUDGET_LADDER.len() - 1) as f32
+}
+
 /// A budget as a position along the ladder, whole numbers being the rungs.
 ///
 /// This is `log2` and not a search because [`prefs::UNDO_BUDGET_LADDER`] is
@@ -944,9 +1003,8 @@ const GIGABYTE: u32 = 1024;
 /// `the_undo_budget_ladder_is_doublings_from_the_floor` is what holds the two
 /// together, since nothing about the constant's *type* says so.
 fn budget_position(megabytes: u32) -> f32 {
-    let last = (prefs::UNDO_BUDGET_LADDER.len() - 1) as f32;
     let ratio = megabytes.max(1) as f32 / prefs::MIN_UNDO_BUDGET_MB as f32;
-    ratio.log2().clamp(0.0, last)
+    ratio.log2().clamp(0.0, last_rung())
 }
 
 /// A budget with nothing after it, in whichever unit [`budget_label`] would use.
@@ -1133,6 +1191,10 @@ fn autosave_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &m
 /// readout became typable — which is the point at which two copies of four
 /// characters' difference stop being a coincidence.
 fn ladder_index(value: f32, rungs: usize) -> usize {
+    // A ladder with no rungs has no index to answer with, and both callers pass
+    // a `const` array that plainly has some. `saturating_sub` keeps the answer
+    // in bounds of the arithmetic; only this says the caller is wrong.
+    debug_assert!(rungs > 0, "a ladder needs at least one rung");
     (value.round().max(0.0) as usize).min(rungs.saturating_sub(1))
 }
 
@@ -3031,6 +3093,15 @@ enum KeymapRequest {
 /// name is built from something that is already a filename. There is no id here
 /// to borrow, so the name is a constant: nothing about a keymap identifies whose
 /// it is.
+///
+/// **The write is atomic, through `docformat::write_encoded`.** A plain
+/// `fs::write` that dies halfway leaves a truncated keymap where the artist's
+/// keymap was, which is the failure a temporary neighbour and a rename exist to
+/// prevent — and the two other export-to-a-chosen-path routes in Umber,
+/// `themelib::export` and `PaletteLibrary::export`, both already answer it. This
+/// borrows the document writer's one rather than adding a third copy of
+/// temp-and-rename; what it saves is a keymap rather than a document, but the
+/// guarantee wanted is exactly the one that function is.
 fn export_keymap(bindings: &[shortcuts::Binding], ed: &mut Editor) {
     let Some(path) = rfd::FileDialog::new()
         .set_title("Export shortcuts")
@@ -3040,7 +3111,8 @@ fn export_keymap(bindings: &[shortcuts::Binding], ed: &mut Editor) {
     else {
         return;
     };
-    if let Err(e) = std::fs::write(&path, shortcuts::to_keymap(bindings)) {
+    let keymap = shortcuts::to_keymap(bindings);
+    if let Err(e) = umber_core::docformat::write_encoded(&path, keymap.as_bytes()) {
         ed.notice = Some(Notice {
             title: "Could not export the shortcuts".to_owned(),
             lines: vec![e.to_string()],
@@ -3081,51 +3153,54 @@ fn import_keymap(over: &[shortcuts::Binding], ed: &mut Editor) -> Option<Vec<sho
         return None;
     };
 
-    let mut lines = Vec::new();
-    if keymap.unknown_actions > 0 {
-        lines.push(plural(
+    // Not a loss, and it still has to be said: the file may bind one key to two
+    // commands, or bind a key that a command it did not mention already holds.
+    // Both are kept, exactly as they are when somebody types a clash into a row.
+    //
+    // **The sentence must not promise a mark**, and the first draft did.
+    // `shadowed` compares chords alone, so it also counts a key one command
+    // holds twice — and `clashes_with` filters that case out, so the row draws
+    // no badge for it. It also cannot tell a clash the import made from one the
+    // table already had, which is why the wording is not "now".
+    let clashes = shortcuts::shadowed(&keymap.bindings).len();
+    // One table rather than five near-identical blocks: the five sentences are
+    // one notice and read as one, and a sixth counter on `Keymap` cannot be
+    // added without a row here — which is the "forgotten at the sixth" failure
+    // written out in advance rather than discovered.
+    let lines: Vec<String> = [
+        (
             keymap.unknown_actions,
             "One line names a command this Umber does not have, and was skipped.",
             "lines name commands this Umber does not have, and were skipped.",
-        ));
-    }
-    if keymap.unreadable_chords > 0 {
-        lines.push(plural(
+        ),
+        (
             keymap.unreadable_chords,
             "One line names a key Umber could not read, so that command kept the \
              shortcut it had.",
             "lines name keys Umber could not read, so those commands kept the \
              shortcuts they had.",
-        ));
-    }
-    if keymap.unreadable_lines > 0 {
-        lines.push(plural(
+        ),
+        (
             keymap.unreadable_lines,
             "One line was not a shortcut at all and was skipped.",
             "lines were not shortcuts at all and were skipped.",
-        ));
-    }
-    if keymap.untouched > 0 {
-        lines.push(plural(
+        ),
+        (
             keymap.untouched,
             "One command is not in the file and kept the shortcut it had.",
             "commands are not in the file and kept the shortcuts they had.",
-        ));
-    }
-    // Not a loss, and it still has to be said: the file may bind one key to two
-    // commands, or bind a key that something the file did not mention already
-    // holds. Both are kept, exactly as they are when somebody types a clash into
-    // a row, and the list below marks them.
-    let clashes = shortcuts::shadowed(&keymap.bindings).len();
-    if clashes > 0 {
-        lines.push(plural(
+        ),
+        (
             clashes,
-            "One key now does two things. The list below marks it, and the \
-             command listed first wins.",
-            "keys now each do two things. The list below marks them, and the \
-             command listed first wins.",
-        ));
-    }
+            "One key is bound to two commands. The command listed first wins.",
+            "keys are each bound to two commands. The command listed first wins.",
+        ),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, one, many)| plural(count, one, many))
+    .collect();
+
     if !lines.is_empty() {
         ed.notice = Some(Notice {
             title: "Imported, with notes".to_owned(),
@@ -3390,6 +3465,15 @@ mod tests {
     /// fail the build when it stops being true. Same idiom as
     /// `panels`' `ticking_a_layer_does_not_move_the_layer_list`.
     fn measure(tab: Option<SettingsTab>) -> egui::Vec2 {
+        // The General pane draws `undo_section`, which can reach
+        // `prefs::set_undo_budget` and therefore the undo budget's
+        // process-global. It cannot today — `RawInput::default()` carries no
+        // pointer, so nothing is clicked — but a regression that made the row
+        // write on every draw would put the recorded 10-in-40 flake back into
+        // `the_undo_budget_reaches_the_history_and_back`, from a test that looks
+        // entirely unrelated to it. Taking the lock costs nothing and is what
+        // `prefs::prefs_lock`'s docs ask of anyone who can reach that global.
+        let _serial = prefs::prefs_lock();
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WIDTH, HEIGHT))),
@@ -3505,7 +3589,7 @@ mod tests {
             assert_eq!(
                 committed_budget(&budget_bare(held), held),
                 None,
-                "the figure {held} MB opens the field on moved when nobody typed",
+                "the bare figure {held} MB opens on moved when nobody typed",
             );
             assert_eq!(
                 committed_budget(&budget_label(held), held),
@@ -3595,6 +3679,133 @@ mod tests {
                 ed.history.budget_bytes(),
                 prefs::undo_budget_bytes(megabytes),
                 "drawing the row moved a budget of {megabytes} MB",
+            );
+        }
+    }
+
+    /// The budget field fits the line it is drawn into.
+    ///
+    /// It is drawn through `ui.new_child(max_rect(header))`, which allocates
+    /// nothing in the parent — so a field taller than its slot paints over its
+    /// neighbours instead of pushing them down, and no layout test can see it.
+    /// `inset_field` is a bordered well with its own margin, where
+    /// `widgets::number_field` is a bare `TextEdit` with `Margin::ZERO`, so it
+    /// is genuinely the taller of the two and this is the first caller to give
+    /// one a fixed height.
+    ///
+    /// Measured rather than eyeballed, because nobody here can look at the pane
+    /// in a test. Three passes: a fresh context lays text out against a
+    /// half-built font atlas and the size it reports is not the one it settles
+    /// at.
+    #[test]
+    fn the_budget_field_fits_the_line_it_is_drawn_into() {
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        let mut measured = 0.0f32;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                // The widest thing anybody types into it, which is also the
+                // tallest: one line of the monospace face plus the well.
+                let mut buffer = budget_bare(prefs::MAX_UNDO_BUDGET_MB);
+                let _ = inset_field(
+                    ui,
+                    &palette,
+                    egui::Id::new("budget-field-measure"),
+                    &mut buffer,
+                    BUDGET_FIELD,
+                    FontId::monospace(text::TINY),
+                );
+                measured = ui.min_rect().height();
+            });
+        }
+        assert!(
+            measured <= BUDGET_LINE,
+            "the budget field is {measured} points tall in a {BUDGET_LINE}-point line",
+        );
+    }
+
+    /// A budget somebody typed lands, and Escape on the same buffer abandons it.
+    ///
+    /// **This is the half `committed_budget`'s own doc comment concedes is not a
+    /// pure function**, and leaving it untested is the recorded failure: a critic
+    /// reverted one call site elsewhere in this project and 1,485 tests stayed
+    /// green. Deleting `budget_field`'s `key_pressed(Escape)` guard passes every
+    /// other test in this file.
+    ///
+    /// The buffer is seeded rather than typed, because what has to be exercised
+    /// is the commit path — the frame the caret has left — and egui has already
+    /// dropped the focus by then, so a real keystroke would add machinery
+    /// without adding reach.
+    #[test]
+    fn a_typed_budget_lands_and_escape_abandons_it() {
+        let _serial = prefs::prefs_lock();
+        let palette = Palette::of(ThemeKind::Graphite);
+
+        let typed = |input: egui::RawInput| {
+            let ctx = egui::Context::default();
+            let mut ed = Editor::default();
+            ed.history.set_budget(prefs::undo_budget_bytes(512));
+            ctx.data_mut(|d| d.insert_temp(budget_buffer_id(), "2048".to_owned()));
+            let _ = ctx.run_ui(input, |ui| undo_section(ui, &palette, &mut ed));
+            (
+                (ed.history.budget_bytes() / (1024 * 1024)) as u32,
+                ctx.data(|d| d.get_temp::<String>(budget_buffer_id())),
+            )
+        };
+
+        let (landed, left) = typed(egui::RawInput::default());
+        assert_eq!(landed, 2048, "a typed budget did not reach the history");
+        assert!(left.is_none(), "the buffer outlived the commit");
+
+        let escaped = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let (after, left) = typed(escaped);
+        assert_eq!(
+            after, 512,
+            "Escape applied the buffer instead of dropping it"
+        );
+        assert!(left.is_none(), "Escape left the buffer to be applied later");
+    }
+
+    /// A pane that is not in front forgets what was half typed in it, and the
+    /// one in front keeps it.
+    ///
+    /// Both halves are the assertion: a rule that forgot everything every frame
+    /// would pass the first and make the field impossible to type in.
+    ///
+    /// It measures [`forget_absent_panes`] rather than [`show`], and that is a
+    /// stated limit rather than an oversight — `show` reads and may write the
+    /// preferences file of whoever runs the suite, which no test here may do.
+    /// What this buys is that the rule is enumerated over the tabs in one place
+    /// instead of an `if` per pane, so the next field cannot be the one nobody
+    /// wrote a gate for.
+    #[test]
+    fn a_pane_that_is_not_in_front_forgets_what_was_half_typed_in_it() {
+        let ctx = egui::Context::default();
+        for showing in [
+            None,
+            Some(SettingsTab::General),
+            Some(SettingsTab::InputAndPen),
+            Some(SettingsTab::Themes),
+            Some(SettingsTab::Shortcuts),
+        ] {
+            ctx.data_mut(|d| d.insert_temp(budget_buffer_id(), "2048".to_owned()));
+            forget_absent_panes(&ctx, showing);
+            let kept = ctx
+                .data(|d| d.get_temp::<String>(budget_buffer_id()))
+                .is_some();
+            assert_eq!(
+                kept,
+                showing == Some(SettingsTab::General),
+                "a half-typed budget was handled wrongly while showing {showing:?}",
             );
         }
     }
