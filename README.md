@@ -161,13 +161,20 @@ be turned to whatever angle you like to work at, and each keeps its own.
 |---|---|---|---|
 | ![](docs/images/picker-wheel.png) | ![](docs/images/picker-wheel-square.png) | ![](docs/images/picker-square.png) | ![](docs/images/picker-sliders.png) |
 
-A fifth mode, **Harmony**, marks the complement, triad, tetrad, analogues or
-split-complement of the hue you are on and lets you take one with a click.
+A fifth mode, **Harmony**, marks the complement, triad, either tetrad, analogues
+or split-complement of the hue you are on and lets you take one with a click.
+The angles are the RGB colour wheel's, so the complement of blue is yellow here
+rather than the orange a paint-mixing wheel gives you.
 
 The **Palette** module keeps the colours you want to come back to. Click a slot
-to store what is in hand, and save a whole set into a library. Palettes are
-plain GIMP `.gpl` files in a folder of their own, so anything that reads them
-can read yours.
+to store what is in hand, and save a whole set into a library. A pencil in the
+header unlocks adding, renaming and rearranging, so a colour is hard to lose by
+accident.
+
+Palettes are plain GIMP `.gpl` files in a folder of their own, so anything that
+reads them can read yours. Umber also opens `.ase`, `.aco`, `.pal`, `.hex` and
+Paint.NET's `.txt`, and there is a box you can paste a list of hex codes into,
+which is what a Coolors link or a palette copied out of a chat actually is.
 
 ## Text
 
@@ -187,7 +194,7 @@ text: reopen the document and you can still fix the typo.
 | Bold and italic | a family's own faces, never a fake slant or a smeared outline. Umber says so when a family has neither |
 
 Placing it works exactly like a paste, so `Esc` abandons it and one undo takes
-it back off. It is pixels once it is down, not something that can be re-typed.
+it back off.
 
 <br clear="right">
 
@@ -327,12 +334,7 @@ a speed-derived approximation, and a mouse always paints at full pressure.
   window the eyedropper works everywhere. On macOS and Linux the tool options
   strip says so, rather than the drag quietly doing nothing. There is no
   magnifier under the cursor yet, so a one-pixel target takes a steady hand.
-- **Text becomes paint the moment you place it.** It is not kept as text, so
-  reopening a document gives you the picture and not the words, and fixing a
-  typo means undoing and typing it again. Everything up to placing it is live:
-  the face, the size and the setting can all be changed while you are still in
-  the panel.
-- **Three more things about text**, each of which the panel tells you about
+- **Three things about text**, each of which the panel tells you about
   rather than letting you find out later. Lines break where you break them and
   nothing wraps. A line mixing left-to-right and right-to-left writing is shaped
   but not reordered. A character the chosen face has no glyph for is left blank
