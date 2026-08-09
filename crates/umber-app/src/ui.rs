@@ -4817,4 +4817,208 @@ mod tests {
         }
         println!("wrote {written} shots to {}", dir.display());
     }
+
+    // -----------------------------------------------------------------------
+    // The eyedropper's loupe
+    // -----------------------------------------------------------------------
+
+    /// Every flat-filled rectangle a run of the interface produced, with its
+    /// colour, recursing through `Shape::Vec` for `strings_in`'s reason.
+    fn rects_in(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match shape {
+            egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    rects_in(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The same for filled circles, which is what the rim and the
+    /// single-colour fallback are drawn as.
+    fn circles_in(shape: &egui::Shape, out: &mut Vec<(f32, egui::Color32)>) {
+        match shape {
+            egui::Shape::Circle(c) => out.push((c.radius, c.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    circles_in(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Draw one loupe into a fresh context and hand back what it painted and
+    /// the context it painted into.
+    fn draw_loupe(seen: crate::loupe::Loupe) -> (egui::Context, Vec<(egui::Rect, egui::Color32)>) {
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+        let mut ed = Editor::default();
+        ed.ui.tool = crate::editor::Tool::Eyedropper;
+        ed.cursor = seen.at;
+        ed.loupe = Some(seen);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            super::loupe_overlay(ui, &palette, &ed);
+        });
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            rects_in(&clipped.shape, &mut rects);
+        }
+        (ctx, rects)
+    }
+
+    /// A full patch of one colour, with the middle overridden.
+    fn patch_of(all: [u8; 3], middle: Option<[u8; 3]>) -> crate::loupe::Patch {
+        let cells = crate::loupe::CELLS;
+        let mut texels = vec![Some(all); (cells * cells) as usize];
+        let m = (cells / 2) as usize;
+        texels[m * cells as usize + m] = middle;
+        crate::loupe::Patch::new(cells, texels).expect("a patch")
+    }
+
+    #[test]
+    fn the_loupe_draws_the_colour_a_release_would_take_and_not_the_block_it_read() {
+        // **Two readings that disagree**, which is the only way to test which
+        // of them the middle cell is drawn from. Off the screen they can
+        // genuinely differ — the colour is the block's middle texel, but a
+        // `BitBlt` that failed falls back to `syspick::sample` and there is no
+        // rule saying the fallback and a stale patch agree — and over the
+        // canvas they never do, so a fixture where both are the same value
+        // would pass under either reading. That is CLAUDE.md's rule about a
+        // two-state reading applied to a painter.
+        let taken = umber_core::Color::from_srgb_u8(220, 30, 140, 255);
+        let (_, rects) = draw_loupe(crate::loupe::Loupe {
+            at: glam::Vec2::new(600.0, 400.0),
+            taken: Some(taken),
+            patch: Some(patch_of([12, 200, 60], Some([9, 9, 9]))),
+        });
+        let wanted = egui::Color32::from_rgb(220, 30, 140);
+        let block = egui::Color32::from_rgb(9, 9, 9);
+        assert!(
+            rects.iter().any(|(_, fill)| *fill == wanted),
+            "the colour a release takes is drawn"
+        );
+        assert!(
+            !rects.iter().any(|(_, fill)| *fill == block),
+            "and the block's own middle texel is not"
+        );
+        // The rest of the block is what it read, so the loupe is a picture and
+        // not a swatch.
+        assert!(
+            rects
+                .iter()
+                .any(|(_, fill)| *fill == egui::Color32::from_rgb(12, 200, 60)),
+            "the neighbours are the block's"
+        );
+    }
+
+    #[test]
+    fn a_texel_the_loupe_could_not_read_is_left_blank_rather_than_filled() {
+        // Off every monitor, off the canvas, or fully transparent. Drawing
+        // black there would be a control that lies about what is under the
+        // pointer, so exactly one fewer cell is painted.
+        let at = glam::Vec2::new(600.0, 400.0);
+        let taken = umber_core::Color::from_srgb_u8(10, 10, 10, 255);
+        let full = patch_of([80, 80, 80], Some([80, 80, 80]));
+        let mut texels =
+            vec![Some([80u8, 80, 80]); (crate::loupe::CELLS * crate::loupe::CELLS) as usize];
+        // A texel next to the middle, so it is nowhere near the circle's
+        // boundary and cannot have been dropped by the clipping instead.
+        let m = (crate::loupe::CELLS / 2) as usize;
+        texels[m * crate::loupe::CELLS as usize + m + 1] = None;
+        let holed = crate::loupe::Patch::new(crate::loupe::CELLS, texels).expect("a patch");
+
+        let (_, with_all) = draw_loupe(crate::loupe::Loupe {
+            at,
+            taken: Some(taken),
+            patch: Some(full),
+        });
+        let (_, with_hole) = draw_loupe(crate::loupe::Loupe {
+            at,
+            taken: Some(taken),
+            patch: Some(holed),
+        });
+        assert_eq!(
+            with_all.len(),
+            with_hole.len() + 1,
+            "exactly the one unread texel goes unpainted"
+        );
+    }
+
+    #[test]
+    fn the_loupe_claims_no_pointer() {
+        // It is a bare layer painter and not an `Area`, which is what keeps it
+        // out of `Memory::layer_id_at` — the reading `ui_owns_pointer` and
+        // `Editor::pen_dot` both go through. An `Area` here would be a
+        // magnifier that refused the press it exists to aim, and the loupe
+        // sits directly beside the pointer, so it is the one overlay in this
+        // interface that would certainly be under it.
+        let at = glam::Vec2::new(600.0, 400.0);
+        let (ctx, _) = draw_loupe(crate::loupe::Loupe {
+            at,
+            taken: Some(umber_core::Color::from_srgb_u8(10, 10, 10, 255)),
+            patch: Some(patch_of([80, 80, 80], Some([80, 80, 80]))),
+        });
+        // Where `loupe::place` puts it for a pointer with room above.
+        let centre = pos2(at.x, at.y - crate::loupe::RADIUS - crate::loupe::CLEARANCE);
+        let layer = ctx.layer_id_at(centre);
+        assert!(
+            layer.is_none_or(|l| l.order == egui::Order::Background),
+            "the loupe registered an area at {centre:?}: {layer:?}"
+        );
+    }
+
+    #[test]
+    fn a_loupe_with_no_neighbourhood_shows_the_one_colour_it_has() {
+        // The `BitBlt` failed but the pixel was read. A fake grid would be the
+        // thing this control may not do, so the whole disc is the colour — and
+        // that is a decision rather than a gap, which is why it is pinned.
+        //
+        // **Both halves**, because "no grid" alone is what a loupe that drew
+        // nothing at all would also satisfy: the grid is rectangles and the
+        // disc is a circle, so an assertion about rectangles cannot see it.
+        let at = glam::Vec2::new(600.0, 400.0);
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+        let mut ed = Editor::default();
+        ed.ui.tool = crate::editor::Tool::Eyedropper;
+        ed.cursor = at;
+        ed.loupe = Some(crate::loupe::Loupe {
+            at,
+            taken: Some(umber_core::Color::from_srgb_u8(7, 130, 240, 255)),
+            patch: None,
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| super::loupe_overlay(ui, &palette, &ed));
+
+        let (mut rects, mut circles) = (Vec::new(), Vec::new());
+        for clipped in &output.shapes {
+            rects_in(&clipped.shape, &mut rects);
+            circles_in(&clipped.shape, &mut circles);
+        }
+        assert!(
+            rects.is_empty(),
+            "no grid is drawn where none was read: {rects:?}"
+        );
+        assert!(
+            circles
+                .iter()
+                .any(|(r, fill)| *fill == egui::Color32::from_rgb(7, 130, 240)
+                    && (*r - crate::loupe::RADIUS).abs() < 0.01),
+            "the disc is the colour it did read: {circles:?}"
+        );
+    }
 }
