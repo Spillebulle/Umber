@@ -380,8 +380,14 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
             // measurement anchored where the gesture began, the dot is where
             // the nib is now, and watching the second cross the first is how
             // the size is judged.
-            pen_cursor(ui, &p, ed);
+            // Before `pen_cursor` and not after it. Neither paints the other's
+            // cursor — they are exclusive on `Editor::pen_pointer` — but
+            // egui's cursor is whichever was asked for *last*, so putting the
+            // pen's request second means that if the exclusivity ever broke,
+            // the pen's own dot would still win over a crosshair rather than
+            // the window ending up with both.
             aiming_cursor(ui, ed);
+            pen_cursor(ui, &p, ed);
             rect
         })
         .inner;
@@ -1228,11 +1234,11 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
 /// to the right, is the worst possible thing to aim it with. That is why every
 /// application draws a crosshair here and none of them draws one for a brush.
 ///
-/// After [`pen_cursor`], which asks for `CursorIcon::None` and must win: a pen
-/// draws its own dot, and a crosshair *and* a dot would be two pointers. The
-/// pen answers to `pen_pointer`, so the two conditions are exclusive by
-/// construction rather than by ordering — this is belt and braces, and the
-/// order is the cheap half of it.
+/// **Never with a pen**, which draws its own dot: a crosshair and a dot would
+/// be two pointers. That is `Editor::pen_pointer` below, so the two are
+/// exclusive by construction and not by ordering — but this is called *before*
+/// [`pen_cursor`] anyway, because egui takes whichever cursor was asked for
+/// last and being second is what a safeguard would need to be.
 ///
 /// It is a per-frame request like every other cursor in this interface, so
 /// nothing has to remember to put the arrow back: change tool, cross onto a
