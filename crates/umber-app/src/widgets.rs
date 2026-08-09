@@ -1286,11 +1286,15 @@ fn typed_rail(
                     FontId::proportional(text::SMALL),
                     p.text_dim,
                 );
+                // The field's rectangle is settled here, where the header still
+                // is, and it is *drawn* after the drag — so the figure is the
+                // one the knob has just been taken to rather than last frame's.
+                // The inline shape gets that for free from the order its parts
+                // sit in; taking it here is what stops the two disagreeing.
                 let room =
                     figure_width(ui, p, rail).clamp(MIN_TRACK, header.width().max(MIN_TRACK));
                 let field =
                     Rect::from_min_max(pos2(header.right() - room, header.top()), header.max);
-                typed = number_field(ui, p, field, id, shown, rail, egui::Align::RIGHT);
 
                 let (track_row, response) = ui
                     .allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::click_and_drag());
@@ -1309,6 +1313,7 @@ fn typed_rail(
                     to_t(shown, lo, hi, log),
                     metrics::SLIDER_KNOB,
                 );
+                typed = number_field(ui, p, field, id, shown, rail, egui::Align::RIGHT);
                 response
             })
             .inner
