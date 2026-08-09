@@ -2864,10 +2864,30 @@ design shows a whole row of them.
   draws no fill, so a trigger with nothing before it is a word and a chevron on
   the panel's own background. The harmony relation picker was read exactly that
   way — an artist asked for a triad and a tetrad that were already in the menu —
-  and the fix is a small dim caption *above* it rather than a label beside it,
-  because beside costs the width the longest option needs and `Dropdown` elides a
-  label it cannot fit. The picker-mode switch escapes this only because it keeps
-  a leading mark.
+  and **the first fix, a small dim caption above it, made it worse and was
+  reported again**: a dim word over a plain word is a labelled read-only field,
+  so the pair read *more* like a readout than the bare trigger had. The
+  affordance has to be on the control. `Dropdown::outlined` adds a **border**,
+  which is not the filled variant the module refuses — that fill is
+  `widgets::chip`'s and means "not a control" — and it needs no caption. The
+  border may not be `Palette::border`: measured, that is 1.21:1 to 1.45:1 against
+  `dock` across the six themes, and it looks right on every *other* box only
+  because those pair it with a fill that is what makes the box. It is
+  `contrast::ink_on(surface, Ink::Dim)`, so `outlined` carries the **surface**
+  rather than a flag. **It is applied to one of the five triggers that are alone
+  on a line** — `paper_picker`, the palette picker, Blend mode and the
+  Drives/Driven by pair are still bare, and the Blend mode one still wears the
+  caption this retracted. That is a half-applied rule, not an exception, and the
+  code says so. The picker-mode switch escapes this only because it keeps a
+  leading mark.
+- **A rank is stated against a surface, so where it lands against another ink is
+  a consequence.** `Ink::Dim` on `dock` comes out *louder* than `text_dim` in all
+  six themes. Do not write "dimmer than the label" from a rank; measure it, or
+  state the rank against the ink you mean.
+- **A range in a comment invites the wrong conclusion from its own ends.**
+  "1.21:1 to 1.45:1, under the 1.31:1 already rejected" was true about the range
+  and false for two of the six themes. State the figures one by one where a
+  threshold is being argued.
 - **The triangle's Angle rail rotates and Swap white and black reflects, and
   neither reaches the other's arrangements.** Rotation walks the three rotations
   of the corner labelling; the reflection gives the other three. Together they
