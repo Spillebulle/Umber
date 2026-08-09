@@ -2558,6 +2558,51 @@ design shows a whole row of them.
 
 - **Never hard-code a colour.** Everything comes from `theme::Palette`, which is
   what makes the second theme a table of values rather than an edit sweep.
+- **A token cannot answer for a surface nobody chose, and `theme::contrast` is
+  what does.** Four marks sit on `Palette::backdrop` — the canvas scrollbar
+  thumb, the pen dot, the splash's supporting lines and the input strip's prompt
+  — and the theme editor lets anybody set that to anything. They were `text_dim`,
+  chosen for being the one mid-grey ink whichever way a theme's surfaces run,
+  which is exactly why it failed: on Krita's real 50% grey surround a mid-grey
+  ink is **1.34:1**, worse than the 1.31:1 `rail` had already been rejected at,
+  and no other token does better because the problem is the pit.
+  `ink_on(surface, rank)` takes the surface towards black or white — whichever
+  has the greater *headroom*, which is not the greater luminance distance — to a
+  target set geometrically between 3:1 and everything the surface can give. Every
+  surface admits at least 4.58:1, so the floor is always reachable.
+  **`contrast::ratio` is one function shared by the derivation and every guard**,
+  so a figure in a comment is a figure a test prints; two figures in this
+  codebase were wrong until it was asked. Two of those four marks are as often
+  over the *picture* as over the pit, and the docs say so: the worst case over
+  any artwork improves, the common case over dark paint in a light-pit theme does
+  not, and only a two-tone mark could fix that.
+- **`backdrop` is a fill in six places and an ink in four, and only the fills
+  were ever enumerated.** The selection marquee, the transform box, its handles
+  and the rotation mark are dark-then-light pairs whose under-pass was
+  `backdrop`, on the reasoning that it and the accent are "each dark in one theme
+  and light in the other". Making Krita's palette faithful made that false and
+  nothing caught it, because every guard measured inks against *surfaces a theme
+  names* and these marks lie on paint somebody made — at `#808080` the pair's
+  halves came within 1.60:1 and the dark line read **1.00:1** on mid-grey paint.
+  `Palette::accent_underlay` derives that end of the axis from the accent;
+  `the_marquees_pair_reads_over_any_artwork` sweeps artwork, and its second bound
+  — never worse than the token it replaced — is the one that catches a regression
+  rather than a threshold. **When a token changes, ask what is drawn *in* it as
+  well as what is drawn *on* it.**
+- **The accent is never ink on `control_active`.** That fill is the selected
+  state; Graphite and Paper tint it towards the accent so an accent mark on it is
+  4.74 and 3.80, and the four preset themes take their selection colour from the
+  application they are named for, where it is 2.60 / 2.27 / 2.06 / **1.88** — and
+  under 3:1 for all four accents in each. `Palette::active_ink` is the rule: the
+  accent where it reads, `text_strong` where it does not, a derived ink where
+  neither does. Neither fixed answer will do — always-accent is the defect,
+  always-`text_strong` costs the design its ochre in the two themes that *were*
+  the design. On that fill the ranks are `text_strong` and `text`; `text_dim` is
+  1.43:1 in MediaBog and nothing may use it there. `controls::keycap`'s clashing
+  cap is the one that was not a contrast fix at all: it stood
+  `control_active`/`accent_dim`/`accent` in for a caution palette the comment
+  said did not exist yet, and `warning_bg`/`warning_border`/`warning` are the
+  design's own values byte for byte.
 - **Six themes ship, and four of them are other applications' greys.** Every one
   is a `Palette` and nothing else, which is the claim above being cashed in.
   Every grey is sampled from a screenshot rather than eyeballed; the deviations
@@ -3311,6 +3356,13 @@ method rather than as an anecdote:
   catches it is reading the text egui actually drew: `ctx.run_ui` returns a
   `FullOutput` whose `shapes` carry every galley, so asking whether a label is
   there is a genuine panel test that needs no window.
+- **A guard on a palette is not a guard on the panel either, and neither
+  contrast defect moved a palette.** `an_active_mark_reads_on_the_fill_it_is_
+  drawn_on` measures `active_ink` and cannot see whether anything calls it:
+  revert one line and every ratio still passes. So the worst call sites are
+  measured off a headless pass instead — `inks_drawn` tessellates and keeps the
+  opaque vertex colours, which is one field where a shape is a dozen types with
+  three shapes of stroke among them.
 - **A guard on a model is not a guard on the panel, and the panel is where the
   gate usually is.** `a_read_only_palette_cannot_be_changed_by_any_gesture`
   drives `panel`; the palette's adding mark is in `header_controls`, which
