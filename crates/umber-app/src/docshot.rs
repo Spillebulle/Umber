@@ -253,9 +253,9 @@ fn interface(stage: &mut Stage, dir: &Path) -> Result<Vec<(PathBuf, u64, u32, u3
     let mut out = Vec::new();
 
     // Themes first: it is the pane the design draws in full, and the one that
-    // shows most of what the dialog is — the two themes as live cards, the four
-    // accents, and the layout controls under them. Shortcuts is the other,
-    // and is the only place the binding table can be seen at all.
+    // shows most of what the dialog is — every shipped theme as a live card,
+    // the four accents, and the layout controls under them. Shortcuts is the
+    // other, and is the only place the binding table can be seen at all.
     for (tab, name) in [
         (SettingsTab::Themes, "settings-themes.png"),
         (SettingsTab::Shortcuts, "settings-shortcuts.png"),
