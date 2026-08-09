@@ -8,7 +8,9 @@
 use crate::icons::{self, Icon};
 use crate::theme::contrast::{self, Ink};
 use crate::theme::{Palette, metrics, text};
-use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{
+    Align2, Color32, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use umber_core::{
@@ -302,6 +304,15 @@ const DROPDOWN_ICON: f32 = 12.0;
 const DROPDOWN_CHEVRON: f32 = 11.0;
 /// Between any two of a [`dropdown`]'s parts.
 const DROPDOWN_GAP: f32 = 4.0;
+/// The margin an *outlined* [`dropdown`] keeps inside its own border, at both
+/// ends. A label flush against an outline reads as clipped, and a chevron flush
+/// against one reads as part of it.
+///
+/// [`dropdown`] passes this only where a trigger is outlined and passes zero
+/// otherwise, which is what makes [`Dropdown::outlined`] add a variant rather
+/// than move the fourteen triggers that already exist: at zero every
+/// measurement below reduces to exactly the one it was.
+const DROPDOWN_PAD: f32 = 8.0;
 
 /// How wide a [`dropdown`] draws itself.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -343,6 +354,38 @@ pub struct Dropdown<'a> {
     /// rather than part of the choice.
     trailing: Option<&'a str>,
     width: DropdownWidth,
+    /// The surface this trigger is drawn on, where it draws a border round
+    /// itself — see [`Dropdown::outlined`].
+    ///
+    /// The *surface* rather than a flag, because the border is derived from it
+    /// and cannot be a token. Nearly every other box in this interface — the
+    /// curve panel, the pressure graph, `controls::button` — is a
+    /// `Palette::window` or `Palette::control` **fill** with a
+    /// `Palette::border` edge, and the fill is what makes it a box; the edge is
+    /// only its boundary. A dropdown may not have that fill, so its border
+    /// carries the whole affordance alone, and `border` measures 1.21:1
+    /// (Paper), 1.24 (Graphite), 1.25 (ShitStudio), 1.31 (MediaBog), 1.41
+    /// (Krita) and 1.45 (Photoslop) against `dock` — every one of them far
+    /// under [`contrast::READABLE`]'s 3:1, and the same order as the 1.31:1
+    /// already rejected for the canvas scrollbar's thumb, though four of the
+    /// six rather than all six are actually below that figure. Measured before
+    /// it was believed, and stated per theme because a range invites exactly
+    /// the wrong conclusion from its own ends.
+    ///
+    /// **`controls::keycap`'s unbound state is the exception to "nearly", and
+    /// it has this defect.** `CapState::Unbound` takes a transparent fill with a
+    /// `border` stroke, and `controls.rs` skips the fill when it is
+    /// transparent — so Settings → Shortcuts draws an unfilled `border` box at
+    /// 1.13:1 to 1.80:1 on `popover`. Named rather than fixed here: it is
+    /// another file and another agent's, and a premise this doc leans on that
+    /// the codebase quietly contradicts is worse than a known gap.
+    ///
+    /// So it is [`contrast::ink_on`], the same mechanism the four marks on
+    /// `Palette::backdrop` take, at [`Ink::Dim`] — "has to be visible and must
+    /// not shout" is the whole specification for this line. Derived means it
+    /// also survives somebody setting the surface to anything in the theme
+    /// editor, which a token cannot.
+    outlined: Option<Color32>,
 }
 
 impl<'a> Dropdown<'a> {
@@ -354,6 +397,7 @@ impl<'a> Dropdown<'a> {
             icon: None,
             trailing: None,
             width: DropdownWidth::Content,
+            outlined: None,
         }
     }
 
@@ -371,11 +415,46 @@ impl<'a> Dropdown<'a> {
         self.width = width;
         self
     }
+
+    /// Draw a border round the trigger, derived from the `surface` it is drawn
+    /// on — a panel body's `Palette::dock`, a modal's `Palette::popover`.
+    ///
+    /// **A border is not a fill.** The rule this module keeps is that there is
+    /// no *filled* dropdown, because the tool options strip already spends a
+    /// fill on [`chip`], where it means "this is a reading, not a control" — a
+    /// second filled thing that opened would teach the opposite. An outline
+    /// says nothing about that and is how every interface spells "this opens".
+    ///
+    /// It is for the one shape the bare trigger cannot carry: **alone on a line
+    /// with nothing before it**. There the label and the chevron are a word and
+    /// a small mark on the panel's own background, which is a caption; it was
+    /// read as one by an artist who then asked for options that were already in
+    /// the menu. A caption *above* it was tried first and made it worse, since a
+    /// dim word over a plain word is a labelled read-only field. A trigger that
+    /// sits in a row — beside a slider, after a leading mark, inside a header —
+    /// is told from its neighbours by being in a row of controls, and keeps the
+    /// bare look.
+    ///
+    /// **Four other triggers are that shape and are still bare, so the rule
+    /// above describes more than the code does.** `ui::paper_picker`,
+    /// `palettelib`'s palette picker, and the brush editor's Blend mode and its
+    /// Drives / Driven by pair are each `Fill` and alone on their line, and the
+    /// Blend mode one carries the very caption this change removed. Only the
+    /// harmony picker was reported, and only it is outlined; nothing here makes
+    /// the Colour panel special, and one gesture with two looks is what
+    /// `metrics::DROPDOWN`'s own docs say the single dropdown exists to
+    /// prevent. It is said out loud rather than quietly generalised, because
+    /// the next person to meet one of those four needs to know this is a
+    /// half-applied rule and not a considered exception.
+    pub fn outlined(mut self, surface: Color32) -> Self {
+        self.outlined = Some(surface);
+        self
+    }
 }
 
 /// Where a trigger's label starts, relative to its left edge.
-fn dropdown_lead(icon: bool) -> f32 {
-    if icon {
+fn dropdown_lead(icon: bool, pad: f32) -> f32 {
+    pad + if icon {
         DROPDOWN_ICON + DROPDOWN_GAP
     } else {
         0.0
@@ -390,11 +469,16 @@ fn dropdown_lead(icon: bool) -> f32 {
 /// the label may have. Stating it twice is how a picker ends up a few pixels
 /// short of its own longest option, eliding a name that fits, which nobody sees
 /// until they pick that one option.
-fn dropdown_furniture(icon: bool, trailing: Option<f32>) -> f32 {
-    dropdown_lead(icon)
+///
+/// `pad` is [`DROPDOWN_PAD`] on an outlined trigger and zero on every other,
+/// and it is counted twice — once at each end — because both ends of an
+/// outlined trigger have a border to stand off from.
+fn dropdown_furniture(icon: bool, trailing: Option<f32>, pad: f32) -> f32 {
+    dropdown_lead(icon, pad)
         + trailing.map_or(0.0, |w| w + DROPDOWN_GAP)
         + DROPDOWN_GAP
         + DROPDOWN_CHEVRON
+        + pad
 }
 
 /// The dropdown. One trigger, one menu, everywhere in the interface.
@@ -408,6 +492,11 @@ fn dropdown_furniture(icon: bool, trailing: Option<f32>) -> f32 {
 /// ComboBox is also the thing this module exists not to do: egui's own widgets
 /// have a look the design does not use, and restyling them fights the framework
 /// rather than settling it.
+///
+/// The one departure is [`Dropdown::outlined`], which adds a *border* — never a
+/// fill, which stays reserved for [`chip`]'s "not a control". A trigger alone on
+/// a line has nothing beside it to say it is a control, and was read as a
+/// caption; see that field for the whole of it.
 ///
 /// **The menu is `egui::Popup::menu`, and every caller opens it that way.** The
 /// alternative in use was a `bool` on `Editor::ui` toggled by the trigger and
@@ -441,7 +530,12 @@ pub fn dropdown<R>(
     let label_w = measure(trigger.label, &font);
     let trailing_w = trigger.trailing.map(|t| measure(t, &figure));
 
-    let furniture = dropdown_furniture(trigger.icon.is_some(), trailing_w);
+    let pad = if trigger.outlined.is_some() {
+        DROPDOWN_PAD
+    } else {
+        0.0
+    };
+    let furniture = dropdown_furniture(trigger.icon.is_some(), trailing_w, pad);
     let width = match trigger.width {
         DropdownWidth::Content => furniture + label_w,
         DropdownWidth::Fill => ui.available_width(),
@@ -460,10 +554,42 @@ pub fn dropdown<R>(
     };
 
     let painter = ui.painter();
+    // The border, before everything, so nothing it encloses is drawn over, and
+    // one rank brighter on hover so the whole trigger answers as one thing
+    // rather than as a box with a word in it.
+    //
+    // **At rest the outline is the louder of the two, and that is a
+    // consequence rather than a choice.** A rank is stated against the
+    // *surface*, so where it lands relative to `text_dim` is whatever the two
+    // derivations happen to give: measured, the border is 4.34:1 to 5.22:1 on
+    // `dock` against a label at 3.00:1 to 5.07:1, so it is ahead in all six
+    // themes and by 74% in Paper. It is left that way because a hairline and a
+    // word at one ratio are not the same quantity of ink — checked by eye in
+    // every theme, not argued — and because the hover ordering is the other
+    // way round anyway (6.68–9.75 against 8.96–14.77), so the label is what
+    // moves when a trigger is aimed at. A border stated against `text_dim`
+    // rather than against the surface is the fix if that ever stops holding;
+    // it is not a token, and `Ink` has nothing below `Dim`.
+    if let Some(surface) = trigger.outlined {
+        let rank = if response.hovered() {
+            Ink::Muted
+        } else {
+            Ink::Dim
+        };
+        painter.rect_stroke(
+            rect,
+            metrics::RADIUS,
+            Stroke::new(1.0, contrast::ink_on(surface, rank)),
+            StrokeKind::Inside,
+        );
+    }
     if let Some(icon) = trigger.icon {
         icons::draw(
             painter,
-            Rect::from_min_size(rect.left_top(), vec2(DROPDOWN_ICON, rect.height())),
+            Rect::from_min_size(
+                pos2(rect.left() + pad, rect.top()),
+                vec2(DROPDOWN_ICON, rect.height()),
+            ),
             icon,
             ink,
         );
@@ -473,7 +599,7 @@ pub fn dropdown<R>(
     // The figure goes inside it rather than beyond it, which is the one thing
     // the brush library's own switch used to do the other way round.
     let chevron = Rect::from_min_size(
-        pos2(rect.right() - DROPDOWN_CHEVRON, rect.top()),
+        pos2(rect.right() - pad - DROPDOWN_CHEVRON, rect.top()),
         vec2(DROPDOWN_CHEVRON, rect.height()),
     );
     icons::draw(painter, chevron, Icon::ChevronDown, ink);
@@ -488,7 +614,7 @@ pub fn dropdown<R>(
     }
     painter.text(
         pos2(
-            rect.left() + dropdown_lead(trigger.icon.is_some()),
+            rect.left() + dropdown_lead(trigger.icon.is_some(), pad),
             rect.center().y,
         ),
         Align2::LEFT_CENTER,
@@ -3171,8 +3297,10 @@ pub fn pressure_graph(
     }
 }
 
+/// `pub(crate)` rather than private because `inks_drawn` is shared with
+/// `colorpicker`'s tests; nothing outside `cfg(test)` can reach either way.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// What one headless pass drew with, and what it gave back.
@@ -3733,10 +3861,44 @@ mod tests {
         for label in [8.0, 42.0, 137.5] {
             for icon in [false, true] {
                 for trailing in [None, Some(13.0)] {
-                    let width = dropdown_furniture(icon, trailing) + label;
-                    let room = width - dropdown_furniture(icon, trailing);
-                    assert_eq!(room, label, "{label} px label, icon {icon}, {trailing:?}");
+                    for pad in [0.0, DROPDOWN_PAD] {
+                        let width = dropdown_furniture(icon, trailing, pad) + label;
+                        let room = width - dropdown_furniture(icon, trailing, pad);
+                        assert_eq!(
+                            room, label,
+                            "{label} px label, icon {icon}, {trailing:?}, pad {pad}"
+                        );
+                    }
                 }
+            }
+        }
+    }
+
+    /// An outlined trigger costs its own margin and nothing else.
+    ///
+    /// This is what makes [`Dropdown::outlined`] a *variant* rather than a
+    /// change to the fourteen bare triggers beside it: at `pad` zero every
+    /// measurement is the one it was, so a bare trigger is byte for byte where
+    /// it used to be. Stated as a difference for the reason the test below is —
+    /// asserting the total would restate the formula.
+    #[test]
+    fn an_outline_costs_a_margin_at_each_end_and_nothing_else() {
+        for icon in [false, true] {
+            for trailing in [None, Some(13.0)] {
+                assert_eq!(
+                    dropdown_furniture(icon, trailing, DROPDOWN_PAD)
+                        - dropdown_furniture(icon, trailing, 0.0),
+                    2.0 * DROPDOWN_PAD,
+                    "icon {icon}, {trailing:?}",
+                );
+                // And the margin is at the *front* as well, so the label does
+                // not start on the border. Getting this wrong pays for the
+                // width twice and draws the text against the outline.
+                assert_eq!(
+                    dropdown_lead(icon, DROPDOWN_PAD) - dropdown_lead(icon, 0.0),
+                    DROPDOWN_PAD,
+                    "icon {icon}",
+                );
             }
         }
     }
@@ -3748,20 +3910,20 @@ mod tests {
     /// that copies the formula passes whatever the formula becomes.
     #[test]
     fn each_part_of_a_dropdown_costs_itself_and_one_gap() {
-        let bare = dropdown_furniture(false, None);
+        let bare = dropdown_furniture(false, None, 0.0);
         // A bare trigger is its chevron and the gap before it, and nothing else:
         // no fill, no padding, no leading inset.
         assert_eq!(bare, DROPDOWN_GAP + DROPDOWN_CHEVRON);
         assert_eq!(
-            dropdown_furniture(true, None) - bare,
+            dropdown_furniture(true, None, 0.0) - bare,
             DROPDOWN_ICON + DROPDOWN_GAP
         );
         assert_eq!(
-            dropdown_furniture(false, Some(13.0)) - bare,
+            dropdown_furniture(false, Some(13.0), 0.0) - bare,
             13.0 + DROPDOWN_GAP
         );
         assert_eq!(
-            dropdown_furniture(true, Some(13.0)) - bare,
+            dropdown_furniture(true, Some(13.0), 0.0) - bare,
             DROPDOWN_ICON + DROPDOWN_GAP + 13.0 + DROPDOWN_GAP
         );
     }
@@ -4397,7 +4559,16 @@ mod tests {
     /// colour at alpha zero, which is why only fully opaque vertices are kept:
     /// what these tests ask is which ink a control *chose*, and a transparent
     /// vertex is a rounded corner rather than a choice.
-    fn inks_drawn(ctx: &egui::Context, field: Vec2, add: impl FnMut(&mut Ui)) -> Vec<Color32> {
+    ///
+    /// `pub(crate)` so `colorpicker`'s tests can ask the same question of a
+    /// whole picker rather than keeping a second copy of it — a helper copied
+    /// into a second test module is the drift this codebase refuses in shipped
+    /// code and gains nothing by permitting here.
+    pub(crate) fn inks_drawn(
+        ctx: &egui::Context,
+        field: Vec2,
+        add: impl FnMut(&mut Ui),
+    ) -> Vec<Color32> {
         use egui::epaint::Primitive;
 
         let input = egui::RawInput {
@@ -4495,6 +4666,73 @@ mod tests {
             assert!(
                 best >= contrast::READABLE,
                 "{kind:?}: the thumb's best ink is {best:.2}:1 on the pit",
+            );
+        }
+    }
+
+    /// An outlined trigger draws a line somebody can see, in every theme.
+    ///
+    /// Measured as the **difference** the flag makes — every opaque ink an
+    /// outlined trigger puts down that a bare one does not — rather than as
+    /// "some ink in the pass clears 3:1". That distinction is the whole guard:
+    /// the label is already `Palette::text_dim`, which is 3.00:1 to 5.07:1 on
+    /// `dock` across the six themes, so a test asking about the best ink in the
+    /// pass would pass with the border reverted to `Palette::border` and agree
+    /// for the label's reason. Demonstrated by mutation, not argued.
+    ///
+    /// `Palette::border` is 1.21:1 to 1.45:1 there, so it fails this — which is
+    /// the point, because it is what every *filled* box in the interface uses
+    /// and is therefore the obvious thing for somebody to reach for here.
+    #[test]
+    fn an_outlined_trigger_draws_a_line_that_reads_on_its_surface() {
+        use crate::theme::{ThemeKind, contrast};
+
+        for kind in ThemeKind::ALL {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            let field = vec2(240.0, 60.0);
+            let label = "Split complementary";
+            // Twice: a fresh context spends its first pass building the font
+            // atlas, and the label has to be laid out for either trigger to
+            // draw the same things.
+            let (mut bare, mut lined) = (Vec::new(), Vec::new());
+            for _ in 0..2 {
+                bare = inks_drawn(&ctx, field, |ui| {
+                    dropdown(
+                        ui,
+                        &p,
+                        Dropdown::new(label).width(DropdownWidth::Fill),
+                        |_| {},
+                    );
+                });
+                lined = inks_drawn(&ctx, field, |ui| {
+                    dropdown(
+                        ui,
+                        &p,
+                        Dropdown::new(label)
+                            .width(DropdownWidth::Fill)
+                            .outlined(p.dock),
+                        |_| {},
+                    );
+                });
+            }
+
+            let added: Vec<Color32> = lined
+                .iter()
+                .copied()
+                .filter(|ink| !bare.contains(ink))
+                .collect();
+            assert!(
+                !added.is_empty(),
+                "{kind:?}: an outlined trigger drew nothing a bare one does not",
+            );
+            let best = added
+                .iter()
+                .map(|ink| contrast::ratio(*ink, p.dock))
+                .fold(0.0f64, f64::max);
+            assert!(
+                best >= contrast::READABLE,
+                "{kind:?}: the outline's best ink is {best:.2}:1 on the panel it sits on",
             );
         }
     }

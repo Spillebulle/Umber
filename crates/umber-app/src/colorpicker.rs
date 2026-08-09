@@ -680,10 +680,7 @@ fn wheel(
         ui.allocate_exact_size(vec2(ui.available_width().max(size), size), Sense::hover());
     let area = Rect::from_center_size(rect.center(), vec2(size, size));
     let centre = area.center();
-    let outer = size * 0.5;
-    // The ring is a fixed thickness, so a small enough wheel would have its
-    // inner edge outside its outer one. Keep a hub for the triangle instead.
-    let inner = (outer - RING_THICKNESS).max(outer * 0.25);
+    let (inner, outer) = ring_radii(size);
 
     // One interaction for the whole wheel, and where a gesture was *pressed*
     // decides which of the two controls inside it the gesture belongs to.
@@ -883,6 +880,21 @@ const MARKER_STROKE: Stroke = Stroke {
     width: 2.0,
     color: Color32::WHITE,
 };
+
+/// The hue ring's two radii for a wheel of the given side.
+///
+/// One function because both wheels want the same ring, and because
+/// `the_base_ring_stays_on_the_hue_band` has to be able to ask for the band a
+/// real wheel has rather than recomputing the expression it is checking — a
+/// test that copies the formula agrees with whatever the formula becomes.
+///
+/// The ring is a fixed thickness, so a small enough wheel would have its inner
+/// edge outside its outer one; below about 54 points the hub is kept instead
+/// and the band narrows.
+fn ring_radii(size: f32) -> (f32, f32) {
+    let outer = size * 0.5;
+    ((outer - RING_THICKNESS).max(outer * 0.25), outer)
+}
 
 /// The middle of the ring at a given hue — where a marker for that hue goes.
 fn ring_point(centre: Pos2, inner: f32, outer: f32, hue: f32) -> Pos2 {
@@ -1397,6 +1409,43 @@ const HARMONY_MARK_GAP: f32 = 3.0;
 /// would step down under the pointer.
 const HARMONY_ROW: f32 = HARMONY_SWATCH + HARMONY_MARK_GAP + HARMONY_MARK;
 
+/// The radius of a member's marker on the hue ring.
+///
+/// The same 6 the Wheel mode's hue marker uses, deliberately and for the reason
+/// [`MARKER_STROKE`] is one value: every member of a harmony *is* a hue marker,
+/// so a harmony's markers being a size of their own would read as a different
+/// instrument. Every member gets this, the base included — a marker says where a
+/// hue is, and one member's saying it in a different size would say something
+/// about the colour instead.
+const HARMONY_MARKER: f32 = 6.0;
+
+/// How far outside its own marker the base's second, concentric ring sits.
+///
+/// This is what says which member is the colour in hand, now that no member is
+/// filled. It has to be a difference of *mark*: at zero saturation every member
+/// of a harmony is the same grey, so nothing about the colour can tell them
+/// apart. A ring *outside* rather than inside, because an inner ring at this
+/// radius is three pixels across at an ordinary scale factor and reads as a dot
+/// — which is the fill this change exists to remove, put back smaller.
+///
+/// The figure is what keeps the outer ring's **core** inside the hue band
+/// rather than hanging off it, and core is the exact word. The band is
+/// [`RING_THICKNESS`] wide wherever the wheel is wide enough for that — every
+/// size from 54 points up, so every size a panel is actually drawn at — and
+/// `HARMONY_MARKER + HARMONY_BASE_GAP` plus half of [`MARKER_STROKE`] is
+/// exactly half of it. So the figure is at its ceiling: 4 would hang the solid
+/// part of the ring off the rim.
+///
+/// **The drawn extent is half a point more than that**, because egui feathers a
+/// stroke over [`feather`]'s `1.0 / pixels_per_point`, so the fade always
+/// reaches a little past the rim — at every size, not only at the small ones.
+/// It is a fade onto the panel behind and reads as the edge of a white ring
+/// either way. Below 54 points the inner radius is clamped, the band narrows,
+/// and the *core* overhangs too, by up to a point at the [`MIN_PICKER`] floor.
+/// That is left alone as well: it is a panel dragged to nothing.
+/// `the_base_ring_stays_on_the_hue_band` measures the core, and says so.
+const HARMONY_BASE_GAP: f32 = 3.0;
+
 /// The hue ring with the chosen relation's other hues marked on it, a
 /// saturation/value square in the middle, and a row of the resulting colours
 /// underneath.
@@ -1426,8 +1475,7 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
         ui.allocate_exact_size(vec2(ui.available_width().max(size), size), Sense::hover());
     let area = Rect::from_center_size(rect.center(), vec2(size, size));
     let centre = area.center();
-    let outer = size * 0.5;
-    let inner = (outer - RING_THICKNESS).max(outer * 0.25);
+    let (inner, outer) = ring_radii(size);
 
     // One interaction for the whole wheel, settled at the press, for exactly
     // the reason the Wheel mode's is: the centre's rect covers the ring at the
@@ -1462,28 +1510,31 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
     // Which relation. A dropdown rather than a segmented control: six names,
     // the longest of them "Tetrad (rectangle)", in a panel 264 px wide.
     //
-    // With a caption over it, which is the one thing this row was missing.
-    // `widgets::dropdown` draws no fill — see its own docs — so a trigger alone
-    // on a line, with nothing before it, is a word and a chevron on the panel's
-    // own background, and it was being read as a *caption saying which relation
-    // had been drawn* rather than as the control that picks one. Reported: an
-    // artist asking for a triad and a tetrad, both of which were already in
-    // this menu. The mode switch above has a leading mark and reads as a
-    // control because of it; a harmony has no glyph to hand, so the label goes
-    // above instead of beside — beside would cost the width "Split
-    // complementary" needs, and `Dropdown` elides a label it cannot fit, which
-    // would trade one unreadable control for another.
-    ui.label(
-        egui::RichText::new("Relation")
-            .size(crate::theme::text::TINY)
-            .color(p.text_dim),
-    );
-    ui.add_space(2.0);
+    // **Outlined**, which is the one thing this row was missing, and it took two
+    // goes. `widgets::dropdown` draws no fill — see its own docs — so a trigger
+    // alone on a line, with nothing before it, is a word and a small chevron on
+    // the panel's own background, and it was read as a *caption saying which
+    // relation had been drawn* rather than as the control that picks one.
+    // Reported by an artist asking for a triad and a tetrad, both of which were
+    // already in this menu.
+    //
+    // The first repair was a dim "Relation" caption above it, and it was
+    // reported again: a dim word over a plain word is a labelled read-only
+    // field, so the caption made the pair read *more* like a readout, not less.
+    // The affordance has to be on the control itself. A border is the answer and
+    // is not the filled variant the module refuses — see `Dropdown::outlined`,
+    // where that distinction is argued — and it needs no caption, because a box
+    // with a chevron in it is already the shape of "pick one".
     let mut picked = *harmony;
     crate::widgets::dropdown(
         ui,
         p,
-        crate::widgets::Dropdown::new(harmony.label()).width(crate::widgets::DropdownWidth::Fill),
+        crate::widgets::Dropdown::new(harmony.label())
+            .width(crate::widgets::DropdownWidth::Fill)
+            // The panel body's own surface, which is what the border is derived
+            // against. `dock` rather than `window`: this picker is drawn in a
+            // module body, and the theme editor can set either to anything.
+            .outlined(p.dock),
         |ui| {
             for option in Harmony::ALL {
                 if ui
@@ -1510,18 +1561,39 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
     // insertion order within a layer, so these land on top of the ring however
     // far down the layout they are written.
     //
-    // The base wears the same ring the Wheel mode's hue marker does — it is the
-    // same thing — and the others are filled discs of their own colour, so which
-    // one is in hand is a difference of *mark* rather than of colour. That
-    // matters: at zero saturation every member is the same grey.
+    // **Every member wears the same open ring the Wheel mode's hue marker
+    // does**, at the same radius, with the wheel's own hue showing through it.
+    // The others used to be smaller *filled* discs of the member's colour at the
+    // current saturation and value, which paints a muddy disc over the vivid hue
+    // underneath — reported, and right: a marker on a hue ring says *where* a
+    // hue is, and filling it with a duller version of that hue is a swatch
+    // pretending to be a marker. The swatch row below is where the colours are.
+    //
+    // The comment this replaces defended the fill on the ground that "which one
+    // is in hand is a difference of mark rather than of colour", because at zero
+    // saturation every member is the same grey. That is a real constraint and it
+    // survives: the base is still told apart by its **mark**, a second ring
+    // outside the first, which reads at any saturation because both rings are
+    // white on whatever the wheel holds and neither hides a hue. What is gone is
+    // only the *fill*.
+    //
+    // **What carries that is the outer diameter, not a visible gap between two
+    // crisp rings**, and the difference matters at a scale factor of 1. The two
+    // cores leave 1.0 point between them — 6 + 1 to 9 − 1 — while egui feathers
+    // a stroke over `feather`'s own `1.0 / pixels_per_point`, so at 1x each
+    // skirt reaches half a point in and the two meet at radius 7.5 with no hue
+    // surviving between them. At 2x, which is what `harmony_picker_preview`
+    // shoots at, half a point of wheel does survive; the shots therefore flatter
+    // this. Widening the gap is not available — see `HARMONY_BASE_GAP`, which is
+    // already at the most the band allows — so if the doubled ring ever needs to
+    // read as two at 1x, the thing to move is the *inner* radius, and that costs
+    // the base a mark the Wheel mode's hue marker shares.
     let painter = ui.painter();
     for (index, hue) in harmony.hues(hsv.h).as_slice().iter().enumerate() {
         let at = ring_point(centre, inner, outer, *hue);
+        painter.circle_stroke(at, HARMONY_MARKER, MARKER_STROKE);
         if index == 0 {
-            painter.circle_stroke(at, 6.0, MARKER_STROKE);
-        } else {
-            painter.circle_filled(at, 5.0, hsv_colour(*hue, hsv.s, hsv.v));
-            painter.circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
+            painter.circle_stroke(at, HARMONY_MARKER + HARMONY_BASE_GAP, MARKER_STROKE);
         }
     }
 
@@ -3114,6 +3186,17 @@ mod tests {
     /// controls drawn over each other. It also answers the one question the
     /// maths cannot: whether four markers on a ring can be told apart.
     ///
+    /// Six more shots are taken at **zero saturation**, one per theme. That is
+    /// the case the markers' own comment argues from and the one that cannot be
+    /// reasoned about: the swatch row is four identical greys there, so nothing
+    /// *on the ring* can be told apart by colour. The row itself still marks the
+    /// base — `swatch_mark` draws its accent bar at every saturation, which is
+    /// what `HARMONY_MARK`'s docs chose it for — so the ring is not the only
+    /// thing left in the panel, only the only thing left on the wheel. Every
+    /// theme rather than only Graphite, because the relation trigger's outline
+    /// is derived from `Palette::dock` and each theme derives its own — a shot
+    /// in one theme says nothing about the other five.
+    ///
     /// ```sh
     /// cargo test -p umber-app harmony_picker_preview -- --ignored --nocapture
     /// ```
@@ -3131,18 +3214,212 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/harmony");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        let palette = Palette::of(crate::theme::ThemeKind::Graphite);
+        let field = vec2(metrics::PANEL - 2.0 * metrics::PANEL_PAD as f32, 300.0);
+        let mut shot = |name: String, palette: &Palette, relation: Harmony, hsv: Hsv| {
+            let mut harmony = relation;
+            let mut hsv = hsv;
+            let image = stage.shoot(field, 2.0, palette, palette.dock, |root| {
+                harmony_wheel(root, palette, &mut harmony, &mut hsv);
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        };
+
+        let graphite = Palette::of(crate::theme::ThemeKind::Graphite);
         for (index, relation) in Harmony::ALL.into_iter().enumerate() {
+            let name = format!("{}-{}", index + 1, relation.label().replace(' ', "-"));
+            shot(name, &graphite, relation, Hsv::new(28.0, 0.72, 0.86));
+        }
+        // The grey case, in every theme: no colour on the wheel tells one member
+        // from another here, so whatever does it has to be a mark.
+        for kind in crate::theme::ThemeKind::ALL {
+            let name = format!("grey-{}", kind.id());
+            shot(
+                name,
+                &Palette::of(kind),
+                Harmony::Tetrad,
+                Hsv::new(28.0, 0.0, 0.7),
+            );
+        }
+        println!("wrote the shots to {}", dir.display());
+    }
+
+    /// The base's second ring has its **core** on the hue band, not hanging off
+    /// it.
+    ///
+    /// [`HARMONY_BASE_GAP`] is the one number in this picker that is chosen
+    /// against a *margin* rather than against a look, so it needs a guard that
+    /// measures the margin. The sweep is over every side the wheel can be drawn
+    /// at, through [`ring_radii`], which is the same function the two wheels
+    /// call — recomputing `size * 0.5` here would be a test that agrees with
+    /// whatever the arithmetic becomes.
+    ///
+    /// Both halves of what the constant's docs claim are checked, because a
+    /// guard that only asserts the comfortable half is one that will be read as
+    /// promising the other: it fits from 54 points up, and it overhangs by no
+    /// more than a point below that. An assertion that it *always* fits would be
+    /// false today, and one that never checked the floor would go quiet the day
+    /// somebody widened the gap.
+    ///
+    /// **What it does not measure is the antialiased skirt**, and saying so is
+    /// the point rather than a caveat: egui fades a stroke over [`feather`]'s
+    /// `1.0 / pixels_per_point`, which is a scale factor this test has no
+    /// `Ui` to ask for, so the drawn edge reaches up to half a point further
+    /// than anything asserted here at *every* size. The constant's docs say the
+    /// same. A guard's comment claiming the whole drawn extent when it measures
+    /// the core is the overclaim this codebase keeps catching, so it is named
+    /// here instead of being left for somebody to find.
+    #[test]
+    fn the_base_ring_stays_on_the_hue_band() {
+        // The outermost *solid* part drawn for the base: the second ring, plus
+        // the half of its stroke that lies outside its own radius. The fade
+        // beyond it is deliberately not in this figure — see above.
+        let reach = HARMONY_MARKER + HARMONY_BASE_GAP + MARKER_STROKE.width * 0.5;
+        let mut sides = vec![MIN_PICKER, 53.0, 54.0, 176.0];
+        sides.extend((48..=176).map(|n| n as f32));
+        for size in sides {
+            let (inner, outer) = ring_radii(size);
+            // A marker sits on the middle of the band, so what it has to spare
+            // is half the band's width.
+            let half_band = (outer - inner) * 0.5;
+            if size >= 54.0 {
+                assert!(
+                    reach <= half_band + 1e-3,
+                    "at {size} the base ring reaches {reach} into a half-band of {half_band}",
+                );
+            } else {
+                assert!(
+                    reach <= half_band + 1.0 + 1e-3,
+                    "at {size} the base ring overhangs by {}, which is more than the \
+                     point `HARMONY_BASE_GAP`'s docs admit to",
+                    reach - half_band,
+                );
+            }
+        }
+    }
+
+    /// No marker on the harmony wheel is filled, and the base is the one
+    /// wearing two rings.
+    ///
+    /// This is the artist's complaint pinned rather than paraphrased: a member
+    /// used to be a *filled* disc of its own colour at the current saturation
+    /// and value, painted over the vivid hue it was pointing at. So the
+    /// assertion is about the fill — `Color32::TRANSPARENT` on every circle this
+    /// pass draws — and not about which colour was chosen, because "it drew the
+    /// right muddy orange" is the defect passing its own test.
+    ///
+    /// The counts are the other half. Every member has to wear the *same* mark,
+    /// which is `HARMONY_MARKER` exactly `hues.len()` times, and exactly one
+    /// second ring says which one is in hand. Both directions matter: dropping
+    /// the second ring leaves nothing **on the wheel** saying which member is
+    /// the colour in hand, which is what the fill used to say and is the thing
+    /// this change had to replace rather than remove. On the wheel and not in
+    /// the panel — `swatch_mark`'s accent bar under the first swatch is
+    /// unaffected by any of this and would still be there.
+    #[test]
+    fn every_harmony_marker_is_an_open_ring_and_only_the_base_wears_two() {
+        use crate::theme::metrics;
+
+        fn circles(shape: &egui::Shape, into: &mut Vec<egui::epaint::CircleShape>) {
+            match shape {
+                egui::Shape::Circle(c) => into.push(*c),
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        circles(s, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let p = Palette::of(crate::theme::ThemeKind::Graphite);
+        let field = vec2(metrics::PANEL - 2.0 * metrics::PANEL_PAD as f32, 300.0);
+        for relation in Harmony::ALL {
+            let ctx = egui::Context::default();
             let mut harmony = relation;
             let mut hsv = Hsv::new(28.0, 0.72, 0.86);
-            let field = vec2(metrics::PANEL - 2.0 * metrics::PANEL_PAD as f32, 300.0);
-            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
-                harmony_wheel(root, &palette, &mut harmony, &mut hsv);
-            });
-            let name = format!("{}-{}", index + 1, relation.label().replace(' ', "-"));
-            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), field)),
+                    ..Default::default()
+                },
+                |ui| {
+                    harmony_wheel(ui, &p, &mut harmony, &mut hsv);
+                },
+            );
+            let mut seen = Vec::new();
+            for clipped in &output.shapes {
+                circles(&clipped.shape, &mut seen);
+            }
+
+            for circle in &seen {
+                assert_eq!(
+                    circle.fill,
+                    Color32::TRANSPARENT,
+                    "{relation:?}: a marker at radius {} is filled with {:?}",
+                    circle.radius,
+                    circle.fill,
+                );
+            }
+            let members = relation.hues(hsv.h).as_slice().len();
+            let at = |r: f32| seen.iter().filter(|c| c.radius == r).count();
+            assert_eq!(
+                at(HARMONY_MARKER),
+                members,
+                "{relation:?}: {} members but {} markers at the shared radius",
+                members,
+                at(HARMONY_MARKER),
+            );
+            assert_eq!(
+                at(HARMONY_MARKER + HARMONY_BASE_GAP),
+                1,
+                "{relation:?}: {} second rings, so nothing or more than one thing \
+                 claims to be the colour in hand",
+                at(HARMONY_MARKER + HARMONY_BASE_GAP),
+            );
         }
-        println!("wrote {} shots to {}", Harmony::ALL.len(), dir.display());
+    }
+
+    /// The relation picker is *drawn* outlined, in every theme.
+    ///
+    /// **A guard on the widget is not a guard on the panel**, and this whole
+    /// defect is that lesson twice over: `widgets`'
+    /// `an_outlined_trigger_draws_a_line_that_reads_on_its_surface` measures
+    /// what `Dropdown::outlined` produces and cannot see whether anything asks
+    /// for it — drop the one call below and every ratio it checks still passes.
+    /// So this measures the ink that reached the pass, off the whole
+    /// `harmony_wheel`, which is where a revert would land.
+    ///
+    /// It names the exact derived colour rather than asking for "some ink that
+    /// reads", because this pass draws a hue ring: nearly every vivid hue on it
+    /// clears 3:1 against a panel, so the weaker question would be answered by
+    /// the wheel and would hold whatever the trigger did.
+    #[test]
+    fn the_relation_picker_is_drawn_outlined() {
+        use crate::theme::contrast::{self, Ink};
+        use crate::theme::{ThemeKind, metrics};
+        use crate::widgets::tests::inks_drawn;
+
+        for kind in ThemeKind::ALL {
+            let ctx = egui::Context::default();
+            let q = Palette::of(kind);
+            let want = contrast::ink_on(q.dock, Ink::Dim);
+            let field = vec2(metrics::PANEL - 2.0 * metrics::PANEL_PAD as f32, 300.0);
+            // Twice, for the font atlas: the label is what a first pass has no
+            // glyphs for, and the outline is drawn beside it either way.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let mut harmony = Harmony::Tetrad;
+                let mut hsv = Hsv::new(28.0, 0.72, 0.86);
+                seen = inks_drawn(&ctx, field, |ui| {
+                    harmony_wheel(ui, &q, &mut harmony, &mut hsv);
+                });
+            }
+            assert!(
+                seen.contains(&want),
+                "{kind:?}: the relation picker drew no {want:?} — the outline \
+                 derived from this theme's own panel surface",
+            );
+        }
     }
 
     /// A triangle squashed to nothing has no outward direction, and one NaN
