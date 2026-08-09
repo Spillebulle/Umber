@@ -2591,12 +2591,18 @@ fn set_token(ed: &mut Editor, state: &mut Themes, token: Token, at: usize) -> bo
     true
 }
 
-/// How wide the token picker is.
+/// How wide the token picker's content is, inside its own margins.
 ///
-/// Wide enough for the wheel at its full 176 plus the frame's margins, so the
-/// picker is the size it is in the Colour panel rather than a squeezed copy of
-/// it: `colorpicker` clamps the wheel to the width it is given, and a narrower
-/// modal would draw a smaller wheel than the one the same artist uses to paint.
+/// Comfortably past the 176 `colorpicker` clamps the wheel to, so the wheel is
+/// the size it is in the Colour panel rather than a squeezed copy of it — a
+/// narrower modal would silently draw a smaller wheel than the one the same
+/// artist paints with. The rest of the width goes to the things that fill it:
+/// the harmony swatch row, and the relation dropdown, whose longest label is
+/// "Split complementary".
+///
+/// A local figure rather than one in `theme::metrics`, like [`WIDTH`] and
+/// [`RAIL_WIDTH`] beside it: the design has no such modal, so this is not one
+/// of its fixed sizes.
 const TOKEN_PICKER_WIDTH: f32 = 216.0;
 
 /// An interface colour as the picker's own state.
