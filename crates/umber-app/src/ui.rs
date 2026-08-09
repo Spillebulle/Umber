@@ -2007,7 +2007,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // where it cannot, it is the only place that says so. The tool
             // itself is *not* disabled there: picking inside the window works
             // everywhere, so disabling it would take away the half that does
-            // work. `syspick::unreadable_reason` is where the two readings
+            // work. `syspick::outside_line` is where the two readings
             // live, so the strip cannot say one thing and the module do
             // another.
             ui.label(
@@ -2021,11 +2021,11 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             if ui.available_width() >= strip_budget::EYEDROPPER {
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new(syspick::unreadable_reason())
+                    egui::RichText::new(syspick::outside_line())
                         .size(text::SMALL)
                         .color(p.text_dim),
                 )
-                .on_hover_text(syspick::unreadable_detail());
+                .on_hover_text(syspick::outside_detail());
             }
         } else {
             // Pan and Zoom. Two sentences in the Transform hint's register
@@ -3924,7 +3924,7 @@ mod tests {
         let palette = Palette::of(ThemeKind::Graphite);
         crate::theme::install_fonts(&ctx);
         crate::theme::apply(&ctx, &palette);
-        let sentence = crate::syspick::unreadable_reason();
+        let sentence = crate::syspick::outside_line();
         let mut widest_overrun: Option<(f32, f32)> = None;
         let mut ever_drew_it = false;
         for step in 0..140 {

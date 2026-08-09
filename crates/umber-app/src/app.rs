@@ -2633,7 +2633,7 @@ impl UmberApp {
             // every frame of a drag and a notice raised per frame is not a
             // refusal, it is a fault. Where the sentence belongs is the tool
             // options strip, *before* somebody tries — see `ui::options_strip`,
-            // and `syspick::unreadable_reason` for the wording.
+            // and `syspick::outside_line` for the wording.
             syspick::Aim::Unreachable => {}
             syspick::Aim::Desktop(x, y) => {
                 if let Some([r, g, b]) = syspick::sample(x, y) {

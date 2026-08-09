@@ -151,16 +151,19 @@ use glam::Vec2;
 /// spellings of the same question.
 pub const DESKTOP_READABLE: bool = cfg!(windows);
 
-/// What the tool options strip says where the desktop cannot be read.
+/// What the tool options strip says about picking *outside* the window.
 ///
-/// Short, because it shares one unwrapped row with the sentence above it and a
-/// strip does not reflow. The *why* is [`unreadable_detail`], on hover, which
-/// is the split every long explanation in this interface makes.
-pub const fn unreadable_reason() -> &'static str {
+/// One line per platform and every one of them is drawn — this is not a refusal
+/// message, it is the sentence, and on Windows it says what the gesture does.
+/// That is deliberate: one function means the strip cannot describe a
+/// capability the module does not have, which is the failure a separate
+/// "supported" string and "unsupported" string invite.
+///
+/// Short, because it shares one unwrapped row with the sentence beside it and a
+/// strip does not reflow. Everything longer is [`outside_detail`], on hover,
+/// which is the split every long explanation in this interface makes.
+pub const fn outside_line() -> &'static str {
     if cfg!(windows) {
-        // Unreachable in a shipped build — the strip draws the other sentence
-        // entirely. Stated anyway so the function is total and nobody has to
-        // wonder what happens if it is called.
         "Drag off the window to take one from anywhere on the screen."
     } else if cfg!(target_os = "macos") {
         "Picking outside the window is not built for macOS yet."
@@ -169,13 +172,14 @@ pub const fn unreadable_reason() -> &'static str {
     }
 }
 
-/// Why not, in one hover.
+/// The rest of it, in one hover.
 ///
-/// Per platform rather than "not supported here", because the two reasons are
-/// genuinely different and only one of them is ever likely to change: on
-/// Wayland it is a deliberate property of the display server, and on macOS it
-/// is a permission nobody here has the hardware to test.
-pub const fn unreadable_detail() -> &'static str {
+/// Per platform rather than one sentence for all three, because what there is
+/// to say genuinely differs and only one of the three is likely to change: on
+/// Wayland it is a deliberate property of the display server, on macOS it is a
+/// permission nobody here has the hardware to test, and on Windows there is no
+/// obstacle to explain so it says where to look for the answer instead.
+pub const fn outside_detail() -> &'static str {
     if cfg!(windows) {
         "The colour under the pointer becomes the painting colour as you drag, \
          so the Colour module's swatch is the readout."
@@ -406,21 +410,23 @@ mod tests {
 
     #[test]
     fn the_strip_says_what_this_platform_can_actually_do() {
-        // The string is the only thing a user of an unsupported platform ever
+        // The line is the only thing a user of an unsupported platform ever
         // sees of this module, so it must never be empty and must never be the
         // Windows arm on a platform that is not Windows — a live-sounding
         // sentence over a gesture that does nothing is precisely the control
-        // that lies.
-        let reason = unreadable_reason();
-        assert!(!reason.is_empty());
-        assert!(!unreadable_detail().is_empty());
+        // that lies. Both directions are asserted: the second is what catches
+        // an arm that has stopped saying "not built" while still being the
+        // arm a platform without the feature draws.
+        let line = outside_line();
+        assert!(!line.is_empty());
+        assert!(!outside_detail().is_empty());
         assert_eq!(
-            reason.starts_with("Drag off the window"),
+            line.starts_with("Drag off the window"),
             DESKTOP_READABLE,
             "only the platform that can do it may say it can"
         );
         assert_eq!(
-            reason.contains("not built"),
+            line.contains("not built"),
             !DESKTOP_READABLE,
             "and only one that cannot may say it is not built"
         );
@@ -430,7 +436,7 @@ mod tests {
     fn neither_sentence_uses_an_em_dash() {
         // This project's rule for text the interface draws, and these two are
         // the only strings in this module that reach a person.
-        for line in [unreadable_reason(), unreadable_detail()] {
+        for line in [outside_line(), outside_detail()] {
             assert!(!line.contains('—'), "an em dash in {line:?}");
         }
     }
