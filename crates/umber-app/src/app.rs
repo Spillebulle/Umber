@@ -2566,6 +2566,35 @@ impl UmberApp {
     /// the same jump-at-pointer-up this codebase refuses everywhere else. The
     /// staleness it costs is at most one frame, and nobody reads a colour off a
     /// swatch during a flick.
+    ///
+    /// # This is a blocking `pick_colour` on the frame loop, on purpose
+    ///
+    /// CLAUDE.md's rule is that `pick_colour` and `read_layer_rect` block on
+    /// the GPU and must never be called from the drawing loop. This is the one
+    /// exception and it is worth stating rather than hoping nobody checks.
+    ///
+    /// **What the rule protects is a stroke, and a pick is not one.** It was
+    /// written for a smudging brush, which needs the canvas colour on every
+    /// frame *while dabs are being laid down* — `probe_canvas` is the
+    /// non-blocking answer built for exactly that. A pick cannot coexist with a
+    /// stroke: `Interaction` holds one value, and a press that resolves to
+    /// `Press::Eyedropper` finishes any stroke in flight before it becomes
+    /// `Picking`. Nothing is being painted, no dab is waiting on the frame, and
+    /// the only thing stalling costs is the frame rate of a modal gesture the
+    /// artist is holding a button down for.
+    ///
+    /// **`probe_canvas` is the obvious reuse and is the wrong instrument.** Its
+    /// answer arrives a frame or two later, and its own docs say why that is
+    /// free: a smudge is a trailing average by construction. An eyedropper is
+    /// the opposite. The artist lets go when the swatch shows the colour they
+    /// want, so a two-frame lag means letting go over the wrong pixel — the
+    /// gesture would be *aimed* by a readout that is behind the hand. A cost of
+    /// a millisecond beats being wrong by two frames.
+    ///
+    /// The read is a 1×1 render and a four-byte readback, which is what
+    /// `pick_colour` was built to be, and it is bounded above by the desktop
+    /// half's own cost anyway: `Self::picked_at`'s measurement puts a screen
+    /// read at a whole display refresh.
     fn pick_this_frame(&mut self) {
         if self.editor.interaction != Interaction::Picking {
             // Not picking, so nothing to remember. Cleared here rather than at
@@ -3066,6 +3095,12 @@ impl UmberApp {
         // blocks on the GPU. `Self::picked_at` has the figures. Before the
         // interface is built, so the swatch this frame draws is the colour
         // under the pointer *now* rather than the one from the frame before.
+        //
+        // Yes, this puts a blocking `pick_colour` on the frame loop, which
+        // CLAUDE.md forbids. `pick_this_frame`'s docs have the whole argument —
+        // the short of it is that the rule protects a *stroke*, a pick cannot
+        // coexist with one, and `probe_canvas`'s two-frame lag is exactly wrong
+        // for a gesture whose readout is what the hand aims by.
         self.pick_this_frame();
 
         let Some(gfx) = self.gfx.as_mut() else { return };
