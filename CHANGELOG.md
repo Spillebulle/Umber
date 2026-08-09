@@ -12,6 +12,94 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.1 — 2026-08-09
+
+Clip Studio Paint documents open, there is an eyedropper that reaches the whole
+screen, and every number you can drag can now be typed.
+
+Six themes ship instead of two, four of them drawn from the greys of
+applications you already use. The canvas size dialog has been rebuilt around
+the shape you want first. And palettes can be brought in from wherever you
+found them, including a list of hex codes pasted out of a chat window.
+
+### New
+
+- **Clip Studio Paint `.clip` documents open**, layers, folders and masks. That
+  makes four applications Umber reads: Photoshop, Krita, Clip Studio and
+  MyPaint, alongside OpenRaster and PNG.
+- **A Krita group arrives as a folder** instead of being flattened away.
+- **An eyedropper tool**, on `I`, and Alt with any other tool in hand. It reads
+  the canvas, Umber's own interface, and anything else on your screen: press
+  inside the window and drag out to whatever you want the colour of. A loupe
+  above the pointer magnifies what is under it and marks the exact pixel a
+  release will take. Reading outside the window is Windows only for now, and
+  the tool options strip says so where it is not.
+- **Every rail's figure can be typed.** Click the number on the brush size,
+  opacity or stabiliser rail, on the tool options strip, or in the brush editor,
+  and type what you want. A typed figure is not snapped and is not held to what
+  the rail can reach.
+- **Brush size goes to 1000 px** on the rail, and past it if you type it.
+- **The undo memory limit can be typed, up to 32 GB.**
+- **Four more themes**: Photoslop, Shit Studio Paint, Krita and MediaBog Pro,
+  every grey sampled from the application it is named for.
+- **The canvas size dialog, rebuilt.** Pick the shape first — 1:1, 16:9, 9:16,
+  4:3, paper or your own — and the sizes under it follow. Paper sizes are
+  physical sizes now, so A4 at 300 dpi is A4 and not a poster, and a size your
+  graphics card cannot hold is not offered.
+- **Palettes can be imported**, from `.gpl`, `.ase`, `.aco`, `.soc`, `.css` and
+  plain lists of hex codes. There is a paste box too, so a Coolors link or a row
+  of colours out of a chat window comes straight in.
+- **A palette has an editing mode**, behind the pencil in its header. With it
+  off the grid cannot be changed, because a palette is written to disk the
+  moment you touch it and there is no undo for one.
+- **Two more harmonies**: a square tetrad and a rectangle one, beside the triad
+  and the complements. The `+` in the Palette module adds the whole relation
+  when a harmony is showing.
+- **A theme's colours open in Umber's own colour wheel** rather than a plainer
+  picker, with your own picker settings on the same dialog.
+- **The wheel's triangle can be swapped** light corner for dark.
+- **The Layers module's commands moved into its header** — new folder, up, down
+  and delete — so a short panel no longer scrolls them out of reach. The add
+  mark is on the flags row, and "Layer settings" no longer needs saying.
+
+### Fixed
+
+- **The eyedropper took a blend of up to four pixels** rather than the one under
+  the pointer. It has done since it shipped.
+- **Import and Export on the Shortcuts page did nothing.** They were drawn and
+  wired to nothing.
+- **The relation picker for harmonies read as a caption**, so the triad and the
+  tetrads could not be found. It has a border now.
+- **A harmony's other colours were drawn as filled dots**, hiding the wheel
+  under them. Every member is an open ring showing the colour beneath it, and
+  the one in your hand wears a second ring.
+- **Buttons touched each other** in the brush library, on the Shortcuts page and
+  in the theme editor.
+- **Marks over the canvas could be unreadable on a mid-grey theme.** The
+  selection outline, the transform box and its handles took their colours from a
+  token, and on the greys of the new themes the dark half and the light half of
+  each pair came within a hair of each other. They are derived from the surface
+  they land on now.
+- **A Clip Studio brush's texture and interval settings were read even when the
+  brush had them switched off**, so brushes painted through paper they did not
+  have.
+- Clip Studio bitmaps could ask for more memory than the canvas could ever use.
+- A palette name typed and then clicked away was discarded.
+- A rail's typed figure could be overwritten by the drag that closed the field.
+
+### Known limits
+
+- Reading a colour from outside the Umber window is **Windows only**. Picking
+  inside the window works everywhere.
+- MediBang `.mdp` is still not read. The format is understood; what is missing
+  is a sample file that settles which end of its layer list is the top, and
+  guessing would silently turn every multi-layer document upside down.
+- Photoshop layer masks are still skipped, which is a limit of the library
+  Umber reads `.psd` with.
+- Harmonies are computed on the RGB wheel, so the complement of blue is yellow
+  rather than the orange a painter's colour wheel gives. Krita, Clip Studio and
+  Photoshop offer no harmonies at all, so there is nothing to match.
+
 ## 0.1.0 — 2026-08-09
 
 Layers can carry effects, and text stays text.
