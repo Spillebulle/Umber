@@ -5021,4 +5021,112 @@ mod tests {
             "the disc is the colour it did read: {circles:?}"
         );
     }
+
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn loupe_preview() {
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/loupe");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // A neighbourhood with structure in it, so the grid is legible as a
+        // grid rather than as a disc: a diagonal edge, a couple of holes where
+        // nothing could be read, and a middle that is neither.
+        let cells = crate::loupe::CELLS;
+        let patch = |hole: bool| {
+            let mut texels = Vec::new();
+            for row in 0..cells {
+                for col in 0..cells {
+                    let dark = col + row < cells;
+                    let missing = hole && col + 2 >= cells;
+                    texels.push(if missing {
+                        None
+                    } else if dark {
+                        Some([32, 44, 70])
+                    } else {
+                        Some([224, 196, 120])
+                    });
+                }
+            }
+            crate::loupe::Patch::new(cells, texels).expect("a patch")
+        };
+
+        let field = vec2(420.0, 320.0);
+        let mut written = 0;
+        for (theme, ink) in [
+            (ThemeKind::Graphite, "graphite"),
+            (ThemeKind::Paper, "paper"),
+        ] {
+            let palette = Palette::of(theme);
+            for (name, at, taken, held) in [
+                (
+                    "1-middle",
+                    vec2(210.0, 200.0),
+                    Some([224, 196, 120]),
+                    Some(patch(false)),
+                ),
+                (
+                    "2-against-the-top",
+                    vec2(210.0, 12.0),
+                    Some([32, 44, 70]),
+                    Some(patch(false)),
+                ),
+                (
+                    "3-with-holes",
+                    vec2(120.0, 200.0),
+                    Some([224, 196, 120]),
+                    Some(patch(true)),
+                ),
+                (
+                    "4-outside-the-window",
+                    vec2(900.0, 160.0),
+                    Some([200, 40, 40]),
+                    Some(patch(false)),
+                ),
+                (
+                    "5-one-colour",
+                    vec2(300.0, 200.0),
+                    Some([60, 170, 120]),
+                    None,
+                ),
+                ("6-nothing-there", vec2(300.0, 200.0), None, None),
+            ] {
+                let mut ed = Editor::default();
+                ed.ui.theme = theme;
+                ed.ui.tool = crate::editor::Tool::Eyedropper;
+                ed.cursor = glam::Vec2::new(at.x, at.y);
+                ed.loupe = Some(crate::loupe::Loupe {
+                    at: glam::Vec2::new(at.x, at.y),
+                    taken: taken.map(|[r, g, b]| umber_core::Color::from_srgb_u8(r, g, b, 255)),
+                    patch: held,
+                });
+                let image = stage.shoot(field, 2.0, &palette, palette.backdrop, |ui| {
+                    // A crosshair stand-in where the pointer is, so the gap the
+                    // clearance buys can be judged rather than taken on trust.
+                    if at.x < field.x {
+                        let p = pos2(at.x, at.y);
+                        ui.painter().line_segment(
+                            [p - vec2(6.0, 0.0), p + vec2(6.0, 0.0)],
+                            egui::Stroke::new(1.0, palette.text),
+                        );
+                        ui.painter().line_segment(
+                            [p - vec2(0.0, 6.0), p + vec2(0.0, 6.0)],
+                            egui::Stroke::new(1.0, palette.text),
+                        );
+                    }
+                    super::loupe_overlay(ui, &palette, &ed);
+                });
+                docshot::write_png(&dir.join(format!("{ink}-{name}.png")), &image)
+                    .expect("write the png");
+                written += 1;
+            }
+        }
+        println!("wrote {written} shots to {}", dir.display());
+    }
 }
