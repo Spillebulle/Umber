@@ -233,7 +233,13 @@ fn hue_colour(h: f32) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-fn hsv_colour(h: f32, s: f32, v: f32) -> Color32 {
+/// One `Hsv` as the colour egui paints with.
+///
+/// `pub(crate)` because the theme editor mixes a palette token on this very
+/// picker and has to turn its answer back into a `Color32`; a wrapper of its
+/// own would be a second `to_srgb_u8` call to keep in step with this one, which
+/// is the drift the palette and the clipboard both refuse.
+pub(crate) fn hsv_colour(h: f32, s: f32, v: f32) -> Color32 {
     let [r, g, b, _] = Hsv::new(h, s, v).to_color(1.0).to_srgb_u8();
     Color32::from_rgb(r, g, b)
 }
@@ -2513,17 +2519,21 @@ mod tests {
         }
     }
 
-    /// **No angle whatever reaches the swapped arrangement**, which is the whole
-    /// reason this is a second control rather than two more stops on the Angle
-    /// rail.
+    /// **No angle whatever reaches the swapped arrangement, and the two
+    /// controls together reach all six** — which is the whole reason this is a
+    /// second control rather than two more stops on the Angle rail.
     ///
     /// The rail turns all three corners together, so it walks the three
     /// *rotations* of the corner labelling; the swap is a reflection and gives
-    /// the other three. Somebody proposing to fold one into the other would
-    /// find this test, which is the point of writing it: the two together reach
-    /// all six arrangements and neither reaches more than three.
+    /// the other three. Somebody proposing to fold one into the other will find
+    /// this test, so it has to check both halves of the sentence rather than
+    /// only the first: a sweep against one swapped triangle says the rail
+    /// cannot get there, and the six-way comparison says the pair does not
+    /// waste a control by reaching the same arrangement twice.
     #[test]
-    fn no_angle_reaches_the_arrangement_the_swap_makes() {
+    fn the_angle_and_the_swap_reach_six_arrangements_and_no_angle_reaches_a_swap() {
+        // Half a degree at a time round the whole turn, which is finer than the
+        // 45° the rail snaps to and finer than anything that could be typed.
         let swapped = triangle_corners(CENTRE, RADIUS, 0.0, true);
         for step in 0..720 {
             let base = (step as f32 * 0.5).to_radians();
@@ -2532,6 +2542,27 @@ mod tests {
                 && apart(plain.1, swapped.1) < 0.5
                 && apart(plain.2, swapped.2) < 0.5;
             assert!(!same, "{}° reproduces the swap", step as f32 * 0.5);
+        }
+
+        // And the six are six. A third of a turn is the triangle's own period,
+        // so these are every arrangement of the three corner roles that either
+        // control can produce; any two of them being the same set of three
+        // labelled points would mean one of the six is unreachable and a
+        // control is doing less than it says.
+        let all: Vec<(Pos2, Pos2, Pos2)> = [false, true]
+            .into_iter()
+            .flat_map(|mirrored| {
+                [0.0_f32, 120.0, 240.0]
+                    .into_iter()
+                    .map(move |d| triangle_corners(CENTRE, RADIUS, d.to_radians(), mirrored))
+            })
+            .collect();
+        assert_eq!(all.len(), 6);
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate().skip(i + 1) {
+                let same = apart(a.0, b.0) < 0.5 && apart(a.1, b.1) < 0.5 && apart(a.2, b.2) < 0.5;
+                assert!(!same, "arrangements {i} and {j} are the same one");
+            }
         }
     }
 

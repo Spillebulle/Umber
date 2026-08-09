@@ -2453,10 +2453,13 @@ fn token_row(
         // label rather than a field, and the two say the same thing by being
         // the same shape they always were.
         // The same gate the hex field below uses and the same one
-        // `token_picker` applies. A chip that opened a picker the picker would
-        // then decline is a control that does nothing, which is worse than one
-        // that was never live.
-        let opens = editable && at.is_some();
+        // `token_picker` applies, plus the library being writable. A chip that
+        // opened a picker the picker would then decline is a control that does
+        // nothing; one that opened a picker whose caption promises the theme
+        // saves itself, over a library that cannot be written, is worse — it is
+        // a control that lies. `new_theme_card` draws itself from the same
+        // reading.
+        let opens = editable && at.is_some() && state.writable();
         let (chip, chip_response) = ui.allocate_exact_size(
             egui::Vec2::splat(18.0),
             if opens {
@@ -2479,6 +2482,24 @@ fn token_row(
                 .on_hover_text("Choose this colour on the wheel")
                 .clicked()
             {
+                // **Opening the picker abandons what was half-typed**, exactly
+                // as Escape does, and putting the readout back here is the
+                // whole of it. Two things go wrong otherwise, and both are
+                // silent. This chip is clickable, so egui surrenders the
+                // field's caret inside the field's *own* interact and
+                // `lost_focus` is not reported until the next frame — by which
+                // time `token_picker` has already normalised `state.hex[at]` to
+                // the colour the palette holds, so a `#C08` in the buffer is
+                // gone with nothing said. And if it were *not* overwritten, the
+                // next frame's blur would apply that stale buffer straight over
+                // the colour the wheel had just been opened to choose, which is
+                // the bug `paint_colour` records one door over.
+                //
+                // Before the field is drawn, because the field is drawn from
+                // this buffer a few lines below.
+                if let Some(at) = at {
+                    state.hex[at] = themelib::hex(colour);
+                }
                 // Seeded here and only here. `Picking::hsv` is the picker's
                 // state from now on — see its own docs for why re-deriving it
                 // from the token each frame would lose the hue.
@@ -2489,10 +2510,13 @@ fn token_row(
                 });
             }
         } else {
-            chip_response.on_hover_text(if editable {
-                "This colour cannot be edited"
-            } else {
+            chip_response.on_hover_text(if !editable {
                 "Built-in themes cannot be edited. New theme copies this one."
+            } else if !state.writable() {
+                // Never invented wording: it is what the library reported.
+                state.why_not()
+            } else {
+                "This colour cannot be edited"
             });
         }
         ui.add_space(metrics::BUTTON_GAP);
@@ -2617,12 +2641,30 @@ fn hsv_of(colour: Color32) -> umber_core::Hsv {
 
 /// The picker's state back as an interface colour.
 ///
-/// Through `umber_core::Color`'s own sRGB pair rather than a second `powf`
-/// here, which is the rule the palette and the clipboard both keep. Alpha is
-/// dropped because a palette token has none — see [`themelib::hex`].
+/// `colorpicker`'s own, not a second copy of it: that module already turns an
+/// HSV into the colour egui paints the wheel with, and a wrapper here would be
+/// a second `to_srgb_u8` to keep in step with it. The inverse of [`hsv_of`],
+/// and exact in both directions —
+/// `opening_the_picker_on_a_colour_and_closing_it_moves_nothing`.
 fn colour_of(hsv: umber_core::Hsv) -> Color32 {
-    let [r, g, b, _] = hsv.to_color(1.0).to_srgb_u8();
-    Color32::from_rgb(r, g, b)
+    crate::colorpicker::hsv_colour(hsv.h, hsv.s, hsv.v)
+}
+
+/// Whether the theme file should be written this frame.
+///
+/// A pure function so the rule can be checked without a window, which is the
+/// division `gesture::press` and `sysclip::decide` keep — and it is worth
+/// having as one, because the failure it prevents is invisible: a write per
+/// frame of a hue drag looks and behaves exactly like a write per gesture.
+///
+/// `closing` is not redundant with `!gesturing`, and the reason is not the
+/// obvious one. Every close route reports on a *release*, so on a Done click or
+/// a click outside the pointer is already up. What it is there for is
+/// **Escape**, which can arrive with a button still held — press on the hue
+/// ring, drag, and hit Escape without letting go. Without this term the picker
+/// would be gone with the colour applied to the palette and never written.
+fn should_write_theme(unsaved: bool, closing: bool, gesturing: bool) -> bool {
+    unsaved && (closing || !gesturing)
 }
 
 /// Umber's own colour picker, over one palette token.
@@ -2650,6 +2692,17 @@ fn colour_of(hsv: umber_core::Hsv) -> Color32 {
 /// [`theme_editor`] already lives by: every control on this page writes itself
 /// out. That is also what makes leaving the page mid-edit safe — reaching
 /// another page takes a pointer release, and a release is what writes.
+///
+/// **A modal inside a modal is one frame behind, in both directions**, and
+/// that is egui's and not ours. `Memory::top_modal_layer` is the *previous*
+/// frame's reading, so on the frame this opens it is not yet the top modal and
+/// an Escape arriving on that very frame would close the settings dialog
+/// instead; and on the frame after it closes, `top_modal_layer` still names a
+/// layer nothing draws, so a second Escape pressed immediately is swallowed
+/// rather than closing the dialog. Both need a keystroke inside one frame of a
+/// click, neither damages anything, and neither is fixable from here without
+/// keeping a modal drawn that has been dismissed. Recorded so the next person
+/// to see it knows it is not this module's bug.
 fn token_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &mut Themes) {
     let Some(mut picking) = state.picking else {
         return;
@@ -2664,15 +2717,33 @@ fn token_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &mut The
 
     let mut done = false;
     let response = egui::Modal::new(egui::Id::new("theme-token-colour"))
+        // **No second backdrop.** `egui::Modal` paints `from_black_alpha(100)`
+        // over the whole window by default, and the settings dialog has already
+        // painted one — so a nested modal at the default would put the
+        // interface at 37% and the dialog it sits on at 61%, which is precisely
+        // the interface this picker exists to judge a colour against. It is
+        // still a modal in every way that matters: the backdrop is what makes
+        // clicking outside close it, and it goes on refusing input to
+        // everything under it whether or not it is painted.
+        .backdrop_color(Color32::TRANSPARENT)
         .frame(
             Frame::NONE
-                .fill(p.window)
+                // `popover`, not `window`: with no backdrop between them the
+                // settings dialog behind is at full brightness, so a fill
+                // matching it would leave a 1px border doing all the work of
+                // saying where one ends and the other begins.
+                .fill(p.popover)
                 .stroke(Stroke::new(1.0, p.popover_border))
                 .corner_radius(CORNER)
                 .inner_margin(Margin::symmetric(14, 12)),
         )
         .show(ui.ctx(), |ui| {
             ui.set_width(TOKEN_PICKER_WIDTH);
+            // The token's name, and it is load-bearing rather than decoration:
+            // `Modal` anchors its area to the centre of the window, so this may
+            // well be sitting over the very row whose chip was clicked. The
+            // heading is then the only thing saying which colour is being
+            // mixed.
             ui.label(
                 egui::RichText::new(picking.token.label())
                     .size(text::CONTROL)
@@ -2690,39 +2761,10 @@ fn token_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &mut The
             crate::panels::picker_mode_switch(ui, p, ed);
             ui.add_space(8.0);
 
-            // Copied out and put back, exactly as `panels::colour_body` does:
-            // `show` reports a change of *colour*, so keying the preferences
-            // write off its return would queue one for every frame of a drag
-            // around the hue ring.
-            let mut shape = ed.ui.wheel_shape;
-            let mut rotates = ed.ui.wheel_rotates;
-            let mut mirrored = ed.ui.wheel_mirrored;
-            let mut angles = ed.ui.wheel_angles;
-            let mut harmony = ed.ui.harmony;
-            crate::colorpicker::show(
-                ui,
-                p,
-                ed.ui.picker,
-                &mut shape,
-                &mut rotates,
-                &mut mirrored,
-                &mut angles,
-                &mut harmony,
-                &mut picking.hsv,
-            );
-            if shape != ed.ui.wheel_shape
-                || rotates != ed.ui.wheel_rotates
-                || mirrored != ed.ui.wheel_mirrored
-                || angles != ed.ui.wheel_angles
-                || harmony != ed.ui.harmony
-            {
-                ed.ui.wheel_shape = shape;
-                ed.ui.wheel_rotates = rotates;
-                ed.ui.wheel_mirrored = mirrored;
-                ed.ui.wheel_angles = angles;
-                ed.ui.harmony = harmony;
-                prefs::mark_dirty();
-            }
+            // The Colour panel's own body, over this token's colour instead of
+            // the artist's — one statement of "draw the picker and keep what it
+            // was set to", not a copy of it. See `panels::picker_with_settings`.
+            crate::panels::picker_with_settings(ui, p, ed, &mut picking.hsv);
 
             ui.add_space(10.0);
             // Inside a `horizontal`: a bare right-to-left layout claims the
@@ -2752,13 +2794,10 @@ fn token_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &mut The
     // still going — the pointer's own state rather than egui's "is a widget
     // being interacted with", which is behind a private accessor and is not
     // the reading that matters anyway: what the write waits for is the hand
-    // coming off the rail.
-    //
-    // `close` is in the condition because the click that closes *is* a pointer
-    // being used, so the last colour of a session that ended on Done would
-    // otherwise never be written at all.
+    // coming off the rail. The rule itself is [`should_write_theme`], so it can
+    // be checked without a window.
     let gesturing = ui.ctx().input(|i| i.pointer.any_down());
-    if picking.unsaved && (close || !gesturing) {
+    if should_write_theme(picking.unsaved, close, gesturing) {
         save_theme_in_hand(ed, state);
         picking.unsaved = false;
     }
@@ -3600,15 +3639,21 @@ mod tests {
         }
     }
 
-    /// The wheel repaints the interface at once and touches the disk only when
-    /// the hand comes off.
+    /// Holding a colour reaches the palette and writes no file; saving writes
+    /// it.
     ///
-    /// Both halves are the feature. Live to the palette is what lets a colour
-    /// be judged against the thing it is for, which is the whole reason the
-    /// picker is here rather than in a preview box. Not live to the file is
-    /// what stops a drag around the hue ring being a file write per frame — a
-    /// `ThemeLibrary` write reaches the disk immediately, so nothing else is
-    /// throttling it.
+    /// **This is half of the rule and it says which half.** It drives the two
+    /// functions and therefore cannot see *when* `token_picker` calls the
+    /// second one — delete the throttle there and this stays green while the
+    /// file is written every frame of a hue drag.
+    /// `the_theme_file_is_written_when_the_gesture_ends_and_not_during_it` is
+    /// the other half, over `should_write_theme`, which is a pure function for
+    /// exactly that reason.
+    ///
+    /// What this half is for: live to the palette is what lets a colour be
+    /// judged against the thing it is for, which is the whole reason the picker
+    /// is here rather than in a preview box; and `hold_token` writing no file
+    /// is what makes a throttle possible at all.
     #[test]
     fn a_colour_held_on_the_wheel_reaches_the_palette_before_the_file() {
         let (dir, mut ed, mut state) = staged("held");
@@ -3656,6 +3701,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// When the theme file is written, as a rule rather than as four lines
+    /// buried in a drawing function.
+    ///
+    /// `a_colour_held_on_the_wheel_reaches_the_palette_before_the_file` below
+    /// drives `hold_token` and `save_theme_in_hand` and therefore says nothing
+    /// about *when* the second one is called — delete the throttle from
+    /// `token_picker` and it stays green while the file is written on every
+    /// frame of a hue drag. This is the half that was only reasoning.
+    #[test]
+    fn the_theme_file_is_written_when_the_gesture_ends_and_not_during_it() {
+        // Nothing to write is nothing to write, whatever the pointer is doing.
+        for closing in [false, true] {
+            for gesturing in [false, true] {
+                assert!(!should_write_theme(false, closing, gesturing));
+            }
+        }
+        // Mid-drag: the palette has the colour and the disk waits.
+        assert!(!should_write_theme(true, false, true));
+        // The hand comes off.
+        assert!(should_write_theme(true, false, false));
+        // And Escape with a button still held — press on the hue ring, drag,
+        // hit Escape without letting go. This is the one case `closing` exists
+        // for, and without it the picker would be gone with the colour applied
+        // to the palette and never written.
+        assert!(should_write_theme(true, true, true));
+    }
+
     /// **Escape over a half-typed hex leaves the theme alone.**
     ///
     /// The recorded defect, and it needed a window to see: egui's default
@@ -3684,6 +3756,13 @@ mod tests {
         let before = ed.palette().token(Token::Window);
         let field = egui::Id::new(("theme-token-field", Token::Window.id()));
 
+        // **Inside a real `egui::Modal`**, because the argument the fix rests
+        // on is about one: the row may read Escape only because `Modal`
+        // consumes it in `should_close`, which runs *after* its content. Drawn
+        // bare, this test would pass against a framework that took the key
+        // first and would say nothing about the claim in the comment it
+        // guards. `should_close` is called for the same reason — that is where
+        // the consumption happens.
         let frame = |ed: &mut Editor, state: &mut Themes, events: Vec<Event>| {
             let _ = ctx.run_ui(
                 RawInput {
@@ -3691,7 +3770,12 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| token_row(ui, &palette, ed, state, Token::Window, true),
+                |ui| {
+                    let modal = egui::Modal::new(egui::Id::new("settings")).show(ui.ctx(), |ui| {
+                        token_row(ui, &palette, ed, state, Token::Window, true)
+                    });
+                    let _ = modal.should_close();
+                },
             );
         };
 

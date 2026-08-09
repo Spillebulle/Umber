@@ -181,6 +181,15 @@ pub struct UiState {
     /// with from another application, sets once, and never thinks about again.
     /// Meaningless for the square, which has no corner standing for either —
     /// see `WheelShape::can_swap_ends`.
+    ///
+    /// **One flag rather than one per shape, unlike `wheel_angles`**, and the
+    /// two differ for a reason: an angle means something for *both* centres and
+    /// stands for a different pose in each, where this means something for one
+    /// of them and nothing at all for the other. It is `wheel_rotates`' shape,
+    /// which is the setting it sits beside on the panel. A third centre with
+    /// corners would want its own, and would want a key per shape in the
+    /// preferences file the way `wheel_angle_key` already writes one — that is
+    /// a migration and it is cheaper than carrying a table for one live value.
     pub wheel_mirrored: bool,
     /// How far each wheel centre is turned from its neutral pose, when the hue
     /// is not deciding it. One angle per shape — see [`WheelAngles`].

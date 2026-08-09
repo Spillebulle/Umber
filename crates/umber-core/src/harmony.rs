@@ -374,6 +374,38 @@ mod tests {
         }
     }
 
+    /// Every relation is in [`Harmony::ALL`], guarded by an exhaustive `match`
+    /// rather than by walking the array.
+    ///
+    /// A test that iterates `ALL` can only ever check what is in it, and every
+    /// other test in this file does exactly that — so a variant left out would
+    /// be unreachable from the dropdown *and* from a preferences file
+    /// (`prefs::harmony_from_id` resolves by iterating `ALL` too), with the
+    /// whole suite green. That is the `[EditKind; 11]` shape CLAUDE.md already
+    /// names, and adding a sixth relation is exactly when it stops being
+    /// hypothetical.
+    ///
+    /// The arms index `ALL`, so an array that is too *short* is an
+    /// out-of-bounds panic as well. That is still not total — an arm that does
+    /// not index its own position compiles and passes — and the hole is named
+    /// here rather than papered over: the only complete fix is a macro deriving
+    /// the enum and the array from one list, which this codebase's taste for
+    /// per-variant rustdoc argues against.
+    #[test]
+    fn every_relation_is_in_the_array_that_lists_them() {
+        for harmony in Harmony::ALL {
+            let at = match harmony {
+                Harmony::Complementary => 0,
+                Harmony::Analogous => 1,
+                Harmony::Triad => 2,
+                Harmony::SplitComplementary => 3,
+                Harmony::Tetrad => 4,
+                Harmony::RectangleTetrad => 5,
+            };
+            assert_eq!(Harmony::ALL[at], harmony, "{} is misfiled", harmony.label());
+        }
+    }
+
     /// A wheel can only draw what it is handed room for.
     #[test]
     fn no_harmony_is_wider_than_the_array_that_holds_it() {
