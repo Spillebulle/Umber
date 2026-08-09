@@ -196,7 +196,10 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 /// that surface — and a guard measures the pair. Four marks are not like that:
 /// the canvas scrollbar thumb, the pen dot, the splash's supporting lines and
 /// the input strip's prompt all sit on [`Palette::backdrop`], which the theme
-/// editor lets anybody set to anything. They were drawn in `text_dim`, on the
+/// editor lets anybody set to anything. (A fifth thing is drawn there — the
+/// input strip's own scribble, in `text_strong` — and it is not in the list
+/// because it needs nothing: it is the strongest ink there is and reads 3.47:1
+/// on the worst pit any theme ships.) They were drawn in `text_dim`, on the
 /// reasoning that it is the one token that is a mid-grey whichever way a
 /// theme's surfaces run — and that is exactly why it fails: a mid-grey ink on a
 /// mid-grey pit is 1.34:1, which is worse than the 1.31:1 `rail` was rejected
@@ -1152,6 +1155,15 @@ impl Palette {
     /// were not the design — and it is unnecessary, because the preset themes'
     /// own applications draw a near-white on those fills, so the fallback is
     /// the faithful answer there rather than a compromise.
+    ///
+    /// **Two icon buttons on that fill are still not covered by this**, and
+    /// they are named rather than quietly left: `controls::icon_button` inks
+    /// `text_muted` at rest and `ui::icon_button` inks `text_dim`, which on
+    /// `control_active` are 1.94:1 and 1.43:1 in MediaBog. Both are shared
+    /// widgets drawn on half a dozen surfaces, so the fix is a surface they are
+    /// told about rather than a token swapped here, and that is a refactor
+    /// rather than a contrast repair. The armed shortcut row and the selected
+    /// modulation row are where they land.
     ///
     /// A per-theme table is the other alternative and cannot be kept true: the
     /// accent is a preference on top of the theme, so it would be twenty-four
