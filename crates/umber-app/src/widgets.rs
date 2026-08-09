@@ -358,14 +358,27 @@ pub struct Dropdown<'a> {
     /// itself — see [`Dropdown::outlined`].
     ///
     /// The *surface* rather than a flag, because the border is derived from it
-    /// and cannot be a token. Every other box in this interface — the curve
-    /// panel, the pressure graph, `controls::button` — is a `Palette::window`
-    /// or `Palette::control` **fill** with a `Palette::border` edge, and the
-    /// fill is what makes it a box; the edge is only its boundary. A dropdown
-    /// may not have that fill, so its border carries the whole affordance
-    /// alone, and `border` is 1.21:1 to 1.45:1 against `dock` across the six
-    /// shipped themes — under the 1.31:1 that was already rejected for the
-    /// canvas scrollbar's thumb. Measured before it was believed.
+    /// and cannot be a token. Nearly every other box in this interface — the
+    /// curve panel, the pressure graph, `controls::button` — is a
+    /// `Palette::window` or `Palette::control` **fill** with a
+    /// `Palette::border` edge, and the fill is what makes it a box; the edge is
+    /// only its boundary. A dropdown may not have that fill, so its border
+    /// carries the whole affordance alone, and `border` measures 1.21:1
+    /// (Paper), 1.24 (Graphite), 1.25 (ShitStudio), 1.31 (MediaBog), 1.41
+    /// (Krita) and 1.45 (Photoslop) against `dock` — every one of them far
+    /// under [`contrast::READABLE`]'s 3:1, and the same order as the 1.31:1
+    /// already rejected for the canvas scrollbar's thumb, though four of the
+    /// six rather than all six are actually below that figure. Measured before
+    /// it was believed, and stated per theme because a range invites exactly
+    /// the wrong conclusion from its own ends.
+    ///
+    /// **`controls::keycap`'s unbound state is the exception to "nearly", and
+    /// it has this defect.** `CapState::Unbound` takes a transparent fill with a
+    /// `border` stroke, and `controls.rs` skips the fill when it is
+    /// transparent — so Settings → Shortcuts draws an unfilled `border` box at
+    /// 1.13:1 to 1.80:1 on `popover`. Named rather than fixed here: it is
+    /// another file and another agent's, and a premise this doc leans on that
+    /// the codebase quietly contradicts is worse than a known gap.
     ///
     /// So it is [`contrast::ink_on`], the same mechanism the four marks on
     /// `Palette::backdrop` take, at [`Ink::Dim`] — "has to be visible and must
@@ -421,6 +434,18 @@ impl<'a> Dropdown<'a> {
     /// sits in a row — beside a slider, after a leading mark, inside a header —
     /// is told from its neighbours by being in a row of controls, and keeps the
     /// bare look.
+    ///
+    /// **Four other triggers are that shape and are still bare, so the rule
+    /// above describes more than the code does.** `ui::paper_picker`,
+    /// `palettelib`'s palette picker, and the brush editor's Blend mode and its
+    /// Drives / Driven by pair are each `Fill` and alone on their line, and the
+    /// Blend mode one carries the very caption this change removed. Only the
+    /// harmony picker was reported, and only it is outlined; nothing here makes
+    /// the Colour panel special, and one gesture with two looks is what
+    /// `metrics::DROPDOWN`'s own docs say the single dropdown exists to
+    /// prevent. It is said out loud rather than quietly generalised, because
+    /// the next person to meet one of those four needs to know this is a
+    /// half-applied rule and not a considered exception.
     pub fn outlined(mut self, surface: Color32) -> Self {
         self.outlined = Some(surface);
         self
@@ -529,12 +554,22 @@ pub fn dropdown<R>(
     };
 
     let painter = ui.painter();
-    // The border, before everything, so nothing it encloses is drawn over. It
-    // brightens by one rank on hover rather than to the label's own ink: the
-    // outline is furniture saying "this is a control" and the ink is the
-    // choice, so a border as bright as the word it holds would compete with it
-    // — but both moving together is what makes the whole trigger answer as one
-    // thing rather than as a box with a word in it.
+    // The border, before everything, so nothing it encloses is drawn over, and
+    // one rank brighter on hover so the whole trigger answers as one thing
+    // rather than as a box with a word in it.
+    //
+    // **At rest the outline is the louder of the two, and that is a
+    // consequence rather than a choice.** A rank is stated against the
+    // *surface*, so where it lands relative to `text_dim` is whatever the two
+    // derivations happen to give: measured, the border is 4.34:1 to 5.22:1 on
+    // `dock` against a label at 3.00:1 to 5.07:1, so it is ahead in all six
+    // themes and by 74% in Paper. It is left that way because a hairline and a
+    // word at one ratio are not the same quantity of ink — checked by eye in
+    // every theme, not argued — and because the hover ordering is the other
+    // way round anyway (6.68–9.75 against 8.96–14.77), so the label is what
+    // moves when a trigger is aimed at. A border stated against `text_dim`
+    // rather than against the surface is the fix if that ever stops holding;
+    // it is not a token, and `Ink` has nothing below `Dim`.
     if let Some(surface) = trigger.outlined {
         let rank = if response.hovered() {
             Ink::Muted

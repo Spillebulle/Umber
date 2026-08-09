@@ -1428,15 +1428,22 @@ const HARMONY_MARKER: f32 = 6.0;
 /// radius is three pixels across at an ordinary scale factor and reads as a dot
 /// — which is the fill this change exists to remove, put back smaller.
 ///
-/// The figure is what keeps the outer ring inside the hue band rather than
-/// hanging off it: the band is [`RING_THICKNESS`] wide wherever the wheel is
-/// wide enough for that — which is every size from 54 points up, so every size
-/// a panel is actually drawn at — and `HARMONY_MARKER + HARMONY_BASE_GAP` plus
-/// half of [`MARKER_STROKE`] is exactly half of it. Below that the inner radius
-/// is clamped and the band narrows, so on a wheel at the [`MIN_PICKER`] floor
-/// the ring overhangs the rim by a point. That is left alone rather than solved:
-/// it is a panel dragged to nothing, and a white ring a point over the rim is
-/// still a white ring. `the_base_ring_stays_on_the_hue_band` measures both.
+/// The figure is what keeps the outer ring's **core** inside the hue band
+/// rather than hanging off it, and core is the exact word. The band is
+/// [`RING_THICKNESS`] wide wherever the wheel is wide enough for that — every
+/// size from 54 points up, so every size a panel is actually drawn at — and
+/// `HARMONY_MARKER + HARMONY_BASE_GAP` plus half of [`MARKER_STROKE`] is
+/// exactly half of it. So the figure is at its ceiling: 4 would hang the solid
+/// part of the ring off the rim.
+///
+/// **The drawn extent is half a point more than that**, because egui feathers a
+/// stroke over [`feather`]'s `1.0 / pixels_per_point`, so the fade always
+/// reaches a little past the rim — at every size, not only at the small ones.
+/// It is a fade onto the panel behind and reads as the edge of a white ring
+/// either way. Below 54 points the inner radius is clamped, the band narrows,
+/// and the *core* overhangs too, by up to a point at the [`MIN_PICKER`] floor.
+/// That is left alone as well: it is a panel dragged to nothing.
+/// `the_base_ring_stays_on_the_hue_band` measures the core, and says so.
 const HARMONY_BASE_GAP: f32 = 3.0;
 
 /// The hue ring with the chosen relation's other hues marked on it, a
@@ -1566,9 +1573,21 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
     // is in hand is a difference of mark rather than of colour", because at zero
     // saturation every member is the same grey. That is a real constraint and it
     // survives: the base is still told apart by its **mark**, a second ring
-    // outside the first. Two concentric rings can only mean "this one", they
-    // read at any saturation because both are white on whatever the wheel holds,
-    // and neither of them hides a hue. What is gone is only the *fill*.
+    // outside the first, which reads at any saturation because both rings are
+    // white on whatever the wheel holds and neither hides a hue. What is gone is
+    // only the *fill*.
+    //
+    // **What carries that is the outer diameter, not a visible gap between two
+    // crisp rings**, and the difference matters at a scale factor of 1. The two
+    // cores leave 1.0 point between them — 6 + 1 to 9 − 1 — while egui feathers
+    // a stroke over `feather`'s own `1.0 / pixels_per_point`, so at 1x each
+    // skirt reaches half a point in and the two meet at radius 7.5 with no hue
+    // surviving between them. At 2x, which is what `harmony_picker_preview`
+    // shoots at, half a point of wheel does survive; the shots therefore flatter
+    // this. Widening the gap is not available — see `HARMONY_BASE_GAP`, which is
+    // already at the most the band allows — so if the doubled ring ever needs to
+    // read as two at 1x, the thing to move is the *inner* radius, and that costs
+    // the base a mark the Wheel mode's hue marker shares.
     let painter = ui.painter();
     for (index, hue) in harmony.hues(hsv.h).as_slice().iter().enumerate() {
         let at = ring_point(centre, inner, outer, *hue);
@@ -3169,8 +3188,11 @@ mod tests {
     ///
     /// Six more shots are taken at **zero saturation**, one per theme. That is
     /// the case the markers' own comment argues from and the one that cannot be
-    /// reasoned about: the swatch row is four identical greys there, so the ring
-    /// is the only thing left saying which member is the colour in hand. Every
+    /// reasoned about: the swatch row is four identical greys there, so nothing
+    /// *on the ring* can be told apart by colour. The row itself still marks the
+    /// base — `swatch_mark` draws its accent bar at every saturation, which is
+    /// what `HARMONY_MARK`'s docs chose it for — so the ring is not the only
+    /// thing left in the panel, only the only thing left on the wheel. Every
     /// theme rather than only Graphite, because the relation trigger's outline
     /// is derived from `Palette::dock` and each theme derives its own — a shot
     /// in one theme says nothing about the other five.
@@ -3207,8 +3229,8 @@ mod tests {
             let name = format!("{}-{}", index + 1, relation.label().replace(' ', "-"));
             shot(name, &graphite, relation, Hsv::new(28.0, 0.72, 0.86));
         }
-        // The grey case, in every theme: the swatch row says nothing here, so
-        // whatever tells the base from the rest has to be on the ring.
+        // The grey case, in every theme: no colour on the wheel tells one member
+        // from another here, so whatever does it has to be a mark.
         for kind in crate::theme::ThemeKind::ALL {
             let name = format!("grey-{}", kind.id());
             shot(
@@ -3221,7 +3243,8 @@ mod tests {
         println!("wrote the shots to {}", dir.display());
     }
 
-    /// The base's second ring is on the hue band, not hanging off it.
+    /// The base's second ring has its **core** on the hue band, not hanging off
+    /// it.
     ///
     /// [`HARMONY_BASE_GAP`] is the one number in this picker that is chosen
     /// against a *margin* rather than against a look, so it needs a guard that
@@ -3236,10 +3259,20 @@ mod tests {
     /// more than a point below that. An assertion that it *always* fits would be
     /// false today, and one that never checked the floor would go quiet the day
     /// somebody widened the gap.
+    ///
+    /// **What it does not measure is the antialiased skirt**, and saying so is
+    /// the point rather than a caveat: egui fades a stroke over [`feather`]'s
+    /// `1.0 / pixels_per_point`, which is a scale factor this test has no
+    /// `Ui` to ask for, so the drawn edge reaches up to half a point further
+    /// than anything asserted here at *every* size. The constant's docs say the
+    /// same. A guard's comment claiming the whole drawn extent when it measures
+    /// the core is the overclaim this codebase keeps catching, so it is named
+    /// here instead of being left for somebody to find.
     #[test]
     fn the_base_ring_stays_on_the_hue_band() {
-        // The outermost thing drawn for the base: the second ring, plus the half
-        // of its stroke that lies outside its own radius.
+        // The outermost *solid* part drawn for the base: the second ring, plus
+        // the half of its stroke that lies outside its own radius. The fade
+        // beyond it is deliberately not in this figure — see above.
         let reach = HARMONY_MARKER + HARMONY_BASE_GAP + MARKER_STROKE.width * 0.5;
         let mut sides = vec![MIN_PICKER, 53.0, 54.0, 176.0];
         sides.extend((48..=176).map(|n| n as f32));
@@ -3277,9 +3310,11 @@ mod tests {
     /// The counts are the other half. Every member has to wear the *same* mark,
     /// which is `HARMONY_MARKER` exactly `hues.len()` times, and exactly one
     /// second ring says which one is in hand. Both directions matter: dropping
-    /// the second ring leaves nothing saying which member is the colour in hand,
-    /// which is what the fill used to say and is the thing this change had to
-    /// replace rather than remove.
+    /// the second ring leaves nothing **on the wheel** saying which member is
+    /// the colour in hand, which is what the fill used to say and is the thing
+    /// this change had to replace rather than remove. On the wheel and not in
+    /// the panel — `swatch_mark`'s accent bar under the first swatch is
+    /// unaffected by any of this and would still be there.
     #[test]
     fn every_harmony_marker_is_an_open_ring_and_only_the_base_wears_two() {
         use crate::theme::metrics;
