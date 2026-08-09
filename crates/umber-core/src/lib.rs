@@ -8,6 +8,7 @@
 pub mod brush;
 pub mod brushimport;
 pub mod camera;
+pub mod canvassize;
 pub mod clipboard;
 pub mod color;
 pub mod curve;
@@ -43,6 +44,7 @@ pub mod transform;
 
 pub use brush::{Brush, BrushMode, GrainPattern};
 pub use camera::{Camera, ScrollSpan};
+pub use canvassize::{Aspect, CanvasLimit, Orientation, Sheet};
 pub use clipboard::{Clip, Cut};
 pub use color::{Color, Hsv};
 pub use curve::ResponseCurve;
