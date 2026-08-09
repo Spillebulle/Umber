@@ -2437,13 +2437,12 @@ fn token_row(
     token: Token,
     editable: bool,
 ) {
-    // The token's place in the buffer table. `None` is unreachable — every
-    // token drawn comes out of `TokenGroup::tokens`, which is a filter over
-    // `Token::ALL` — and it falls through to the read-only readout rather than
-    // to slot zero, because writing *Backdrop's* buffer would be a row silently
-    // editing the wrong colour, and to `expect` would be a panic on the drawing
-    // path. Neither is a trade worth taking for a case that cannot happen.
-    let at = Token::ALL.iter().position(|t| *t == token);
+    // The token's place in the buffer table — see [`token_slot`] for why `None`
+    // is unreachable and why it still falls through to the read-only readout
+    // rather than to slot zero. Read once and shared by the chip and the field,
+    // so the two controls on this row cannot end up gated on different answers
+    // to the same question.
+    let at = token_slot(state, token);
     let colour = ed.palette().token(token);
     ui.horizontal(|ui| {
         // The chip is a control where the theme is the user's own, and a
@@ -2453,6 +2452,10 @@ fn token_row(
         // A built-in's chip is therefore hover-only, exactly as its hex is a
         // label rather than a field, and the two say the same thing by being
         // the same shape they always were.
+        // The same gate the hex field below uses and the same one
+        // `token_picker` applies. A chip that opened a picker the picker would
+        // then decline is a control that does nothing, which is worse than one
+        // that was never live.
         let opens = editable && at.is_some();
         let (chip, chip_response) = ui.allocate_exact_size(
             egui::Vec2::splat(18.0),
@@ -2499,13 +2502,13 @@ fn token_row(
                 .color(p.text_muted),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // The length check is a third line of defence, after `refill`
-            // always filling the whole table and `Token::ALL` being what this
-            // loop walks — it is here because the alternative failure is an
-            // index panic on the *drawing path*, which is the worst place in
-            // the application to put one. `Palette::link_colour`'s modulo is
-            // the same argument.
-            let Some(at) = at.filter(|_| editable && state.hex.len() == Token::ALL.len()) else {
+            // `token_slot` has already made the length check that is the third
+            // line of defence, after `refill` always filling the whole table
+            // and `Token::ALL` being what this loop walks — it is made because
+            // the alternative failure is an index panic on the *drawing path*,
+            // which is the worst place in the application to put one.
+            // `Palette::link_colour`'s modulo is the same argument.
+            let Some(at) = at.filter(|_| editable) else {
                 ui.label(
                     egui::RichText::new(themelib::hex(colour))
                         .monospace()
