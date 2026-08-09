@@ -1424,7 +1424,19 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     let mut changed = false;
     let is_folder = ed.layers.active_is_folder();
     if !is_folder {
-        ui.horizontal(|ui| {
+        // **Wrapped, and the add mark is what made it have to be.** This row is
+        // three toggles for a plain layer and five controls once the layer
+        // carries a mask, because the Layer/Mask pair appears with it; the add
+        // mark takes another twenty-six points off the front. At
+        // `limits::SIDEBAR_MIN_WIDTH` that is 190 points of row in a 166 point
+        // body, and a plain `horizontal` does not wrap — it overruns and the
+        // body clips it, so "Mask" would be half a word nobody could press.
+        // Wrapping costs nothing at `metrics::PANEL`, where it all fits on one
+        // line, and at the narrowest a column may be dragged it puts the pair
+        // on a second line instead of off the end.
+        // `the_layers_body_fits_the_narrowest_column_it_can_be_dragged_to` is
+        // the guard, and it failed by 23.75 points before this.
+        ui.horizontal_wrapped(|ui| {
             add_layer_button(ui, p, ed, actions);
             let has_mask = ed.layers.active_mask().is_some();
             if widgets::icon_toggle(
@@ -1534,18 +1546,27 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 layer.locked = !is_locked;
                 changed = true;
             }
-            // **Not a label beside it.** A label in an egui horizontal layout
-            // defaults to `TextWrapMode::Extend`, so a sentence here sizes the
-            // strip — and with it the panel and the window — instead of being
-            // sized by it. That is the exact failure `brushlib::notice_bar` and
-            // `controls::banner` were written to avoid, and putting one here
-            // pushed the layer list past the right edge of the window: the
-            // blend labels read "Nor". Seen in a running window, which is the
-            // only way this shows up.
-            ui.label(
-                egui::RichText::new("A group carries its layers")
-                    .size(text::TINY)
-                    .color(p.text_muted),
+            // **Truncated, never extending.** A label in an egui horizontal
+            // layout defaults to `TextWrapMode::Extend`, so a sentence here
+            // sizes the strip — and with it the panel and the window — instead
+            // of being sized by it. That is the exact failure
+            // `brushlib::notice_bar` and `controls::banner` were written to
+            // avoid, and putting one here pushed the layer list past the right
+            // edge of the window: the blend labels read "Nor". Seen in a
+            // running window, which is the only way *that* shows up — and it
+            // came back the moment the add mark took twenty-six points off the
+            // front of this row, which is how
+            // `the_layers_body_fits_the_narrowest_column_it_can_be_dragged_to`
+            // came to exist. `truncate` is what makes the row sized by the
+            // column rather than by the sentence; the whole sentence is in the
+            // tooltip either way.
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("A group carries its layers")
+                        .size(text::TINY)
+                        .color(p.text_muted),
+                )
+                .truncate(),
             )
             .on_hover_text(
                 "A group has no blend mode and no opacity of its own. Its \
@@ -3404,6 +3425,68 @@ mod tests {
         }
     }
 
+    /// The Layers body fits the narrowest column it can be dragged to, in every
+    /// state its flags row has.
+    ///
+    /// That row is the one thing here that grows: it is three toggles for a
+    /// plain layer, five controls once the layer has a mask — the Layer/Mask
+    /// pair appears — and the add mark has just been put at the head of it. A
+    /// row that overran would be clipped by the body rather than wrapped, so the
+    /// last control on it would be half a control, which is the same failure the
+    /// tick line's six buttons already produced once at a width that fitted in
+    /// the abstract.
+    ///
+    /// The body's own width, not the panel's: `panel` hands the body
+    /// `metrics::PANEL_PAD` off each side.
+    #[test]
+    fn the_layers_body_fits_the_narrowest_column_it_can_be_dragged_to() {
+        use crate::dock::limits;
+        use crate::editor::Editor;
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Pos2, Rect, vec2};
+
+        let body = limits::SIDEBAR_MIN_WIDTH - 2.0 * f32::from(metrics::PANEL_PAD);
+        let palette = Palette::of(ThemeKind::Graphite);
+        // A plain layer, a layer carrying a mask — which is what puts the
+        // Layer/Mask pair on the row — and a folder, whose row is the other
+        // branch entirely.
+        for state in ["plain", "masked", "folder"] {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(body, 600.0))),
+                ..Default::default()
+            };
+            let mut ed = Editor::default();
+            ed.layers.add();
+            ed.layers.add();
+            match state {
+                "masked" => {
+                    let active = ed.layers.active_index();
+                    assert!(ed.layers.add_mask(active).is_some(), "no mask to draw");
+                }
+                "folder" => {
+                    ed.layers.group(&[1, 2]);
+                }
+                _ => {}
+            }
+            // Twice: the first pass through a fresh context builds the font
+            // atlas, and text laid out against a half-built one is not the
+            // width it will settle at.
+            let mut used = 0.0;
+            for _ in 0..2 {
+                let _ = ctx.run_ui(input.clone(), |ui| {
+                    let mut actions = crate::ui::UiActions::default();
+                    super::layers_body(ui, &palette, &mut ed, &mut actions);
+                    used = ui.min_rect().width();
+                });
+            }
+            assert!(
+                used <= body,
+                "the Layers body ({state}) wanted {used} of a {body} column"
+            );
+        }
+    }
+
     /// The Layers module at the panel's real width, in each of the three states
     /// the tick column's header can be in.
     ///
@@ -3672,10 +3755,10 @@ mod tests {
 
         // The narrowest a column may be dragged, which is where the heading has
         // least room, and the design's width for comparison.
-        for (name, width, lock, editing) in [
-            ("7-narrow", limits::SIDEBAR_MIN_WIDTH, false, false),
-            ("8-wide", metrics::PANEL, false, false),
-            ("9-locked-folder", metrics::PANEL, true, false),
+        for (name, width, lock, editing, mask) in [
+            ("7-narrow", limits::SIDEBAR_MIN_WIDTH, false, false, false),
+            ("8-wide", metrics::PANEL, false, false, false),
+            ("9-locked-folder", metrics::PANEL, true, false, false),
             // The tightest case there is, and the one
             // `a_module_header_never_draws_its_title_under_its_controls`
             // measures: the narrowest column, with the close mark taking
@@ -3687,6 +3770,20 @@ mod tests {
                 limits::SIDEBAR_MIN_WIDTH,
                 false,
                 true,
+                false,
+            ),
+            // The widest the flags row ever gets, in the narrowest column: the
+            // add mark, three toggles and the Layer/Mask pair a mask brings
+            // with it. `the_layers_body_fits_the_narrowest_column_it_can_be_
+            // dragged_to` says it no longer runs off the end; this is what says
+            // the second line it wraps onto reads as one row rather than as two
+            // unrelated ones.
+            (
+                "11-narrow-masked",
+                limits::SIDEBAR_MIN_WIDTH,
+                false,
+                false,
+                true,
             ),
         ] {
             let mut ed = Editor::default();
@@ -3694,7 +3791,13 @@ mod tests {
             ed.layout.set_edit_mode(editing);
             ed.layers.add();
             ed.layers.add();
-            ed.layers.group(&[1, 2]);
+            if mask {
+                // On the selected layer, which is the one the flags row draws.
+                let active = ed.layers.active_index();
+                assert!(ed.layers.add_mask(active).is_some(), "no mask to draw");
+            } else {
+                ed.layers.group(&[1, 2]);
+            }
             if lock {
                 // The folder alone. Its two layers are locked by it and hold no
                 // flag of their own, which is precisely the case that showed
@@ -3719,6 +3822,6 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 4 edge cases to {}", dir.display());
+        println!("wrote 5 edge cases to {}", dir.display());
     }
 }
