@@ -12,7 +12,8 @@
 
 <p align="center">
   Paints on the GPU · reads brushes from MyPaint, GIMP, Krita, Photoshop and
-  Clip Studio · opens Krita and Photoshop documents · saves to OpenRaster
+  Clip Studio · opens Krita, Clip Studio and Photoshop documents · saves to
+  OpenRaster
 </p>
 
 ![The Umber workspace: the tool rail, the canvas, and the Colour, Brushes,
@@ -235,6 +236,7 @@ format of its own, deliberately.
 |---|---|
 | `.ora` | OpenRaster: Krita, MyPaint, GIMP, Drawpile, Pinta |
 | `.kra` | Krita |
+| `.clip` | Clip Studio Paint |
 | `.psd` | Photoshop |
 | `.png` | a flat image |
 
@@ -260,8 +262,11 @@ Every panel is a module you drag where you want it, the tool rail included, and
 they are **locked while you paint**. **Window → Customise layout** unlocks them,
 and your arrangement is saved between runs.
 
-Two themes ship, and you can make your own from a copy of either. There is an
-interface scale for a dense display, which leaves the canvas alone.
+Six themes ship. Two are Umber's own; the other four take their greys from
+Photoshop, Clip Studio Paint, Krita and MediBang Paint, so a painter arriving
+from one of those starts with colours they already know. Make your own from a
+copy of any of them. There is an interface scale for a dense display, which
+leaves the canvas alone.
 
 Shortcut labels follow your own keyboard, so a Nordic layout shows the key that
 actually zooms. **Settings → Input & pen** is the page to open when a pen feels
@@ -288,14 +293,14 @@ wrong.
 | Input | Action |
 |---|---|
 | Left drag | Use the selected tool |
-| `B` / `E` / `S` / `T` / `H` / `Z` | Brush / eraser / select / transform / pan / zoom |
+| `B` / `E` / `S` / `T` / `I` / `H` / `Z` | Brush / eraser / select / transform / eyedropper / pan / zoom |
 | `Ctrl` + `D` | Deselect |
 | `Ctrl` + `C` / `X` / `V` | Copy / cut / paste |
 | `Shift` / `Ctrl` / both + drag with Select | Add to the selection / take away / keep the overlap |
 | `Enter` / `Esc` while selecting | Close / abandon the outline |
 | `Enter` / `Esc` while transforming | Put the picture down / throw the move away |
 | `X` | Swap foreground and background colours |
-| `Alt` + click | Pick the colour under the cursor |
+| `Alt` + drag, or the eyedropper | Take the colour under the pointer. Drag off the window to take one from anywhere on the screen |
 | `Alt` + move, nothing held | Resize the brush; right and up is bigger |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |
@@ -317,7 +322,11 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 
 ## What is not there yet
 
-- **Ten of the sixteen tools**, shapes among them.
+- **Nine of the sixteen tools**, shapes among them.
+- **Picking a colour from outside the window is Windows only.** Inside the
+  window the eyedropper works everywhere. On macOS and Linux the tool options
+  strip says so, rather than the drag quietly doing nothing. There is no
+  magnifier under the cursor yet, so a one-pixel target takes a steady hand.
 - **Text becomes paint the moment you place it.** It is not kept as text, so
   reopening a document gives you the picture and not the words, and fixing a
   typo means undoing and typing it again. Everything up to placing it is live:
