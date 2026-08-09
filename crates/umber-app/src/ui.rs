@@ -23,6 +23,7 @@ use crate::panels;
 use crate::shortcuts::{self, Action};
 use crate::tabs;
 use crate::theme::{Palette, metrics, text};
+use crate::tweaks::Tweak;
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use umber_core::{
@@ -1670,16 +1671,28 @@ mod strip_budget {
     pub const OPACITY: f32 = 185.0;
     /// The stabiliser rail. It used to be 110 for a `widgets::chip`, which is a
     /// label and a small pill; it is a third [`crate::widgets::inline_slider`]
-    /// now, so it costs what one costs — the 90 point rail, the readout, and a
-    /// label three characters longer than "Opacity"'s.
+    /// now, so it costs what one costs — the 90 point rail, the *field*, and a
+    /// label three characters longer than "Opacity"'s. The figure is a field
+    /// rather than a painted readout since it became typable, which means it is
+    /// as wide as the widest figure the rail can show rather than as wide as
+    /// the one showing; all three of these were re-measured against that by
+    /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn`.
     pub const STABILISER: f32 = 190.0;
     /// The line naming the modifiers that add to, subtract from and intersect a
     /// selection, and say what the feather applies to.
     pub const COMBINE: f32 = 320.0;
     /// The four marks that say what a new shape does to the selection.
     pub const SELECT_OP: f32 = 105.0;
-    /// The feather rail, its label and its readout.
-    pub const FEATHER: f32 = 165.0;
+    /// The feather rail, its label and its figure.
+    ///
+    /// 165 while the figure was a painted label as wide as the value showing —
+    /// one character at the default of 0. It is a field now, reserving the
+    /// widest figure the rail can produce ("250" plus a digit's room for the
+    /// caret), which is about twenty points more. Widened by hand rather than
+    /// measured, because the Select strip is the one
+    /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn` declines to
+    /// sweep and says why.
+    pub const FEATHER: f32 = 185.0;
     // Pan's and Zoom's second sentence are budgeted per tool, on
     // `navigate_hint`'s own third field, because the two lines are a third
     // apart in width and one figure for both drops Pan's while it still fits.
@@ -1774,6 +1787,75 @@ const fn combine_hint() -> &'static str {
     }
 }
 
+/// The strip's brush size rail.
+///
+/// A function rather than a struct literal at the call site, for the reason
+/// `settings::scale_row` is one: a test that restated these numbers would go on
+/// passing while the control it stands for was changed underneath it. This one
+/// carries the whole point of the rail — that its `span` stops at
+/// [`Tweak::span`]'s 1000 while a *typed* figure is held to [`Tweak::range`]'s
+/// `Brush::MAX_SIZE` — so a test of `widgets::typed_value` that built its own
+/// `Rail` would prove the widget respects a limit and not that this rail passes
+/// one. `widgets`' tests read it.
+pub(crate) fn strip_size_rail() -> widgets::Rail<'static> {
+    widgets::Rail {
+        label: "Size",
+        // The rail stops at `tweaks::SIZE_RAIL_TOP` and a size does not: type
+        // 1500 and the brush is 1500 px across. Shared with the brush editor's
+        // own size rail so the two cannot stop in different places.
+        span: Tweak::Size.span(),
+        limit: Tweak::Size.range(),
+        log: true,
+        snap: 0.0,
+        deferred: false,
+        // Bare, not `Tweak::Size.figure()`'s " px": the strip is one unwrapped
+        // row of three rails and a unit on each is nine points it cannot spare.
+        // The label is directly beside it and says which setting it is.
+        figure: widgets::Figure::new(1.0, "", 0),
+    }
+}
+
+/// The strip's opacity rail, and the stabiliser's beside it.
+///
+/// One function for the pair because they are the same control with two names
+/// and two bounds — a percentage of something, dragged and typed the same way.
+/// Stated here rather than at the call site for [`strip_size_rail`]'s reason.
+///
+/// The stabiliser's range is the brush editor's own — 0.0..=0.95, where 1.0
+/// would be a stroke that never reaches the pen — so the two controls cannot
+/// disagree about what full stabilisation is, and it is the typed limit as
+/// well: a percentage rail whose hundred is not reachable is one whose hundred
+/// is not real.
+pub(crate) fn strip_percent_rail(label: &'static str, top: f32) -> widgets::Rail<'static> {
+    widgets::Rail {
+        label,
+        span: 0.0..=top,
+        limit: 0.0..=top,
+        log: false,
+        snap: 0.0,
+        deferred: false,
+        figure: widgets::Figure::new(100.0, "", 0),
+    }
+}
+
+/// The Select tool's feather rail.
+///
+/// Its figure can be typed exactly as the brush rails' can — `inline_slider` is
+/// one control — and what has not changed is that it sets what the *next* shape
+/// will be rather than softening the one standing. [`combine_hint`] is where
+/// the strip says so.
+pub(crate) fn strip_feather_rail() -> widgets::Rail<'static> {
+    widgets::Rail {
+        label: "Feather",
+        span: 0.0..=Selection::MAX_FEATHER,
+        limit: 0.0..=Selection::MAX_FEATHER,
+        log: false,
+        snap: 0.0,
+        deferred: false,
+        figure: widgets::Figure::new(1.0, "", 0),
+    }
+}
+
 /// The horizontal strip of settings for the current tool.
 ///
 /// Size and opacity live here as well as further down the dock because they are
@@ -1802,25 +1884,14 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         if ed.ui.tool.paints() {
             let room = ui.available_width();
             if room >= strip_budget::SIZE {
-                widgets::inline_slider(
-                    ui,
-                    p,
-                    "Size",
-                    &mut ed.brush.size,
-                    Brush::MIN_SIZE..=400.0,
-                    true,
-                    |v| format!("{v:.0}"),
-                );
+                widgets::inline_slider(ui, p, &mut ed.brush.size, &strip_size_rail());
             }
             if room >= strip_budget::SIZE + strip_budget::OPACITY {
                 widgets::inline_slider(
                     ui,
                     p,
-                    "Opacity",
                     &mut ed.brush.opacity,
-                    0.0..=1.0,
-                    false,
-                    |v| format!("{:.0}", v * 100.0),
+                    &strip_percent_rail("Opacity", 1.0),
                 );
             }
             if room >= strip_budget::SIZE + strip_budget::OPACITY + strip_budget::STABILISER {
@@ -1828,22 +1899,12 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 // It used to be a `widgets::chip` — a reading, with a tooltip
                 // saying to go to the brush editor to change it — which put the
                 // one setting a painter adjusts *while* drawing a line behind
-                // two clicks and a tab. `metrics::OPTIONS_STRIP` is 36 points,
-                // so `widgets::number_row`'s two stacked rows do not fit here
-                // and this figure cannot be typed; that is the strip's own
-                // trade and is why `inline_slider` is what the strip uses.
-                //
-                // The range is the brush editor's own — 0.0..=0.95, where 1.0
-                // would be a stroke that never reaches the pen — so the two
-                // controls cannot disagree about what full stabilisation is.
+                // two clicks and a tab.
                 widgets::inline_slider(
                     ui,
                     p,
-                    "Stabiliser",
                     &mut ed.brush.stabilization,
-                    0.0..=Brush::MAX_STABILIZATION,
-                    false,
-                    |v| format!("{:.0}", v * 100.0),
+                    &strip_percent_rail("Stabiliser", Brush::MAX_STABILIZATION),
                 );
             }
         } else if ed.ui.tool == Tool::Transform {
@@ -1884,15 +1945,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             }
             if room >= strip_budget::SELECT_OP + strip_budget::FEATHER {
                 divider(ui, p);
-                widgets::inline_slider(
-                    ui,
-                    p,
-                    "Feather",
-                    &mut ed.ui.selection_feather,
-                    0.0..=Selection::MAX_FEATHER,
-                    false,
-                    |v| format!("{v:.0}"),
-                );
+                widgets::inline_slider(ui, p, &mut ed.ui.selection_feather, &strip_feather_rail());
             }
             ui.add_space(4.0);
             ui.label(
@@ -2410,9 +2463,13 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             p,
             "Size",
             &mut ed.brush.size,
-            Brush::MIN_SIZE..=400.0,
+            // `Tweak::span`, shared with the tool options strip's size rail, so
+            // the two cannot stop in different places. It is not
+            // `Tweak::range`: that is what a size may *be*, and the difference
+            // is the whole of `tweaks::SIZE_RAIL_TOP`'s note.
+            Tweak::Size.span(),
             true,
-            |v| format!("{v:.0} px"),
+            |v| Tweak::Size.format(v),
         );
         // A tip *replaces* the procedural falloff rather than being multiplied
         // into it, so hardness has nothing left to shape. Drawn dead with the
@@ -3810,6 +3867,128 @@ mod tests {
                 "{tool:?}'s second sentence runs to {:.0} points on a {:.0} point strip",
                 widest_overrun.unwrap().1,
                 widest_overrun.unwrap().0
+            );
+        }
+    }
+
+    /// Every rail the strip draws fits the room its budget claims.
+    ///
+    /// [`strip_budget`]'s figures are hand-measured, and the strip is a single
+    /// unwrapped row — so a budget a few points short does not reflow, it draws
+    /// the rail off the right edge of the window. That went from a theoretical
+    /// risk to a live one when the readouts became fields: a painted label is
+    /// as wide as the figure showing, and a field is as wide as the *widest*
+    /// figure its rail can produce, so all four grew at once.
+    ///
+    /// **What is measured is the width the strip *claimed*, not where its
+    /// glyphs landed**, and the first draft got that wrong. A field reserves
+    /// `widgets::figure_width` and paints its galley at one end of that box —
+    /// the left end, on this shape — so up to three characters of allocated
+    /// width carry no shape at all, and the group whose reserve hangs off the
+    /// edge is exactly the last one drawn. The frame's own rect is what every
+    /// allocation adds up to, which is the reading that cannot miss an empty
+    /// reserve; the shapes are read *as well*, because a label in a horizontal
+    /// layout extends rather than wrapping and can therefore draw past what it
+    /// claimed.
+    ///
+    /// Swept rather than sampled, for `neither_navigation_hint_overruns_the_
+    /// strip_it_is_drawn_on`'s reason: a budget is wrong over a *band* of
+    /// widths — from the budget up to what the group actually costs — and the
+    /// slack here is a point or two, so the step is one point rather than the
+    /// five the first draft used.
+    ///
+    /// **It sweeps the brush strip and deliberately not the Select one**, and
+    /// that is worth stating because the Feather is a rail like the other three
+    /// and leaving it out is how a fourth budget goes unmeasured in the very
+    /// commit that widened it. Two readings were tried on Select and neither is
+    /// an assertion worth shipping. The whole strip's right edge is exceeded
+    /// from 200 points up by the **mode hint**, which is drawn unconditionally
+    /// and is in no budget at all — `SelectionMode::Polygon`'s is eighty-four
+    /// characters — so that reading fails on prose this change did not touch.
+    /// Measuring where the rails end instead, by the left edge of the sentence
+    /// that follows them, gives a figure 69 points *larger* at 430..445 than at
+    /// 446 and above **with the identical groups drawn**, which is an anomaly in
+    /// that strip's layout that predates this change and that nobody has
+    /// explained. Asserting over a reading nobody understands is worse than not
+    /// asserting: it fails on the next unrelated edit and gets silenced rather
+    /// than diagnosed. The numbers are here for whoever picks it up, and
+    /// [`strip_budget::FEATHER`] was widened by hand instead.
+    #[test]
+    fn every_rail_on_the_strip_fits_the_budget_that_lets_it_be_drawn() {
+        use crate::editor::Tool;
+        use std::cell::Cell;
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+
+        for (tool, last) in [(Tool::Brush, "Stabiliser")] {
+            let mut worst: Option<(f32, f32)> = None;
+            let mut ever_drew_the_last = false;
+            for step in 0..760 {
+                let width = 200.0 + step as f32;
+                let mut ed = Editor::default();
+                ed.ui.tool = tool;
+                let after_the_rails = umber_core::SelectionMode::default().hint();
+                // Two passes: the first through a fresh context builds the font
+                // atlas, and a field measured against a half-built one is not
+                // the width it settles at.
+                let claimed = Cell::new(f32::NEG_INFINITY);
+                let mut reached = f32::NEG_INFINITY;
+                let mut drew_the_last = false;
+                for _ in 0..2 {
+                    let input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            pos2(0.0, 0.0),
+                            vec2(width, metrics::OPTIONS_STRIP),
+                        )),
+                        ..Default::default()
+                    };
+                    let output = ctx.run_ui(input, |ui| {
+                        let frame = egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                            .show(ui, |ui| {
+                                ui.set_height(metrics::OPTIONS_STRIP);
+                                super::options_strip(ui, &palette, &mut ed);
+                            });
+                        claimed.set(frame.response.rect.right());
+                    });
+                    let mut drawn = Vec::new();
+                    for clipped in &output.shapes {
+                        strings_in(&clipped.shape, &mut drawn);
+                    }
+                    drew_the_last = drawn.iter().any(|d| d.text == last);
+                    reached = match drawn.iter().find(|d| d.text == after_the_rails) {
+                        // Where the rails finished: the sentence that follows
+                        // them starts there, reserves and all.
+                        Some(prose) => prose.rect.left(),
+                        // Nothing follows them, so what they claimed *is* the
+                        // strip's own width. Read off the frame rather than off
+                        // the shapes, because a field reserves the widest figure
+                        // its rail can show and paints its galley at one end of
+                        // that box — up to three characters of allocated width
+                        // carry no shape at all, and the group whose reserve
+                        // hangs off the edge is exactly the last one drawn.
+                        None => claimed.get(),
+                    };
+                }
+                ever_drew_the_last |= drew_the_last;
+                // A rail ending exactly on the strip's own right margin is
+                // inside it. Half a point of slack for the frame's rounding.
+                if reached.is_finite() && reached > width + 0.5 {
+                    worst = Some((width, reached));
+                }
+            }
+            assert!(
+                ever_drew_the_last,
+                "{tool:?}'s {last} rail was never drawn at any width, so this proved nothing"
+            );
+            assert!(
+                worst.is_none(),
+                "{tool:?}'s rails reach {:.1} points on a {:.0} point strip",
+                worst.unwrap().1,
+                worst.unwrap().0
             );
         }
     }
