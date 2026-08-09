@@ -1290,7 +1290,7 @@ fn typed_rail(
                     figure_width(ui, p, rail).clamp(MIN_TRACK, header.width().max(MIN_TRACK));
                 let field =
                     Rect::from_min_max(pos2(header.right() - room, header.top()), header.max);
-                typed = number_field(ui, p, field, id, shown, rail);
+                typed = number_field(ui, p, field, id, shown, rail, egui::Align::RIGHT);
 
                 let (track_row, response) = ui
                     .allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::click_and_drag());
@@ -1332,7 +1332,7 @@ fn typed_rail(
             let room = figure_width(ui, p, rail);
             let (field, _) =
                 ui.allocate_exact_size(vec2(room, metrics::SLIDER_ROW), Sense::hover());
-            typed = number_field(ui, p, field, id, shown, rail);
+            typed = number_field(ui, p, field, id, shown, rail, egui::Align::LEFT);
             response
         }
     };
@@ -1394,6 +1394,7 @@ fn number_field(
     id: egui::Id,
     value: f32,
     rail: &Rail<'_>,
+    align: egui::Align,
 ) -> Option<f32> {
     let edit_id = id.with("field");
     let buffer_id = id.with("typed");
@@ -1413,10 +1414,17 @@ fn number_field(
     let editing = held.is_some();
     let mut text = held.unwrap_or_else(|| rail.figure.format(value));
 
+    // The field is as wide as the widest figure its rail can show, so the
+    // figure has to be pinned to whichever end of that box faces the rail — a
+    // number floating in the middle of its own reserve reads as belonging to
+    // whatever is on the other side of the gap. On a panel row the rail is
+    // beneath and the figure is the right end of the header; on the strip the
+    // rail is to the left of it and a right-aligned figure sat closer to the
+    // next control's label than to its own track.
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     let edit = child.add(
         egui::TextEdit::singleline(&mut text)
@@ -1424,7 +1432,7 @@ fn number_field(
             .frame(egui::Frame::NONE)
             .margin(egui::Margin::ZERO)
             .desired_width(rect.width())
-            .horizontal_align(egui::Align::RIGHT)
+            .horizontal_align(align)
             .clip_text(true)
             .font(font)
             .text_color(p.text),
