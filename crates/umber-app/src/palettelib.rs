@@ -373,7 +373,11 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         Icon::Pencil,
         state.editing,
         true,
-        if state.editing { EDITING_ON } else { EDITING_OFF },
+        if state.editing {
+            EDITING_ON
+        } else {
+            EDITING_OFF
+        },
     ) {
         state.editing = !state.editing;
         // Whatever gesture was in flight is abandoned with the mode. A drag
@@ -1003,8 +1007,7 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
         // hover it then swallows — and a mode somebody switches is not that.
         let marks = editing.then(|| {
             let mark = remove_rect(cell);
-            let remove =
-                ui.interact(mark, ui.id().with(("swatch-remove", index)), Sense::click());
+            let remove = ui.interact(mark, ui.id().with(("swatch-remove", index)), Sense::click());
             let naming = name_rect(cell);
             let name = ui.interact(naming, ui.id().with(("swatch-name", index)), Sense::click());
             (mark, remove, naming, name)
@@ -1035,7 +1038,8 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
             // somebody is typing into. A mark that is only there to identify a
             // colour has no business being the one that can throw it away.
             if revealed || named == Some(index) {
-                ui.painter().rect_filled(*naming, metrics::RADIUS, p.popover);
+                ui.painter()
+                    .rect_filled(*naming, metrics::RADIUS, p.popover);
                 crate::icons::draw(
                     ui.painter(),
                     naming.shrink(2.0),
@@ -2391,7 +2395,8 @@ mod tests {
                         changed_with_editing_on += usize::from(after != before);
                     } else {
                         assert_eq!(
-                            after, before,
+                            after,
+                            before,
                             "a {} at {at:?} changed a palette whose module is read-only",
                             if slow { "drag" } else { "click" }
                         );
