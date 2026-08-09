@@ -3894,6 +3894,75 @@ mod tests {
         }
     }
 
+    /// The eyedropper's second sentence does not run off the strip either.
+    ///
+    /// The same failure `neither_navigation_hint_overruns_the_strip_it_is_
+    /// drawn_on` guards and the same sweep, against `strip_budget::EYEDROPPER`
+    /// rather than a per-tool figure. A separate test because the sentence does
+    /// not come from `navigate_hint` — it comes from `syspick`, and *which* of
+    /// its two readings is drawn depends on the platform. Both are within a few
+    /// characters of each other, so one budget covers them; what this asserts
+    /// is that whichever one this build carries fits.
+    #[test]
+    fn the_eyedroppers_hint_does_not_overrun_the_strip_it_is_drawn_on() {
+        use crate::editor::Tool;
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+        let sentence = crate::syspick::unreadable_reason();
+        let mut widest_overrun: Option<(f32, f32)> = None;
+        let mut ever_drew_it = false;
+        for step in 0..140 {
+            let width = 200.0 + step as f32 * 5.0;
+            let mut ed = Editor::default();
+            ed.ui.tool = Tool::Eyedropper;
+            // Two passes, for the reason the navigation sweep takes two: text
+            // measured against a half-built font atlas is not the width it
+            // settles at.
+            let mut drawn = Vec::new();
+            for _ in 0..2 {
+                drawn.clear();
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(width, metrics::OPTIONS_STRIP),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                        .show(ui, |ui| {
+                            ui.set_height(metrics::OPTIONS_STRIP);
+                            super::options_strip(ui, &palette, &mut ed);
+                        });
+                });
+                for clipped in &output.shapes {
+                    strings_in(&clipped.shape, &mut drawn);
+                }
+            }
+            if let Some(second) = drawn.iter().find(|d| d.text == sentence) {
+                ever_drew_it = true;
+                if second.rect.right() > width {
+                    widest_overrun = Some((width, second.rect.right()));
+                }
+            }
+        }
+        assert!(
+            ever_drew_it,
+            "the eyedropper's second sentence was never drawn at any width, so \
+             this test proved nothing"
+        );
+        assert!(
+            widest_overrun.is_none(),
+            "it runs to {:.0} points on a {:.0} point strip",
+            widest_overrun.unwrap().1,
+            widest_overrun.unwrap().0
+        );
+    }
+
     /// Every category [`Action::category`] can answer with is either a menu
     /// this test knows or a category deliberately not on the menu bar.
     ///

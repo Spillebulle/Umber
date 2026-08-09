@@ -240,6 +240,27 @@ pub struct UmberApp {
     /// copying out of one document and into another is most of what a clipboard
     /// is for.
     sysclip: sysclip::Board,
+    /// Where the eyedropper last read a colour from, in physical window pixels.
+    ///
+    /// **A pick is once per frame, never once per pointer event, and that is
+    /// measured rather than cautious.** `examples/measure-screenpick.rs` puts
+    /// one `GetPixel` against the desktop at about 7 ms on this machine — with
+    /// `GetDC`/`ReleaseDC` at 9 µs, so there is no handle to cache and nothing
+    /// to make cheaper. 7 ms is one refresh of a 144 Hz display, which is what
+    /// it is: the read waits for the compositor rather than computing
+    /// anything. Pointer events arrive far faster than that, so sampling on
+    /// each one would put the event loop minutes behind a drag. The canvas half
+    /// blocks on the GPU for its own reasons and answers to the same rule.
+    ///
+    /// So [`Self::pointer_moved`] records the position and asks for a frame,
+    /// and [`Self::render`] takes at most one sample per frame — skipping it
+    /// where the pointer has not moved since the last one, which is what keeps
+    /// a stationary press from paying a refresh per frame for ever.
+    ///
+    /// On the application rather than in `Editor` for the reason `put_down_at`
+    /// is: it is the pointer's state in physical pixels, and nothing about it
+    /// survives the release.
+    picked_at: Option<Vec2>,
 }
 
 /// How far the pointer may travel from a press outside the transform box before
@@ -341,6 +362,7 @@ impl UmberApp {
             repaint_at: None,
             put_down_at: None,
             sysclip: sysclip::Board::default(),
+            picked_at: None,
         }
     }
 
@@ -2528,15 +2550,52 @@ impl UmberApp {
         )
     }
 
-    /// Take the colour under the cursor as the painting colour.
+    /// Take one sample if the eyedropper is being dragged and has moved.
+    ///
+    /// Called once per frame, from [`Self::render`]. The throttle is the whole
+    /// reason it exists — see [`Self::picked_at`] for the measurement — and the
+    /// "has moved" half is what stops a press held still from paying a display
+    /// refresh on every frame for as long as somebody thinks about it.
+    ///
+    /// **The release takes the last colour that was drawn, not a fresh read at
+    /// the position let go of**, and that is decided rather than overlooked.
+    /// The interaction leaves `Picking` before the next frame, so the last
+    /// sample stands — which means what the swatch showed is what the artist
+    /// keeps. A read on the release would be truer to where the pointer ended
+    /// and would let the colour *change* at the moment of letting go, which is
+    /// the same jump-at-pointer-up this codebase refuses everywhere else. The
+    /// staleness it costs is at most one frame, and nobody reads a colour off a
+    /// swatch during a flick.
+    fn pick_this_frame(&mut self) {
+        if self.editor.interaction != Interaction::Picking {
+            // Not picking, so nothing to remember. Cleared here rather than at
+            // the release so that every path out of the gesture — a release, a
+            // cancel, a second finger, a tab switch — is covered by one line
+            // instead of by five that have to agree.
+            self.picked_at = None;
+            return;
+        }
+        if self.picked_at == Some(self.editor.cursor) {
+            return;
+        }
+        self.pick_now();
+    }
+
+    /// Take the colour under the cursor as the painting colour, now.
     ///
     /// The one route in, from `gesture::Press::Eyedropper` — which is Alt with
     /// any tool in hand, the eyedropper tool's own press, and the pen's
-    /// Alt-tap — and from every frame of the drag that follows. Where the
-    /// pointer has left the window it reads the desktop instead; see
+    /// Alt-tap — and from [`Self::pick_this_frame`] for the drag that follows.
+    /// Where the pointer has left the window it reads the desktop instead; see
     /// [`syspick`], and note that this is a second source of *pixels* and not
     /// a second route to a colour, because both ends come back through
     /// `Color::from_srgb_u8` here.
+    fn pick_now(&mut self) {
+        self.picked_at = Some(self.editor.cursor);
+        self.pick_colour_at_cursor();
+    }
+
+    /// The read itself, wherever the pointer is.
     fn pick_colour_at_cursor(&mut self) {
         let aim = self.pick_aim(self.editor.cursor);
         match aim {
@@ -3000,6 +3059,14 @@ impl UmberApp {
         // after the UI — it needs the frame's encoder — which is too late to be
         // the only place this is asked.
         self.editor.thumbs.follow(self.editor.session.active_id());
+
+        // The eyedropper's drag, at most once a frame — which is where the
+        // sample belongs rather than on the pointer event, because a read of
+        // the desktop costs a whole display refresh and a read of the canvas
+        // blocks on the GPU. `Self::picked_at` has the figures. Before the
+        // interface is built, so the swatch this frame draws is the colour
+        // under the pointer *now* rather than the one from the frame before.
+        self.pick_this_frame();
 
         let Some(gfx) = self.gfx.as_mut() else { return };
 
@@ -4170,11 +4237,15 @@ impl UmberApp {
                 // outside the window is reachable: winit keeps the mouse
                 // capture for as long as a button is held, so the moves go on
                 // arriving once the pointer has left. `syspick`'s module docs
-                // have it. Picking once here as well means a plain click still
-                // takes the colour it landed on, which is what an Alt-click
-                // has always done.
+                // have it.
                 self.editor.interaction = Interaction::Picking;
-                self.pick_colour_at_cursor();
+                // Once here as well as on the frame, so that a press and a
+                // release inside one frame still takes the colour it landed
+                // on — which is what an Alt-click has always done and is most
+                // of how this gesture is used. `pick_now` records where, so
+                // the frame does not immediately pay a second read for the
+                // same pixel.
+                self.pick_now();
             }
         }
         decision
@@ -4196,14 +4267,13 @@ impl UmberApp {
                 let doc = self.editor.screen_to_doc(pos);
                 self.editor.selection_moved(doc);
             }
-            // The colour follows the pointer for the whole drag, applied live
-            // rather than at the release. That is what gives the gesture a
-            // readout at all: the pointer is over somebody else's window, so
-            // there is nowhere near it for Umber to draw one, and the Colour
-            // module's swatch is what moves instead. It is also what every
-            // other application does with this gesture. `Editor::cursor` was
-            // written just above, which is what `pick_colour_at_cursor` reads.
-            Interaction::Picking => self.pick_colour_at_cursor(),
+            // Nothing to do but ask for a frame, which the return below does:
+            // the sample itself is taken once per *frame* rather than once per
+            // event, because a read of the desktop costs a display refresh and
+            // a read of the canvas blocks on the GPU. `Self::picked_at` has the
+            // measurement. `Editor::cursor` was written just above, so the
+            // frame already knows where to look.
+            Interaction::Picking => {}
             Interaction::Panning => {
                 let delta = pos - self.editor.last_cursor;
                 self.editor.camera.pan_by_screen(delta);

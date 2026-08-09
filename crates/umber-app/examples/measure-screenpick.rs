@@ -9,10 +9,13 @@
 //! rather than believed, and CLAUDE.md says to re-run them before rebuilding an
 //! argument from memory. This one answers:
 //!
-//! * **Is `GetPixel` cheap enough to call once per pointer event?** The
-//!   eyedropper's drag samples on every `CursorMoved`, which on a gaming mouse
-//!   is a thousand a second. If a read costs a millisecond it has to be
-//!   throttled and `syspick` says nothing about throttling.
+//! * **How often may a pick be taken?** The first run of this answered the
+//!   question the design had assumed: a read is about **7 ms**, which is one
+//!   refresh of a 144 Hz display, and `GetDC`/`ReleaseDC` around it is 9 µs. So
+//!   there is no handle to cache, the call cannot be made cheaper, and the
+//!   sample cannot live on the pointer event. `App::picked_at` is the throttle
+//!   that came out of it. A machine with a 60 Hz panel should read about 16 ms
+//!   here, because the figure is the display's.
 //! * **Does the simple route lose anything the harder one keeps?** `GetPixel`
 //!   is one GDI call; `BitBlt` into a memory bitmap plus `GetDIBits` is five,
 //!   and is the route that could carry `CAPTUREBLT` for layered windows.
@@ -90,7 +93,7 @@ mod windows {
                     info.bmiHeader.biHeight = -1;
                     info.bmiHeader.biPlanes = 1;
                     info.bmiHeader.biBitCount = 32;
-                    info.bmiHeader.biCompression = BI_RGB as u32;
+                    info.bmiHeader.biCompression = BI_RGB;
                     let mut px = [0u8; 4];
                     if GetDIBits(
                         mem,
@@ -145,7 +148,12 @@ mod windows {
         ];
 
         println!("{:<26} {:>14} {:>14}  agree", "at", "GetPixel", "BitBlt");
-        let mut disagreements = 0;
+        #[derive(Default)]
+        struct Disagreements {
+            inside: u32,
+            outside: u32,
+        }
+        let mut disagreements = Disagreements::default();
         for (name, x, y) in &probes {
             let a = syspick::sample(*x, *y);
             let b = via_bitblt(*x, *y);
@@ -154,8 +162,13 @@ mod windows {
                 None => "      -".to_string(),
             };
             let agree = a == b;
+            let inside = *x >= vx && *y >= vy && *x < vx + vw && *y < vy + vh;
             if !agree {
-                disagreements += 1;
+                if inside {
+                    disagreements.inside += 1;
+                } else {
+                    disagreements.outside += 1;
+                }
             }
             println!(
                 "{name:<26} {:>14} {:>14}  {}",
@@ -165,14 +178,32 @@ mod windows {
             );
         }
         println!();
-        if disagreements == 0 {
-            println!("The two routes agree everywhere. `syspick`'s one-call `GetPixel`");
-            println!("is losing nothing the five-call BitBlt route would have kept.");
+        // A disagreement *inside* the virtual screen would be a real finding —
+        // two routes reading the same surface and getting different pixels.
+        // Outside it, the disagreement is the point: `GetPixel` answers
+        // `CLR_INVALID` where `BitBlt` succeeds against nothing and hands back
+        // black, and "there is nothing there" against "it is black there" is
+        // exactly the distinction the drag needs. So the two counts are
+        // separate; the first must be zero and the second is expected.
+        if disagreements.inside == 0 {
+            println!("The two routes agree on every pixel that exists.");
         } else {
-            println!("{disagreements} disagreement(s). Read `syspick`'s note on hardware");
+            println!(
+                "{} disagreement(s) on real pixels. Read `syspick`'s note on hardware",
+                disagreements.inside
+            );
             println!("overlays and layered windows before changing anything: a BitBlt");
             println!("without CAPTUREBLT reads the same surface, so a difference here");
             println!("is something else and is worth chasing.");
+        }
+        if disagreements.outside > 0 {
+            println!(
+                "{} outside the virtual screen, where GetPixel refuses and BitBlt",
+                disagreements.outside
+            );
+            println!("hands back black. That is why `syspick` uses GetPixel: a pick in");
+            println!("the gap between two screens of different heights must read as");
+            println!("nothing rather than as black.");
         }
         println!();
 
@@ -212,9 +243,41 @@ mod windows {
         }
         let per_blt = t.elapsed().as_secs_f64() * 1e6 / f64::from(RUNS);
         println!("BitBlt + GetDIBits, same:                    {per_blt:.1} us per read");
+
+        // Where the cost is. If the answer is `GetDC`, holding a screen DC for
+        // the length of the drag is the fix and `syspick` would need state; if
+        // it is `GetPixel`, nothing about the call can be made cheaper and the
+        // sample has to be throttled to once per frame instead. That is a
+        // design question and this is what decides it, so both halves are
+        // timed separately rather than one figure being blamed.
+        //
+        // SAFETY: as `syspick::sample`, and the DC is released once at the end.
+        let (per_dc, per_pixel) = unsafe {
+            use windows_sys::Win32::Graphics::Gdi::GetPixel;
+            let t = Instant::now();
+            for _ in 0..RUNS {
+                let dc = GetDC(std::ptr::null_mut());
+                std::hint::black_box(dc);
+                ReleaseDC(std::ptr::null_mut(), dc);
+            }
+            let dc_only = t.elapsed().as_secs_f64() * 1e6 / f64::from(RUNS);
+
+            let dc = GetDC(std::ptr::null_mut());
+            let t = Instant::now();
+            for _ in 0..RUNS {
+                std::hint::black_box(GetPixel(dc, cx, cy));
+            }
+            let pixel_only = t.elapsed().as_secs_f64() * 1e6 / f64::from(RUNS);
+            ReleaseDC(std::ptr::null_mut(), dc);
+            (dc_only, pixel_only)
+        };
+        println!("GetDC + ReleaseDC alone:                     {per_dc:.1} us");
+        println!("GetPixel alone, on a DC already held:        {per_pixel:.1} us");
         println!();
-        println!("A pointer event arrives at most once a millisecond. Anything under");
-        println!("about 100 us is comfortably once per event; anything near 1000 us");
-        println!("means the drag has to throttle, which `syspick` does not do.");
+        println!("A pointer event arrives at most once a millisecond, so anything");
+        println!("near 1000 us has to be throttled rather than sampled per event.");
+        println!("Which half carries the cost decides how: an expensive GetDC means");
+        println!("holding one for the drag, an expensive GetPixel means there is");
+        println!("nothing to hold and the sample belongs on the frame instead.");
     }
 }

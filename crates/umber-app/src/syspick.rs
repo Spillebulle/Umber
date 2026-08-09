@@ -66,6 +66,28 @@
 //! options strip says why. A control that is live where it cannot work is the
 //! thing this project refuses everywhere else.
 //!
+//! # A read costs a display refresh, so it is once per frame
+//!
+//! `examples/measure-screenpick.rs`, on a two-monitor 144 Hz desktop: one
+//! `GetPixel` against the screen DC is **about 7 ms**, and `GetDC` plus
+//! `ReleaseDC` around it is **9 µs**. So there is no handle worth caching and
+//! nothing about the call to make cheaper — 7 ms is 1/144 s, which is what the
+//! figure actually is. The read waits for the compositor rather than computing
+//! anything, and it will be one refresh of whatever display it is asked about.
+//! The `BitBlt` route measured the same, which is the other half of the same
+//! observation.
+//!
+//! That decides where the sample goes. Pointer events arrive far faster than a
+//! refresh, so a read per event puts the event loop minutes behind a drag;
+//! `App::picked_at` is the throttle and `App::render` is where the one sample
+//! per frame is taken. **Re-run the example before changing any of that**, and
+//! note that a machine with a 60 Hz panel should read about 16 ms rather than
+//! 7 — the number is the display's, not the code's.
+//!
+//! It also settles the loupe from a second direction: a `BitBlt` of a block
+//! costs what a `BitBlt` of one pixel costs, because the wait is the wait. A
+//! magnifier would be no more expensive to *read* than this already is.
+//!
 //! # What is subtly wrong even on Windows
 //!
 //! Say these rather than discover them. `examples/measure-screenpick.rs` is
@@ -87,9 +109,18 @@
 //!   those reads whatever is behind it — usually black. `CAPTUREBLT` is the
 //!   flag that widens a `BitBlt` to include layered windows and it is
 //!   deliberately not used: it forces a repaint of the whole desktop, which at
-//!   one call per pointer event is a visible flicker across every window on the
-//!   machine.
+//!   one call per frame of a drag is a visible flicker across every window on
+//!   the machine.
+//! * **Off every monitor must read as nothing and not as black**, and that is
+//!   why this is `GetPixel` rather than the `BitBlt` route. Measured: outside
+//!   the virtual screen `GetPixel` answers `CLR_INVALID` where a `BitBlt`
+//!   succeeds against nothing and hands back `[0, 0, 0]`. Two monitors of
+//!   different heights leave a real gap that a drag crosses, and a picker that
+//!   silently took black there would be worse than one that took nothing.
 //! * **Multi-monitor is right, and only because the process is DPI aware.**
+//!   The example was run on a desktop whose virtual screen origin is
+//!   `(-2560, 0)` — a second monitor left of the primary one — and the reads at
+//!   its corners answered, negative coordinates included.
 //!   winit calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` before
 //!   any window exists, so `Window::inner_position` is in true virtual-screen
 //!   physical pixels and the screen DC's coordinate space is the same one —
