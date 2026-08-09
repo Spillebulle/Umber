@@ -7,18 +7,18 @@
 //! link out of a public item into a private one, and a broken link is worse
 //! than a name. Nothing below this module knows the desktop exists, and the
 //! canvas half of the eyedropper is untouched — it still goes through
-//! `CanvasRenderer::pick_colour`, which reuses the screen composite pass, so
+//! `CanvasRenderer::pick_patch`, which reuses the screen composite pass, so
 //! there is exactly one path from a pixel to a colour inside the document and
-//! this adds a second one only for pixels that are outside it.
+//! this adds a second one only for pixels that are not in it.
 //!
 //! **The decision is pure and the platform call is the thin part**, which is
 //! `sysclip::decide`'s shape and is the only reason any of this is testable.
 //! [`aim`] is a function of five readings — where the pointer is, whether that
 //! is over the picture, how big the client area is, where it sits on the
 //! desktop, and whether this build can read the desktop at all — and it is what
-//! says whether a sample belongs to the canvas, to the desktop, or to nothing
-//! at all. [`sample`] is nine lines of GDI under a `cfg`. No test touches the
-//! screen.
+//! says whether a sample belongs to the canvas, to the screen, or to nothing at
+//! all. [`sample`] is nine lines of GDI under a `cfg` and [`sample_patch`] is
+//! the same call over a block. No test touches the screen.
 //!
 //! # How the pointer gets outside the window at all
 //!
@@ -86,9 +86,12 @@
 //!   nobody working on Umber has a Mac. `CGDisplayCreateImage` is the call.
 //!
 //! On all three [`DESKTOP_READABLE`] is false, [`aim`] answers
-//! [`Aim::Unreachable`] the moment the pointer leaves the window, and the tool
-//! options strip says why. A control that is live where it cannot work is the
-//! thing this project refuses everywhere else.
+//! [`Aim::Unreachable`] the moment the pointer leaves the *canvas*, and the
+//! tool options strip says why. A control that is live where it cannot work is
+//! the thing this project refuses everywhere else. The boundary used to be the
+//! window rather than the canvas, and moved when Umber's own chrome became a
+//! screen read: there is one reason a platform cannot answer, so there is one
+//! variant for it.
 //!
 //! # A read costs a display refresh, so it is once per frame
 //!

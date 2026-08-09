@@ -4561,7 +4561,7 @@ impl UmberApp {
                 // Put back the wobble the tap made of the size before reading
                 // the colour: a click is not allowed to have resized anything.
                 self.editor.brush.size = resize.from;
-                // Through `pick_now` and not `pick_colour_at_cursor`, so that
+                // Through `pick_now` and not `take_sample`, so that
                 // "one route in" is true of the function that claims it rather
                 // than of two functions that happen to agree. It is still a
                 // click: no `Interaction::Picking`, so nothing follows the
