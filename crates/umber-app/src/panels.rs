@@ -2343,9 +2343,13 @@ fn history_row(ui: &mut Ui, p: &Palette, row: &HistoryRow) -> egui::Response {
     }
 
     // The marker is the cursor: filled and accented where the document stands,
-    // hollow behind it, and hollow and dim ahead of it.
+    // hollow behind it, and hollow and dim ahead of it. `ink` carries the dot,
+    // the icon and the label, so it is a row of small text as well as a mark —
+    // and the current row is the one drawn on `control_active`, where the
+    // accent is 1.88:1 in MediaBog. `active_ink` keeps the accent in the two
+    // themes it reads in and hands the presets their own selected-row ink.
     let ink = match (row.current, row.applied) {
-        (true, _) => p.accent,
+        (true, _) => p.active_ink(),
         (false, true) => p.text,
         (false, false) => p.text_dim.gamma_multiply(0.55),
     };
@@ -2837,9 +2841,12 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
         .show(root, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(
+                    // The strip is filled with `control_active`, so the heading
+                    // takes the ink that reads on it — 10.5 points of accent on
+                    // that fill is 1.88:1 in MediaBog. See `Palette::active_ink`.
                     egui::RichText::new("LAYOUT EDIT")
                         .size(text::TINY)
-                        .color(p.accent)
+                        .color(p.active_ink())
                         .strong(),
                 );
                 ui.add_space(4.0);
@@ -3683,6 +3690,52 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         println!("wrote 3 shots to {}", dir.display());
+    }
+
+    /// The tool rail with a tool selected, in every theme.
+    ///
+    /// The selected tool is `control_active` under [`Palette::active_ink`], and
+    /// that pairing appears in **no** other picture this crate writes: the
+    /// theme shots draw the Settings dialog, whose only `control_active` is the
+    /// Shortcuts page's armed row, and `layers_panel_preview` draws Graphite
+    /// alone. So a selection colour taken from another application — which is
+    /// the whole point of four of the six themes — was a thing nobody could
+    /// look at, and the accent on one of those fills reads 1.88:1 in MediaBog.
+    /// Six shots is what makes "does it still read as selected" a question
+    /// somebody can answer.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app tool_rail_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn tool_rail_preview() {
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::{ThemeKind, metrics};
+        use egui::vec2;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tool-rail");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        for kind in ThemeKind::ALL {
+            let mut ed = Editor::default();
+            ed.ui.theme = kind;
+            ed.ui.tool = crate::editor::Tool::Select;
+            let palette = ed.palette();
+            let field = vec2(metrics::TOOL_RAIL, 190.0);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                super::tools_body(root, &palette, &mut ed);
+            });
+            docshot::write_png(&dir.join(format!("{}.png", kind.id())), &image)
+                .expect("write the png");
+        }
+        println!("wrote {} shots to {}", ThemeKind::ALL.len(), dir.display());
     }
 
     /// The mark a drag puts on the list, at each nesting it can land at.

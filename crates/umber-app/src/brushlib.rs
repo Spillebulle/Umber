@@ -2053,9 +2053,12 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
         .show(root, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(
+                    // On `control_active`, like `panels::edit_bar`'s heading
+                    // above it and for the same reason: the accent on that fill
+                    // is 1.88:1 in MediaBog. See `Palette::active_ink`.
                     RichText::new("BRUSH TIP")
                         .size(text::TINY)
-                        .color(p.accent)
+                        .color(p.active_ink())
                         .strong(),
                 );
                 ui.add_space(4.0);

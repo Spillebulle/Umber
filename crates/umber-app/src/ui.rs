@@ -2808,6 +2808,17 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             .corner_radius(6)
             .inner_margin(Margin::symmetric(10, 6))
             .show(ui, |ui| {
+                // Both labels step up a rank on the selected row, because that
+                // row is the one drawn on `control_active` and the fills the
+                // preset themes take from their own applications are bright:
+                // `text` on MediaBog's selection blue is 2.60:1 and `text_dim`
+                // is 1.43:1. Every other selected row in this interface already
+                // inks its primary line `text_strong`; this one did not.
+                let (primary, secondary) = if selected {
+                    (p.text_strong, p.text)
+                } else {
+                    (p.text, p.text_dim)
+                };
                 ui.horizontal(|ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
@@ -2817,7 +2828,7 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                             entry.input.label()
                         ))
                         .size(text::TINY)
-                        .color(p.text),
+                        .color(primary),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, p, Icon::Trash, true, "Remove this input") {
@@ -2830,7 +2841,7 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                                 entry.target.format(entry.high)
                             ))
                             .size(text::TINY)
-                            .color(p.text_dim),
+                            .color(secondary),
                         );
                     });
                 });
@@ -4601,6 +4612,11 @@ mod tests {
         for (theme, ink) in [
             (ThemeKind::Graphite, "graphite"),
             (ThemeKind::Paper, "paper"),
+            // Krita's pit is the 50% grey, which is the surface the token this
+            // thumb used to be inked with could say nothing on. A shot of the
+            // two extremes says nothing about the middle, which is exactly the
+            // mistake recorded above one level up.
+            (ThemeKind::Krita, "krita"),
         ] {
             for (name, zoom, centre) in [
                 ("1-zoomed-in", 1.0, middle),

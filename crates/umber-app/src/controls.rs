@@ -277,13 +277,18 @@ pub fn keycap(
     let (rect, response) =
         ui.allocate_exact_size(vec2(text_w + 16.0 + cross, 20.0), Sense::click());
 
-    // The design gives a clashing cap its own warm palette (#2A1D18 fill,
-    // #6E4034 border, #D08770 ink). `theme::Palette` carries no caution colour
-    // yet, so the nearest warm tokens stand in: `control_active` is the warm
-    // tinted fill and `accent` is the warm ink, in both themes.
+    // The design gives a clashing cap its own warm palette — #2A1D18 fill,
+    // #6E4034 border, #D08770 ink — and those are Graphite's `warning_bg`,
+    // `warning_border` and `warning` byte for byte. This used to stand
+    // `control_active`, `accent_dim` and `accent` in for them, on the reasoning
+    // that the palette carried no caution colour yet; it has carried one for a
+    // while, and the stand-in was wrong twice. It said "selected" where the
+    // design says "look at this", and the accent on `control_active` is 1.88:1
+    // in MediaBog — a clash nobody can read is a warning that is not one.
+    // `warning_ink_contrasts_with_its_own_fill` holds the real pair to 4.5.
     let (fill, border, ink) = match state {
         CapState::Bound => (p.window, p.border, p.text),
-        CapState::Clashing => (p.control_active, p.accent_dim, p.accent),
+        CapState::Clashing => (p.warning_bg, p.warning_border, p.warning),
         CapState::Unbound => (Color32::TRANSPARENT, p.border, p.text_dim),
     };
 

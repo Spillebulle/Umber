@@ -1661,10 +1661,17 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     brush_sample(painter, p, sample, row.brush, row.tip);
 
     // A dot marks the rows that are yours — the ones the browser will let you
-    // rename and delete.
+    // rename and delete. On a selected row it sits on `control_active`, where
+    // the accent is 1.88:1 in MediaBog, so it takes `active_ink` there; on
+    // every other row the accent reads against the panel and stays.
     let mut right = rect.right() - 7.0 - row.trailing;
     if row.user {
-        painter.circle_filled(pos2(right - 3.0, rect.center().y), 3.0, p.accent);
+        let dot = if row.selected {
+            p.active_ink()
+        } else {
+            p.accent
+        };
+        painter.circle_filled(pos2(right - 3.0, rect.center().y), 3.0, dot);
         right -= 12.0;
     }
 
@@ -2948,7 +2955,11 @@ pub fn tool_button(ui: &mut Ui, p: &Palette, icon: Icon, active: bool, tooltip: 
         painter.rect_filled(rect, metrics::RADIUS_LARGE, fill);
     }
 
-    let colour = if active { p.accent } else { p.text_muted };
+    // `active_ink` rather than the accent: this is the selected tool and it is
+    // on screen permanently, and the accent on `control_active` is 1.88:1 in
+    // MediaBog. Graphite and Paper still get the ochre, which is what the
+    // design draws; see `Palette::active_ink`.
+    let colour = if active { p.active_ink() } else { p.text_muted };
     icons::draw(painter, rect.shrink(7.0), icon, colour);
 
     response.on_hover_text(tooltip)

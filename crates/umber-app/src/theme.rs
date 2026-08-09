@@ -591,6 +591,11 @@ pub struct Palette {
     pub control: Color32,
     pub control_hover: Color32,
     /// Selected tool / active pill.
+    ///
+    /// A *fill*, and the one control token that is. What goes on it is
+    /// [`Palette::active_ink`] or `text_strong`, never the accent directly:
+    /// the four preset themes take their selection colour from the application
+    /// they are named for, and the accent on those reads down to 1.88:1.
     pub control_active: Color32,
     pub text_strong: Color32,
     pub text: Color32,
@@ -1097,6 +1102,42 @@ impl Palette {
     /// because the number's origin is a file rather than this process.
     pub fn link_colour(&self, group: u8) -> Color32 {
         self.link_colours[group as usize % self.link_colours.len()]
+    }
+
+    /// The ink a mark takes on [`Palette::control_active`] — the accent where
+    /// it reads against that fill, and `text_strong` where it does not.
+    ///
+    /// **Both halves are live in the shipped themes, and that is the whole
+    /// reason it is a measurement rather than a token.** `control_active` is
+    /// the selected state, and Graphite and Paper tint it faintly towards the
+    /// accent, so the accent on it is 4.74:1 and 3.80:1 — an ochre mark on a
+    /// warm fill, which is what the design draws. The four preset themes take
+    /// their selection colour from the application they are named for, and
+    /// those are *saturated*: the accent on one reads 2.60:1 in Clip Studio's
+    /// slate, 2.27 in Photoshop's grey, 2.06 in Krita's blue and 1.88 in
+    /// MediBang's — under the 3:1 the accent is already held to on `control`,
+    /// and worse for every one of the other three accents, down to 1.24.
+    ///
+    /// Neither fixed answer will do. Always-accent is the defect. Always-
+    /// `text_strong` would take the ochre off the default theme's tool rail,
+    /// its layout-edit strip and its history cursor to fix four themes that
+    /// were not the design — and it is unnecessary, because the preset themes'
+    /// own applications draw a near-white on those fills, so the fallback is
+    /// the faithful answer there rather than a compromise.
+    ///
+    /// A per-theme table is the other alternative and cannot be kept true: the
+    /// accent is a preference on top of the theme, so it would be twenty-four
+    /// authored answers today, and the theme editor lets somebody set
+    /// `control_active` and `accent` to anything at all. `an_active_mark_reads_
+    /// on_the_fill_it_is_drawn_on` is the guard, and it drives *both* readings
+    /// — a rule with two answers that only ever takes one is a rule nothing
+    /// tests.
+    pub fn active_ink(&self) -> Color32 {
+        if contrast::ratio(self.accent, self.control_active) >= contrast::READABLE {
+            self.accent
+        } else {
+            self.text_strong
+        }
     }
 
     /// The theme in its authored accent.
@@ -1870,6 +1911,23 @@ mod tests {
                 r >= 3.0,
                 "{kind:?}: text_strong on control_active is {r:.2}:1",
             );
+            // `text` is the *secondary* line on such a row — the modulation
+            // list's range figure is the one place it lands there — and 2.59 is
+            // what this palette actually reaches rather than a round number,
+            // exactly as `text_dim` on `window` above. MediaBog's is 2.5976,
+            // and the figure is written to the place it fails at rather than
+            // rounded, because a bound rounded *up* is a bound that fails on
+            // the palette it was written for. Its selection blue is measured
+            // off MediBang and already deepened once so `text_strong` clears 3;
+            // a second rank on a fill that bright is not available without
+            // moving the theme further from the application it is named for. It
+            // used to be `text_dim` there, at 1.43:1, which is the defect this
+            // row exists to stop coming back.
+            let r = ratio(p.text, p.control_active);
+            assert!(
+                r >= 2.59,
+                "{kind:?}: text on control_active is {r:.3}:1, under 2.59:1",
+            );
         }
     }
 
@@ -1892,6 +1950,41 @@ mod tests {
             );
             let r = contrast::ratio(p.warning, p.warning_bg);
             assert!(r >= 4.5, "{kind:?}: warning on warning_bg is {r:.2}:1");
+        }
+    }
+
+    /// A mark on a selected row reads on the fill it is drawn on, in every
+    /// theme and under every accent.
+    ///
+    /// [`Palette::active_ink`] has two answers and this drives both, which is
+    /// the point: a test of a two-state reading that only ever meets one state
+    /// is testing the state it happens to like. Graphite and Paper answer with
+    /// the accent for all four accents, the four presets answer `text_strong`
+    /// for all four, and the split is asserted rather than merely covered — so
+    /// a change that quietly collapsed the rule to one branch fails here even
+    /// though every ratio would still pass.
+    ///
+    /// The floor is 3:1, the same one the accent on `control` is already held
+    /// to, because these are icons, dots and short labels on a fill rather than
+    /// body text.
+    #[test]
+    fn an_active_mark_reads_on_the_fill_it_is_drawn_on() {
+        for kind in ThemeKind::ALL {
+            for accent in Accent::ALL {
+                let p = Palette::with_accent(kind, accent);
+                let ink = p.active_ink();
+                let r = contrast::ratio(ink, p.control_active);
+                assert!(
+                    r >= contrast::READABLE,
+                    "{kind:?}/{accent:?}: the active mark is {r:.2}:1",
+                );
+                let took_accent = ink == p.accent;
+                let expected = matches!(kind, ThemeKind::Graphite | ThemeKind::Paper);
+                assert_eq!(
+                    took_accent, expected,
+                    "{kind:?}/{accent:?}: took the accent? {took_accent}",
+                );
+            }
         }
     }
 
