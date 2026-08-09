@@ -338,6 +338,32 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
                 .max_height(body_height)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
+                    // A sheet is a physical size, so its pixels follow the
+                    // resolution. Reconciled once, here, rather than beside each
+                    // control that can move that resolution — the quick-pick,
+                    // the field, and whatever is added next to them — because
+                    // that is the invariant that gets forgotten at the third
+                    // call site. It is the exact identity whenever no sheet is
+                    // in hand.
+                    //
+                    // Without it: A4 chosen at 300 and then set to 600 keeps
+                    // 2480 × 3508 and is a 105 × 148 millimetre card wearing
+                    // A4's name.
+                    // `a_resolution_typed_into_the_dialog_moves_the_paper_it_is_
+                    // holding` is the guard, and it drives the dialog rather
+                    // than the form, because a guard on `apply_sheet` cannot see
+                    // whether the panel calls it.
+                    //
+                    // **At the top and not the foot**, which is not tidiness.
+                    // The resolution controls are drawn *below* the size fields
+                    // and the physical readout, so reconciling after them left
+                    // the frame that changed a resolution drawing the old pixels
+                    // beside the new dpi — a millimetre figure wrong by the
+                    // ratio rather than merely stale. Here the two always agree.
+                    // What Apply reads is safe either way: it is a click, and a
+                    // click lands on one widget per frame.
+                    form.apply_sheet();
+
                     // Both dialogs, and that is the point of them sharing a
                     // form. The shape a canvas is has nothing to do with whether
                     // it exists yet, and offering the sizes to only one of the
@@ -362,23 +388,6 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
                         anchor_field(ui, p, form);
                     }
                 });
-
-            // A sheet is a physical size, so its pixels follow the resolution.
-            // Reconciled once at the foot of the body rather than beside each
-            // control that can move that resolution — the quick-pick, the field,
-            // and whatever is added next to them — because that is the invariant
-            // that gets forgotten at the third call site. It runs before the
-            // buttons, so what Apply reads is never a canvas that stopped
-            // matching the sheet it is filed under, and it is the exact identity
-            // whenever no sheet is in hand.
-            //
-            // Without it: A4 chosen at 300 and then set to 600 keeps 2480 × 3508
-            // and is a 105 × 148 millimetre card wearing A4's name.
-            // `a_resolution_typed_into_the_dialog_moves_the_paper_it_is_holding`
-            // is the guard, and it drives the dialog rather than the form,
-            // because a guard on `apply_sheet` cannot see whether the panel
-            // calls it.
-            form.apply_sheet();
 
             ui.add_space(16.0);
             // Inside a `horizontal`. A bare `right_to_left` takes the whole of
