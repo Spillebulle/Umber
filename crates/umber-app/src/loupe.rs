@@ -29,18 +29,19 @@
 //! [`place`] exists to hold is that the circle is never within [`CLEARANCE`] of
 //! the pointer, and [`CELLS`] is odd and small enough that half of it in points
 //! is under that figure at any sane scale — which is
-//! `the_loupe_never_covers_the_pixels_it_reads`. The colour that is actually
-//! *taken* is read at the pointer alone, so it can never be the loupe's own
-//! ink whatever else happens.
+//! `the_loupe_never_covers_the_pixels_it_reads`. That rule carries the colour
+//! as well as the picture, because the colour a release takes is the block's
+//! *middle* texel: the pointer's own pixel, which is the furthest of the
+//! hundred and twenty-one from the circle.
 //!
 //! What that does not cover, and it is worth saying rather than discovering: a
-//! pointer flicked **upwards** by more than the gap in a single frame arrives
-//! where the previous frame's loupe was still painted on the screen, and that
-//! frame's magnified picture holds a ghost of it. One frame, during a flick,
-//! in the picture only — the colour under the pointer is right on every frame,
-//! because that pixel is never under the circle. Excluding our own window from
-//! a screen read is not something GDI offers without a layered window, which is
-//! the design this module exists to avoid.
+//! pointer flicked **towards** the circle by more than the gap in a single
+//! frame arrives where the previous frame's loupe was still painted on the
+//! screen, and that frame's block holds a ghost of it. One frame, during a
+//! flick, in the outer cells only — the middle texel is the pointer's own pixel
+//! and the circle is never on that, so the colour is right on every frame.
+//! Excluding our own window from a screen read is not something GDI offers
+//! without a layered window, which is the design this module exists to avoid.
 
 use glam::Vec2;
 use umber_core::Color;
@@ -292,7 +293,10 @@ mod tests {
         // place to aim a picker.
         let pointer = Vec2::new(6.0, 6.0);
         let at = place(pointer, VIEW, RADIUS).expect("a corner still gets one");
-        assert!(at.x > pointer.x && at.y > pointer.y, "down and to the right");
+        assert!(
+            at.x > pointer.x && at.y > pointer.y,
+            "down and to the right"
+        );
         assert!(
             (at.distance(pointer) - (RADIUS + CLEARANCE)).abs() < 1e-3,
             "still exactly the reach away, which is what keeps the sweep below \

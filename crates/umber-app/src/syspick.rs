@@ -108,15 +108,21 @@
 //! note that a machine with a 60 Hz panel should read about 16 ms rather than
 //! 7 — the number is the display's, not the code's.
 //!
-//! It also settles the loupe from a second direction, and this is now measured
-//! rather than predicted: a `BitBlt` of an 11×11 block costs what a `BitBlt` of
-//! one pixel costs, because the wait is the wait. Reading the same
-//! neighbourhood with `GetPixel` would be 121 refreshes — 850 ms a frame, which
-//! is not a control — so [`sample_patch`] is one `BitBlt` and there is no
-//! second candidate. **A frame of the drag pays both calls**, because the
-//! colour that is actually *taken* still comes from [`sample`]: that is the one
-//! route that answers "nothing" off every monitor, and the loupe must not be
-//! what decides which pixel a click keeps.
+//! It also settles the loupe, and this is measured rather than predicted. A
+//! `BitBlt` of an 11×11 block costs **4.6 ms**, which is what a `BitBlt` of one
+//! pixel costs, because the wait is the wait rather than the pixels. Reading
+//! the same neighbourhood with `GetPixel` would be 121 refreshes — 569 ms a
+//! frame on the run these figures come from, which is not a control — so
+//! [`sample_patch`] is one `BitBlt` and there is no second candidate.
+//!
+//! **And a frame pays one read, not two.** The first draft took `GetPixel` for
+//! the colour and the block for the picture, which measured **9.0 ms** against
+//! 4.6: the second call of a frame waits again, so the loupe would have doubled
+//! the cost of a gesture that already existed, and the colour kept would have
+//! come from an instant four milliseconds from the picture around it. The
+//! middle texel of the block is the colour instead. See [`sample_patch`] for
+//! why that is safe, which is the one place the "off every monitor" rule below
+//! had to be restated rather than repeated.
 //!
 //! # What is subtly wrong even on Windows
 //!
@@ -142,11 +148,21 @@
 //!   one call per frame of a drag is a visible flicker across every window on
 //!   the machine.
 //! * **Off every monitor must read as nothing and not as black**, and that is
-//!   why this is `GetPixel` rather than the `BitBlt` route. Measured: outside
-//!   the virtual screen `GetPixel` answers `CLR_INVALID` where a `BitBlt`
-//!   succeeds against nothing and hands back `[0, 0, 0]`. Two monitors of
-//!   different heights leave a real gap that a drag crosses, and a picker that
-//!   silently took black there would be worse than one that took nothing.
+//!   why [`sample`] is `GetPixel` rather than the `BitBlt` route. Measured:
+//!   outside the virtual screen `GetPixel` answers `CLR_INVALID` where a
+//!   `BitBlt` succeeds against nothing and hands back `[0, 0, 0]`. Two monitors
+//!   of different heights leave a real gap that a drag crosses, and a picker
+//!   that silently took black there would be worse than one that took nothing.
+//!
+//!   **[`sample_patch`] does not rest on that and must not be read as
+//!   contradicting it.** A block has to answer the question per texel and
+//!   `CLR_INVALID` cannot, so it asks `MonitorFromPoint` with
+//!   `MONITOR_DEFAULTTONULL` — which answers "is there a screen here" directly
+//!   where `GetPixel`'s refusal answers it by accident. That is what lets one
+//!   read serve the picture and the colour both. The example drives the two
+//!   against each other over the virtual screen's corners, one pixel off each
+//!   edge and far off every monitor, at the real block size so the centring is
+//!   what is under test: they agree everywhere, including on refusing.
 //! * **Multi-monitor is right, and only because the process is DPI aware.**
 //!   The example was run on a desktop whose virtual screen origin is
 //!   `(-2560, 0)` — a second monitor left of the primary one — and the reads at
@@ -406,12 +422,18 @@ pub fn sample(_x: i32, _y: i32) -> Option<[u8; 3]> {
 /// this against the single pixel; a block costs what one pixel costs, because
 /// the wait is the wait rather than the pixels.
 ///
-/// **It does not decide what a click takes.** [`sample`] does, on every path,
-/// and this is only the picture around it. That is deliberate rather than
-/// redundant: `GetPixel` is the route that answers "nothing" off every monitor
-/// where a `BitBlt` succeeds against nothing and hands back black, so the
-/// colour that is kept must never come out of here. The cost of the pair is
-/// measured beside the block in that example.
+/// **It does decide what a click takes**, through its middle texel, and that
+/// took overturning the rule above. The first draft called [`sample`] beside
+/// this on every frame, because `GetPixel` is the route that answers "nothing"
+/// off every monitor where a `BitBlt` succeeds against nothing and hands back
+/// black. That rule is about the *blit*; the `MonitorFromPoint` sweep below is
+/// a different and more direct answer to the same question, so it does not
+/// apply here. Measured, the pair cost 9.0 ms a frame against 4.6 for one — the
+/// second read of a frame waits again — and the two answers were four
+/// milliseconds apart on a live desktop. The example drives them against each
+/// other at this size and they agree, refusals included. [`sample`] remains the
+/// fallback for a blit that failed outright, which is the one thing a block
+/// cannot report.
 ///
 /// `None` for a GDI failure or a `size` of zero. No `CAPTUREBLT`, for the
 /// reason the module docs give: it repaints the whole desktop.
@@ -510,9 +532,8 @@ pub fn sample_patch(x: i32, y: i32, size: u32) -> Option<Vec<Option<[u8; 3]>>> {
                 let py = top + (i / size as usize) as i32;
                 // SAFETY: takes a `POINT` by value and a flag, and returns a
                 // handle this never dereferences.
-                let monitor = unsafe {
-                    MonitorFromPoint(POINT { x: px, y: py }, MONITOR_DEFAULTTONULL)
-                };
+                let monitor =
+                    unsafe { MonitorFromPoint(POINT { x: px, y: py }, MONITOR_DEFAULTTONULL) };
                 (!monitor.is_null()).then_some(rgb)
             })
             .collect(),

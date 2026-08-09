@@ -25,15 +25,21 @@
 //!   multi-monitor claim is that the screen DC's space is the virtual screen,
 //!   negative coordinates included, and that a position off every monitor comes
 //!   back `CLR_INVALID` rather than as black.
-//! * **What does a *block* cost, and what does a block on top of the single
-//!   pixel cost?** The loupe needs a neighbourhood, and a neighbourhood read
-//!   with `GetPixel` is N² display refreshes — 850 ms for an 11×11, which is
-//!   not a control. One `BitBlt` of the block is the only candidate. The pair
-//!   matters separately, because the colour that is *taken* still comes from
-//!   `GetPixel` (it is the one route that answers "nothing" off every monitor),
-//!   so a frame of the drag pays both: if the wait is the compositor's, the
-//!   second read of the same frame should be nearly free, and if it is not the
-//!   loupe costs a second refresh.
+//! * **What does a *block* cost, and may it answer on its own?** The loupe
+//!   needs a neighbourhood, and a neighbourhood read with `GetPixel` is N²
+//!   display refreshes — 569 ms for an 11×11 here, which is not a control. One
+//!   `BitBlt` of the block is the only candidate, and it measured the same as
+//!   one pixel: the wait is the display's rather than the pixels'.
+//!
+//!   The second half decided the design. Taking `GetPixel` for the colour and
+//!   the block for the picture cost **9.0 ms** against **4.6** for one read, so
+//!   the second call of a frame waits again and the loupe would have doubled
+//!   the cost of a gesture that already existed. So the block's middle texel is
+//!   the colour, and the last table here is what says that is safe: the two
+//!   routes are driven against each other over the corners, one pixel off each
+//!   edge and far off every monitor, **at the real block size** so the centring
+//!   is what is under test rather than a size of one where every offset is
+//!   zero.
 //!
 //! **This reads the screen, which is why it is an example and not a test.** No
 //! test in Umber may: a CI runner has no desktop to read, and sampling
@@ -296,5 +302,123 @@ mod windows {
         println!("Which half carries the cost decides how: an expensive GetDC means");
         println!("holding one for the drag, an expensive GetPixel means there is");
         println!("nothing to hold and the sample belongs on the frame instead.");
+        println!();
+
+        // The loupe. Three figures decide whether a magnified neighbourhood is
+        // affordable at all, and the first is the one that rules out the naive
+        // route before anything is built.
+        const BLOCK: u32 = umber_app::loupe::CELLS;
+        println!("The loupe's neighbourhood, {BLOCK} x {BLOCK}:");
+        println!(
+            "  by GetPixel, one per texel:                {:.1} us",
+            per * f64::from(BLOCK * BLOCK)
+        );
+        println!("  (predicted from the figure above, not run: at that rate a frame");
+        println!("   of the drag would take most of a second)");
+
+        // Warm up the block route as well: the first `CreateCompatibleBitmap`
+        // of a size is not the one that matters.
+        for _ in 0..20 {
+            let _ = syspick::sample_patch(cx, cy, BLOCK);
+        }
+        const BLOCKS: u32 = 500;
+        let t = Instant::now();
+        for _ in 0..BLOCKS {
+            std::hint::black_box(syspick::sample_patch(cx, cy, BLOCK));
+        }
+        let per_block = t.elapsed().as_secs_f64() * 1e6 / f64::from(BLOCKS);
+        println!("  by one BitBlt (syspick::sample_patch):     {per_block:.1} us");
+
+        // How much of that is the per-texel `MonitorFromPoint` sweep rather
+        // than the blit, which is what says whether "a texel on no monitor is
+        // nothing rather than black" costs anything worth having a second
+        // opinion about.
+        let t = Instant::now();
+        for _ in 0..BLOCKS {
+            std::hint::black_box(via_bitblt(cx, cy));
+        }
+        let per_one = t.elapsed().as_secs_f64() * 1e6 / f64::from(BLOCKS);
+        println!("  one pixel by the same route, for scale:    {per_one:.1} us");
+
+        // What a frame of the drag actually pays: the colour comes from
+        // `GetPixel` because it is the one route that answers "nothing" off
+        // every monitor, and the picture from the block. If the wait is the
+        // compositor's, the second read of a frame should be nearly free; if
+        // it is not, the loupe costs a whole second refresh and that is a
+        // figure somebody has to be told.
+        let t = Instant::now();
+        for _ in 0..BLOCKS {
+            std::hint::black_box(syspick::sample(cx, cy));
+            std::hint::black_box(syspick::sample_patch(cx, cy, BLOCK));
+        }
+        let per_pair = t.elapsed().as_secs_f64() * 1e6 / f64::from(BLOCKS);
+        println!("  the pair a frame of the drag takes:        {per_pair:.1} us");
+        println!();
+        println!("If the block costs what one pixel costs, the wait is the display's");
+        println!("and not the pixels', which is what makes a magnifier free to read.");
+        println!("If the pair costs about one read, the second call of a frame does");
+        println!("not wait again; if it costs two, the loupe is a second refresh.");
+        println!();
+
+        // **Could the block answer on its own?** That is the question the pair's
+        // cost raises: if the middle texel of `sample_patch` said everything
+        // `sample` says — including "nothing" for a position on no monitor,
+        // which is what `GetPixel`'s CLR_INVALID is used for — a frame of the
+        // drag would be one refresh instead of two, and the colour taken and
+        // the picture shown would come from one instant instead of two four
+        // milliseconds apart.
+        //
+        // `sample_patch` decides that per texel with `MonitorFromPoint`, which
+        // answers the question directly where CLR_INVALID answers it by
+        // accident. This is whether the two actually agree, on the corners
+        // (static, so a mismatch is real) and off the edges (where the whole
+        // distinction lives).
+        //
+        // At the **real** block size, not at one, because the centring is
+        // where an off-by-one would hide: `sample_patch` blits from `(x, y)`
+        // minus half the block and calls texel `size / 2` the middle, and a
+        // size of one makes both of those zero and tests nothing.
+        println!(
+            "{:<26} {:>14} {:>14}  agree",
+            "at", "GetPixel", "block middle"
+        );
+        let mut split = 0u32;
+        let mid = (BLOCK * BLOCK / 2) as usize;
+        for (name, x, y) in &probes {
+            let a = syspick::sample(*x, *y);
+            let b = syspick::sample_patch(*x, *y, BLOCK).and_then(|t| t[mid]);
+            let show = |v: Option<[u8; 3]>| match v {
+                Some([r, g, b]) => format!("{r:3} {g:3} {b:3}"),
+                None => "      -".to_string(),
+            };
+            if a != b {
+                split += 1;
+            }
+            println!(
+                "{name:<26} {:>14} {:>14}  {}",
+                show(a),
+                show(b),
+                if a == b { "yes" } else { "NO" }
+            );
+        }
+        println!(
+            "far off every monitor: GetPixel {:?}, block middle {:?}",
+            syspick::sample(far.0, far.1),
+            syspick::sample_patch(far.0, far.1, BLOCK).and_then(|t| t[mid])
+        );
+        // The centring, said a second way: the block's middle must move with
+        // the position rather than being fixed at its top-left. One pixel to
+        // the right must read what `GetPixel` reads one pixel to the right.
+        let (px, py) = (vx + vw / 2 + 1, vy + vh / 2);
+        println!(
+            "one pixel right of centre: GetPixel {:?}, block middle {:?}",
+            syspick::sample(px, py),
+            syspick::sample_patch(px, py, BLOCK).and_then(|t| t[mid])
+        );
+        println!();
+        println!("{split} disagreement(s). A live desktop repaints between two reads");
+        println!("four milliseconds apart, so a mismatch on a pixel that is changing");
+        println!("proves nothing; one on a static corner, or on the presence of a");
+        println!("colour at all, is the finding.");
     }
 }

@@ -2750,31 +2750,42 @@ impl UmberApp {
         }
     }
 
-    /// A pixel of the screen and the block around it.
+    /// A block of the screen, and the colour at the middle of it.
     ///
-    /// **Two calls, and the second may not decide the colour.** `syspick::
-    /// sample` is `GetPixel`, which answers `CLR_INVALID` for a position on no
-    /// monitor; `sample_patch` is one `BitBlt`, which succeeds against nothing
-    /// and hands back black. So the colour that a release keeps comes from the
-    /// first and the picture from the second, and a position in the gap between
-    /// two screens of different heights reads as nothing rather than as black.
-    /// `examples/measure-screenpick.rs` times the pair.
+    /// **One read, and the middle texel is the colour a release takes.** The
+    /// first draft of this took two — `syspick::sample`'s `GetPixel` for the
+    /// colour and `sample_patch`'s `BitBlt` for the picture — on the standing
+    /// rule that `GetPixel` is what answers "nothing" for a position on no
+    /// monitor where a `BitBlt` succeeds against nothing and hands back black.
+    /// That rule was about the *blit* and `sample_patch` does not rest on it:
+    /// it asks `MonitorFromPoint` per texel, which answers the question
+    /// directly rather than by accident.
     ///
-    /// The block is skipped where there is no colour at all, which is the
-    /// common shape of that gap: nothing to magnify, so nothing to pay a second
-    /// screen read for.
+    /// The pair was **measured** at 9.0 ms a frame against 4.6 for one, so the
+    /// loupe would have doubled the cost of a gesture that already existed —
+    /// and the two reads are four milliseconds apart on a live desktop, so the
+    /// colour kept and the picture around it came from different instants.
+    /// `examples/measure-screenpick.rs` also drives the two against each other
+    /// over the screen's corners, off both edges and far off every monitor, at
+    /// the real block size so the centring is what is being checked: they agree
+    /// everywhere, including on refusing.
+    ///
+    /// `sample` is the fallback for a `BitBlt` that failed outright, which is
+    /// the one thing the block cannot report and the single pixel can.
     fn sample_screen(&self, x: i32, y: i32) -> loupe::Loupe {
-        // The desktop hands over sRGB bytes and the engine is linear
-        // throughout, so this goes through the one door the clipboard and the
-        // palette also use. Never a second `powf`.
-        let taken = syspick::sample(x, y).map(|[r, g, b]| Color::from_srgb_u8(r, g, b, 255));
-        let patch = taken.and_then(|_| {
-            syspick::sample_patch(x, y, loupe::CELLS)
-                .and_then(|texels| loupe::Patch::new(loupe::CELLS, texels))
-        });
+        let patch = syspick::sample_patch(x, y, loupe::CELLS)
+            .and_then(|texels| loupe::Patch::new(loupe::CELLS, texels));
+        let middle = patch.as_ref().map(|p| p.middle());
+        let rgb = match (&patch, middle) {
+            (Some(patch), Some(m)) => patch.at(m, m),
+            _ => syspick::sample(x, y),
+        };
         loupe::Loupe {
             at: self.editor.cursor,
-            taken,
+            // The desktop hands over sRGB bytes and the engine is linear
+            // throughout, so this goes through the one door the clipboard and
+            // the palette also use. Never a second `powf`.
+            taken: rgb.map(|[r, g, b]| Color::from_srgb_u8(r, g, b, 255)),
             patch,
         }
     }
