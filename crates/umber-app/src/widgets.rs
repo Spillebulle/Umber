@@ -31,8 +31,8 @@ pub(crate) const MIN_TRACK: f32 = 8.0;
 /// Label on the left, monospace readout on the right, thin rail beneath.
 ///
 /// Returns true when the value changed. `log` maps the rail logarithmically,
-/// which is what makes a 1–400 px brush size usable — half the travel covers
-/// 1–20 px, where the useful sizes actually live.
+/// which is what makes a 1–1000 px brush size usable — half the travel covers
+/// 1–32 px, where the useful sizes actually live.
 ///
 /// The rail is immediate: the value is handed back as the knob moves. The one
 /// case that cannot be — a rail drawn *inside* the thing it scales, which moves
@@ -516,8 +516,8 @@ pub fn dropdown<R>(
 
 /// Map a value onto `0..=1` along a slider, linearly or logarithmically.
 ///
-/// A logarithmic map is what makes a 1–400 px brush size usable: half the
-/// travel covers 1–20 px, where the useful sizes actually live.
+/// A logarithmic map is what makes a 1–1000 px brush size usable: half the
+/// travel covers 1–32 px, where the useful sizes actually live.
 fn to_t(v: f32, lo: f32, hi: f32, log: bool) -> f32 {
     let v = v.clamp(lo, hi);
     if log {
@@ -591,8 +591,12 @@ struct Span {
 /// pinned at whichever end the value is past, and a tap there — the one spot
 /// that looks as though it will do nothing, because the knob is already
 /// there — used to set the value to that end. That is how a 1045 px brush
-/// became a 400 px one, and it is not confined to brush size: of the 252
-/// shipped presets, 15 carry a `size` past its rail, 4 an airbrush rate of
+/// became a 400 px one — the size rail stops at
+/// [`crate::tweaks::SIZE_RAIL_TOP`]'s 1000 now and that brush is *still* past
+/// it, which is why the example survives its own fix — and it is not confined
+/// to brush size: of the 252
+/// shipped presets, 1 carries a `size` past its rail (15 did at 400), 4 an
+/// airbrush rate of
 /// 300/s past a rail stopping at 100, 2 a spacing of 1.47 and 5.12 past one
 /// stopping at 0.5 — spacings `docs`' dab-shape rule calls deliberate — and 13
 /// a stroke span outside `1..=500` in *both* directions, down to 0.61 and up to
@@ -1169,8 +1173,11 @@ impl<'a> NumberRow<'a> {
 /// in.
 ///
 /// The cost of comparing text is that typing the digits the readout already
-/// shows is not a change — type "25" over a size of 24.7 and it stays 24.7.
-/// That is invisible on the readout and is the far smaller of the two.
+/// shows is not a change — type "25" over a size of 24.7 and it stays 24.7,
+/// and type "0" over an airbrush rate of 0.3 and it stays 0.3. That reaches
+/// **every** rail drawn at no decimal places whose value is not a whole one of
+/// the readout's units, which is all of them, not only size. It is invisible on
+/// the readout in each case, and it is the far smaller of the two.
 fn typed_value(text: &str, seed: &str, escaped: bool, rail: &Rail<'_>) -> Option<f32> {
     if escaped {
         return None;
@@ -3920,35 +3927,24 @@ mod tests {
         }
     }
 
-    /// The tool options strip's Size rail, as `ui::options_strip` states it.
+    /// The tool options strip's Size rail, **as the strip itself states it**
+    /// rather than as a copy of its numbers.
     ///
-    /// The one rail in Umber whose span and limit are different numbers, which
+    /// The one rail in Umber whose span and limit are different figures, which
     /// is what makes it the fixture every test below about that distinction has
-    /// to use: on a rail where they agree, either rule passes.
-    fn size_rail() -> Rail<'static> {
-        Rail {
-            label: "Size",
-            span: crate::tweaks::Tweak::Size.span(),
-            limit: crate::tweaks::Tweak::Size.range(),
-            log: true,
-            snap: 0.0,
-            deferred: false,
-            figure: Figure::new(1.0, "", 0),
-        }
-    }
+    /// to use: on a rail where they agree, either rule passes. And it has to be
+    /// the strip's own — a fixture built here would prove that
+    /// [`typed_value`] respects a limit and *not* that the size rail passes
+    /// one, which is `docs`' "a guard on a model is not a guard on the panel"
+    /// in the small. `settings::scale_row` is imported by these tests for the
+    /// same reason.
+    use crate::ui::strip_size_rail as size_rail;
 
-    /// And one where they agree, for the half of each rule that still has to
-    /// hold there.
+    /// And one where the two agree, for the half of each rule that still has to
+    /// hold there. Also the strip's, and it carries the `per_unit` of 100 that
+    /// nothing else here would read.
     fn opacity_rail() -> Rail<'static> {
-        Rail {
-            label: "Opacity",
-            span: 0.0..=1.0,
-            limit: 0.0..=1.0,
-            log: false,
-            snap: 0.0,
-            deferred: false,
-            figure: Figure::new(100.0, "", 0),
-        }
+        crate::ui::strip_percent_rail("Opacity", 1.0)
     }
 
     /// A typed brush size is held to what a size may be, not to where the rail
