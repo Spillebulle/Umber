@@ -1352,8 +1352,8 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   Losing something every time is a bug somebody reports; losing it sometimes is
   one they doubt themselves over.
 - **A parameter record needs a size bound of its own, and it is the first entry
-  that did.** Every other entry is a canvas and answers to `MAX_TOTAL_BYTES`'
-  2 GiB; a record's size follows a *count* the format does not bound. Measured:
+  that did.** Every other entry is a canvas and answers to `MAX_TOTAL_BYTES`;
+  a record's size follows a *count* the format does not bound. Measured:
   569 KB expands to 300 MB and twenty million effects in eight seconds,
   materialised before any budget check sees it, and sixty-four layers may name
   the same entry. `MAX_EFFECTS_BYTES` is 64 KiB, derived from what
@@ -1742,6 +1742,39 @@ reporter's own window.
 
 `umber-core::docimport` reads `.ora`, `.kra`, `.psd` and `.png`.
 
+- **A refusal must name the bound the file actually met.** `check_bounds` has
+  two ways to refuse a size and they are different errors: `CanvasTooLarge` is
+  one edge past `MAX_DIMENSION`, `StackTooLarge` is every layer's pixels past
+  `MAX_TOTAL_BYTES`. They were one variant, so a 15000×5000 Clip Studio
+  document — an edge 1384 px *inside* the limit, refused for its layer count —
+  was told its canvas was larger than Umber can open. It was not, and no amount
+  of shrinking it would have helped: the sentence sent the artist to fix the
+  thing that was not broken, which is worse than a vague refusal. The stack one
+  names the layer count and the byte figure, because "reduce the stack" is
+  something somebody can act on.
+- **The stack's two bounds count different things, and `StackSize` is what
+  keeps them apart.** `LayerStack::MAX` bounds *entries* and a folder occupies
+  one; the byte total is *buffers* and a folder holds none. One count served
+  both, so a `.clip` filed into groups paid for its own filing and the artist's
+  tidying was what brought the refusal on. The first repair was two `usize`
+  parameters, which is discipline: reintroducing the bug in the `.clip` reader
+  left all 1,061 tests green, because the guard drove `check_bounds` and could
+  not see what its caller passed. `StackSize::of` takes the folder *readings*
+  and derives both, so there is nothing to get the wrong way round — **and a
+  reader-level guard beside it**, because `all_painted(nodes.len())` is still
+  writable. Structure narrows the mistake; only a test at the call site catches
+  it.
+- **`MAX_TOTAL_BYTES` does not fully meet "a reader must never be stricter than
+  the writer", and its docs say where it stops.** At the old 2 GiB Umber could
+  save a document it then refused to reopen — 15000×5000 broke at eight layers.
+  It is 16 GiB, which admits every real document and still refuses a full stack
+  past 8192². The gap is not closable by tuning: every figure admitting a real
+  25.6 GB document also admits a malformed header asking for 25.6 GB, because
+  they are the same header and a layer's buffer is allocated canvas-sized
+  whatever the source data weighs.
+  `a_document_umber_could_save_can_be_reopened` pins both the range where the
+  rule holds and the case where it does not, so closing it is a deliberate
+  change rather than a silent one.
 - **An import that loses something must say so.** Every loss appends an
   `ImportWarning` and the UI shows them; the rule is that subtly wrong pixels
   are worse than a refusal, because a refusal sends the artist to export an ORA
