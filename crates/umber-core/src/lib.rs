@@ -8,6 +8,7 @@
 pub mod brush;
 pub mod brushimport;
 pub mod camera;
+pub mod canvassize;
 pub mod clipboard;
 pub mod color;
 pub mod curve;
@@ -44,6 +45,12 @@ pub mod transform;
 
 pub use brush::{Brush, BrushMode, GrainPattern};
 pub use camera::{Camera, ScrollSpan};
+// `canvassize` is deliberately not re-exported here. Its one consumer imports
+// the module, and a partial re-export would have to pick four of its ten public
+// items — claiming `Orientation`, a broad name, at a root that already carries
+// `Anchor` and `Unit`, and leaving the next caller to wonder why `Chosen` and
+// `LockedShape` are not beside them. `palette::Palette` is kept out for a
+// related reason and says so above.
 pub use clipboard::{Clip, Cut};
 pub use color::{Color, Hsv};
 pub use curve::ResponseCurve;
