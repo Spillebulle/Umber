@@ -766,7 +766,8 @@ fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         if widgets::slider_row(ui, p, "", &mut position, 0.0..=last, false, |_| {
             String::new()
         }) {
-            let rung = prefs::UNDO_BUDGET_LADDER[budget_index(position)];
+            let rung =
+                prefs::UNDO_BUDGET_LADDER[ladder_index(position, prefs::UNDO_BUDGET_LADDER.len())];
             // A typed figure wins over the rail on the frame it lands, because
             // the click that puts the pointer on the rail is the same click that
             // blurs the field: taking the rail's answer would discard what was
@@ -936,12 +937,6 @@ fn committed_budget(text: &str, held: u32) -> Option<u32> {
 /// gigabytes.
 const GIGABYTE: u32 = 1024;
 
-/// A ladder step, clamped — a rail's value is a float and the ends can land a
-/// hair outside. [`ladder_index`]'s counterpart for the undo budget.
-fn budget_index(value: f32) -> usize {
-    (value.round().max(0.0) as usize).min(prefs::UNDO_BUDGET_LADDER.len() - 1)
-}
-
 /// A budget as a position along the ladder, whole numbers being the rungs.
 ///
 /// This is `log2` and not a search because [`prefs::UNDO_BUDGET_LADDER`] is
@@ -1087,9 +1082,13 @@ fn autosave_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &m
             &mut step,
             0.0..=(autosave::EXPIRY_LADDER.len() - 1) as f32,
             false,
-            |v| expiry_label(autosave::EXPIRY_LADDER[ladder_index(v)]),
+            |v| {
+                expiry_label(
+                    autosave::EXPIRY_LADDER[ladder_index(v, autosave::EXPIRY_LADDER.len())],
+                )
+            },
         ) {
-            let chosen = autosave::EXPIRY_LADDER[ladder_index(step)];
+            let chosen = autosave::EXPIRY_LADDER[ladder_index(step, autosave::EXPIRY_LADDER.len())];
             ed.autosave.expiry = (chosen > 0).then(|| Duration::from_secs(chosen as u64 * 3600));
             prefs::mark_dirty();
         }
@@ -1125,10 +1124,16 @@ fn autosave_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &m
     });
 }
 
-/// A ladder step, clamped — a slider's value is a float and the ends can land
-/// a hair outside.
-fn ladder_index(value: f32) -> usize {
-    (value.round().max(0.0) as usize).min(autosave::EXPIRY_LADDER.len() - 1)
+/// A ladder step, clamped — a rail's value is a float and the ends can land a
+/// hair outside.
+///
+/// One function over both ladders, the autosave's expiry and the undo budget's,
+/// because they are the same arithmetic and only the number of rungs differs.
+/// They were two copies, and the second gained a caller when the budget's
+/// readout became typable — which is the point at which two copies of four
+/// characters' difference stop being a coincidence.
+fn ladder_index(value: f32, rungs: usize) -> usize {
+    (value.round().max(0.0) as usize).min(rungs.saturating_sub(1))
 }
 
 /// A number of hours as the dialog says it: for ever, in hours, or in days.
@@ -3555,7 +3560,7 @@ mod tests {
                 (at - i as f32).abs() < 1e-4,
                 "{rung} MB is rung {i} and sits at {at}",
             );
-            assert_eq!(budget_index(at), i);
+            assert_eq!(ladder_index(at, prefs::UNDO_BUDGET_LADDER.len()), i);
         }
         // Half way between 2048 and 4096 in the value is *past* half way along
         // the rail, because the rungs are doublings: 3072 is 0.585 of the way.
