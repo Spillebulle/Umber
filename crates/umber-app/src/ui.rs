@@ -23,6 +23,7 @@ use crate::panels;
 use crate::shortcuts::{self, Action};
 use crate::syspick;
 use crate::tabs;
+use crate::theme::contrast::{self, Ink};
 use crate::theme::{Palette, metrics, text};
 use crate::tweaks::Tweak;
 use crate::widgets;
@@ -1216,19 +1217,19 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
         return;
     };
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-    // `text_dim` is the palette's recessive ink, and it is the one token that
-    // is a mid-grey in *every* theme — the surfaces invert between the light
-    // ones and the dark ones and most of the ink with them, so anything
-    // stronger would be black on one and white on the other, over artwork that
-    // is neither.
-    //
-    // That it reads against the pit is now a bound rather than an observation:
-    // `theme`'s `text_reads_against_every_surface_it_is_drawn_on` holds
-    // `text_dim` on `backdrop` to 2.6:1 for every shipped theme, this being one
-    // of the three places that pair is drawn. Krita's own 50% grey canvas
-    // surround is a palette this refuses, and `Palette::krita` says so.
-    ui.painter()
-        .circle_filled(ed.to_points(at), metrics::PEN_DOT, p.text_dim);
+    // Derived from the pit, at the rank `text_dim` used to hold. That token was
+    // chosen for being the one ink that is a mid-grey in *every* theme — the
+    // surfaces invert between the light themes and the dark ones and most of
+    // the ink with them, so a fixed strong ink would be black on one and white
+    // on the other, over artwork that is neither. The flaw is the same reading
+    // read the other way: on a mid-grey pit a mid-grey dot is 1.34:1, which is
+    // a cursor nobody can find. `theme::contrast` has the argument, and
+    // `a_mark_on_the_canvas_pit_reads_in_every_theme` is the bound.
+    ui.painter().circle_filled(
+        ed.to_points(at),
+        metrics::PEN_DOT,
+        contrast::ink_on(p.backdrop, Ink::Dim),
+    );
 }
 
 /// A crosshair over the canvas while the eyedropper is in hand.

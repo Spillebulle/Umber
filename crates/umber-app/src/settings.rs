@@ -47,6 +47,7 @@ use crate::inputlog;
 use crate::prefs;
 use crate::shortcuts::{self, Action, Binding};
 use crate::tabs::Notice;
+use crate::theme::contrast::{self, Ink};
 use crate::theme::{Accent, Palette, ThemeKind, Token, TokenGroup, metrics, text};
 use crate::themelib::{self, ThemeLibrary};
 use crate::ui::UiActions;
@@ -1730,7 +1731,12 @@ fn test_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Align2::CENTER_CENTER,
             "Drag here",
             FontId::proportional(text::SMALL),
-            p.text_dim,
+            // The strip is filled with `backdrop` above, so this is the fourth
+            // mark in the interface drawn on the canvas pit and it takes the
+            // same derived ink the other three do. It was `text_dim`, which on
+            // Krita's mid-grey pit is 1.34:1 — a prompt saying how to use the
+            // control, invisible. See `theme::contrast`.
+            contrast::ink_on(p.backdrop, Ink::Dim),
         );
         return;
     }

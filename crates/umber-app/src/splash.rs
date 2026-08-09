@@ -56,6 +56,7 @@
 use crate::cputext::Font;
 use crate::logo;
 use crate::theme::Palette;
+use crate::theme::contrast::{self, Ink};
 use egui::Color32;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -299,18 +300,24 @@ pub fn render(
     }
 
     if let Some(font) = &status {
+        // Derived from the backdrop this whole picture is filled with, at the
+        // rank `text_dim` held. The splash is the one screen where the pit is
+        // the *only* surface, so an ink that cannot be read on it cannot be
+        // read at all — and `text_dim` is a mid-grey, which on Krita's mid-grey
+        // pit is 1.34:1. See `theme::contrast`.
+        let ink = contrast::ink_on(palette.backdrop, Ink::Dim);
         font.draw(
             stage.status(),
             block_left,
             status_baseline,
             |px, py, cov| {
-                buf.blend(px, py, palette.text_dim, cov);
+                buf.blend(px, py, ink, cov);
             },
         );
         if !adapter.is_empty() {
             let x = block_right - font.width(adapter);
             font.draw(adapter, x, status_baseline, |px, py, cov| {
-                buf.blend(px, py, palette.text_dim, cov);
+                buf.blend(px, py, ink, cov);
             });
         }
     }
@@ -416,11 +423,14 @@ fn brand(buf: &mut Buffer, w: f32, h: f32, scale: f32, palette: &Palette, taglin
     if let Some(font) = Font::new(tagline_px, 400.0, design::TAGLINE_TRACKING * scale) {
         let baseline = group_top + row_h + design::TAGLINE_GAP * scale + font.cap_height();
         let x = (w - font.width(line)) * 0.5;
-        // The design's #6e7176 is dimmer than any token here; `text_dim` is the
-        // nearest, and is the token these supporting lines would use in the
-        // workspace anyway.
+        // The design's #6e7176 is dimmer than any token here, and `text_dim`
+        // was the nearest. It is derived from the backdrop now, for the reason
+        // the status line beside it is: this picture is *nothing but* the
+        // backdrop, so a supporting line has to be readable on whatever that
+        // is. On Graphite the two answers are within a couple of levels.
+        let ink = contrast::ink_on(palette.backdrop, Ink::Dim);
         font.draw(line, x, baseline, |px, py, coverage| {
-            buf.blend(px, py, palette.text_dim, coverage);
+            buf.blend(px, py, ink, coverage);
         });
     }
 }
@@ -682,15 +692,52 @@ mod tests {
 
     #[test]
     fn the_banner_omits_the_version() {
-        // The tagline and the status line are the only `text_dim` on the splash,
-        // and the tagline is where `CARGO_PKG_VERSION` appears. A committed
-        // picture carrying a version number is wrong from the next release on.
+        // The tagline and the status line are the only supporting ink on the
+        // splash, and the tagline is where `CARGO_PKG_VERSION` appears. A
+        // committed picture carrying a version number is wrong from the next
+        // release on.
+        //
+        // The ink is `contrast::ink_on(backdrop, Dim)` rather than `text_dim`
+        // now, and this asks it the same way `render` computes it — one
+        // statement of what colour the supporting lines are, so the test cannot
+        // go on passing by counting a colour nothing draws.
         let palette = Palette::of(ThemeKind::Graphite);
         let px = banner(600, 220, 1.0, &palette);
-        assert_eq!(
-            px.iter().filter(|&&p| p == pack(palette.text_dim)).count(),
-            0
-        );
+        let supporting = pack(contrast::ink_on(palette.backdrop, Ink::Dim));
+        assert_eq!(px.iter().filter(|&&p| p == supporting).count(), 0);
+    }
+
+    /// The supporting lines are drawn in the ink derived from the pit, and
+    /// `text_dim` has left the splash entirely.
+    ///
+    /// Two halves, because either alone passes for the wrong reason. The
+    /// positive one counts pixels of the exact derived colour — at scale 3 the
+    /// tagline is 34 points of Archivo and has plenty of fully covered texels,
+    /// where at scale 1 it has one, which is why this does not reuse the
+    /// splash's own test size. The negative one *mutates* `text_dim` to
+    /// magenta and requires the picture not to move: a positive test cannot
+    /// tell an ink that was changed from one that was copied, and this is the
+    /// only reading that says the old token is gone rather than merely joined.
+    #[test]
+    fn the_supporting_lines_are_derived_from_the_pit() {
+        for kind in [ThemeKind::Graphite, ThemeKind::Paper, ThemeKind::Krita] {
+            let palette = Palette::of(kind);
+            let px = render(900, 500, 3.0, &palette, Stage::Ready, "");
+            let supporting = pack(contrast::ink_on(palette.backdrop, Ink::Dim));
+            let lit = px.iter().filter(|&&p| p == supporting).count();
+            assert!(lit > 100, "{kind:?}: only {lit} pixels of supporting ink");
+            // And it is not the token it replaced, or the theme this was broken
+            // for would be passing on the old colour.
+            assert_ne!(supporting, pack(palette.text_dim), "{kind:?}");
+
+            let mut moved = palette;
+            moved.text_dim = Color32::from_rgb(0xFF, 0x00, 0xFF);
+            assert_eq!(
+                px,
+                render(900, 500, 3.0, &moved, Stage::Ready, ""),
+                "{kind:?}: something on the splash still draws text_dim",
+            );
+        }
     }
 
     /// The row the banner sizes its field from has to be the row the banner

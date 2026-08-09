@@ -6,6 +6,7 @@
 //! with via styling.
 
 use crate::icons::{self, Icon};
+use crate::theme::contrast::{self, Ink};
 use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
@@ -698,8 +699,12 @@ fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: 
 /// These are on screen on every frame of every document — see
 /// `ui::canvas_scrollbars` — so the track is left unpainted altogether: two
 /// permanent filled strips down the edges of a picture is the furniture that
-/// decision is against. The thumb's own ink went the other way for the same
-/// reason; see the note beside it.
+/// decision is against. The thumb is therefore the whole control, which is why
+/// its ink is [`theme::contrast`]'s derived one rather than a token: it has to
+/// read on any canvas pit somebody can author, and the marks that failed did so
+/// on a pit Umber ships. See the note beside it.
+///
+/// [`theme::contrast`]: crate::theme::contrast
 ///
 /// `live` is the caller's "a press in this strip is not mine" — the space-held
 /// canvas pan. The thumb is still painted and still lights under the pointer,
@@ -774,23 +779,33 @@ pub fn canvas_scrollbar(
     let panning = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
     let dragging = live && !panning && response.dragged_by(egui::PointerButton::Primary);
 
-    // `text_dim` idle, for `pen_cursor`'s reason and it is the same problem:
-    // this is a mark drawn over *artwork*, and `text_dim` is the one token
-    // that is a mid-grey in both themes, where the surfaces invert and most of
-    // the ink with them. `rail` was the obvious choice and is the slider
-    // *track* colour — a hair off the surface it sits on by design, which on
-    // the canvas backdrop is 1.31:1 in Graphite and 1.07:1 in Paper. Six levels
-    // per channel. That was survivable while a bar only appeared when the
-    // picture ran off the view, because its appearing was itself the signal;
-    // now that it is the standing answer to "can this be moved", a control
-    // nobody can see is the same lie as a control that does nothing.
-    let ink = if dragging {
-        p.text_strong
+    // Derived from the pit rather than taken off the type ramp, and the three
+    // ranks are where `text_strong`, `text_muted` and `text_dim` used to be.
+    //
+    // `rail` was the obvious choice and is the slider *track* colour — a hair
+    // off the surface it sits on by design, which on the canvas backdrop is
+    // 1.31:1 in Graphite and 1.06:1 in Paper. Six levels per channel. That was
+    // survivable while a bar only appeared when the picture ran off the view,
+    // because its appearing was itself the signal; now that it is the standing
+    // answer to "can this be moved", a control nobody can see is the same lie
+    // as a control that does nothing.
+    //
+    // `text_dim` replaced it, on the reasoning that this is a mark drawn over
+    // *artwork* and that `text_dim` is the one token that is a mid-grey
+    // whichever way a theme's surfaces run. **That is exactly what broke it**:
+    // a mid-grey ink on Krita's real 50% grey pit is 1.34:1, worse than the
+    // figure `rail` was thrown out at, and no token can do better because the
+    // problem is the pit and not the ramp. `theme::contrast` has the argument;
+    // what it buys here is a floor of 3:1 on any pit somebody can author, and
+    // three ranks that stay distinct even on a pit with only 5.32:1 in it.
+    let rank = if dragging {
+        Ink::Strong
     } else if response.hovered() {
-        p.text_muted
+        Ink::Muted
     } else {
-        p.text_dim
+        Ink::Dim
     };
+    let ink = contrast::ink_on(p.backdrop, rank);
     let inset = thumb_rect.shrink(2.0);
     ui.painter()
         .rect_filled(inset, inset.width().min(inset.height()) * 0.5, ink);
