@@ -964,9 +964,31 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     });
 }
 
-fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+/// The colour picker, over whatever colour it is handed, with the artist's own
+/// settings kept and written out.
+///
+/// **There is one of this and it is drawn in two places.** This panel mixes
+/// `Editor::hsv`, and `settings::token_picker` mixes a palette token on the
+/// same instrument. The block below — five locals, `show`, a comparison and
+/// five assignments — is the shape `colorpicker::show_sliders`' own docs call
+/// "the same block written twice and one more place to edit every time this
+/// signature grows", and it was written twice for exactly one commit before
+/// this said so. It lives here rather than in `colorpicker` because it reads
+/// and writes an `Editor`, which that module deliberately knows nothing about.
+///
+/// The `hsv` is passed in rather than taken off the editor, because the theme
+/// editor's is not the editor's: it mixes a token, and routing that through
+/// `Editor::hsv` would repaint the brush in the artist's hand every time
+/// somebody adjusted a border.
+pub(crate) fn picker_with_settings(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    hsv: &mut umber_core::Hsv,
+) -> bool {
     let mut shape = ed.ui.wheel_shape;
     let mut rotates = ed.ui.wheel_rotates;
+    let mut mirrored = ed.ui.wheel_mirrored;
     let mut angles = ed.ui.wheel_angles;
     let mut harmony = ed.ui.harmony;
     let changed = colorpicker::show(
@@ -975,28 +997,43 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         ed.ui.picker,
         &mut shape,
         &mut rotates,
+        &mut mirrored,
         &mut angles,
         &mut harmony,
-        &mut ed.hsv,
+        hsv,
     );
-    // All four are kept between runs, though their controls are here rather
-    // than in the settings dialog — they are choices about the workspace, and
-    // where one is set does not decide whether it should still be true tomorrow.
+    // All five are kept between runs, though their controls are on the panel
+    // rather than in the settings dialog — they are choices about the
+    // workspace, and where one is set does not decide whether it should still
+    // be true tomorrow.
     //
     // Compared before and after rather than asked of the controls, because
     // `show` reports a change of *colour*: keying off its return would queue a
     // preferences write for every frame of a drag around the hue ring.
     if shape != ed.ui.wheel_shape
         || rotates != ed.ui.wheel_rotates
+        || mirrored != ed.ui.wheel_mirrored
         || angles != ed.ui.wheel_angles
         || harmony != ed.ui.harmony
     {
         ed.ui.wheel_shape = shape;
         ed.ui.wheel_rotates = rotates;
+        ed.ui.wheel_mirrored = mirrored;
         ed.ui.wheel_angles = angles;
         ed.ui.harmony = harmony;
         crate::prefs::mark_dirty();
     }
+    changed
+}
+
+fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    // Copied out and put back because `picker_with_settings` needs the whole
+    // editor as well as the colour, and `Hsv` is `Copy`. The alternative is to
+    // give that function a flag saying which colour it is mixing, which is a
+    // branch standing in for a borrow.
+    let mut hsv = ed.hsv;
+    let changed = picker_with_settings(ui, p, ed, &mut hsv);
+    ed.hsv = hsv;
     if changed {
         ed.commit_picker();
     }
@@ -2392,7 +2429,13 @@ fn history_row(ui: &mut Ui, p: &Palette, row: &HistoryRow) -> egui::Response {
 /// [`widgets::dropdown`] — and the one that keeps its leading mark, because a
 /// half-filled disc genuinely says "colour picker" where none of the others has
 /// a glyph to hand.
-fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+///
+/// Reachable from `settings::token_picker` as well as from this panel, because
+/// the theme editor draws the *same* picker over a palette token and a second
+/// copy of this switch would be two controls for one setting. It writes
+/// `ed.ui.picker`, which is the point: there is one colour picker in Umber and
+/// it is set up once.
+pub(crate) fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let label = ed.ui.picker.label();
     widgets::dropdown(
         ui,
@@ -3312,6 +3355,18 @@ mod tests {
         };
 
         let idle = height(&mut ed);
+        // And it still fits the field `docshot` shoots the README's picture of
+        // this panel into. That picture is committed, so a body that outgrew
+        // the field would be a README image with its hex row clipped off — and
+        // a screenshot goes stale in silence, which is exactly where nobody
+        // looks. The wheel's own controls have grown once already; checked here
+        // because this is where the body is measured and `docshot`'s own tests
+        // want a device.
+        assert!(
+            idle <= crate::docshot::PICKER_FIELD.y,
+            "the Colour body is {idle} points and the README's shot gives it {}",
+            crate::docshot::PICKER_FIELD.y
+        );
         ctx.memory_mut(|m| m.request_focus(super::hex_edit_id()));
         let busy = height(&mut ed);
         // Or the two measurements are the same measurement and this test says

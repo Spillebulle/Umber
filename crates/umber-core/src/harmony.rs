@@ -12,15 +12,49 @@
 //! one: what the relation names is the angle round the wheel, and altering the
 //! other two axes on the way would be the module inventing a colour nobody
 //! asked for. The picker applies the artist's own `s` and `v` to every hue this
-//! returns, so a harmony of a grey is five greys — which is correct, and is
+//! returns, so a harmony of a grey is a row of identical greys — correct, and is
 //! also why the picker draws the base swatch beside the rest rather than
 //! relying on the ring to tell them apart.
+//!
+//! ## Which wheel these angles are on
+//!
+//! The **RGB wheel**, because that is what [`crate::Hsv`]'s hue is: 0° is red,
+//! 120° green, 240° blue. So the complement of blue here is *yellow* and the
+//! complement of red is *cyan*. On the painter's RYB wheel taught as colour
+//! theory, blue's complement is orange and red's is green. Both are defensible
+//! and they are visibly different answers, so it is worth saying plainly which
+//! one this is and why it is not going to change quietly.
+//!
+//! The offsets below are right **for the wheel they are stated on** — 180° is
+//! genuinely the opposite hue, a triad is genuinely three equal thirds — and
+//! that is the only sense in which a set of angles can be right. Reading them
+//! as RYB angles is what would be wrong.
+//!
+//! It also matches every painting application that draws a hue wheel. Krita's
+//! selectors are HSV/HSL/HSI/HSY' over RGB and offer no harmony rules at all
+//! (gamut masks instead); Clip Studio's Color Wheel palette is HSV or HLS with
+//! no relation generator; Photoshop has had none in the application since the
+//! Adobe Color Themes panel was withdrawn. The one mainstream tool that
+//! computes harmonies on RYB is **Adobe Color**, a web tool rather than a
+//! painting application, and it converts RGB to RYB and back for exactly this
+//! — which is why its complement of red comes out near hue 137 rather than 180
+//! and reads as an error to anybody checking the arithmetic.
+//!
+//! **An RYB mode would be a real feature and is not a bug fix.** It needs a
+//! control, because a painter who wants one wheel does not want the other by
+//! surprise; it may not change what any existing preset or document means, and
+//! nothing here reaches a file today; and it cannot be a second `hues` beside
+//! this one, because the whole module would then have two answers to one
+//! question. The shape it would take is a hue *mapping* on the way in and out —
+//! RGB hue to RYB, the offsets applied there, RYB back to RGB — leaving these
+//! angles and every caller untouched. Nobody has asked for it twice yet.
 
-/// One of the five relations the design's Harmony mode names.
+/// One of the relations the design's Harmony mode names.
 ///
-/// Five and not more: each is a *rule* about the wheel that a painter can hold
-/// in their head, and a sixth that was only a different number of degrees would
-/// be a row in a menu rather than something anybody would reach for.
+/// Each is a *rule* about the wheel that a painter can hold in their head. One
+/// that was only a different number of degrees would be a row in a menu rather
+/// than something anybody would reach for — which is why the two tetrads are
+/// both here and a "double complementary at 45°" is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Harmony {
     /// The hue and its opposite.
@@ -35,11 +69,25 @@ pub enum Harmony {
     SplitComplementary,
     /// Four hues a quarter of the wheel apart — the *square* tetrad.
     ///
-    /// The other reading of the word is the rectangle (0°, 60°, 180°, 240°),
-    /// which is a different set. Only one of them can be called Tetrad without
-    /// the label lying about which it drew, and the square is the one every
-    /// wheel-based picker means by the bare word.
+    /// **The variant keeps the bare name and the label does not**, and that is
+    /// deliberate rather than an oversight. `Harmony::Tetrad` is what a
+    /// preferences file has been writing as `tetrad` since this enum existed,
+    /// so renaming it would either change what such a file means or leave a
+    /// variant and its id spelling different things — the trap
+    /// `docformat`'s "a derived spelling that reaches a file is a format"
+    /// rule already names. The *label* is free to move, and had to: with
+    /// [`Self::RectangleTetrad`] beside it a bare "Tetrad" no longer says
+    /// which of the two was drawn.
     Tetrad,
+    /// Four hues as two complementary pairs 60° apart — the *rectangle* tetrad,
+    /// also called the double complementary.
+    ///
+    /// A genuinely different set from the square, not a rotation of it: the
+    /// square is four hues nobody can pair off, where this is two
+    /// complementaries chosen to sit near each other, so one pair dominates and
+    /// the other accents it. That is the whole reason a painter reaches for it,
+    /// and it is why the two cannot share a row.
+    RectangleTetrad,
 }
 
 /// How many hues the widest harmony has, including the base.
@@ -50,21 +98,31 @@ pub enum Harmony {
 pub const MAX_HUES: usize = 4;
 
 impl Harmony {
-    pub const ALL: [Harmony; 5] = [
+    pub const ALL: [Harmony; 6] = [
         Self::Complementary,
         Self::Analogous,
         Self::Triad,
         Self::SplitComplementary,
         Self::Tetrad,
+        Self::RectangleTetrad,
     ];
 
+    /// The name the picker draws.
+    ///
+    /// Both tetrads are qualified, and neither may be left bare. The word names
+    /// two different sets of four hues, so a row reading "Tetrad" beside one
+    /// reading "Tetrad (rectangle)" would be a control lying about which of
+    /// them it drew — and the two are one dropdown row apart, which is exactly
+    /// where nobody would notice. They share a first word so the list groups
+    /// them without needing a heading.
     pub fn label(self) -> &'static str {
         match self {
             Self::Complementary => "Complementary",
             Self::Analogous => "Analogous",
             Self::Triad => "Triad",
             Self::SplitComplementary => "Split complementary",
-            Self::Tetrad => "Tetrad",
+            Self::Tetrad => "Tetrad (square)",
+            Self::RectangleTetrad => "Tetrad (rectangle)",
         }
     }
 
@@ -86,6 +144,13 @@ impl Harmony {
             // wheel, and a second number would be two rules to remember.
             Self::SplitComplementary => &[0.0, 150.0, 210.0],
             Self::Tetrad => &[0.0, 90.0, 180.0, 270.0],
+            // Two complementary pairs — 0/180 and 60/240 — and sixty is the
+            // gap between them rather than a fourth arbitrary number: it is
+            // the analogous step doubled, which is the widest separation that
+            // still reads as one pair leaning on another rather than as the
+            // square. Listed in order round the wheel, so the swatch row runs
+            // the way the markers do.
+            Self::RectangleTetrad => &[0.0, 60.0, 180.0, 240.0],
         }
     }
 
@@ -180,6 +245,25 @@ mod tests {
         }
     }
 
+    /// The wheel these angles are on is the RGB one, and that is a decision
+    /// rather than an accident — see the module docs.
+    ///
+    /// Pinned as the three pairs somebody would actually check by eye, because
+    /// "the complement of blue is yellow" is the sentence an RYB reading would
+    /// make false, and a change to RYB that left the offsets alone would leave
+    /// every other test in this file green.
+    #[test]
+    fn a_complement_is_the_opposite_hue_on_the_rgb_wheel() {
+        let opposite = |hue: f32| Harmony::Complementary.hues(hue).as_slice()[1];
+        assert_eq!(
+            opposite(240.0),
+            60.0,
+            "blue's complement is yellow, not orange"
+        );
+        assert_eq!(opposite(0.0), 180.0, "red's complement is cyan, not green");
+        assert_eq!(opposite(120.0), 300.0, "green's complement is magenta");
+    }
+
     /// The relations are what their names say. Checked as *angles*, because
     /// that is the only thing a harmony is.
     #[test]
@@ -201,6 +285,74 @@ mod tests {
             Harmony::Tetrad.hues(0.0).as_slice(),
             &[0.0, 90.0, 180.0, 270.0]
         );
+        // The rectangle is two complementary pairs, which is the property that
+        // tells it from the square and the only one worth asserting: checking
+        // the four numbers alone would pass for any four.
+        let rect = Harmony::RectangleTetrad.hues(0.0);
+        assert_eq!(rect.as_slice(), &[0.0, 60.0, 180.0, 240.0]);
+        for (a, b) in [(0, 2), (1, 3)] {
+            let apart = (rect.as_slice()[b] - rect.as_slice()[a]).rem_euclid(360.0);
+            assert!(
+                (apart - 180.0).abs() < 1e-3,
+                "{a} and {b} are {apart} apart"
+            );
+        }
+    }
+
+    /// The two tetrads are different *sets*, not one drawn from two headings.
+    ///
+    /// A rotation would make them the same relation under two names, which is
+    /// the row nobody would ever reach for twice — and it is the failure a
+    /// label alone cannot catch, because both labels would be true of both
+    /// sets. Checked as an unordered set at every base, since "the same four
+    /// hues in a different order" is still the same harmony.
+    #[test]
+    fn the_two_tetrads_are_not_the_same_four_hues() {
+        let sorted = |harmony: Harmony, base: f32| {
+            let mut hues = harmony.hues(base).as_slice().to_vec();
+            hues.sort_by(f32::total_cmp);
+            hues
+        };
+        for base in [0.0, 37.0, 90.0, 200.0, 359.0] {
+            assert_ne!(
+                sorted(Harmony::Tetrad, base),
+                sorted(Harmony::RectangleTetrad, base),
+                "at {base}"
+            );
+        }
+    }
+
+    /// No relation names one hue twice.
+    ///
+    /// A repeated member draws two identical swatches, one of which is dead —
+    /// the picker marks the base and makes the rest clickable, so a duplicate
+    /// would be a "take this colour" that hands back the colour already in
+    /// hand. It is also the shape a mistyped offset takes: 240 written where
+    /// 180 was meant is a legal-looking set with a hole in it.
+    #[test]
+    fn no_relation_names_the_same_hue_twice() {
+        for harmony in Harmony::ALL {
+            let hues = harmony.hues(17.0);
+            let hues = hues.as_slice();
+            for (i, a) in hues.iter().enumerate() {
+                for b in &hues[i + 1..] {
+                    let apart = (b - a).rem_euclid(360.0).min((a - b).rem_euclid(360.0));
+                    assert!(apart > 1.0, "{} repeats {a}", harmony.label());
+                }
+            }
+        }
+    }
+
+    /// Both tetrads are named as tetrads, and neither is left bare.
+    ///
+    /// The one property of the labels that can be wrong in a way nobody sees:
+    /// the two sets are adjacent rows of one dropdown, so a bare "Tetrad"
+    /// beside "Tetrad (rectangle)" reads as *the* tetrad rather than as the
+    /// square one. Pinned as text because the label is what a painter reads.
+    #[test]
+    fn neither_tetrad_is_called_only_a_tetrad() {
+        assert_eq!(Harmony::Tetrad.label(), "Tetrad (square)");
+        assert_eq!(Harmony::RectangleTetrad.label(), "Tetrad (rectangle)");
     }
 
     /// A harmony is a rotation, so turning the base turns the whole set by the
@@ -219,6 +371,38 @@ mod tests {
                     harmony.label()
                 );
             }
+        }
+    }
+
+    /// Every relation is in [`Harmony::ALL`], guarded by an exhaustive `match`
+    /// rather than by walking the array.
+    ///
+    /// A test that iterates `ALL` can only ever check what is in it, and every
+    /// other test in this file does exactly that — so a variant left out would
+    /// be unreachable from the dropdown *and* from a preferences file
+    /// (`prefs::harmony_from_id` resolves by iterating `ALL` too), with the
+    /// whole suite green. That is the `[EditKind; 11]` shape CLAUDE.md already
+    /// names, and adding a sixth relation is exactly when it stops being
+    /// hypothetical.
+    ///
+    /// The arms index `ALL`, so an array that is too *short* is an
+    /// out-of-bounds panic as well. That is still not total — an arm that does
+    /// not index its own position compiles and passes — and the hole is named
+    /// here rather than papered over: the only complete fix is a macro deriving
+    /// the enum and the array from one list, which this codebase's taste for
+    /// per-variant rustdoc argues against.
+    #[test]
+    fn every_relation_is_in_the_array_that_lists_them() {
+        for harmony in Harmony::ALL {
+            let at = match harmony {
+                Harmony::Complementary => 0,
+                Harmony::Analogous => 1,
+                Harmony::Triad => 2,
+                Harmony::SplitComplementary => 3,
+                Harmony::Tetrad => 4,
+                Harmony::RectangleTetrad => 5,
+            };
+            assert_eq!(Harmony::ALL[at], harmony, "{} is misfiled", harmony.label());
         }
     }
 
