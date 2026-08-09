@@ -715,7 +715,10 @@ fn accent_from_id(id: &str) -> Option<Accent> {
 }
 
 fn theme_from_id(id: &str) -> Option<ThemeKind> {
-    ThemeKind::ALL.into_iter().find(|k| theme_id(*k) == id)
+    // The other direction of [`theme_id`], and delegating for the same reason:
+    // a second walk over `ALL` here is a second statement of the lookup, which
+    // is what the writing side had and what it stopped having.
+    ThemeKind::from_id(id)
 }
 
 /// Stable names for the picker modes, for the same reason as `theme_id`.

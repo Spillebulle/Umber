@@ -1208,9 +1208,16 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
     };
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
     // `text_dim` is the palette's recessive ink, and it is the one token that
-    // is a mid-grey in *both* themes — the surfaces invert between Graphite and
-    // Paper and most of the ink with them, so anything stronger would be black
-    // on one and white on the other, over artwork that is neither.
+    // is a mid-grey in *every* theme — the surfaces invert between the light
+    // ones and the dark ones and most of the ink with them, so anything
+    // stronger would be black on one and white on the other, over artwork that
+    // is neither.
+    //
+    // That it reads against the pit is now a bound rather than an observation:
+    // `theme`'s `text_reads_against_every_surface_it_is_drawn_on` holds
+    // `text_dim` on `backdrop` to 2.6:1 for every shipped theme, this being one
+    // of the three places that pair is drawn. Krita's own 50% grey canvas
+    // surround is a palette this refuses, and `Palette::krita` says so.
     ui.painter()
         .circle_filled(ed.to_points(at), metrics::PEN_DOT, p.text_dim);
 }

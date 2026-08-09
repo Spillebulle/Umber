@@ -456,7 +456,7 @@ pub struct Palette {
     pub link_colours: [Color32; umber_core::LayerStack::LINK_GROUPS],
 }
 
-/// The link marks the four preset themes share, for a dark surface.
+/// The link marks the three *dark* preset themes share.
 ///
 /// Shared rather than copied four times, and that is not a token left carrying
 /// another theme's value: a link colour is a position on the hue wheel and not
@@ -597,7 +597,11 @@ impl Palette {
             accent_dim: Color32::from_rgb(0x38, 0x5F, 0x8D),
             warning: Color32::from_rgb(0xE0, 0x87, 0x6A),
             warning_bg: Color32::from_rgb(0x3A, 0x26, 0x20),
-            warning_border: Color32::from_rgb(0x6E, 0x40, 0x34),
+            // Authored against this theme's own fill, not Graphite's. It was
+            // `#6E4034` — Graphite's exactly — beside a `warning` and a
+            // `warning_bg` that had both been moved, which is the shape of a
+            // token somebody forgot rather than one they chose.
+            warning_border: Color32::from_rgb(0x74, 0x46, 0x3A),
             backdrop: Color32::from_rgb(0x28, 0x28, 0x28),
             window: Color32::from_rgb(0x2E, 0x2E, 0x2E),
             dock: Color32::from_rgb(0x32, 0x32, 0x32),
@@ -634,9 +638,11 @@ impl Palette {
     /// So the greys are Clip Studio's light interface rather than sampled, and
     /// they are cool where Paper is warm — the two light themes have to be
     /// told apart at a glance, and Paper's cream against this one's neutral
-    /// grey is the difference. The canvas surround is the mid grey Clip Studio
-    /// shows a page on, which is the second thing that distinguishes them:
-    /// Paper's pit is nearly the colour of its panels.
+    /// grey is the difference. The pit is a step deeper than the panels rather
+    /// than the mid grey Clip Studio shows a page on, for Krita's reason: the
+    /// canvas scrollbar thumb and the pen dot are drawn in `text_dim` over
+    /// `backdrop`, and at `#A0A0A0` that is 1.47:1. This is 2.70, a shade
+    /// clearer than Paper's own 2.61.
     pub const fn shit_studio() -> Self {
         Self {
             accent: Color32::from_rgb(0x1E, 0x6F, 0xD9),
@@ -644,7 +650,7 @@ impl Palette {
             warning: Color32::from_rgb(0xA8, 0x48, 0x2C),
             warning_bg: Color32::from_rgb(0xF6, 0xE4, 0xDC),
             warning_border: Color32::from_rgb(0xDD, 0xBA, 0xA8),
-            backdrop: Color32::from_rgb(0xA0, 0xA0, 0xA0),
+            backdrop: Color32::from_rgb(0xD8, 0xD8, 0xD8),
             window: Color32::from_rgb(0xE4, 0xE4, 0xE4),
             dock: Color32::from_rgb(0xEA, 0xEA, 0xEA),
             chrome: Color32::from_rgb(0xF0, 0xF0, 0xF0),
@@ -669,37 +675,51 @@ impl Palette {
     /// Krita's mid grey and its slate-blue selection.
     ///
     /// `#474747` panels, `#414141` docker headers and `#383838` list wells are
-    /// all sampled, and so is the one thing that makes a Krita window
-    /// recognisable across a room: **the canvas surround is lighter than the
-    /// interface**, a flat 50% `#808080`. That inverts the ordering Graphite
-    /// and Paper both keep, where the pit is the recessive extreme — which is
-    /// why [`Palette::with_accent`] derives a muted accent towards `window`
-    /// rather than towards `backdrop` for every theme but Graphite. Mixed
-    /// towards this pit a "muted" accent would come out louder than the accent
-    /// it mutes.
+    /// all sampled. **The canvas pit is not**, and it is the one place this
+    /// theme knowingly departs from the application it is named for.
+    ///
+    /// Krita surrounds the page with a flat 50% `#808080` — lighter than its
+    /// own interface, which is the thing that makes a Krita window
+    /// recognisable across a room, and it was this palette's `backdrop` until
+    /// it was measured against what gets drawn on it. Three marks are drawn in
+    /// `text_dim` over `backdrop` and nothing else: the canvas scrollbar thumb,
+    /// the dot that replaces the cursor under a pen, and the splash's status
+    /// line. `widgets.rs` explains why — `text_dim` is the only ink that is a
+    /// mid-grey whichever way the surfaces run — and names the bar it rejected:
+    /// `rail` at **1.31:1**. A `#808080` pit puts the thumb at **1.34:1**,
+    /// worse than the value that argument threw out, and the pen dot with it.
+    /// No pit between the panels and 50% grey fixes it, because `text_dim` is
+    /// itself a mid-grey: the contrast is lowest exactly where the pit is.
+    /// So the pit is dark like every other theme's, at 5.11:1, and what carries
+    /// Krita here is its mid grey and its slate selection — which is what it
+    /// was asked for.
+    /// **The other repair is the better one and is not in this file**: draw
+    /// that thumb in something chosen against the backdrop rather than in
+    /// `text_dim`. Do that and this can go back to `#808080`.
     ///
     /// `control_active` is the measured selection fill; `accent` is the same
-    /// slate blue lifted until it reads as ink on `#474747`, which is the
-    /// relationship Graphite's `control_active` and `accent` already have.
+    /// slate blue lifted until it reads as ink on `#474747` *and* clears
+    /// `Accent::Steel`, which the measured blue did not — see
+    /// `no_two_accents_look_alike_in_one_theme`. That is the relationship
+    /// Graphite's `control_active` and `accent` already have.
     pub const fn krita() -> Self {
         Self {
-            accent: Color32::from_rgb(0x6E, 0x9B, 0xC8),
-            accent_dim: Color32::from_rgb(0x53, 0x6B, 0x81),
+            accent: Color32::from_rgb(0x66, 0xAA, 0xEC),
+            accent_dim: Color32::from_rgb(0x4F, 0x72, 0x94),
             warning: Color32::from_rgb(0xE0, 0x8A, 0x6E),
             warning_bg: Color32::from_rgb(0x3B, 0x29, 0x24),
             warning_border: Color32::from_rgb(0x71, 0x44, 0x39),
-            backdrop: Color32::from_rgb(0x80, 0x80, 0x80),
+            backdrop: Color32::from_rgb(0x26, 0x26, 0x26),
             window: Color32::from_rgb(0x38, 0x38, 0x38),
             dock: Color32::from_rgb(0x41, 0x41, 0x41),
             chrome: Color32::from_rgb(0x47, 0x47, 0x47),
             border: Color32::from_rgb(0x57, 0x57, 0x57),
-            // Darker than the dock column rather than two units off it, which
-            // is what the measured `#3F3F3F` was: a menu dropped over a docked
-            // panel has to be told from it by more than its own hairline. Krita
-            // draws its menus darker than its dockers, so this is the faithful
-            // direction as well as the legible one. MediaBog's had the same
-            // defect and worse — see its `popover`.
-            popover: Color32::from_rgb(0x3A, 0x3A, 0x3A),
+            // Below the measured trio rather than inside it. `#3F3F3F` was the
+            // reading and sat two units off `dock`; `#3A3A3A` moved it two
+            // units off `window`, which is `extreme_bg_color` and therefore
+            // every inset well a menu can be dropped over. This clears both,
+            // and darker is the direction Krita's own menus go.
+            popover: Color32::from_rgb(0x31, 0x31, 0x31),
             popover_border: Color32::from_rgb(0x5C, 0x5C, 0x5C),
             control: Color32::from_rgb(0x52, 0x52, 0x52),
             control_hover: Color32::from_rgb(0x5E, 0x5E, 0x5E),
@@ -708,7 +728,7 @@ impl Palette {
             text: Color32::from_rgb(0xDC, 0xDC, 0xDC),
             text_muted: Color32::from_rgb(0xB0, 0xB0, 0xB0),
             text_dim: Color32::from_rgb(0x96, 0x96, 0x96),
-            rail: Color32::from_rgb(0x30, 0x30, 0x30),
+            rail: Color32::from_rgb(0x2A, 0x2A, 0x2A),
             knob: Color32::from_rgb(0xB8, 0xB8, 0xB8),
             link_colours: PRESET_LINKS_DARK,
         }
@@ -729,8 +749,12 @@ impl Palette {
     /// document with no edge.
     pub const fn mediabog() -> Self {
         Self {
-            accent: Color32::from_rgb(0x4F, 0xA8, 0xE8),
-            accent_dim: Color32::from_rgb(0x40, 0x6C, 0x8D),
+            // Lifted from the measured `#1883D7`/`#4FA8E8` far enough that the
+            // *emphasised* text button's label clears 3:1 on `control`, which
+            // is the one place the accent is ink on a fill rather than on a
+            // panel. `#4FA8E8` reads 2.76 there.
+            accent: Color32::from_rgb(0x5F, 0xB2, 0xEE),
+            accent_dim: Color32::from_rgb(0x48, 0x71, 0x90),
             warning: Color32::from_rgb(0xE8, 0x89, 0x6B),
             warning_bg: Color32::from_rgb(0x3A, 0x2A, 0x24),
             warning_border: Color32::from_rgb(0x7A, 0x4A, 0x38),
@@ -745,8 +769,14 @@ impl Palette {
             // keep these two apart; noticed in `every_theme_preview`, which is
             // what a picture is for.
             popover: Color32::from_rgb(0x40, 0x3D, 0x3D),
-            popover_border: Color32::from_rgb(0x5C, 0x5C, 0x5C),
-            control: Color32::from_rgb(0x5A, 0x57, 0x57),
+            // Warm, like every other grey here. It was `#5C5C5C` — neutral,
+            // and byte for byte Krita's, in the one theme whose stated identity
+            // is that its channels are unequal.
+            popover_border: Color32::from_rgb(0x5E, 0x5A, 0x5A),
+            // Deep enough that `text` on a resting button clears 4.5:1. At the
+            // measured `#5A5757` it is 4.28, which is under the floor this
+            // palette's own `text_strong` is held to on the identical surface.
+            control: Color32::from_rgb(0x55, 0x52, 0x52),
             control_hover: Color32::from_rgb(0x66, 0x62, 0x62),
             // The blue a selected row wears, taken deeper than the measured
             // `#559CD1` so that `text_strong` on it clears 3:1 — MediBang draws
@@ -760,7 +790,10 @@ impl Palette {
             text: Color32::from_rgb(0xC8, 0xC8, 0xC8),
             text_muted: Color32::from_rgb(0xAD, 0xAD, 0xAD),
             text_dim: Color32::from_rgb(0x94, 0x94, 0x94),
-            rail: Color32::from_rgb(0x30, 0x2E, 0x2E),
+            // Below `window` rather than equal to it, which is what it was: a
+            // slider track inside an inset well would have had nothing to sit
+            // on. No other theme sets those two the same.
+            rail: Color32::from_rgb(0x27, 0x25, 0x25),
             knob: Color32::from_rgb(0xC8, 0xC8, 0xC8),
             link_colours: PRESET_LINKS_DARK,
         }
@@ -1354,6 +1387,45 @@ mod tests {
         }
     }
 
+    /// The four accents are four adjacent circles in the settings pane, so two
+    /// of them the same colour is a picker offering a choice that is not one.
+    ///
+    /// Nothing measured this before there were six themes, and nothing needed
+    /// to: the four swatches are the design's own and are told apart by
+    /// construction. What changed is that [`Accent::Umber`] now answers with
+    /// *the theme's own* accent, so each preset theme puts a fifth colour into
+    /// that comparison — and Krita's measured slate blue landed 35 from
+    /// `Accent::Steel`, against a worst of 64 anywhere else. Both drawn as
+    /// 18-point circles side by side, one of them labelled "Umber".
+    ///
+    /// The bound is the link test's metric and its accent figure, and 64 —
+    /// Graphite's own Umber against its Clay — is the bar this cannot be
+    /// tightened past without moving the design's swatches.
+    #[test]
+    fn no_two_accents_look_alike_in_one_theme() {
+        let apart = |a: Color32, b: Color32| {
+            let d = |x: u8, y: u8| u32::from(x.abs_diff(y));
+            d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
+        };
+        for kind in ThemeKind::ALL {
+            let inks: Vec<Color32> = Accent::ALL
+                .into_iter()
+                .map(|a| Palette::with_accent(kind, a).accent)
+                .collect();
+            for (i, a) in inks.iter().enumerate() {
+                for (j, b) in inks.iter().enumerate().skip(i + 1) {
+                    let d = apart(*a, *b);
+                    assert!(
+                        d >= 60,
+                        "{kind:?}: {:?} and {:?} are only {d} apart",
+                        Accent::ALL[i],
+                        Accent::ALL[j],
+                    );
+                }
+            }
+        }
+    }
+
     /// The accent mechanism must not perturb the default. If re-hueing ever
     /// starts running for Umber, this catches it before the whole interface
     /// shifts colour by a couple of units.
@@ -1475,11 +1547,13 @@ mod tests {
     /// the shipped pair does not meet is a bound stated wrongly, and finding
     /// that out is worth more than a guard that only ever looks at new code.
     /// **It found one.** The floors were 4.5 / 4.5 / 3.0 / 3.0 and Paper's
-    /// `text_dim` on its own `window` is **2.92** — the design's dimmest label
-    /// on its palest inset, shipped and looked at by somebody. So the dim floor
-    /// is what Paper actually reaches rather than the round number, and the
-    /// four themes added here clear it by a margin: nothing new may be dimmer
-    /// than the dimmest thing already on screen.
+    /// `text_dim` on its own `window` is **2.92** — the dimmest of the four
+    /// panel surfaces below, shipped and looked at by somebody. So the dim
+    /// floor is what Paper actually reaches rather than the round number, and
+    /// the four themes added here clear even 3.0: nothing new may be dimmer
+    /// than the dimmest thing already on screen. (Paper is dimmer still on
+    /// `control` — 2.79 — and that pair is deliberately not below, because
+    /// nothing draws `text_dim` on a button.)
     ///
     /// `control_active` is here too, and is the one token that is a background
     /// rather than a mark — a selected row draws `text_strong` on it. That is
@@ -1544,6 +1618,22 @@ mod tests {
                     "control_hover",
                     4.5,
                 ),
+                // `controls::text_button` fills with `control` and inks its
+                // label in `text`, or in `accent` when it is the emphasised
+                // one — which is the primary button of every dialog footer.
+                // Reading `style_from` alone missed both: this interface's real
+                // controls are *painted* in `controls.rs` and `widgets.rs`, so
+                // the tokens egui is handed are only half the domain.
+                (p.text, "text", p.control, "control", 4.5),
+                (p.accent, "accent", p.control, "control", 3.0),
+                // Three marks are drawn in `text_dim` over the *canvas pit* and
+                // nowhere else: `widgets`'s canvas scrollbar thumb, `ui`'s pen
+                // dot, and `splash`'s status line. `widgets.rs` states the bar
+                // it rejected when it chose that ink — `rail`, at 1.31:1 — and
+                // 2.6 is what the palette it was written against actually
+                // reaches, which is Paper's 2.61. Krita's own 50% grey pit put
+                // the thumb at 1.34, under the number that argument threw out.
+                (p.text_dim, "text_dim", p.backdrop, "backdrop", 2.6),
             ] {
                 let r = ratio(ink, surface);
                 assert!(
