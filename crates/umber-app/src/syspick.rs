@@ -1,9 +1,11 @@
 //! Reading a pixel of the desktop, for the eyedropper's other half.
 //!
-//! In `umber-app` for the reason [`sysclip`](crate::sysclip) and
-//! [`syscursor`](crate::syscursor) are: `umber-core` and `umber-render` may not
-//! learn about the platform, which is the boundary that keeps them testable
-//! without one. Nothing below this module knows the desktop exists, and the
+//! In `umber-app` for the reason `sysclip` and `syscursor` are: `umber-core`
+//! and `umber-render` may not learn about the platform, which is the boundary
+//! that keeps them testable without one. Those two are named rather than linked
+//! because they are private modules and this one is `pub` — rustdoc refuses a
+//! link out of a public item into a private one, and a broken link is worse
+//! than a name. Nothing below this module knows the desktop exists, and the
 //! canvas half of the eyedropper is untouched — it still goes through
 //! `CanvasRenderer::pick_colour`, which reuses the screen composite pass, so
 //! there is exactly one path from a pixel to a colour inside the document and
@@ -11,11 +13,12 @@
 //!
 //! **The decision is pure and the platform call is the thin part**, which is
 //! `sysclip::decide`'s shape and is the only reason any of this is testable.
-//! [`aim`] is a function of four readings — where the pointer is, how big the
-//! client area is, where that area sits on the desktop, and whether this build
-//! can read the desktop at all — and it is what says whether a sample belongs
-//! to the canvas, to the desktop, or to nothing. [`sample`] is nine lines of
-//! GDI under a `cfg`. No test touches the screen.
+//! [`aim`] is a function of five readings — where the pointer is, whether that
+//! is over the picture, how big the client area is, where it sits on the
+//! desktop, and whether this build can read the desktop at all — and it is what
+//! says whether a sample belongs to the canvas, to the desktop, or to nothing
+//! at all. [`sample`] is nine lines of GDI under a `cfg`. No test touches the
+//! screen.
 //!
 //! # How the pointer gets outside the window at all
 //!
@@ -51,9 +54,14 @@
 //! which is then either occluding the pixel it exists to magnify or offset from
 //! it by a hand-tuned margin, and either way is a second wgpu surface and a
 //! second render pass. It is the right thing to build eventually and it is not
-//! built. What stands in for it is that the sample is applied *live*: the
-//! colour under the pointer is the painting colour for as long as the drag
-//! lasts, so the Colour module's swatch is the readout.
+//! built. What stands in for it is that the sample follows the pointer: the
+//! colour under it becomes the painting colour as the drag moves, so the
+//! Colour module's swatch is the readout. Not *live* — `App::pick_this_frame`
+//! skips a frame the pointer did not move on, so a pixel that changes
+//! underneath a hand held still (a video, another window repainting) is not
+//! re-read. That is the throttle earning its keep and it is worth saying,
+//! because the swatch is the whole of the feedback and somebody will hold
+//! still over something that moves.
 //!
 //! # What is only true on Windows
 //!
@@ -197,46 +205,76 @@ pub const fn outside_detail() -> &'static str {
 /// Where a sample taken at some pointer position belongs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aim {
-    /// Inside the window's own client area. The canvas answers, through the
-    /// composite pass, exactly as an Alt-click has always done — and where the
-    /// point is off the document that read declines and the colour is left
-    /// alone. Nothing about Umber's own interface is ever sampled: a pick over
-    /// a panel is a pick over a point that is not in the document.
+    /// On the document. The canvas answers, through the composite pass,
+    /// exactly as an Alt-click has always done — and where the point is
+    /// outside the picture that read declines and the colour is left alone.
     Canvas,
-    /// Outside it, at these virtual-screen physical pixels.
+    /// Inside Umber's own window and not on the document: a panel, the tab
+    /// strip, a scrollbar, the selection's strip, the margin round a canvas
+    /// smaller than the view. **Nothing is read**, and that is the whole of
+    /// what this variant is for.
+    ///
+    /// It exists because the first draft did not have it. `Editor::cursor` is
+    /// not clipped to the canvas region and `screen_to_doc` is a plain camera
+    /// transform, so a point over the Layers panel maps to a real document
+    /// pixel whenever the picture reaches under the dock — which it does at any
+    /// zoom that fills the window. A drag that left the canvas therefore went
+    /// on changing the painting colour to colours the artist could not see.
+    /// The press was already safe (`ui_owns_pointer` refuses it); the drag was
+    /// not, because nothing after the press asked again.
+    Interface,
+    /// Outside the window, at these virtual-screen physical pixels.
     Desktop(i32, i32),
-    /// Outside it, and this build cannot read the desktop.
+    /// Outside the window, and this build cannot read the desktop.
     Unreachable,
 }
 
 /// Decide where a pick lands.
 ///
-/// `pointer` and `client` are in physical window pixels — winit's unit, and
-/// what `Editor::cursor` holds. `origin` is `Window::inner_position`, the
-/// client area's top-left in desktop physical pixels, and it is an `Option`
-/// because winit's is: a platform that cannot say answers `None`, and a
-/// position that cannot be placed on the desktop is one that cannot be read
-/// off it either.
+/// Four injected readings and no state, which is `sysclip::decide`'s shape and
+/// the only reason any of this is testable — the macOS and Linux answers are
+/// checked on a Windows machine, and the panel case is checked with no window
+/// at all.
 ///
-/// `desktop_readable` is injected rather than read from [`DESKTOP_READABLE`]
-/// for the reason `install::detect` takes a `Probe`: the answer this gives on a
-/// machine that cannot read the desktop is the half that has to be tested on
-/// the machine that can.
+/// * `pointer` and `client` are physical window pixels, winit's unit and what
+///   `Editor::cursor` holds.
+/// * `over_canvas` is `Editor::pointer_over_canvas`, which is the *canvas
+///   region* minus the panels, the scrollbars and the canvas's own overlay
+///   controls. Injected rather than derived here, because that reading belongs
+///   to the layout and this module may not learn about panels.
+/// * `origin` is `Window::inner_position`, the client area's top-left in
+///   desktop physical pixels, and it is an `Option` because winit's is.
+/// * `desktop_readable` is injected rather than read from [`DESKTOP_READABLE`]
+///   for the reason `install::detect` takes a `Probe`.
 ///
-/// **The test is the client area and not the document.** Inside the window and
-/// off the canvas — over a panel, over the tab strip, over the margin — is
-/// [`Aim::Canvas`], which the canvas read then declines. Making it
-/// [`Aim::Desktop`] instead would sample Umber's own interface off the screen
-/// surface, which is a colour the palette can already provide and is a second,
-/// worse route to it: the pixels there are the *theme's*, already composited
-/// with whatever egui drew over them.
-pub fn aim(pointer: Vec2, client: Vec2, origin: Option<(i32, i32)>, desktop_readable: bool) -> Aim {
+/// **The order is canvas, then window, then desktop**, and the middle one is
+/// what stops Umber's own interface being sampled: reading a panel off the
+/// screen surface would hand back the theme's own ink already composited with
+/// whatever egui had drawn over it, which is a colour the palette can give you
+/// properly.
+///
+/// **Umber's title bar and window borders are the one exception**, and it is
+/// stated rather than fixed: they are outside the *client* area, so a drag onto
+/// them reads them off the desktop like anything else. What comes back is the
+/// title bar's own colour, which is harmless and is the same answer any other
+/// screen picker gives; excluding them would mean reading `outer_position` and
+/// `outer_size` as well and having two rectangles to keep in step for that.
+pub fn aim(
+    pointer: Vec2,
+    over_canvas: bool,
+    client: Vec2,
+    origin: Option<(i32, i32)>,
+    desktop_readable: bool,
+) -> Aim {
+    if over_canvas {
+        return Aim::Canvas;
+    }
     let inside = pointer.x >= 0.0
         && pointer.y >= 0.0
         && pointer.x < client.x.max(0.0)
         && pointer.y < client.y.max(0.0);
     if inside {
-        return Aim::Canvas;
+        return Aim::Interface;
     }
     if !desktop_readable {
         return Aim::Unreachable;
@@ -247,7 +285,17 @@ pub fn aim(pointer: Vec2, client: Vec2, origin: Option<(i32, i32)>, desktop_read
     // `floor` rather than `as i32`, which truncates towards zero and would
     // therefore round the wrong way for every position left of or above the
     // window — the exact half of the range this branch exists for.
-    Aim::Desktop(ox + pointer.x.floor() as i32, oy + pointer.y.floor() as i32)
+    //
+    // `saturating_add` because the sum is the only arithmetic in this module
+    // and `as i32` saturates rather than wrapping: a nonsense pointer position
+    // would give `i32::MAX`, and `origin + i32::MAX` is a panic in a debug
+    // build. winit's Windows path bounds these to a `i16` in practice, so this
+    // is not reachable today and costs nothing to make unreachable by
+    // construction.
+    Aim::Desktop(
+        ox.saturating_add(pointer.x.floor() as i32),
+        oy.saturating_add(pointer.y.floor() as i32),
+    )
 }
 
 /// Read one pixel of the desktop, at virtual-screen physical pixels.
@@ -306,37 +354,70 @@ mod tests {
     const CLIENT: Vec2 = Vec2::new(1280.0, 800.0);
     const ORIGIN: Option<(i32, i32)> = Some((100, 50));
 
+    /// On the canvas: what `Editor::pointer_over_canvas` says over the picture.
+    fn on_canvas(at: Vec2) -> Aim {
+        aim(at, true, CLIENT, ORIGIN, true)
+    }
+
+    /// Inside the window and not on the canvas: over a panel, a scrollbar, the
+    /// tab strip, or outside the window altogether.
+    fn off_canvas(at: Vec2) -> Aim {
+        aim(at, false, CLIENT, ORIGIN, true)
+    }
+
     #[test]
-    fn inside_the_client_area_is_the_canvas() {
+    fn over_the_picture_is_the_canvas() {
         for at in [
             Vec2::new(0.0, 0.0),
             Vec2::new(640.0, 400.0),
             Vec2::new(1279.0, 799.0),
         ] {
-            assert_eq!(aim(at, CLIENT, ORIGIN, true), Aim::Canvas, "at {at:?}");
+            assert_eq!(on_canvas(at), Aim::Canvas, "at {at:?}");
         }
     }
 
     #[test]
-    fn a_position_over_a_panel_is_still_the_canvas_read_to_refuse() {
-        // The rule this module could most plausibly have got the other way
-        // round. Umber's own interface is inside the client area, so it is
-        // `Canvas` and the composite read then declines it for being off the
-        // document — rather than being read off the screen surface, which
-        // would hand back the theme's own ink already composited with whatever
-        // egui had drawn over it.
-        assert_eq!(aim(Vec2::new(4.0, 4.0), CLIENT, ORIGIN, true), Aim::Canvas);
+    fn a_drag_onto_a_panel_reads_nothing_at_all() {
+        // **The defect this variant was added for.** The press is refused by
+        // `ui_owns_pointer`, but the *drag* asks nothing after it, and
+        // `screen_to_doc` is a plain camera transform with no clip to the
+        // canvas region — so at any zoom that fills the window a point over the
+        // Layers panel maps to a real document pixel, and the painting colour
+        // went on changing to colours the artist could not see.
+        //
+        // The tempting answers are both wrong. `Canvas` was the original and is
+        // this bug. `Desktop` reads Umber's own panel off the screen surface,
+        // which hands back the theme's ink already composited with whatever
+        // egui drew over it — a colour the palette can give properly.
+        for at in [
+            Vec2::new(4.0, 4.0),
+            Vec2::new(1279.0, 400.0),
+            Vec2::new(640.0, 799.0),
+        ] {
+            assert_eq!(off_canvas(at), Aim::Interface, "at {at:?}");
+        }
     }
 
     #[test]
-    fn outside_it_lands_on_the_desktop_at_the_windows_own_offset() {
+    fn outside_the_window_lands_on_the_desktop_at_its_own_offset() {
         assert_eq!(
-            aim(Vec2::new(1280.0, 400.0), CLIENT, ORIGIN, true),
+            off_canvas(Vec2::new(1280.0, 400.0)),
             Aim::Desktop(1380, 450)
         );
+        assert_eq!(off_canvas(Vec2::new(10.0, 800.0)), Aim::Desktop(110, 850));
+    }
+
+    #[test]
+    fn the_canvas_wins_over_the_window_test_and_never_the_other_way() {
+        // `over_canvas` is asked first, so a canvas region that somehow
+        // reported true outside the client area would still read as the canvas
+        // rather than as the desktop. That is the safe direction: the canvas
+        // read declines a point off the document, where a desktop read would
+        // hand back a pixel of somebody else's window for a position Umber
+        // believed was its own.
         assert_eq!(
-            aim(Vec2::new(10.0, 800.0), CLIENT, ORIGIN, true),
-            Aim::Desktop(110, 850)
+            aim(Vec2::new(-4.0, -4.0), true, CLIENT, ORIGIN, true),
+            Aim::Canvas
         );
     }
 
@@ -346,18 +427,12 @@ mod tests {
         // every position in the leftmost column of the drag would be read one
         // pixel to the right of where the pointer was. This is the whole
         // reason `aim` floors.
-        assert_eq!(
-            aim(Vec2::new(-0.5, 400.0), CLIENT, ORIGIN, true),
-            Aim::Desktop(99, 450)
-        );
-        assert_eq!(
-            aim(Vec2::new(-1.5, -1.5), CLIENT, ORIGIN, true),
-            Aim::Desktop(98, 48)
-        );
+        assert_eq!(off_canvas(Vec2::new(-0.5, 400.0)), Aim::Desktop(99, 450));
+        assert_eq!(off_canvas(Vec2::new(-1.5, -1.5)), Aim::Desktop(98, 48));
         // And the positive side keeps agreeing with it, so the two halves of
         // the drag are one rule rather than two.
         assert_eq!(
-            aim(Vec2::new(1280.5, 800.5), CLIENT, ORIGIN, true),
+            off_canvas(Vec2::new(1280.5, 800.5)),
             Aim::Desktop(1380, 850)
         );
     }
@@ -367,31 +442,86 @@ mod tests {
         // Windows puts the virtual screen's origin at the primary monitor's
         // top-left, so a second screen to the left is at negative x — and a
         // window on it has a negative `inner_position`. Nothing clamps.
+        let far_left = Some((-1920, -120));
         assert_eq!(
-            aim(Vec2::new(10.0, 10.0), CLIENT, Some((-1920, -120)), true),
+            aim(Vec2::new(10.0, 10.0), true, CLIENT, far_left, true),
             Aim::Canvas
         );
         assert_eq!(
-            aim(Vec2::new(-10.0, -10.0), CLIENT, Some((-1920, -120)), true),
+            aim(Vec2::new(-10.0, -10.0), false, CLIENT, far_left, true),
             Aim::Desktop(-1930, -130)
         );
     }
 
     #[test]
-    fn a_build_that_cannot_read_the_desktop_says_so_rather_than_guessing() {
-        // The macOS and Linux answer, tested on the machine that can. Inside
-        // the window is unchanged — the canvas half works everywhere.
-        assert_eq!(aim(Vec2::new(4.0, 4.0), CLIENT, ORIGIN, false), Aim::Canvas);
+    fn a_nonsense_position_saturates_rather_than_overflowing() {
+        // `as i32` saturates, so a pointer at `f32::MAX` becomes `i32::MAX` and
+        // a plain `+` on the origin is an overflow — which in a debug build is
+        // a panic and in a release build is a wrap to a coordinate on the far
+        // side of the desktop. Not reachable through winit today, and free to
+        // make unreachable by construction.
+        //
+        // **Both ends, and both with an origin that pushes it over rather than
+        // one that happens to absorb it.** Against `ORIGIN`'s (100, 50) the
+        // negative case does not overflow at all, so a test written only that
+        // way passes under a plain `+` and proves nothing.
         assert_eq!(
-            aim(Vec2::new(-4.0, 4.0), CLIENT, ORIGIN, false),
+            aim(
+                Vec2::new(f32::MAX, f32::MAX),
+                false,
+                CLIENT,
+                Some((1, 1)),
+                true
+            ),
+            Aim::Desktop(i32::MAX, i32::MAX)
+        );
+        assert_eq!(
+            aim(
+                Vec2::new(f32::MIN, f32::MIN),
+                false,
+                CLIENT,
+                Some((-1, -1)),
+                true
+            ),
+            Aim::Desktop(i32::MIN, i32::MIN)
+        );
+        // And an ordinary origin with a saturated pointer still lands
+        // somewhere, rather than being clamped to the extreme by a second
+        // saturation nobody asked for.
+        assert_eq!(
+            aim(Vec2::new(f32::MIN, f32::MIN), false, CLIENT, ORIGIN, true),
+            Aim::Desktop(i32::MIN + 100, i32::MIN + 50)
+        );
+    }
+
+    #[test]
+    fn a_build_that_cannot_read_the_desktop_says_so_rather_than_guessing() {
+        // The macOS and Linux answer, tested on the machine that can. Both of
+        // the inside-the-window answers are unchanged there: the canvas half
+        // works everywhere, and a panel still reads nothing.
+        assert_eq!(
+            aim(Vec2::new(4.0, 4.0), true, CLIENT, ORIGIN, false),
+            Aim::Canvas
+        );
+        assert_eq!(
+            aim(Vec2::new(4.0, 4.0), false, CLIENT, ORIGIN, false),
+            Aim::Interface
+        );
+        assert_eq!(
+            aim(Vec2::new(-4.0, 4.0), false, CLIENT, ORIGIN, false),
             Aim::Unreachable
         );
     }
 
     #[test]
     fn a_window_that_cannot_say_where_it_is_reads_nothing_off_the_desktop() {
+        // Defensive rather than live: `aim` tests `desktop_readable` first, and
+        // the only platform where that is true is the one whose
+        // `inner_position` never fails. Kept because the `Option` is winit's
+        // and a platform gaining a screen read before it gains a position is a
+        // combination nothing else would catch.
         assert_eq!(
-            aim(Vec2::new(-4.0, 4.0), CLIENT, None, true),
+            aim(Vec2::new(-4.0, 4.0), false, CLIENT, None, true),
             Aim::Unreachable
         );
     }
@@ -399,11 +529,11 @@ mod tests {
     #[test]
     fn a_zero_sized_client_area_is_all_outside() {
         // Minimised, or the frame between a resize and the first paint. Every
-        // position is outside, and none of them is `Canvas` — which matters
-        // because `Canvas` would send a coordinate into the composite read for
-        // a surface that has no pixels.
+        // position is outside the window, so nothing reads as `Interface` and
+        // the desktop answers — which is right: the pointer genuinely is over
+        // whatever is behind a window with no pixels.
         assert_eq!(
-            aim(Vec2::ZERO, Vec2::ZERO, ORIGIN, true),
+            aim(Vec2::ZERO, false, Vec2::ZERO, ORIGIN, true),
             Aim::Desktop(100, 50)
         );
     }

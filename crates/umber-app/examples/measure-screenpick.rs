@@ -83,7 +83,16 @@ mod windows {
             let mut out = None;
             if !mem.is_null() && !bmp.is_null() {
                 let old = SelectObject(mem, bmp as _);
-                if BitBlt(mem, 0, 0, 1, 1, screen, x, y, SRCCOPY) != 0 {
+                let blitted = BitBlt(mem, 0, 0, 1, 1, screen, x, y, SRCCOPY) != 0;
+                // **Deselected before `GetDIBits`, not after.** MSDN: "The
+                // bitmap identified by the `hbm` parameter must not be selected
+                // into a device context when the application calls this
+                // function." It happens to work either way, and this example is
+                // the *evidence* for `syspick`'s claim that the two routes
+                // agree — a second opinion resting on documented misuse is not
+                // one.
+                SelectObject(mem, old);
+                if blitted {
                     let mut info: BITMAPINFO = std::mem::zeroed();
                     info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
                     info.bmiHeader.biWidth = 1;
@@ -109,7 +118,6 @@ mod windows {
                         out = Some([px[2], px[1], px[0]]);
                     }
                 }
-                SelectObject(mem, old);
             }
             if !bmp.is_null() {
                 DeleteObject(bmp as _);

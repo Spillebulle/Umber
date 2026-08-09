@@ -1732,13 +1732,12 @@ mod strip_budget {
     /// each other, so unlike the navigation pair one figure covers them.
     ///
     /// **Bisected against its own guard rather than estimated**, which is what
-    /// the estimate was worth: the sentence needs somewhere between 295 and
-    /// 305 points, so a figure taken from `ZOOM`'s points-per-character would
-    /// have landed either side of it by luck. 320 is the smallest round number
-    /// with real slack in it, and
+    /// the estimate was worth: 305 came from `ZOOM`'s points-per-character and
     /// `the_eyedroppers_hint_does_not_overrun_the_strip_it_is_drawn_on` fails
-    /// at 295 and 305 — the second by four points, which is exactly the sort of
-    /// margin a font metric moves by.
+    /// at it, by four points — which is exactly the margin a font metric moves
+    /// by. It also fails at 295 and passes at 320, so what the sentence
+    /// actually needs is somewhere in `(305, 320]` and the `ui::add_space(6.0)`
+    /// before the label is part of it.
     pub const EYEDROPPER: f32 = 320.0;
     // Pan's and Zoom's second sentence are budgeted per tool, on
     // `navigate_hint`'s own third field, because the two lines are a third
@@ -1778,7 +1777,7 @@ mod strip_budget {
 /// `neither_navigation_hint_overruns_the_strip_it_is_drawn_on`.
 ///
 /// **Exhaustive over [`Tool`] rather than a wildcard**, for the reason
-/// `panels::edit_icon` is exhaustive over `EditKind`: ten of the design's
+/// `panels::edit_icon` is exhaustive over `EditKind`: nine of the design's
 /// sixteen tools are not built, and the first navigation tool added would
 /// otherwise silently draw Pan's two sentences. The five that never reach this
 /// branch are named so that `Tool` growing is a compile error and not a wrong

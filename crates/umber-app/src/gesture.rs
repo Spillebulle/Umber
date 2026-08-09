@@ -41,7 +41,7 @@ pub fn is_tap(distance: f32) -> bool {
 /// Everything the decision below is allowed to read.
 ///
 /// Deliberately a snapshot of observations rather than a borrow of the editor:
-/// it is what makes the whole matrix — six tools times two pointers times the
+/// it is what makes the whole matrix — every tool times two pointers times the
 /// modifiers — statable in a test.
 #[derive(Clone, Copy, Debug)]
 pub struct Pointer {
@@ -339,7 +339,10 @@ mod tests {
     /// therefore checked by `every_tool_is_in_this_modules_own_list` below —
     /// which is the shape CLAUDE.md's rule for an `ALL` array prescribes: a
     /// hand-written array is exactly the thing a new variant does not appear
-    /// in, so something has to fail the build when one is added.
+    /// in, so something has to fail the build when one is added. The arms
+    /// there index this array rather than returning a literal, which is the
+    /// half of the rule that makes a short array an out-of-bounds panic; the
+    /// first draft returned literals and could not have caught it.
     const TOOLS: [Tool; 7] = [
         Tool::Brush,
         Tool::Eraser,
@@ -360,16 +363,23 @@ mod tests {
         // known hole is an arm that indexes somebody else's position; that is
         // what the equality is for.
         for (i, tool) in TOOLS.iter().enumerate() {
+            // Each arm *indexes* `TOOLS`, which is CLAUDE.md's rule and not a
+            // stylistic choice: with literal integers here — which is what the
+            // first draft wrote — adding `Tool::Fill => 7` and forgetting the
+            // array compiles and passes, and every sweep built on `TOOLS`
+            // quietly stops covering the new tool. Indexing makes that an
+            // out-of-bounds panic instead.
             let expected = match tool {
-                Tool::Brush => 0,
-                Tool::Eraser => 1,
-                Tool::Select => 2,
-                Tool::Transform => 3,
-                Tool::Eyedropper => 4,
-                Tool::Pan => 5,
-                Tool::Zoom => 6,
+                Tool::Brush => TOOLS[0],
+                Tool::Eraser => TOOLS[1],
+                Tool::Select => TOOLS[2],
+                Tool::Transform => TOOLS[3],
+                Tool::Eyedropper => TOOLS[4],
+                Tool::Pan => TOOLS[5],
+                Tool::Zoom => TOOLS[6],
             };
-            assert_eq!(i, expected, "{tool:?} is filed in the wrong place");
+            assert_eq!(*tool, expected, "{tool:?} is filed in the wrong place");
+            assert_eq!(TOOLS[i], *tool, "the sweep is walking its own array");
         }
     }
 

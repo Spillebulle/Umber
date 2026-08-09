@@ -2588,13 +2588,16 @@ impl UmberApp {
     /// free: a smudge is a trailing average by construction. An eyedropper is
     /// the opposite. The artist lets go when the swatch shows the colour they
     /// want, so a two-frame lag means letting go over the wrong pixel — the
-    /// gesture would be *aimed* by a readout that is behind the hand. A cost of
-    /// a millisecond beats being wrong by two frames.
+    /// gesture would be *aimed* by a readout that is behind the hand.
     ///
-    /// The read is a 1×1 render and a four-byte readback, which is what
-    /// `pick_colour` was built to be, and it is bounded above by the desktop
-    /// half's own cost anyway: `Self::picked_at`'s measurement puts a screen
-    /// read at a whole display refresh.
+    /// **What it costs has not been measured, and that is worth admitting**
+    /// rather than putting a figure beside the two that were: a `pick_colour`
+    /// is a 1×1 render, a fresh texture and staging buffer per call, and a map
+    /// and wait, now once per frame of a drag rather than once per click.
+    /// `examples/measure-screenpick.rs` measures the desktop half and not this
+    /// one. What the argument rests on is the shape and not the number — this
+    /// runs only while a button is held, and only for a gesture during which
+    /// nothing is being painted.
     fn pick_this_frame(&mut self) {
         if self.editor.interaction != Interaction::Picking {
             // Not picking, so nothing to remember. Cleared here rather than at
@@ -2612,10 +2615,22 @@ impl UmberApp {
 
     /// Take the colour under the cursor as the painting colour, now.
     ///
-    /// The one route in, from `gesture::Press::Eyedropper` — which is Alt with
-    /// any tool in hand, the eyedropper tool's own press, and the pen's
-    /// Alt-tap — and from [`Self::pick_this_frame`] for the drag that follows.
-    /// Where the pointer has left the window it reads the desktop instead; see
+    /// The one route in, and it is reached three ways: the eyedropper tool's
+    /// own press and Alt with any other tool both resolve to
+    /// `gesture::Press::Eyedropper`; [`Self::pick_this_frame`] carries the drag
+    /// that follows; and the pen's Alt-tap comes here from
+    /// [`Self::pointer_released`] once [`gesture::is_tap`] has settled that the
+    /// contact was a tap and not a brush-size drag.
+    ///
+    /// **That third one is a click and not a drag**, and it is the one
+    /// asymmetry in this feature. A pen with Alt held resolves to
+    /// `Press::ResizeBrush` at the press — it has to, or a tablet would have no
+    /// way to resize a brush — so the pick is only decided at the release, by
+    /// which time there is no gesture left to follow the pointer with. A pen
+    /// user reaches the desktop half through the *tool* instead, where the
+    /// press is an ordinary `Press::Eyedropper` and the drag is the drag.
+    ///
+    /// Where the pointer has left the window it reads the desktop; see
     /// [`syspick`], and note that this is a second source of *pixels* and not
     /// a second route to a colour, because both ends come back through
     /// `Color::from_srgb_u8` here.
@@ -2628,13 +2643,13 @@ impl UmberApp {
     fn pick_colour_at_cursor(&mut self) {
         let aim = self.pick_aim(self.editor.cursor);
         match aim {
-            // Nothing to say: the pointer is off the window on a platform with
-            // no screen read. Silent rather than a notice, because this runs on
-            // every frame of a drag and a notice raised per frame is not a
-            // refusal, it is a fault. Where the sentence belongs is the tool
-            // options strip, *before* somebody tries — see `ui::options_strip`,
-            // and `syspick::outside_line` for the wording.
-            syspick::Aim::Unreachable => {}
+            // Over Umber's own panels, or off the window on a platform with no
+            // screen read. Both read nothing, and both are silent: this runs on
+            // every frame of a drag, and a notice raised per frame is not a
+            // refusal, it is a fault. Where the platform sentence belongs is
+            // the tool options strip, *before* somebody tries — see
+            // `ui::options_strip` and `syspick::outside_line`.
+            syspick::Aim::Interface | syspick::Aim::Unreachable => {}
             syspick::Aim::Desktop(x, y) => {
                 if let Some([r, g, b]) = syspick::sample(x, y) {
                     // The desktop hands over sRGB bytes and the engine is
@@ -2650,12 +2665,23 @@ impl UmberApp {
 
     /// Where the pointer at `pos` is, as far as a pick is concerned.
     ///
-    /// The window's own geometry is read here and the rule is
-    /// [`syspick::aim`]'s, which is a pure function so that "outside the
-    /// window is the desktop, inside it is the canvas, and a build that cannot
-    /// read the desktop says so" is testable on a machine with no second
-    /// monitor. With no window at all there is nothing outside to be outside
-    /// *of*, so the canvas answers and then declines for want of a renderer.
+    /// The readings are gathered here and the rule is [`syspick::aim`]'s, which
+    /// is a pure function so that "on the picture is the canvas, elsewhere in
+    /// the window is nothing, outside it is the desktop, and a build that
+    /// cannot read the desktop says so" is testable on a machine with no second
+    /// monitor and no window at all.
+    ///
+    /// **`pointer_over_canvas` is the reading that matters and it is the one
+    /// the first draft left out.** `ui_owns_pointer` gates the *press*, and
+    /// nothing asked again for the rest of the drag — so a pointer that left
+    /// the canvas onto a panel went on picking, off a `screen_to_doc` that is a
+    /// plain camera transform and happily maps a point over the Layers panel to
+    /// a real document pixel. It is the same test `ui::aiming_cursor` uses to
+    /// decide where the crosshair is drawn, which is what makes the mark and
+    /// the behaviour agree.
+    ///
+    /// With no window there is nothing to be outside of and no layout to be
+    /// over, so the canvas answers and then declines for want of a renderer.
     fn pick_aim(&self, pos: Vec2) -> syspick::Aim {
         let Some(gfx) = self.gfx.as_ref() else {
             return syspick::Aim::Canvas;
@@ -2669,7 +2695,13 @@ impl UmberApp {
         // there is no second guard here: two conditions that must agree is one
         // more than there needs to be.
         let origin = gfx.window.inner_position().ok().map(|p| (p.x, p.y));
-        syspick::aim(pos, client, origin, syspick::DESKTOP_READABLE)
+        syspick::aim(
+            pos,
+            self.editor.pointer_over_canvas(pos),
+            client,
+            origin,
+            syspick::DESKTOP_READABLE,
+        )
     }
 
     /// The canvas half: the colour the document shows under the cursor.
@@ -4380,7 +4412,13 @@ impl UmberApp {
                 // Put back the wobble the tap made of the size before reading
                 // the colour: a click is not allowed to have resized anything.
                 self.editor.brush.size = resize.from;
-                self.pick_colour_at_cursor();
+                // Through `pick_now` and not `pick_colour_at_cursor`, so that
+                // "one route in" is true of the function that claims it rather
+                // than of two functions that happen to agree. It is still a
+                // click: no `Interaction::Picking`, so nothing follows the
+                // pointer afterwards — see `pick_now` for why a pen's Alt-tap
+                // cannot be a drag.
+                self.pick_now();
             }
             // Re-seat the drag where the nib left off. Alt is still held — the
             // gesture is armed until `ModifiersChanged` says otherwise — and
@@ -4405,7 +4443,21 @@ impl UmberApp {
                 let doc = self.editor.screen_to_doc(pos);
                 self.editor.selection_release(doc);
             }
-            _ => self.editor.interaction = Interaction::Idle,
+            // **No wildcard**, which is CLAUDE.md's "partial exhaustiveness is
+            // worse than none" applied to the one enum in this file that gained
+            // a variant. A `_` arm swallowed `Picking` silently and happened to
+            // land on the right answer; the next variant may not be so lucky,
+            // and the compiler had no opinion about it either way. Four arms
+            // cost nothing and make adding a fifth a decision somebody has to
+            // take here.
+            //
+            // `Picking` ends here rather than taking one last sample: what the
+            // artist keeps is what the swatch was showing, which is
+            // `pick_this_frame`'s rule and its docs have the argument.
+            Interaction::Idle
+            | Interaction::Panning
+            | Interaction::Zooming
+            | Interaction::Picking => self.editor.interaction = Interaction::Idle,
         }
     }
 
