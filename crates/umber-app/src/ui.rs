@@ -4562,8 +4562,9 @@ mod tests {
     /// lies over the *canvas*, which is what the composite pass paints
     /// `backdrop` with, and the surfaces invert between Graphite and Paper so a
     /// shot of one says nothing about the other. Shooting the idle thumb on
-    /// `chrome` in Graphite alone is how an ink at 1.07:1 in Paper survived
-    /// being looked at.
+    /// `chrome` in Graphite alone is how an ink at 1.06:1 in Paper survived
+    /// being looked at. (1.07 here and in `widgets.rs` until `contrast::ratio`
+    /// was asked; `rail` on Paper's pit is 1.0589.)
     ///
     /// It takes **no `gputest::lock()`**, and that is decided rather than
     /// skipped — see the note in the body.

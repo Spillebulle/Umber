@@ -321,9 +321,20 @@ pub mod contrast {
     /// Bisected rather than solved, because [`super::mix`] rounds to bytes and
     /// the guarantee has to hold for the colour that is actually drawn. The
     /// predicate is monotone in `t`, `hi` starts at the extreme — which reaches
-    /// the target by construction — and `hi` is what comes back, so the answer
-    /// is never *under* the target. Fourteen halvings is finer than a byte, and
-    /// the whole call is some forty `powf`s a frame against two scrollbars.
+    /// the target exactly, `luminance(WHITE)` being exactly 1.0 and
+    /// `luminance(BLACK)` exactly 0.0 in `f64` — and `hi` is what comes back,
+    /// so the answer is never *under* the target. Fourteen halvings is finer
+    /// than a byte.
+    ///
+    /// **The cost is about ninety `powf` a call, not the "some forty a frame"
+    /// this comment first claimed**, because each halving asks [`ratio`], which
+    /// evaluates *both* luminances: 14 × 6, plus the three [`headroom`] takes
+    /// and the two in the target. The two canvas scrollbars and the pen dot are
+    /// the per-frame callers, so it is roughly 270 and some fifteen
+    /// microseconds — still nothing beside a frame, which is why the figure
+    /// being wrong did not matter and being *stated* wrong did. Hoisting the
+    /// surface's luminance out of the loop would halve it and would mean not
+    /// calling `ratio` here, which is the one thing this module is for.
     pub fn ink_on(surface: Color32, rank: Ink) -> Color32 {
         let (extreme, headroom) = headroom(surface);
         // `headroom` is never below READABLE, so this is monotone in the rank
