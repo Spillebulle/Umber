@@ -2629,10 +2629,11 @@ impl UmberApp {
         let aim = self.pick_aim(self.editor.cursor);
         match aim {
             // Nothing to say: the pointer is off the window on a platform with
-            // no screen read. Silent rather than a notice, because this fires
-            // once per pointer event and a dialog per mouse move is not a
-            // refusal, it is an assault. The options strip is where the
-            // sentence lives — see `ui::options_strip`.
+            // no screen read. Silent rather than a notice, because this runs on
+            // every frame of a drag and a notice raised per frame is not a
+            // refusal, it is a fault. Where the sentence belongs is the tool
+            // options strip, *before* somebody tries — see `ui::options_strip`,
+            // and `syspick::unreadable_reason` for the wording.
             syspick::Aim::Unreachable => {}
             syspick::Aim::Desktop(x, y) => {
                 if let Some([r, g, b]) = syspick::sample(x, y) {
@@ -2661,16 +2662,13 @@ impl UmberApp {
         };
         let size = gfx.window.inner_size();
         let client = Vec2::new(size.width as f32, size.height as f32);
-        let origin = gfx
-            .window
-            .inner_position()
-            .ok()
-            .map(|p| (p.x, p.y))
-            // `inner_position` is `Err` on the platforms that will not say —
-            // Wayland, and Android — which is exactly the set that cannot read
-            // the desktop either, so this never costs a pick that would have
-            // worked.
-            .filter(|_| syspick::DESKTOP_READABLE);
+        // `inner_position` is `Err` on the platforms that will not say — Wayland
+        // and Android — and `aim` reads that `None` as "nothing outside the
+        // window can be placed, so nothing outside it can be read". That is the
+        // same answer `DESKTOP_READABLE` gives on those platforms, which is why
+        // there is no second guard here: two conditions that must agree is one
+        // more than there needs to be.
+        let origin = gfx.window.inner_position().ok().map(|p| (p.x, p.y));
         syspick::aim(pos, client, origin, syspick::DESKTOP_READABLE)
     }
 
