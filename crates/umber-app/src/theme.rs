@@ -1718,10 +1718,21 @@ mod tests {
     /// things arithmetic can settle, and neither of them can say whether a
     /// theme looks like the application it was sampled from. The Settings
     /// dialog is the subject because it puts most of the tokens on one screen —
-    /// every surface, both borders, all three control states, the four text
-    /// ranks, the accent, a rail and a knob — and because its own Themes pane
-    /// draws each theme as a card, so one shot per theme is also six shots of
-    /// all six.
+    /// every surface, both borders, `control` and `control_hover`, the four
+    /// text ranks, the accent, a rail and a knob — and because its own Themes
+    /// pane draws each theme as a card, so one shot per theme is also six
+    /// shots of all six.
+    ///
+    /// **`control_active` is the one token these shots do not show**, and it
+    /// is worth knowing before a palette is judged from them: this pane's own
+    /// selected rail row is `control_hover`, and the only thing on the Settings
+    /// dialog that fills with `control_active` is the Shortcuts page's armed
+    /// chord row. Scanning a shot for the exact byte triple finds none of it.
+    /// It is a *selected row* colour — the layer list, the brush list, the tool
+    /// grid, a segmented picker — so `panels::tests::layers_panel_preview` is
+    /// where it can be looked at, and that one draws in Graphite. Anybody
+    /// authoring a theme whose selection colour is the point of it has to
+    /// render a panel to see it.
     ///
     /// ```sh
     /// cargo test -p umber-app every_theme_preview -- --ignored --nocapture
