@@ -95,21 +95,25 @@
 //!
 //! # A read costs a display refresh, so it is once per frame
 //!
-//! `examples/measure-screenpick.rs`, on a two-monitor 144 Hz desktop: one
-//! `GetPixel` against the screen DC is **about 7 ms**, and `GetDC` plus
+//! **Every figure in this section comes from one run** of
+//! `examples/measure-screenpick.rs`, and that is deliberate rather than tidy:
+//! a page carrying 7 ms from one afternoon beside 4.6 from another is a page
+//! that cannot be argued against. The run is a two-monitor desktop, virtual
+//! origin `(-2560, 0)`, with nothing else building.
+//!
+//! One `GetPixel` against the screen DC is **4.7 ms**, and `GetDC` plus
 //! `ReleaseDC` around it is **9 µs**. So there is no handle worth caching and
-//! nothing about the call to make cheaper — 7 ms is 1/144 s, which is what the
-//! figure actually is. The read waits for the compositor rather than computing
-//! anything, and it will be one refresh of whatever display it is asked about.
-//! The `BitBlt` route measured the same, which is the other half of the same
-//! observation.
+//! nothing about the call to make cheaper. The read waits for the compositor
+//! rather than computing anything, so it is one refresh of whatever display it
+//! is asked about — the figure is the display's, not the code's, and an earlier
+//! run of this on a busier machine read 7 ms. The `BitBlt` route measured the
+//! same, which is the other half of the same observation.
 //!
 //! That decides where the sample goes. Pointer events arrive far faster than a
 //! refresh, so a read per event puts the event loop minutes behind a drag;
 //! `App::picked_at` is the throttle and `App::render` is where the one sample
 //! per frame is taken. **Re-run the example before changing any of that**, and
-//! note that a machine with a 60 Hz panel should read about 16 ms rather than
-//! 7 — the number is the display's, not the code's.
+//! expect a different number: a 60 Hz panel should read about 16 ms.
 //!
 //! It also settles the loupe, and this is measured rather than predicted. A
 //! `BitBlt` of an 11×11 block costs **4.6 ms**, which is what a `BitBlt` of one
@@ -421,9 +425,10 @@ pub fn sample(_x: i32, _y: i32) -> Option<[u8; 3]> {
 ///
 /// **One `BitBlt`, and the alternative is not close.** `GetPixel` waits for a
 /// display refresh, so an 11×11 neighbourhood read that way is 121 refreshes —
-/// about 850 ms per frame of a drag. `examples/measure-screenpick.rs` times
-/// this against the single pixel; a block costs what one pixel costs, because
-/// the wait is the wait rather than the pixels.
+/// **569 ms** a frame on the run the module docs quote, which is not a control.
+/// `examples/measure-screenpick.rs` times this against the single pixel; the
+/// block came out at 4.6 ms against the pixel's 4.7, because the wait is the
+/// wait rather than the pixels.
 ///
 /// **It does decide what a click takes**, through its middle texel, and that
 /// took overturning the rule above. The first draft called [`sample`] beside

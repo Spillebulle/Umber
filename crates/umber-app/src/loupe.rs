@@ -57,10 +57,30 @@ use umber_core::Color;
 /// what makes the read cheap enough to state plainly — one `BitBlt` of 121
 /// pixels costs what one pixel costs, where 121 `GetPixel`s would be 121
 /// display refreshes. See `syspick::sample_patch`.
+///
+/// **More is read than is shown, and that is the safe direction.** The grid is
+/// square and the window is round, so the corners of the block, and at this
+/// figure the outermost row and column, fall outside the circle and are never
+/// drawn. The block is this wide because a `BitBlt` of it is free, not because
+/// every texel reaches the screen — and a magnifier showing *fewer* pixels than
+/// it read is nothing like one showing pixels it did not.
 pub const CELLS: u32 = 11;
 
-/// The circle's radius, in points.
+/// The magnified grid's radius, in points.
 pub const RADIUS: f32 = 33.0;
+
+/// The band of surface colour around the grid, in points.
+///
+/// Here rather than in `ui::loupe_overlay` where it is painted, because
+/// [`place`] is handed [`OUTER`] and the guard has to measure the shape that is
+/// actually drawn. A rim that lived at the call site would make the clearance
+/// sweep three points optimistic about a circle it had never seen — which is
+/// the "measure the output, never restate the rule" failure this codebase
+/// records at four other call sites.
+pub const RIM: f32 = 3.0;
+
+/// What the loupe occupies: the grid plus its rim.
+pub const OUTER: f32 = RADIUS + RIM;
 
 /// The gap between the pointer and the nearest point of the circle, in points.
 ///
@@ -246,12 +266,19 @@ pub struct Loupe {
     pub at: Vec2,
     /// The colour a release would take, or `None` for nothing there.
     ///
-    /// **Not derived from the patch**, and that is the point of carrying it.
-    /// Off the screen it comes from `syspick::sample`, which is the one route
-    /// that answers "nothing" for a position on no monitor; the patch comes
-    /// from a `BitBlt`, which succeeds against nothing and hands back black. On
-    /// the canvas the two do come from one read, and carrying the colour
-    /// separately costs that case nothing.
+    /// **It is the patch's middle texel wherever there is a patch**, and this
+    /// field is still separate because it does not have to be. Both readers
+    /// have a fallback the block cannot supply: off the screen a `BitBlt` that
+    /// failed outright leaves `syspick::sample`'s single pixel, and on the
+    /// canvas a block reaching no pixel at all is refused before the GPU is
+    /// touched, so a `Loupe` can hold a colour with no picture and a picture
+    /// with no colour. Deriving it at the painter would put that pair of rules
+    /// in the drawing.
+    ///
+    /// An earlier draft carried it because the two genuinely came from
+    /// different GDI calls, `GetPixel` for the colour and one `BitBlt` for the
+    /// block. That measured at two display refreshes a frame; see
+    /// `syspick::sample_patch` for why one is enough and what says so.
     pub taken: Option<Color>,
     /// The neighbourhood, or `None` where only the one pixel could be read.
     pub patch: Option<Patch>,
@@ -268,8 +295,8 @@ mod tests {
 
     #[test]
     fn it_sits_above_the_pointer_where_there_is_room() {
-        let at = place(Vec2::new(640.0, 400.0), VIEW, RADIUS).expect("room");
-        assert_eq!(at, Vec2::new(640.0, 400.0 - RADIUS - CLEARANCE));
+        let at = place(Vec2::new(640.0, 400.0), VIEW, OUTER).expect("room");
+        assert_eq!(at, Vec2::new(640.0, 400.0 - OUTER - CLEARANCE));
     }
 
     #[test]
@@ -278,8 +305,8 @@ mod tests {
         // the tool options strip happens, so this is the ordinary case for the
         // interface half rather than an edge one.
         let pointer = Vec2::new(640.0, 8.0);
-        let at = place(pointer, VIEW, RADIUS).expect("room");
-        assert_eq!(at, pointer + Vec2::new(0.0, RADIUS + CLEARANCE));
+        let at = place(pointer, VIEW, OUTER).expect("room");
+        assert_eq!(at, pointer + Vec2::new(0.0, OUTER + CLEARANCE));
     }
 
     #[test]
@@ -292,13 +319,13 @@ mod tests {
         // diagonals were added. The top-left of the menu bar is not an exotic
         // place to aim a picker.
         let pointer = Vec2::new(6.0, 6.0);
-        let at = place(pointer, VIEW, RADIUS).expect("a corner still gets one");
+        let at = place(pointer, VIEW, OUTER).expect("a corner still gets one");
         assert!(
             at.x > pointer.x && at.y > pointer.y,
             "down and to the right"
         );
         assert!(
-            (at.distance(pointer) - (RADIUS + CLEARANCE)).abs() < 1e-3,
+            (at.distance(pointer) - (OUTER + CLEARANCE)).abs() < 1e-3,
             "still exactly the reach away, which is what keeps the sweep below \
              true without a clamp"
         );
@@ -310,7 +337,7 @@ mod tests {
             Vec2::new(0.0, 800.0),
             Vec2::new(1280.0, 800.0),
         ] {
-            assert!(place(corner, VIEW, RADIUS).is_some(), "at {corner:?}");
+            assert!(place(corner, VIEW, OUTER).is_some(), "at {corner:?}");
         }
     }
 
@@ -341,11 +368,11 @@ mod tests {
             VIEW,
             View {
                 min: Vec2::ZERO,
-                max: Vec2::splat(2.0 * RADIUS + 6.0),
+                max: Vec2::splat(2.0 * OUTER + 6.0),
             },
             View {
                 min: Vec2::ZERO,
-                max: Vec2::new(2.0 * (RADIUS + CLEARANCE) - 4.0, 300.0),
+                max: Vec2::new(2.0 * (OUTER + CLEARANCE) - 4.0, 300.0),
             },
             View {
                 min: Vec2::new(-90.0, -40.0),
@@ -362,10 +389,10 @@ mod tests {
                     while y <= hi.y {
                         let pointer = Vec2::new(x, y);
                         y += 7.0;
-                        let Some(at) = place(pointer, view, RADIUS) else {
+                        let Some(at) = place(pointer, view, OUTER) else {
                             continue;
                         };
-                        let clear = at.distance(pointer) - RADIUS;
+                        let clear = at.distance(pointer) - OUTER;
                         assert!(
                             clear > half_block,
                             "at {pointer:?} in {view:?} at scale {ppp}: {clear}                              of clearance against a half-block of {half_block}"
@@ -381,10 +408,10 @@ mod tests {
     fn a_pointer_outside_the_window_keeps_the_loupe_inside_it() {
         // The desktop half: the pointer is on somebody else's window and the
         // loupe stays where it can be seen, against the edge nearest the hand.
-        let at = place(Vec2::new(1600.0, 400.0), VIEW, RADIUS).expect("room");
-        assert_eq!(at, Vec2::new(1280.0 - RADIUS, 400.0));
-        let at = place(Vec2::new(-300.0, -300.0), VIEW, RADIUS).expect("room");
-        assert_eq!(at, Vec2::new(RADIUS, RADIUS));
+        let at = place(Vec2::new(1600.0, 400.0), VIEW, OUTER).expect("room");
+        assert_eq!(at, Vec2::new(1280.0 - OUTER, 400.0));
+        let at = place(Vec2::new(-300.0, -300.0), VIEW, OUTER).expect("room");
+        assert_eq!(at, Vec2::splat(OUTER));
     }
 
     #[test]
@@ -394,14 +421,14 @@ mod tests {
         // an ordinary clamp would have answered wrongly.
         let tiny = View {
             min: Vec2::ZERO,
-            max: Vec2::splat(RADIUS),
+            max: Vec2::splat(OUTER),
         };
-        assert_eq!(place(Vec2::splat(10.0), tiny, RADIUS), None);
+        assert_eq!(place(Vec2::splat(10.0), tiny, OUTER), None);
         let snug = View {
             min: Vec2::ZERO,
-            max: Vec2::splat(2.0 * RADIUS + 4.0),
+            max: Vec2::splat(2.0 * OUTER + 4.0),
         };
-        assert_eq!(place(Vec2::splat(RADIUS + 2.0), snug, RADIUS), None);
+        assert_eq!(place(Vec2::splat(OUTER + 2.0), snug, OUTER), None);
     }
 
     #[test]

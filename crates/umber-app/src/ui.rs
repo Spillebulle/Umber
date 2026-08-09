@@ -1304,22 +1304,30 @@ fn aiming_cursor(ui: &egui::Ui, ed: &Editor) {
 /// here is held to, and it is why [`loupe::Patch`] carries an `Option` per
 /// texel rather than a colour.
 ///
-/// **The middle cell is drawn from the colour that will be taken and not from
-/// the block**, which matters only off the screen, where the two come from
-/// different GDI calls: `syspick::sample` is the one that answers "nothing" on
-/// no monitor and is therefore the one that decides. Over the canvas they are
-/// the same render and the same texel.
+/// **The middle cell is drawn from [`loupe::Loupe::taken`] and not from the
+/// block.** Today those are the same value wherever there is a block — the
+/// colour *is* the middle texel — so this reads as a distinction without a
+/// difference and is not one: `taken` is what a release keeps, the two have
+/// separate fallbacks the other cannot supply, and the cell under the mark is
+/// the one thing here that must be the colour rather than the picture. Drawing
+/// it from the block would be right by coincidence.
 ///
 /// Where the circle goes is [`loupe::place`]'s, in a model with no drawing in
 /// it, for the reason `overlay::place_strip` and `ScrollSpan` are — and it
 /// carries a rule the painter cannot state: the circle never comes within half
 /// a block of the pointer, because over the interface and the desktop the block
-/// is read off the same screen the circle is drawn on.
+/// is read off the same screen the circle is drawn on. It is handed
+/// [`loupe::OUTER`], the radius of the *rim*, and not the grid's own — the
+/// guard has to measure the shape that is drawn, so the rim is a figure of that
+/// module's rather than a number here.
 ///
 /// The cells are clipped to the circle *conservatively*, per row, so the grid
 /// never pokes past the ring; whatever gap that leaves shows the rim, which is
 /// why the rim is drawn first and is a whole surface colour rather than a
-/// hairline.
+/// hairline. A consequence worth stating rather than discovering: the grid is
+/// square and the window is round, so the outermost row, column and corners of
+/// the block are read and not shown. The block is that wide because a `BitBlt`
+/// of it costs what one pixel costs, not because every texel is on screen.
 fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
     let Some(seen) = ed.loupe.as_ref() else {
         return;
@@ -1336,7 +1344,7 @@ fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
             min: glam::Vec2::new(view.min.x, view.min.y),
             max: glam::Vec2::new(view.max.x, view.max.y),
         },
-        loupe::RADIUS,
+        loupe::OUTER,
     ) else {
         return;
     };
@@ -1351,8 +1359,7 @@ fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
         egui::Id::new("umber-loupe"),
     ));
 
-    let rim = 3.0;
-    painter.circle_filled(centre, loupe::RADIUS + rim, p.popover);
+    painter.circle_filled(centre, loupe::OUTER, p.popover);
 
     let taken = seen.taken.map(|c| {
         let [r, g, b, _] = c.to_srgb_u8();
@@ -1374,7 +1381,7 @@ fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
     // leave a stepped edge standing proud of it.
     painter.circle_stroke(
         centre,
-        loupe::RADIUS + rim * 0.5,
+        loupe::OUTER - loupe::RIM * 0.5,
         Stroke::new(1.0, p.popover_border),
     );
 }
@@ -4968,7 +4975,7 @@ mod tests {
             patch: Some(patch_of([80, 80, 80], Some([80, 80, 80]))),
         });
         // Where `loupe::place` puts it for a pointer with room above.
-        let centre = pos2(at.x, at.y - crate::loupe::RADIUS - crate::loupe::CLEARANCE);
+        let centre = pos2(at.x, at.y - crate::loupe::OUTER - crate::loupe::CLEARANCE);
         let layer = ctx.layer_id_at(centre);
         assert!(
             layer.is_none_or(|l| l.order == egui::Order::Background),

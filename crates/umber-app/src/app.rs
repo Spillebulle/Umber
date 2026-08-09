@@ -2610,31 +2610,50 @@ impl UmberApp {
     /// gesture would be *aimed* by a readout that is behind the hand.
     ///
     /// **What it costs has not been measured, and that is worth admitting**
-    /// rather than putting a figure beside the two that were: a `pick_colour`
-    /// is a 1×1 render, a fresh texture and staging buffer per call, and a map
-    /// and wait, now once per frame of a drag rather than once per click.
+    /// rather than putting a figure beside the two that were: it is a `CELLS`
+    /// square render — 121 fragments, not one — a fresh texture and staging
+    /// buffer per call, two submissions and a map and wait.
     /// `examples/measure-screenpick.rs` measures the desktop half and not this
-    /// one. What the argument rests on is the shape and not the number — this
-    /// runs only while a button is held, and only for a gesture during which
-    /// nothing is being painted.
+    /// one. What the argument rests on is the shape and not the number.
+    ///
+    /// **And the shape widened, so say what it widened to.** This used to run
+    /// only while a button was held. The loupe has to be on screen *before* the
+    /// press — that is what the artist asked for — so it now runs on a hover
+    /// too, whenever the eyedropper tool is in hand over the canvas and the
+    /// pointer has moved since the last frame. Three things bound it, and each
+    /// is load-bearing rather than incidental: it is one tool, chosen
+    /// deliberately, during which nothing is painted;
+    /// [`Interaction::allows_aim`] takes it off for every other gesture, so a
+    /// pan with the eyedropper selected costs nothing; and a pointer held still
+    /// pays nothing, because [`Self::picked_at`] skips a frame it has already
+    /// read. A hover over the *margin* around a canvas smaller than the view
+    /// reaches no pixel at all, and [`Self::sample_canvas`] answers that
+    /// without touching the GPU.
     fn pick_this_frame(&mut self) {
-        let aiming = self.pick_aimed();
-        if aiming == Aimed::No {
-            // Not picking, so nothing to remember. Cleared here rather than at
-            // the release so that every path out of the gesture — a release, a
-            // cancel, a second finger, a tab switch — is covered by one line
-            // instead of by five that have to agree. The loupe goes with it,
-            // for exactly that reason: it is a picture of a gesture, so it must
-            // not outlive one.
-            self.picked_at = None;
-            self.editor.loupe = None;
-            return;
-        }
+        // A `match` and not two `==`s, which is CLAUDE.md's rule and is the one
+        // this enum exists to be governed by: it was added *because* reading a
+        // pixel and keeping it are different decisions, so a fourth answer must
+        // fail the build rather than fall in with one of the three.
+        let keep = match self.pick_aimed() {
+            Aimed::No => {
+                // Not picking, so nothing to remember. Cleared here rather than
+                // at the release so that every path out of the gesture — a
+                // release, a cancel, a second finger, a tab switch — is covered
+                // by one line instead of by five that have to agree. The loupe
+                // goes with it, for exactly that reason: it is a picture of a
+                // gesture, so it must not outlive one.
+                self.picked_at = None;
+                self.editor.loupe = None;
+                return;
+            }
+            Aimed::Hovering => false,
+            Aimed::Dragging => true,
+        };
         if self.picked_at == Some(self.editor.cursor) {
             return;
         }
         self.picked_at = Some(self.editor.cursor);
-        self.take_sample(aiming == Aimed::Dragging);
+        self.take_sample(keep);
     }
 
     /// Whether a pick is being *made* this frame, merely aimed, or neither.
@@ -2810,9 +2829,31 @@ impl UmberApp {
     /// happens to hand back outside its own bounds, which is the same refusal
     /// the single-pixel read has always made — it declined a point outside the
     /// picture rather than sampling the edge.
+    ///
+    /// **A block that reaches no pixel at all is refused before the GPU is
+    /// touched.** That is the margin around a canvas smaller than the view,
+    /// which `pointer_over_canvas` calls the canvas and which a hover crosses
+    /// constantly; the single-pixel read had that bounds test up front and it
+    /// would have been quietly dropped by widening it to a block. Everything
+    /// the reinstated one refuses would have come back masked to `None` by
+    /// `from_document` anyway, so the picture is unchanged and what is saved is
+    /// a render and a blocking readback per frame.
     fn sample_canvas(&mut self) -> Option<loupe::Loupe> {
         let doc = self.editor.screen_to_doc(self.editor.cursor);
         let size = self.editor.doc.size;
+        let half = (loupe::CELLS / 2) as i32;
+        let first = (doc.x.floor() as i32 - half, doc.y.floor() as i32 - half);
+        let last = (
+            first.0 + loupe::CELLS as i32 - 1,
+            first.1 + loupe::CELLS as i32 - 1,
+        );
+        if last.0 < 0 || last.1 < 0 || first.0 >= size.x as i32 || first.1 >= size.y as i32 {
+            return Some(loupe::Loupe {
+                at: self.editor.cursor,
+                taken: None,
+                patch: None,
+            });
+        }
 
         let float = self.float_preview();
         let layers = self.baked_draws(float)?;
@@ -2821,11 +2862,11 @@ impl UmberApp {
         let canvas = gfx.canvases.get(&id)?;
         let rgba = canvas.pick_patch(&gfx.gpu.device, &gfx.gpu.queue, &layers, doc, loupe::CELLS);
 
-        // The document pixel the top-left texel stands for. `pick_patch` maps
-        // texel `k` to `doc + (k - CELLS / 2)`, so this is one subtraction and
-        // not a second copy of that mapping's rounding.
-        let half = (loupe::CELLS / 2) as i32;
-        let first = (doc.x.floor() as i32 - half, doc.y.floor() as i32 - half);
+        // `first` — the document pixel the top-left texel stands for — is taken
+        // above, where the empty-block refusal needs it too: `pick_patch` snaps
+        // its camera to the middle of the pixel `doc` is in and maps texel `k`
+        // to `floor(doc) + (k - CELLS / 2)`, so this is one subtraction rather
+        // than a second copy of that mapping's rounding.
         let patch = loupe::Patch::from_document(
             loupe::CELLS,
             &rgba,
