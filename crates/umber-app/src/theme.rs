@@ -640,36 +640,46 @@ impl Palette {
     /// Clip Studio's light interface. It does not, and the light draft was
     /// defended on the reasoning that a fourth dark preset would be hard to
     /// tell from the other three — which was never ours to decide in place of
-    /// somebody asking for the reference to be followed. **The worry was real
-    /// and is answered by the ladder rather than by the selection**, and the
-    /// distinction is worth stating because the obvious answer is wrong:
-    /// Krita's selected row is `#54718E` and MediaBog's is `#3E7EB2`, so "the
-    /// only preset with a colour on a selected row" would be false. What is
-    /// true is that this one's is **grey** — 24% saturated against their 41%
-    /// and 65% — and that `#4E4E4E` is the lightest chrome of any preset here
-    /// (Photoslop `#383838`, Krita `#474747`, MediaBog `#4A4747`), over
-    /// `#3F3F3F` panels and a `#2E2E2E` pit. A brighter, wider ladder with a
-    /// flat slate on it is what a Clip Studio window looks like across a room.
+    /// somebody asking for the reference to be followed.
+    ///
+    /// **The worry was real, and it is worth saying plainly how far it goes:
+    /// this and Krita are the two closest themes in the file.** Their `window`
+    /// is the same byte, their `dock` is two levels apart, their `chrome` is
+    /// seven and their pit eight. Neither can be moved off that, because both
+    /// were measured — Clip Studio and Krita genuinely look alike. Three
+    /// tempting distinctions are false and are recorded so nobody reaches for
+    /// them again: it is **not** that the others have no colour on a selected
+    /// row (Krita's is `#54718E`, MediaBog's `#3E7EB2`), and it is **not** a
+    /// wider ladder (`#2E2E2E`→`#4E4E4E` is 32 levels against Krita's 33). What
+    /// is true is smaller and holds: `#4E4E4E` is the lightest chrome of any
+    /// preset here (Photoslop `#383838`, Krita `#474747`, MediaBog `#4A4747`),
+    /// and this selection is the only **grey** one — 24% saturated against
+    /// their 41% and 65%. A brighter ladder with a flat slate on it, which is
+    /// less than the light draft claimed and is what the reference shows.
     ///
     /// Two departures, both forced by contrast and both stated.
     /// `control` is `#5C5C5C` where the measured button fill is `#676767`: at
     /// the measured value `text_muted` on a resting button is 2.73:1 and the
-    /// accent on one is 2.74:1, both under the floors this palette's own
-    /// `text` is held to on that same fill. Nothing is thrown away, because
-    /// the measured grey is `control_hover` — a button lifts to Clip Studio's
-    /// own tone under the pointer. And `popover` is placed in the ladder
-    /// rather than sampled, because no menu is open in the reference; it sits
-    /// between the panel and the menu bar, which is the direction Clip
-    /// Studio's menus go.
+    /// accent on one is 2.74:1, both under the 3.0 that
+    /// `text_reads_against_every_surface_it_is_drawn_on` holds each of those
+    /// two pairs to. Nothing is thrown away, because the measured grey is
+    /// `control_hover` — a button lifts to Clip Studio's own tone under the
+    /// pointer. And `popover` is placed in the ladder rather than sampled,
+    /// because no menu is open in the reference; it sits between the panel and
+    /// the menu bar, which is the direction Clip Studio's menus go.
     ///
     /// The accent is that same blue-grey lifted until it reads as ink.
     /// `#606B7F` on `#4E4E4E` is **1.55:1**, which is not an accent at all,
     /// and Umber draws hyperlinks, dashed marks and focus in it. The lift
-    /// raises the saturation as well as the lightness, deliberately: merely
-    /// brightening a blue-grey lands beside `Accent::Steel`, which is itself a
-    /// blue-grey — `#A0AEC4` is 68 from it against a floor of 60 — and that is
-    /// the trap Krita's measured slate already fell into. `#8FB8E6` is 95
-    /// away and 4.03:1 on chrome.
+    /// raises the saturation as well as the lightness, and the reason is the
+    /// *neighbourhood* rather than a threshold: `Accent::Steel` is itself a
+    /// blue-grey, so merely brightening this one keeps it in Steel's family —
+    /// `#A0AEC4` is 68 from it, which **passes**
+    /// `no_two_accents_look_alike_in_one_theme` and is exactly where Graphite's
+    /// own shipped Umber-against-Clay sits, so the guard is no argument here
+    /// and calling that a trap would be false. Two blue-greys labelled
+    /// "Umber" and "Steel" in one picker is a choice that is not one whatever
+    /// the metric says. `#8FB8E6` is 95 away and 4.03:1 on chrome.
     ///
     /// **The canvas pit needs no deviation, and the light draft had one.**
     /// `widgets.rs` inks the canvas scrollbar thumb and the pen dot in
@@ -723,12 +733,13 @@ impl Palette {
             text_strong: Color32::from_rgb(0xF4, 0xF4, 0xF4),
             text: Color32::from_rgb(0xE2, 0xE2, 0xE2),
             text_muted: Color32::from_rgb(0xB4, 0xB4, 0xB4),
-            // Held up to `#9C` by the `#4E4E4E` menu bar, which is the
-            // lightest surface any theme here draws text on: at `#949494` it
-            // is 2.74:1, under the 2.9 floor Paper set. Demonstrated by
-            // mutation rather than argued — `#949494` is what
-            // `text_reads_against_every_surface_it_is_drawn_on` was fed to
-            // check that it can still see this palette at all.
+            // Held up to `#9C` by `chrome`, which is the lightest of the four
+            // surfaces `text_reads_against_every_surface_it_is_drawn_on` checks
+            // and therefore the binding one: at `#949494` it is 2.74:1, under
+            // the 2.9 floor Paper set, and `#9C9C9C` clears it at 3.03.
+            // Demonstrated by mutation rather than argued — `#949494` is what
+            // that guard was actually fed, to check it can still see this
+            // palette after the whole thing was replaced.
             text_dim: Color32::from_rgb(0x9C, 0x9C, 0x9C),
             rail: Color32::from_rgb(0x2C, 0x2C, 0x2C),
             knob: Color32::from_rgb(0xCE, 0xCE, 0xCE),
@@ -1462,9 +1473,13 @@ mod tests {
     /// `Accent::Steel`, against a worst of 64 anywhere else. Both drawn as
     /// 18-point circles side by side, one of them labelled "Umber".
     ///
-    /// The bound is the link test's metric and its accent figure, and 64 —
-    /// Graphite's own Umber against its Clay — is the bar this cannot be
-    /// tightened past without moving the design's swatches.
+    /// The bound is the link test's metric and its accent figure, and **68** —
+    /// Graphite's own Umber against its Clay, and Paper's Sage against its
+    /// Clay, which tie — is the bar this cannot be tightened past without
+    /// moving the design's swatches. It read 64 until it was computed rather
+    /// than remembered, which is worth more than four units: a figure in a
+    /// comment is what the next palette's accent gets argued against, and this
+    /// one was, in `shit_studio`'s own doc block.
     #[test]
     fn no_two_accents_look_alike_in_one_theme() {
         let apart = |a: Color32, b: Color32| {
