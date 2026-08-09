@@ -8,7 +8,9 @@
 use crate::icons::{self, Icon};
 use crate::theme::contrast::{self, Ink};
 use crate::theme::{Palette, metrics, text};
-use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{
+    Align2, Color32, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use umber_core::{
@@ -302,6 +304,14 @@ const DROPDOWN_ICON: f32 = 12.0;
 const DROPDOWN_CHEVRON: f32 = 11.0;
 /// Between any two of a [`dropdown`]'s parts.
 const DROPDOWN_GAP: f32 = 4.0;
+/// The margin an *outlined* [`dropdown`] keeps inside its own border, at both
+/// ends. A label flush against an outline reads as clipped, and a chevron flush
+/// against one reads as part of it.
+///
+/// Zero for every other trigger, which is what makes [`Dropdown::outlined`] add
+/// a variant rather than move the ones that already exist: with no outline this
+/// is `0.0` and every measurement below reduces to exactly what it was.
+const DROPDOWN_PAD: f32 = 8.0;
 
 /// How wide a [`dropdown`] draws itself.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -343,6 +353,24 @@ pub struct Dropdown<'a> {
     /// rather than part of the choice.
     trailing: Option<&'a str>,
     width: DropdownWidth,
+    /// Whether the trigger draws a border round itself.
+    ///
+    /// **A border is not a fill.** The rule this module keeps is that there is
+    /// no *filled* dropdown, because the tool options strip already spends a
+    /// fill on [`chip`], where it means "this is a reading, not a control" — a
+    /// second filled thing that opened would teach the opposite. An outline
+    /// says nothing about that and is how every interface spells "this opens".
+    ///
+    /// It is for the one shape the bare trigger cannot carry: **alone on a line
+    /// with nothing before it**. There the label and the chevron are a word and
+    /// a small mark on the panel's own background, which is a caption; it was
+    /// read as one by an artist who then asked for options that were already in
+    /// the menu. A caption *above* it was tried first and made it worse, since a
+    /// dim word over a plain word is a labelled read-only field. A trigger that
+    /// sits in a row — beside a slider, after a leading mark, inside a header —
+    /// is told from its neighbours by being in a row of controls, and keeps the
+    /// bare look.
+    outlined: bool,
 }
 
 impl<'a> Dropdown<'a> {
@@ -354,6 +382,7 @@ impl<'a> Dropdown<'a> {
             icon: None,
             trailing: None,
             width: DropdownWidth::Content,
+            outlined: false,
         }
     }
 
@@ -371,11 +400,17 @@ impl<'a> Dropdown<'a> {
         self.width = width;
         self
     }
+
+    /// Draw a border round the trigger. See [`Dropdown::outlined`] for when.
+    pub fn outlined(mut self) -> Self {
+        self.outlined = true;
+        self
+    }
 }
 
 /// Where a trigger's label starts, relative to its left edge.
-fn dropdown_lead(icon: bool) -> f32 {
-    if icon {
+fn dropdown_lead(icon: bool, pad: f32) -> f32 {
+    pad + if icon {
         DROPDOWN_ICON + DROPDOWN_GAP
     } else {
         0.0
@@ -390,11 +425,16 @@ fn dropdown_lead(icon: bool) -> f32 {
 /// the label may have. Stating it twice is how a picker ends up a few pixels
 /// short of its own longest option, eliding a name that fits, which nobody sees
 /// until they pick that one option.
-fn dropdown_furniture(icon: bool, trailing: Option<f32>) -> f32 {
-    dropdown_lead(icon)
+///
+/// `pad` is [`DROPDOWN_PAD`] on an outlined trigger and zero on every other,
+/// and it is counted twice — once at each end — because both ends of an
+/// outlined trigger have a border to stand off from.
+fn dropdown_furniture(icon: bool, trailing: Option<f32>, pad: f32) -> f32 {
+    dropdown_lead(icon, pad)
         + trailing.map_or(0.0, |w| w + DROPDOWN_GAP)
         + DROPDOWN_GAP
         + DROPDOWN_CHEVRON
+        + pad
 }
 
 /// The dropdown. One trigger, one menu, everywhere in the interface.
@@ -408,6 +448,11 @@ fn dropdown_furniture(icon: bool, trailing: Option<f32>) -> f32 {
 /// ComboBox is also the thing this module exists not to do: egui's own widgets
 /// have a look the design does not use, and restyling them fights the framework
 /// rather than settling it.
+///
+/// The one departure is [`Dropdown::outlined`], which adds a *border* — never a
+/// fill, which stays reserved for [`chip`]'s "not a control". A trigger alone on
+/// a line has nothing beside it to say it is a control, and was read as a
+/// caption; see that field for the whole of it.
 ///
 /// **The menu is `egui::Popup::menu`, and every caller opens it that way.** The
 /// alternative in use was a `bool` on `Editor::ui` toggled by the trigger and
@@ -441,7 +486,8 @@ pub fn dropdown<R>(
     let label_w = measure(trigger.label, &font);
     let trailing_w = trigger.trailing.map(|t| measure(t, &figure));
 
-    let furniture = dropdown_furniture(trigger.icon.is_some(), trailing_w);
+    let pad = if trigger.outlined { DROPDOWN_PAD } else { 0.0 };
+    let furniture = dropdown_furniture(trigger.icon.is_some(), trailing_w, pad);
     let width = match trigger.width {
         DropdownWidth::Content => furniture + label_w,
         DropdownWidth::Fill => ui.available_width(),
@@ -460,10 +506,33 @@ pub fn dropdown<R>(
     };
 
     let painter = ui.painter();
+    // The border, before everything, so nothing it encloses is drawn over. It
+    // takes `p.border` rather than the label's ink: the outline is furniture
+    // saying "this is a control" and the ink is the choice, and an outline as
+    // bright as the word it holds competes with it. It brightens on hover in
+    // step with the ink, so the whole trigger answers as one thing.
+    if trigger.outlined {
+        painter.rect_stroke(
+            rect,
+            metrics::RADIUS,
+            Stroke::new(
+                1.0,
+                if response.hovered() {
+                    p.text_dim
+                } else {
+                    p.border
+                },
+            ),
+            StrokeKind::Inside,
+        );
+    }
     if let Some(icon) = trigger.icon {
         icons::draw(
             painter,
-            Rect::from_min_size(rect.left_top(), vec2(DROPDOWN_ICON, rect.height())),
+            Rect::from_min_size(
+                pos2(rect.left() + pad, rect.top()),
+                vec2(DROPDOWN_ICON, rect.height()),
+            ),
             icon,
             ink,
         );
@@ -473,7 +542,7 @@ pub fn dropdown<R>(
     // The figure goes inside it rather than beyond it, which is the one thing
     // the brush library's own switch used to do the other way round.
     let chevron = Rect::from_min_size(
-        pos2(rect.right() - DROPDOWN_CHEVRON, rect.top()),
+        pos2(rect.right() - pad - DROPDOWN_CHEVRON, rect.top()),
         vec2(DROPDOWN_CHEVRON, rect.height()),
     );
     icons::draw(painter, chevron, Icon::ChevronDown, ink);
@@ -488,7 +557,7 @@ pub fn dropdown<R>(
     }
     painter.text(
         pos2(
-            rect.left() + dropdown_lead(trigger.icon.is_some()),
+            rect.left() + dropdown_lead(trigger.icon.is_some(), pad),
             rect.center().y,
         ),
         Align2::LEFT_CENTER,
@@ -3733,10 +3802,44 @@ mod tests {
         for label in [8.0, 42.0, 137.5] {
             for icon in [false, true] {
                 for trailing in [None, Some(13.0)] {
-                    let width = dropdown_furniture(icon, trailing) + label;
-                    let room = width - dropdown_furniture(icon, trailing);
-                    assert_eq!(room, label, "{label} px label, icon {icon}, {trailing:?}");
+                    for pad in [0.0, DROPDOWN_PAD] {
+                        let width = dropdown_furniture(icon, trailing, pad) + label;
+                        let room = width - dropdown_furniture(icon, trailing, pad);
+                        assert_eq!(
+                            room, label,
+                            "{label} px label, icon {icon}, {trailing:?}, pad {pad}"
+                        );
+                    }
                 }
+            }
+        }
+    }
+
+    /// An outlined trigger costs its own margin and nothing else.
+    ///
+    /// This is what makes [`Dropdown::outlined`] a *variant* rather than a
+    /// change to the twelve triggers that already exist: at `pad` zero every
+    /// measurement is the one it was, so a bare trigger is byte for byte where
+    /// it used to be. Stated as a difference for the reason the test below is —
+    /// asserting the total would restate the formula.
+    #[test]
+    fn an_outline_costs_a_margin_at_each_end_and_nothing_else() {
+        for icon in [false, true] {
+            for trailing in [None, Some(13.0)] {
+                assert_eq!(
+                    dropdown_furniture(icon, trailing, DROPDOWN_PAD)
+                        - dropdown_furniture(icon, trailing, 0.0),
+                    2.0 * DROPDOWN_PAD,
+                    "icon {icon}, {trailing:?}",
+                );
+                // And the margin is at the *front* as well, so the label does
+                // not start on the border. Getting this wrong pays for the
+                // width twice and draws the text against the outline.
+                assert_eq!(
+                    dropdown_lead(icon, DROPDOWN_PAD) - dropdown_lead(icon, 0.0),
+                    DROPDOWN_PAD,
+                    "icon {icon}",
+                );
             }
         }
     }
@@ -3748,20 +3851,20 @@ mod tests {
     /// that copies the formula passes whatever the formula becomes.
     #[test]
     fn each_part_of_a_dropdown_costs_itself_and_one_gap() {
-        let bare = dropdown_furniture(false, None);
+        let bare = dropdown_furniture(false, None, 0.0);
         // A bare trigger is its chevron and the gap before it, and nothing else:
         // no fill, no padding, no leading inset.
         assert_eq!(bare, DROPDOWN_GAP + DROPDOWN_CHEVRON);
         assert_eq!(
-            dropdown_furniture(true, None) - bare,
+            dropdown_furniture(true, None, 0.0) - bare,
             DROPDOWN_ICON + DROPDOWN_GAP
         );
         assert_eq!(
-            dropdown_furniture(false, Some(13.0)) - bare,
+            dropdown_furniture(false, Some(13.0), 0.0) - bare,
             13.0 + DROPDOWN_GAP
         );
         assert_eq!(
-            dropdown_furniture(true, Some(13.0)) - bare,
+            dropdown_furniture(true, Some(13.0), 0.0) - bare,
             DROPDOWN_ICON + DROPDOWN_GAP + 13.0 + DROPDOWN_GAP
         );
     }
