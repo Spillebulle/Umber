@@ -2739,13 +2739,15 @@ fn token_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &mut The
     }
 
     let close = done || response.should_close();
-    // And the disk when the gesture is over. `close` is in there because the
-    // click that closes *is* a pointer being used, so the last colour of a
-    // session that ended on a click would otherwise never be written.
-    // A button still held is a gesture still going. The pointer's own state
-    // rather than egui's "is a widget being interacted with", because that one
-    // is behind a private accessor and this is the reading that matters: what
-    // the write is waiting for is the hand coming off the rail.
+    // And the disk once the gesture is over. A button still held is a gesture
+    // still going — the pointer's own state rather than egui's "is a widget
+    // being interacted with", which is behind a private accessor and is not
+    // the reading that matters anyway: what the write waits for is the hand
+    // coming off the rail.
+    //
+    // `close` is in the condition because the click that closes *is* a pointer
+    // being used, so the last colour of a session that ended on Done would
+    // otherwise never be written at all.
     let gesturing = ui.ctx().input(|i| i.pointer.any_down());
     if picking.unsaved && (close || !gesturing) {
         save_theme_in_hand(ed, state);
@@ -3543,15 +3545,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Opening the picker on a token and closing it again moves no colour.
+    /// Opening the picker on a colour and closing it again moves nothing.
     ///
     /// The two conversions are the only thing between a palette and the wheel,
-    /// and a level lost in the pair would mean every token drifted a little
-    /// each time somebody opened its chip to look — silently, over months.
-    /// Checked over every token of every shipped theme, which is a few hundred
-    /// real colours rather than a handful somebody chose.
+    /// and a level lost in the pair would mean every token drifted each time
+    /// somebody opened its chip to *look* — and drifted onto the disk, because
+    /// [`token_picker`] reads the round trip as a change and writes on the next
+    /// release. Silently, over months.
+    ///
+    /// **Swept over the whole domain, not over the shipped themes.** A theme is
+    /// somebody's own file and a token is any hex they can type, so a test over
+    /// `Palette::of` would be a test of the twenty-odd colours this project
+    /// happens to ship — a fixture wearing the costume of coverage. The shipped
+    /// palettes are checked as well, because those are the ones a fresh install
+    /// meets first.
     #[test]
-    fn opening_the_picker_on_a_token_and_closing_it_moves_no_colour() {
+    fn opening_the_picker_on_a_colour_and_closing_it_moves_nothing() {
+        // Every channel byte against a coarse grid of the other two, and both
+        // ends of every axis: the sextant boundaries are where the hue
+        // arithmetic is least well conditioned.
+        for r in 0..=255u8 {
+            for g in [0u8, 1, 63, 127, 128, 200, 254, 255] {
+                for b in [0u8, 1, 63, 127, 128, 200, 254, 255] {
+                    let colour = Color32::from_rgb(r, g, b);
+                    assert_eq!(
+                        colour_of(hsv_of(colour)),
+                        colour,
+                        "a round trip moved #{r:02X}{g:02X}{b:02X}"
+                    );
+                }
+            }
+        }
         for kind in ThemeKind::ALL {
             let palette = Palette::of(kind);
             for token in Token::ALL {
