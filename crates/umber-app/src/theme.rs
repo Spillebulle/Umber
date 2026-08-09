@@ -27,7 +27,7 @@ pub enum ThemeKind {
     Paper,
     /// Adobe Photoshop's neutral greys.
     Photoslop,
-    /// Clip Studio Paint's light neutrals.
+    /// Clip Studio Paint's dark chrome and its blue-grey selection.
     ShitStudio,
     /// Krita's mid grey and its slate-blue selection.
     Krita,
@@ -97,8 +97,10 @@ impl ThemeKind {
     /// together for the six compiled in.
     pub fn is_dark(self) -> bool {
         match self {
-            Self::Graphite | Self::Photoslop | Self::Krita | Self::MediaBog => true,
-            Self::Paper | Self::ShitStudio => false,
+            Self::Graphite | Self::Photoslop | Self::ShitStudio | Self::Krita | Self::MediaBog => {
+                true
+            }
+            Self::Paper => false,
         }
     }
 }
@@ -456,7 +458,7 @@ pub struct Palette {
     pub link_colours: [Color32; umber_core::LayerStack::LINK_GROUPS],
 }
 
-/// The link marks the three *dark* preset themes share.
+/// The link marks the four preset themes share.
 ///
 /// Shared rather than copied four times, and that is not a token left carrying
 /// another theme's value: a link colour is a position on the hue wheel and not
@@ -468,6 +470,12 @@ pub struct Palette {
 /// unchanged.
 /// `link_colours_are_told_apart_from_each_other_and_from_every_accent` is the
 /// measurement, and it runs over every theme.
+///
+/// There is deliberately no light twin of this table. There was one, for a
+/// [`ThemeKind::ShitStudio`] that had been built light against a brief that
+/// misread its own reference; Paper is the only light theme, its own set is
+/// authored on it, and a second table nothing named would be a set of colours
+/// nobody could see to judge.
 const PRESET_LINKS_DARK: [Color32; umber_core::LayerStack::LINK_GROUPS] = [
     Color32::from_rgb(0xE8, 0x6B, 0x32), // orange
     Color32::from_rgb(0x46, 0xB0, 0x4A), // green
@@ -475,17 +483,6 @@ const PRESET_LINKS_DARK: [Color32; umber_core::LayerStack::LINK_GROUPS] = [
     Color32::from_rgb(0x1F, 0xB5, 0xB5), // teal
     Color32::from_rgb(0xEE, 0x5A, 0xA8), // rose
     Color32::from_rgb(0xF0, 0xD5, 0x3C), // yellow
-];
-
-/// The same six taken dark enough to read as ink on a light surface — the
-/// relationship Paper's set has to Graphite's.
-const PRESET_LINKS_LIGHT: [Color32; umber_core::LayerStack::LINK_GROUPS] = [
-    Color32::from_rgb(0xC0, 0x56, 0x1A),
-    Color32::from_rgb(0x2E, 0x7C, 0x33),
-    Color32::from_rgb(0x77, 0x42, 0xAE),
-    Color32::from_rgb(0x13, 0x7F, 0x7F),
-    Color32::from_rgb(0xB0, 0x32, 0x6E),
-    Color32::from_rgb(0x6E, 0x6A, 0x0A),
 ];
 
 impl Palette {
@@ -625,50 +622,90 @@ impl Palette {
         }
     }
 
-    /// Clip Studio Paint's light neutrals.
+    /// Clip Studio Paint's dark chrome and its blue-grey selection.
     ///
-    /// **The reference screenshot is Clip Studio's *dark* interface** — panels
-    /// `#3F3F3F`, menu bar `#4E4E4E`, canvas surround `#2E2E2E`, a `#606B7F`
-    /// selected row — and these values are not it. The brief this was built to
-    /// asked for the light one, and it is the better answer whichever way the
-    /// screenshot had gone: the other three presets are all dark neutrals, and
-    /// a fourth beside them at `#3F3F3F` would have been a theme told from
-    /// Photoslop and Krita only by reading the name on its card.
+    /// Sampled from the reference screenshot, which is Clip Studio's **dark**
+    /// interface: `#3F3F3F` panel bodies and rail, a `#4E4E4E` menu bar and
+    /// every strip and panel header above it, `#383838` behind the document
+    /// tabs, a `#2E2E2E` canvas surround, and `#606B7F` on the selected tool,
+    /// the selected sub-tool row, the selected document tab and the selected
+    /// layer row.
     ///
-    /// So the greys are Clip Studio's light interface rather than sampled, and
-    /// they are cool where Paper is warm — the two light themes have to be
-    /// told apart at a glance, and Paper's cream against this one's neutral
-    /// grey is the difference. The pit is a step deeper than the panels rather
-    /// than the mid grey Clip Studio shows a page on, for Krita's reason: the
-    /// canvas scrollbar thumb and the pen dot are drawn in `text_dim` over
-    /// `backdrop`, and at `#A0A0A0` that is 1.47:1. This is 2.70, a shade
-    /// clearer than Paper's own 2.61.
+    /// **That blue-grey is the theme.** It is the one saturated thing in a
+    /// Clip Studio window that is not the picture, it is the same colour in
+    /// all four of those places, and it is what tells this preset from the
+    /// other three at a glance — Photoslop is neutral, Krita is a flatter mid
+    /// grey and MediaBog is warm, and not one of them puts a colour on a
+    /// selected row. So `control_active` is the measured value with nothing
+    /// done to it.
+    ///
+    /// This was built light first, from a brief that said the reference showed
+    /// Clip Studio's light interface. It does not, and the light draft was
+    /// defended on the reasoning that a fourth dark preset would be hard to
+    /// tell from the other three — which the blue-grey answers, and which was
+    /// never ours to decide in place of the person who asked for the reference
+    /// to be followed.
+    ///
+    /// Two departures, both forced by contrast and both stated.
+    /// `control` is `#5C5C5C` where the measured button fill is `#676767`: at
+    /// the measured value `text_muted` on a resting button is 2.73:1 and the
+    /// accent on one is 2.74:1, both under the floors this palette's own
+    /// `text` is held to on that same fill. Nothing is thrown away, because
+    /// the measured grey is `control_hover` — a button lifts to Clip Studio's
+    /// own tone under the pointer. And `popover` is placed in the ladder
+    /// rather than sampled, because no menu is open in the reference; it sits
+    /// between the panel and the menu bar, which is the direction Clip
+    /// Studio's menus go.
+    ///
+    /// The accent is that same blue-grey lifted until it reads as ink.
+    /// `#606B7F` on `#4E4E4E` is **1.55:1**, which is not an accent at all,
+    /// and Umber draws hyperlinks, dashed marks and focus in it. The lift
+    /// raises the saturation as well as the lightness, deliberately: merely
+    /// brightening a blue-grey lands beside `Accent::Steel`, which is itself a
+    /// blue-grey — `#A0AEC4` is 68 from it against a floor of 60 — and that is
+    /// the trap Krita's measured slate already fell into. `#8FB8E6` is 95
+    /// away and 4.03:1 on chrome.
+    ///
+    /// **The canvas pit needs no deviation, and the light draft had one.**
+    /// `widgets.rs` inks the canvas scrollbar thumb and the pen dot in
+    /// `text_dim` over `backdrop`, so the light draft had to darken its pit
+    /// away from the mid grey to reach 2.70:1. Clip Studio's real pit is
+    /// `#2E2E2E` and the thumb reads **4.95:1** on it, so here the faithful
+    /// colour is also the one that passes and there is no trade to record.
+    /// Krita is the theme that still pays it; see there.
     pub const fn shit_studio() -> Self {
         Self {
-            accent: Color32::from_rgb(0x1E, 0x6F, 0xD9),
-            accent_dim: Color32::from_rgb(0xA6, 0xC3, 0xE8),
-            warning: Color32::from_rgb(0xA8, 0x48, 0x2C),
-            warning_bg: Color32::from_rgb(0xF6, 0xE4, 0xDC),
-            warning_border: Color32::from_rgb(0xDD, 0xBA, 0xA8),
-            backdrop: Color32::from_rgb(0xD8, 0xD8, 0xD8),
-            window: Color32::from_rgb(0xE4, 0xE4, 0xE4),
-            dock: Color32::from_rgb(0xEA, 0xEA, 0xEA),
-            chrome: Color32::from_rgb(0xF0, 0xF0, 0xF0),
-            border: Color32::from_rgb(0xB8, 0xB8, 0xB8),
-            popover: Color32::from_rgb(0xFA, 0xFA, 0xFA),
-            popover_border: Color32::from_rgb(0xA8, 0xA8, 0xA8),
-            control: Color32::from_rgb(0xE0, 0xE0, 0xE0),
-            control_hover: Color32::from_rgb(0xD2, 0xD2, 0xD2),
-            // The pale blue a selected row wears, which is the one saturated
-            // thing in a Clip Studio window that is not the picture.
-            control_active: Color32::from_rgb(0xC6, 0xDC, 0xF5),
-            text_strong: Color32::from_rgb(0x1E, 0x1E, 0x1E),
-            text: Color32::from_rgb(0x2B, 0x2B, 0x2B),
-            text_muted: Color32::from_rgb(0x5C, 0x5C, 0x5C),
-            text_dim: Color32::from_rgb(0x82, 0x82, 0x82),
-            rail: Color32::from_rgb(0xCC, 0xCC, 0xCC),
-            knob: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-            link_colours: PRESET_LINKS_LIGHT,
+            accent: Color32::from_rgb(0x8F, 0xB8, 0xE6),
+            accent_dim: Color32::from_rgb(0x54, 0x63, 0x7A),
+            warning: Color32::from_rgb(0xE8, 0x90, 0x7A),
+            warning_bg: Color32::from_rgb(0x3C, 0x28, 0x23),
+            warning_border: Color32::from_rgb(0x78, 0x49, 0x3C),
+            backdrop: Color32::from_rgb(0x2E, 0x2E, 0x2E),
+            window: Color32::from_rgb(0x38, 0x38, 0x38),
+            dock: Color32::from_rgb(0x3F, 0x3F, 0x3F),
+            chrome: Color32::from_rgb(0x4E, 0x4E, 0x4E),
+            // Darker than the surface it divides, unlike Photoslop's and
+            // Krita's: Clip Studio separates its panels with a near-black line
+            // where Photoshop separates them by tone. Measured off the
+            // dividers either side of the canvas.
+            border: Color32::from_rgb(0x30, 0x30, 0x30),
+            popover: Color32::from_rgb(0x48, 0x48, 0x48),
+            popover_border: Color32::from_rgb(0x5E, 0x5E, 0x5E),
+            control: Color32::from_rgb(0x5C, 0x5C, 0x5C),
+            // The measured fill — see above for why it is the hover and not
+            // the resting state.
+            control_hover: Color32::from_rgb(0x67, 0x67, 0x67),
+            control_active: Color32::from_rgb(0x60, 0x6B, 0x7F),
+            text_strong: Color32::from_rgb(0xF0, 0xF0, 0xF0),
+            text: Color32::from_rgb(0xDC, 0xDC, 0xDC),
+            text_muted: Color32::from_rgb(0xB4, 0xB4, 0xB4),
+            // Held up to `#9C` by the `#4E4E4E` menu bar, which is the
+            // lightest surface any theme here draws text on: at `#949494` it
+            // is 2.73:1, under the 2.9 floor Paper set.
+            text_dim: Color32::from_rgb(0x9C, 0x9C, 0x9C),
+            rail: Color32::from_rgb(0x2C, 0x2C, 0x2C),
+            knob: Color32::from_rgb(0xC8, 0xC8, 0xC8),
+            link_colours: PRESET_LINKS_DARK,
         }
     }
 
