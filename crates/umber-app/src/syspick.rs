@@ -34,6 +34,17 @@
 //! and an overlay is a second window that would be *under the pointer* and
 //! therefore the thing any screen read would read.
 //!
+//! **The pen has not been tried and nothing here rests on it.** winit's
+//! `WM_POINTERDOWN`/`UPDATE`/`UP` handler does *not* call `capture_mouse` — the
+//! capture above is the mouse arm's alone — so a pen relies on Windows' own
+//! implicit pointer capture, which the documentation says holds a contact to
+//! the window that received the down until the up. If that holds, a pen drag
+//! reaches the desktop by the same route with nothing added; if it does not,
+//! the pen simply picks inside the window and stops at its edge. Nobody working
+//! on Umber has a tablet, which is why this is stated rather than claimed, and
+//! Settings → Input & pen is where somebody with one would see what the press
+//! actually resolved to.
+//!
 //! **There is no loupe, and that is what the overlay would have been for.** A
 //! magnifier has to be drawn at the pointer, the pointer is on somebody else's
 //! window, so it is an always-on-top borderless window moved once per event —
