@@ -3672,13 +3672,26 @@ mod tests {
 
         // The narrowest a column may be dragged, which is where the heading has
         // least room, and the design's width for comparison.
-        for (name, width, lock) in [
-            ("7-narrow", limits::SIDEBAR_MIN_WIDTH, false),
-            ("8-wide", metrics::PANEL, false),
-            ("9-locked-folder", metrics::PANEL, true),
+        for (name, width, lock, editing) in [
+            ("7-narrow", limits::SIDEBAR_MIN_WIDTH, false, false),
+            ("8-wide", metrics::PANEL, false, false),
+            ("9-locked-folder", metrics::PANEL, true, false),
+            // The tightest case there is, and the one
+            // `a_module_header_never_draws_its_title_under_its_controls`
+            // measures: the narrowest column, with the close mark taking
+            // another eighteen points off the header's strip. What the
+            // assertion cannot say is whether a title clipped to fit still
+            // reads as the name of a module.
+            (
+                "10-narrow-edit-mode",
+                limits::SIDEBAR_MIN_WIDTH,
+                false,
+                true,
+            ),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
+            ed.layout.set_edit_mode(editing);
             ed.layers.add();
             ed.layers.add();
             ed.layers.group(&[1, 2]);
@@ -3706,6 +3719,6 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 3 edge cases to {}", dir.display());
+        println!("wrote 4 edge cases to {}", dir.display());
     }
 }

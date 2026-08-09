@@ -1898,32 +1898,41 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/palette-module");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        for (name, open, empty, naming, dragging, editing) in [
-            ("1-panel", false, false, false, false, true),
-            ("2-panel-empty", false, true, false, false, true),
-            ("3-library", true, false, false, false, true),
+        for (name, open, empty, naming, dragging, editing, harmony) in [
+            ("1-panel", false, false, false, false, true, false),
+            ("2-panel-empty", false, true, false, false, true, false),
+            ("3-library", true, false, false, false, true, false),
             // The naming field, which is the one piece of this module whose
             // size is decided by a `TextEdit` sharing a line with a chip. A
             // field that overran the panel would look exactly like a field that
             // fitted, in every assertion anybody could write about it.
-            ("4-naming", false, false, true, false, true),
+            ("4-naming", false, false, true, false, true, false),
             // A drag in flight, which is the only way anybody looks at the drop
             // ring. `the_drop_ring_covers_no_colour_and_reaches_no_neighbour`
             // pins the geometry and can say nothing about whether the mark
             // reads as "the colour lands here" beside the solid accent outline
             // that means "this is the colour in hand" — which is the whole
             // argument for it being dashed and square.
-            ("5-dragging", false, false, false, true, true),
+            ("5-dragging", false, false, false, true, true, false),
             // The state the module opens in, which is the one most people will
             // ever see: no corner marks on the swatches, the pencil unlit and
             // the plus beside it dead. What a picture answers and no assertion
             // does is whether a grid with nothing on its corners still reads as
             // a palette rather than as one that has failed to finish drawing.
-            ("6-read-only", false, false, false, false, false),
+            ("6-read-only", false, false, false, false, false, false),
+            // The adding mark in its other reading. The glyph is what says
+            // whether a press puts one colour in or the whole relation, so it is
+            // the one part of that decision no assertion can see: what matters
+            // is whether the two marks are told apart at a glance, in the place
+            // a plus normally sits.
+            ("7-harmony", false, false, false, false, true, true),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
             ed.color = umber_core::Color::from_srgb_u8(143, 88, 42, 255);
+            if harmony {
+                ed.ui.picker = PickerMode::Harmony;
+            }
             let library = if empty {
                 let dir = std::env::temp_dir().join("umber-palette-shot-empty");
                 let _ = std::fs::remove_dir_all(&dir);
@@ -2003,7 +2012,7 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 6 shots to {}", dir.display());
+        println!("wrote 7 shots to {}", dir.display());
     }
 
     /// A palette laid out in fours reads as fours where there is room, and a
