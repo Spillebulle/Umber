@@ -52,14 +52,20 @@ use glam::UVec2;
 
 use crate::document::Document;
 
-/// The resolutions worth one click.
+/// The resolutions worth one click, each with the text its button carries.
 ///
 /// 72 is the screen figure and Umber's own "unstated"; 300 is what a printer
 /// asks for and is what [`Chosen::Sheet`] carries; 150 is the draft between
 /// them and 600 is fine art. Anything else is typed into the resolution field
 /// beside these, which is why this is a short list of the ones people actually
 /// pick rather than an attempt at every one.
-pub const DPI_CHOICES: [u32; 4] = [72, 150, 300, 600];
+///
+/// The label is in the table rather than formatted at the call site because the
+/// quick-pick is drawn on every frame a modal is open, and "nothing on the
+/// drawing path allocates per frame" is a rule of the house. A constant needs no
+/// `String`. `every_resolution_is_labelled_with_itself` is what stops the two
+/// halves of a row drifting apart.
+pub const DPI_CHOICES: [(u32, &str); 4] = [(72, "72"), (150, "150"), (300, "300"), (600, "600")];
 
 /// The resolution a paper size arrives at.
 ///
@@ -100,18 +106,6 @@ impl Orientation {
         match self {
             Self::Portrait => portrait,
             Self::Landscape => UVec2::new(portrait.y, portrait.x),
-        }
-    }
-
-    /// Which way up a size already is.
-    ///
-    /// A square reads as portrait, which is the same answer [`Self::default`]
-    /// gives and matters to nothing: no sheet is square.
-    fn of(size: UVec2) -> Self {
-        if size.x > size.y {
-            Self::Landscape
-        } else {
-            Self::Portrait
         }
     }
 }
@@ -203,18 +197,6 @@ impl Sheet {
             Self::Letter => SheetSize::Inches(8.5, 11.0),
             Self::Legal => SheetSize::Inches(8.5, 14.0),
             Self::Tabloid => SheetSize::Inches(11.0, 17.0),
-        }
-    }
-
-    /// A sentence naming the physical size, for the row's tooltip.
-    ///
-    /// In the units the sheet is defined in, because "Letter, 215.9 × 279.4 mm"
-    /// is a conversion artefact where "8.5 × 11 in" is what is written on the
-    /// packet.
-    pub fn measurement(self) -> String {
-        match self.size() {
-            SheetSize::Millimetres(w, h) => format!("{w:.0} × {h:.0} mm"),
-            SheetSize::Inches(w, h) => format!("{w} × {h} in"),
         }
     }
 
@@ -518,6 +500,16 @@ impl Aspect {
     /// What it is *for* is keeping the strip from lying while an edge is being
     /// nudged: see [`settle`]. Custom holds everything, which is what makes it
     /// sticky — somebody typing numbers is not asking to be filed.
+    ///
+    /// **A ratio holds the nearest whole pixel to itself, not only an exact
+    /// multiple**, and that is the same arithmetic [`choose`] uses rather than a
+    /// tolerance invented here. Exact cross-multiplication was the first draft
+    /// and it is wrong twice. A canvas 1601 pixels wide *cannot* be exactly
+    /// 16:9, so dragging the width across a few pixels made the whole row of
+    /// sizes appear and vanish once per pixel; and `choose` itself produces
+    /// sizes that are only nearest — 5000 square becomes 5000 × 2813 — so
+    /// picking 16:9 gave a canvas that the same module then said was not 16:9.
+    /// `a_size_a_choice_produces_is_one_that_shape_holds` pins the round trip.
     pub fn holds(self, size: UVec2, dpi: u32) -> bool {
         match self {
             Self::Custom => true,
@@ -526,11 +518,13 @@ impl Aspect {
                     .iter()
                     .any(|&up| sheet.pixels(dpi, up) == size)
             }),
+            // Built the way [`choose`] builds it and compared whole, rather
+            // than tested edge by edge: that is what makes the round trip
+            // structural, and it settles the long axis at the same time, so
+            // 16:9 cannot hold a 9:16 canvas and collapse the two rows into
+            // one.
             _ => match self.ratio() {
-                // Cross-multiplied in `u64`: exact, and no division to round.
-                Some((w, h)) => {
-                    u64::from(size.x) * u64::from(h) == u64::from(size.y) * u64::from(w)
-                }
+                Some((w, h)) => shaped(size.x.max(size.y), w, h) == size,
                 None => false,
             },
         }
@@ -672,13 +666,22 @@ pub fn choose(aspect: Aspect, size: UVec2, limit: CanvasLimit) -> Chosen {
                 None => return Chosen::Unchanged,
             };
             let long = size.x.max(size.y).clamp(1, limit.max_edge());
-            let short = derive(long, w.min(h), w.max(h));
-            Chosen::Size(if w >= h {
-                UVec2::new(long, short)
-            } else {
-                UVec2::new(short, long)
-            })
+            Chosen::Size(shaped(long, w, h))
         }
+    }
+}
+
+/// The `w:h` canvas whose longer edge is `long`.
+///
+/// The one statement of the shape, shared by [`choose`] and [`Aspect::holds`],
+/// so "what a choice produces" and "what a shape recognises" cannot drift apart
+/// — which they had, when `holds` cross-multiplied exactly and `choose` rounded.
+fn shaped(long: u32, w: u32, h: u32) -> UVec2 {
+    let short = derive(long, w.min(h), w.max(h));
+    if w >= h {
+        UVec2::new(long, short)
+    } else {
+        UVec2::new(short, long)
     }
 }
 
@@ -734,7 +737,7 @@ impl CanvasLimit {
     /// The bound for a device reporting `max_texture_dimension_2d`.
     pub fn of_device(max_texture_dimension_2d: u32) -> Self {
         Self {
-            max_edge: max_texture_dimension_2d.min(Document::MAX_EDGE).max(1),
+            max_edge: max_texture_dimension_2d.clamp(1, Document::MAX_EDGE),
         }
     }
 
@@ -870,7 +873,7 @@ mod tests {
         let mut closest = 0.5f64;
         for sheet in Sheet::ALL {
             let (w, h) = sheet.size().inches();
-            for dpi in DPI_CHOICES {
+            for (dpi, _) in DPI_CHOICES {
                 for inches in [w, h] {
                     let exact = inches * f64::from(dpi);
                     let gap = (exact - exact.round()).abs();
@@ -881,6 +884,29 @@ mod tests {
         // Nothing gets within a hundredth of a pixel of a tie, which is five
         // orders of magnitude clear of `f64`'s error at these magnitudes.
         assert!(closest > 1e-2, "closest approach to a tie was {closest}");
+    }
+
+    #[test]
+    fn every_resolution_is_labelled_with_itself() {
+        // The pair exists to keep an allocation off the drawing path, so the one
+        // thing it can get wrong is a label that names a different figure from
+        // the one clicking it applies.
+        for (dpi, label) in DPI_CHOICES {
+            assert_eq!(label, dpi.to_string(), "{dpi} is drawn as {label}");
+            assert!(
+                (Document::MIN_DPI as u32..=Document::MAX_DPI as u32).contains(&dpi),
+                "{dpi} is outside what a document can carry"
+            );
+        }
+        // Ascending, which is not decoration: the dialog draws the resolutions a
+        // sheet can reach as a *prefix* of this table rather than a filtered
+        // copy of it, so that it borrows a `const` instead of allocating on
+        // every frame a modal is open. Reorder these and the strip silently
+        // stops offering figures it should.
+        assert!(
+            DPI_CHOICES.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "the quick-pick has to be ascending"
+        );
     }
 
     #[test]
@@ -905,7 +931,7 @@ mod tests {
     #[test]
     fn a_sheet_turned_on_its_side_is_the_same_two_numbers() {
         for sheet in Sheet::ALL {
-            for dpi in DPI_CHOICES {
+            for (dpi, _) in DPI_CHOICES {
                 let portrait = sheet.pixels(dpi, Orientation::Portrait);
                 let landscape = sheet.pixels(dpi, Orientation::Landscape);
                 assert_eq!(landscape, UVec2::new(portrait.y, portrait.x));
@@ -1023,15 +1049,20 @@ mod tests {
         // `read` prefers a fixed ratio over paper, so a sheet that happened to
         // land on one would file itself under the wrong row.
         //
-        // Swept over every resolution both controls can reach, and there is
-        // exactly one collision in the whole domain: A5 at **1 dpi** is six
-        // pixels by eight, which is 3:4. That is what the ordering is for. It is
-        // excluded here rather than the sweep being narrowed to the quick-pick,
-        // because "nothing above one dot per inch" is a far stronger statement
-        // than "none of the four figures on the strip", and the excluded case is
-        // pinned below rather than waved away.
+        // Swept over every resolution both controls can reach above **4 dpi**,
+        // and there is nothing. Below it there are four, all of them a sheet
+        // rendered at twenty-odd pixels — A4 at 2 dpi is 17 × 23, and the
+        // nearest 3:4 canvas 23 pixels tall is 17 × 23. That is not a defect in
+        // the tables, it is what "the nearest whole pixel" means when the whole
+        // picture is twenty pixels: `Aspect::holds` is a half-pixel bound, so it
+        // widens as a fraction of the canvas as the canvas shrinks. The ordering
+        // in [`read`] is what decides those, and one of them is pinned below.
+        //
+        // Excluded rather than the sweep being narrowed to the four figures on
+        // the quick-pick, because "nothing above four dots per inch" is a far
+        // stronger statement than "none of the four we happen to offer".
         for sheet in Sheet::ALL {
-            for dpi in 2..=(Document::MAX_DPI as u32) {
+            for dpi in 5..=(Document::MAX_DPI as u32) {
                 for up in Orientation::ALL {
                     let size = sheet.pixels(dpi, up);
                     for aspect in Aspect::ALL {
@@ -1051,14 +1082,64 @@ mod tests {
     }
 
     #[test]
-    fn the_one_size_that_is_both_reads_as_the_ratio() {
-        // A5 at 1 dpi. Six pixels by eight is a 3:4 canvas that also happens to
-        // measure a sheet of paper, and the module states which way that goes
-        // rather than leaving it to the order of a table somebody may reorder.
+    fn a_size_a_choice_produces_is_one_that_shape_holds() {
+        // The round trip that makes the strip stable: pick a shape, and the
+        // canvas you are given is one that shape still recognises. It failed
+        // under exact cross-multiplication, because a 5000 square becomes
+        // 5000 x 2813 and that is not an exact 16:9.
+        for aspect in Aspect::ALL {
+            if aspect.ratio().is_none() {
+                continue;
+            }
+            for size in [
+                UVec2::new(1, 1),
+                UVec2::new(7, 13),
+                UVec2::new(1000, 1000),
+                UVec2::new(1601, 900),
+                UVec2::new(5000, 5000),
+                UVec2::new(1920, 1080),
+                UVec2::new(Document::MAX_EDGE, 1),
+            ] {
+                let Chosen::Size(out) = choose(aspect, size, CanvasLimit::UNKNOWN) else {
+                    panic!("no size");
+                };
+                assert!(
+                    aspect.holds(out, 72),
+                    "{} produced {out} from {size} and does not hold it",
+                    aspect.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shape_does_not_hold_its_own_transpose() {
+        // Otherwise 16:9 and 9:16 would be one row drawn twice, and `read` would
+        // file every portrait video canvas under the landscape shape.
+        assert!(Aspect::Wide.holds(UVec2::new(1920, 1080), 72));
+        assert!(!Aspect::Wide.holds(UVec2::new(1080, 1920), 72));
+        assert!(Aspect::WideTall.holds(UVec2::new(1080, 1920), 72));
+        assert!(!Aspect::WideTall.holds(UVec2::new(1920, 1080), 72));
+        assert!(Aspect::Standard.holds(UVec2::new(1024, 768), 72));
+        assert!(!Aspect::Standard.holds(UVec2::new(768, 1024), 72));
+    }
+
+    #[test]
+    fn a_size_that_is_both_reads_as_the_ratio() {
+        // A5 at 1 dpi. Six pixels by eight is the nearest 3:4 canvas eight
+        // pixels tall and also, at that resolution, a sheet of paper. The
+        // module states which way that goes rather than leaving it to the order
+        // of a table somebody may one day reorder.
         let tiny = Sheet::A5.pixels(1, Orientation::Portrait);
         assert_eq!(tiny, UVec2::new(6, 8));
         assert!(Aspect::Paper.holds(tiny, 1));
         assert_eq!(read(tiny, 1).aspect, Aspect::StandardTall);
+
+        // And the largest of the four, so the boundary the sweep excludes is
+        // written down rather than only described.
+        let a6 = Sheet::A6.pixels(4, Orientation::Portrait);
+        assert_eq!(a6, UVec2::new(17, 23));
+        assert_eq!(read(a6, 4).aspect, Aspect::StandardTall);
     }
 
     // ------------------------------------------------------------- the reading
@@ -1078,7 +1159,7 @@ mod tests {
     #[test]
     fn a_sheet_reads_back_as_that_sheet_at_that_resolution_and_no_other() {
         for sheet in Sheet::ALL {
-            for dpi in DPI_CHOICES {
+            for (dpi, _) in DPI_CHOICES {
                 for up in Orientation::ALL {
                     let size = sheet.pixels(dpi, up);
                     let reading = read(size, dpi);
@@ -1324,7 +1405,7 @@ mod tests {
         // Which is what makes the quick-pick's four figures the four figures
         // rather than a list that has to be filtered on most computers.
         for sheet in Sheet::ALL {
-            for dpi in DPI_CHOICES {
+            for (dpi, _) in DPI_CHOICES {
                 assert!(
                     CanvasLimit::UNKNOWN.permits(sheet.pixels(dpi, Orientation::Portrait)),
                     "{} at {dpi} dpi",
@@ -1343,11 +1424,5 @@ mod tests {
         let big = memory_note(UVec2::new(16384, 16384)).expect("a sentence");
         assert!(big.contains("1.0 GB"), "{big}");
         assert!(!big.contains('—'), "{big}");
-    }
-
-    #[test]
-    fn a_measurement_is_stated_in_the_units_the_sheet_is_sold_in() {
-        assert_eq!(Sheet::A4.measurement(), "210 × 297 mm");
-        assert_eq!(Sheet::Letter.measurement(), "8.5 × 11 in");
     }
 }

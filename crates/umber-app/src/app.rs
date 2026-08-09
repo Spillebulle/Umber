@@ -4412,6 +4412,18 @@ impl ApplicationHandler<Wake> for UmberApp {
         splash.show(splash::Stage::Ready);
         drop(splash);
 
+        // What the canvas dialogs may offer. `max_texture_dimension_2d` is the
+        // number that decides whether a canvas can exist at all — past it,
+        // creating the layer array is a validation error, which is fatal — and
+        // `Limits::downlevel_defaults` guarantees only 2048 while
+        // `using_resolution` raises exactly that limit from the adapter, so it
+        // has to be read from the device rather than assumed. Read once here,
+        // because it describes the machine and not any document; the import
+        // path asks the same question of the same limit a few hundred lines up.
+        self.editor
+            .canvas_form
+            .set_device_limit(gpu.device.limits().max_texture_dimension_2d);
+
         // Provisional: the real canvas region is not known until the first
         // frame has laid the panels out, which corrects both of these.
         self.editor.canvas_size = Vec2::new(config.width as f32, config.height as f32);
