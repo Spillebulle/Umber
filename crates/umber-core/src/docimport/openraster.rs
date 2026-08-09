@@ -62,8 +62,8 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds,
-    disable_effects_over_budget, flat, history, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
+    check_bounds, disable_effects_over_budget, flat, history, srgb,
 };
 use crate::color::Color;
 use crate::docformat;
@@ -169,8 +169,12 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
             .background
             .map_or(Background::Transparent, Background::opaque);
     }
-    let painted = specs.iter().filter(|spec| !spec.folder).count();
-    check_bounds(FORMAT, size.x, size.y, specs.len(), painted)?;
+    check_bounds(
+        FORMAT,
+        size.x,
+        size.y,
+        StackSize::of(specs.iter().map(|spec| spec.folder)),
+    )?;
 
     let mut layers = Vec::with_capacity(specs.len());
     // Tracked against the layers that actually loaded, not against the specs:

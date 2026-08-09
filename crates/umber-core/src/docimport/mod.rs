@@ -1001,6 +1001,60 @@ fn disable_effects_over_budget(layers: &mut [ImportedLayer]) -> usize {
     disabled
 }
 
+/// What a reader knows about its stack before it decodes a pixel.
+///
+/// **Two counts that must not be interchangeable, which is why this is a type
+/// and not two `usize` parameters.** [`check_bounds`] needs both — entries for
+/// `LayerStack::MAX`, painted layers for the byte total — and with two bare
+/// numbers in the signature every reader could pass its entry count twice.
+/// Every reader did, which is how a folder came to be charged for a canvas it
+/// does not hold.
+///
+/// Demonstrated rather than argued: with the two as parameters, putting
+/// `nodes.len()` in both slots of the `.clip` reader left all 1,061 tests
+/// green, because the guard that knew the difference was testing `check_bounds`
+/// and could not see what its caller handed it. That is the "a guard on a model
+/// is not a guard on the call site" failure CLAUDE.md records. The fix is both
+/// halves: [`Self::of`] takes the folder *readings* and derives both counts
+/// itself, so a caller has nothing to get the wrong way round, and
+/// `a_document_filed_into_folders_is_not_charged_for_the_folders` drives the
+/// reader so that writing it wrongly anyway fails the build.
+#[derive(Clone, Copy, Debug)]
+struct StackSize {
+    /// Everything that will occupy a [`LayerStack`] entry, folders included.
+    entries: usize,
+    /// Everything holding a canvas-sized buffer. Folders are not in it.
+    painted: usize,
+}
+
+impl StackSize {
+    /// Read off one "is this entry a folder" per entry, which is the only
+    /// reading that can tell the two counts apart.
+    fn of(folders: impl IntoIterator<Item = bool>) -> Self {
+        let mut entries = 0;
+        let mut painted = 0;
+        for folder in folders {
+            entries += 1;
+            painted += usize::from(!folder);
+        }
+        Self { entries, painted }
+    }
+
+    /// A reader whose every entry holds pixels.
+    ///
+    /// Named rather than spelled `of(repeat(false))` at the call site so that
+    /// using it is a claim somebody can check: a flat picture is one layer, and
+    /// the `.psd` reader makes no folders at all because a Photoshop group
+    /// arrives as nothing. A reader that grows folders and keeps this call is
+    /// visibly wrong, where a second `n` in an argument list was not.
+    fn all_painted(n: usize) -> Self {
+        Self {
+            entries: n,
+            painted: n,
+        }
+    }
+}
+
 /// Bytes as a figure an artist reads, for a refusal that has to be acted on.
 ///
 /// Decimal GB rather than GiB, because the sentence is telling somebody how big
@@ -1018,19 +1072,12 @@ fn gigabytes(bytes: u64) -> String {
 /// it: decoding sixty 8000² layers and *then* refusing would allocate several
 /// gigabytes to reach the same answer.
 ///
-/// **Two counts, because the two bounds are counting different things.**
-/// `entries` is what a [`LayerStack`] will hold and folders are in it, because
-/// `LayerStack::MAX` bounds entries and a folder occupies one. `pixel_layers`
-/// is what the *bytes* are, and folders are not in it, because a folder holds
-/// no slot and no buffer — `ImportedLayer::folder` allocates nothing at all.
-/// One count served both and the byte total was therefore charging a folder
-/// for a canvas: a Clip Studio document filed into groups paid for its own
-/// filing, and the deeper the artist's tidying the sooner the refusal came.
-///
-/// The two are deliberately not derived from one another here. A reader knows
-/// which of its entries are folders before it decodes anything, which is the
-/// whole reason this can be called off the header, and asking it for both is
-/// what keeps that true.
+/// **The two bounds count different things**, which is what [`StackSize`] is
+/// for. `LayerStack::MAX` bounds entries and a folder occupies one; the byte
+/// total is buffers, and a folder holds none — `ImportedLayer::folder`
+/// allocates nothing at all. One count served both, so the byte total charged
+/// a folder for a canvas: a Clip Studio document filed into groups paid for its
+/// own filing, and the deeper the artist's tidying the sooner the refusal came.
 ///
 /// **Masks are deliberately not counted, and the bound is therefore what a
 /// stack of layers costs rather than what a document costs.** A mask is another
@@ -1048,8 +1095,7 @@ fn check_bounds(
     format: SourceFormat,
     width: u32,
     height: u32,
-    entries: usize,
-    pixel_layers: usize,
+    stack: StackSize,
 ) -> Result<(), ImportError> {
     if width == 0 || height == 0 {
         return Err(ImportError::Malformed {
@@ -1060,18 +1106,18 @@ fn check_bounds(
     if width > ImportedDocument::MAX_DIMENSION || height > ImportedDocument::MAX_DIMENSION {
         return Err(ImportError::CanvasTooLarge { width, height });
     }
-    if entries > LayerStack::MAX {
+    if stack.entries > LayerStack::MAX {
         return Err(ImportError::TooManyLayers {
-            found: entries,
+            found: stack.entries,
             max: LayerStack::MAX,
         });
     }
-    let total = width as u64 * height as u64 * 4 * pixel_layers.max(1) as u64;
+    let total = width as u64 * height as u64 * 4 * stack.painted.max(1) as u64;
     if total > ImportedDocument::MAX_TOTAL_BYTES {
         return Err(ImportError::StackTooLarge {
             width,
             height,
-            layers: pixel_layers,
+            layers: stack.painted,
             bytes: total,
         });
     }
@@ -1172,25 +1218,25 @@ mod tests {
     fn bounds_are_checked_before_any_decoding() {
         let f = SourceFormat::Photoshop;
         assert!(matches!(
-            check_bounds(f, 0, 10, 1, 1),
+            check_bounds(f, 0, 10, StackSize::all_painted(1)),
             Err(ImportError::Malformed { .. })
         ));
         assert!(matches!(
-            check_bounds(f, 40000, 10, 1, 1),
+            check_bounds(f, 40000, 10, StackSize::all_painted(1)),
             Err(ImportError::CanvasTooLarge { .. })
         ));
         assert!(matches!(
-            check_bounds(f, 100, 100, LayerStack::MAX + 1, LayerStack::MAX + 1),
+            check_bounds(f, 100, 100, StackSize::all_painted(LayerStack::MAX + 1)),
             Err(ImportError::TooManyLayers { .. })
         ));
         // 16384² is a legal canvas and 64 of them is 68.7 GB, which is the
         // document the byte bound exists for: a header asking for tens of
         // gigabytes before a pixel has been decoded.
         assert!(matches!(
-            check_bounds(f, 16384, 16384, 64, 64),
+            check_bounds(f, 16384, 16384, StackSize::all_painted(64)),
             Err(ImportError::StackTooLarge { .. })
         ));
-        assert!(check_bounds(f, 2048, 2048, 8, 8).is_ok());
+        assert!(check_bounds(f, 2048, 2048, StackSize::all_painted(8)).is_ok());
     }
 
     /// The refusal the artist actually met, and the two things wrong with it.
@@ -1208,7 +1254,7 @@ mod tests {
             for layers in [1, 8, 22, LayerStack::MAX] {
                 assert!(
                     !matches!(
-                        check_bounds(f, w, h, layers, layers),
+                        check_bounds(f, w, h, StackSize::all_painted(layers)),
                         Err(ImportError::CanvasTooLarge { .. })
                     ),
                     "{w}×{h} at {layers} layers was refused for its canvas size"
@@ -1224,11 +1270,11 @@ mod tests {
     #[test]
     fn an_ordinary_large_document_opens() {
         let f = SourceFormat::ClipStudio;
-        assert!(check_bounds(f, 15000, 5000, 8, 8).is_ok());
-        assert!(check_bounds(f, 15000, 5000, 50, 50).is_ok());
-        assert!(check_bounds(f, 5000, 5000, 22, 22).is_ok());
-        assert!(check_bounds(f, 5000, 5000, LayerStack::MAX, LayerStack::MAX).is_ok());
-        assert!(check_bounds(f, 10000, 10000, 40, 40).is_ok());
+        assert!(check_bounds(f, 15000, 5000, StackSize::all_painted(8)).is_ok());
+        assert!(check_bounds(f, 15000, 5000, StackSize::all_painted(50)).is_ok());
+        assert!(check_bounds(f, 5000, 5000, StackSize::all_painted(22)).is_ok());
+        assert!(check_bounds(f, 5000, 5000, StackSize::all_painted(LayerStack::MAX)).is_ok());
+        assert!(check_bounds(f, 10000, 10000, StackSize::all_painted(40)).is_ok());
     }
 
     /// **A reader must never be stricter than the writer** is the rule the mask
@@ -1256,7 +1302,7 @@ mod tests {
         let f = SourceFormat::OpenRaster;
         for edge in [2048u32, 4096, 8192] {
             assert!(
-                check_bounds(f, edge, edge, LayerStack::MAX, LayerStack::MAX).is_ok(),
+                check_bounds(f, edge, edge, StackSize::all_painted(LayerStack::MAX)).is_ok(),
                 "a full stack on a {edge}² canvas could be saved and not reopened"
             );
         }
@@ -1264,27 +1310,39 @@ mod tests {
         // The gap, pinned so that closing it is a change to this test and not a
         // silent one. Whichever way it moves, both halves move together.
         assert!(
-            check_bounds(f, 10000, 10000, 64, 64).is_err(),
+            check_bounds(f, 10000, 10000, StackSize::all_painted(64)).is_err(),
             "if this now opens, MAX_TOTAL_BYTES was raised and its docs must say so"
         );
-        assert!(check_bounds(f, 10000, 10000, 40, 40).is_ok());
+        assert!(check_bounds(f, 10000, 10000, StackSize::all_painted(40)).is_ok());
     }
 
     /// A folder holds no slot and no buffer, so it may not be charged a canvas.
     ///
-    /// The counts are read separately by construction — see [`check_bounds`] —
-    /// and this is what says the byte half actually uses the second one. Driven
-    /// from a case where the two readings *disagree*: 60 folders over 4 painted
-    /// layers on a 10000² canvas is 9.6 GB read correctly and 25.6 GB read off
-    /// the entry count, so a version taking `entries` for both fails here.
+    /// Driven through [`StackSize::of`] from folder *readings* rather than from
+    /// two hand-written counts, because that constructor is what every reader
+    /// calls and hand-written counts would only agree with themselves. The case
+    /// is one where the two readings disagree loudly: 60 folders over 4 painted
+    /// layers on a 10000² canvas is 9.6 GB counted properly and 25.6 GB counted
+    /// off the entries, so a version that charged folders fails here.
+    ///
+    /// This is the *function's* half. Whether a reader hands it the right
+    /// reading is `a_document_filed_into_folders_is_not_charged_for_the_folders`
+    /// in `clipstudio`, and it has to be there: this test passes whatever the
+    /// caller does.
     #[test]
     fn folders_are_not_charged_for_pixels_they_do_not_hold() {
         let f = SourceFormat::ClipStudio;
-        assert!(check_bounds(f, 10000, 10000, 64, 4).is_ok());
-        // And the entry bound still counts them, because a folder does occupy
-        // a stack entry even though it occupies no memory.
+        let stack = StackSize::of((0..64).map(|i| i >= 4));
+        assert_eq!((stack.entries, stack.painted), (64, 4));
+        assert!(check_bounds(f, 10000, 10000, stack).is_ok());
+
+        // And the entry bound still counts them, because a folder does occupy a
+        // stack entry even though it occupies no memory. One painted layer at
+        // the bottom of `MAX + 1` entries costs no more in bytes than a single
+        // layer and is still a stack too tall to hold.
+        let too_tall = StackSize::of((0..=LayerStack::MAX).map(|i| i > 0));
         assert!(matches!(
-            check_bounds(f, 100, 100, LayerStack::MAX + 1, 1),
+            check_bounds(f, 100, 100, too_tall),
             Err(ImportError::TooManyLayers { .. })
         ));
     }
@@ -1294,7 +1352,7 @@ mod tests {
     #[test]
     fn a_stack_refusal_names_the_stack_and_not_the_canvas() {
         let f = SourceFormat::ClipStudio;
-        let err = check_bounds(f, 16384, 16384, 64, 64).unwrap_err();
+        let err = check_bounds(f, 16384, 16384, StackSize::all_painted(64)).unwrap_err();
         let said = err.to_string();
         assert!(said.contains("64 layers"), "{said}");
         assert!(said.contains("68.7 GB"), "{said}");

@@ -99,7 +99,8 @@ use psd::{ColorMode, PsdChannelKind, PsdDepth};
 
 use super::blend::{self, Fidelity};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
+    check_bounds, srgb,
 };
 use crate::document::Background;
 use crate::layer::BlendMode;
@@ -130,10 +131,15 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     }
 
     let size = UVec2::new(psd.width(), psd.height());
-    // This reader makes no folders — a PSD group arrives as nothing at all —
-    // so every entry it will produce holds pixels and the two counts coincide.
-    let entries = psd.layers().len().max(1);
-    check_bounds(FORMAT, size.x, size.y, entries, entries)?;
+    // This reader makes no folders: a PSD group arrives as nothing at all, so
+    // every entry it will produce holds pixels. If groups are ever read, this
+    // is one of the two places that has to learn about them.
+    check_bounds(
+        FORMAT,
+        size.x,
+        size.y,
+        StackSize::all_painted(psd.layers().len().max(1)),
+    )?;
 
     let mut warnings = Vec::new();
 

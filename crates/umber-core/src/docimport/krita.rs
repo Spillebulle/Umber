@@ -65,8 +65,8 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, flat,
-    lzf, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
+    check_bounds, flat, lzf, srgb,
 };
 use crate::document::Background;
 use crate::layer::{BlendMode, LayerStack};
@@ -117,8 +117,12 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let maindoc = container::read_entry(&mut zip, "maindoc.xml", FORMAT)?;
     let mut warnings = Vec::new();
     let doc = parse_maindoc(&maindoc, &mut warnings)?;
-    let painted = doc.layers.iter().filter(|l| !l.folder).count();
-    check_bounds(FORMAT, doc.size.x, doc.size.y, doc.layers.len(), painted)?;
+    check_bounds(
+        FORMAT,
+        doc.size.x,
+        doc.size.y,
+        StackSize::of(doc.layers.iter().map(|l| l.folder)),
+    )?;
 
     if doc.colourspace != SUPPORTED_COLOURSPACE {
         return flattened_fallback(

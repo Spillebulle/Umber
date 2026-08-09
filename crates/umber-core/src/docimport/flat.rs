@@ -5,7 +5,9 @@
 
 use glam::UVec2;
 
-use super::{ImportError, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, srgb};
+use super::{
+    ImportError, ImportedDocument, ImportedLayer, SourceFormat, StackSize, check_bounds, srgb,
+};
 use crate::document::Background;
 use crate::layer::BlendMode;
 
@@ -87,8 +89,13 @@ fn widen(src: &[u8], stride: usize, f: impl Fn(&[u8]) -> [u8; 4]) -> Vec<u8> {
 pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let format = SourceFormat::Png;
     let image = decode_png(bytes, format)?;
-    // A flat picture is one entry and one buffer, so the two counts coincide.
-    check_bounds(format, image.size.x, image.size.y, 1, 1)?;
+    // A flat picture is one layer and no folders.
+    check_bounds(
+        format,
+        image.size.x,
+        image.size.y,
+        StackSize::all_painted(1),
+    )?;
 
     let mut pixels = image.rgba;
     srgb::encode_buffer(&mut pixels);

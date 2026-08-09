@@ -101,7 +101,8 @@ use glam::UVec2;
 
 use super::blend::{self, Fidelity};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
+    check_bounds, srgb,
 };
 use crate::csblocks::{self, BLOCK, Bitmap, Fill, Packing};
 use crate::document::Background;
@@ -152,8 +153,8 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     // size and not towards its bytes. `.clip` is where that matters most: a
     // Clip Studio document is usually filed into groups, and charging each one
     // a canvas is what made a 15000×5000 file refuse itself.
-    let painted = nodes.iter().filter(|n| !n.folder).count();
-    check_bounds(FORMAT, canvas.size.x, canvas.size.y, nodes.len(), painted)?;
+    let stack = StackSize::of(nodes.iter().map(|n| n.folder));
+    check_bounds(FORMAT, canvas.size.x, canvas.size.y, stack)?;
 
     let mut out = Vec::with_capacity(nodes.len());
     for node in &nodes {
@@ -1013,6 +1014,41 @@ mod tests {
     use super::super::fixtures::{self, ClipLayer};
     use super::*;
     use crate::layer::BlendMode;
+
+    /// **A document filed into folders is not charged for its filing**, which
+    /// is the bug an artist met: a 15000×5000 `.clip` refused with "the canvas
+    /// is larger than Umber can open", a canvas well inside `MAX_DIMENSION`.
+    ///
+    /// This is here rather than beside `check_bounds` because that is where the
+    /// hole was. `folders_are_not_charged_for_pixels_they_do_not_hold` drives
+    /// the *function* and passes whatever the reader hands it, so putting the
+    /// entry count in both slots left all 1,061 tests green — the "a guard on a
+    /// model is not a guard on the call site" failure, demonstrated by mutation
+    /// rather than argued. `StackSize` makes the mistake hard to write; this
+    /// makes it fail.
+    ///
+    /// The canvas has to be genuinely large, because the bound being tested is
+    /// a byte total: at 10000² a stack of 64 is 25.6 GB and refused, while the
+    /// one layer actually holding pixels is 400 MB and fine. The fixture stays
+    /// small — `placed` gives that layer a 1×1 bitmap, and a folder carries no
+    /// pixels at all — so what the test costs is the one canvas-sized buffer
+    /// the reader legitimately produces.
+    #[test]
+    fn a_document_filed_into_folders_is_not_charged_for_the_folders() {
+        let mut layers =
+            vec![ClipLayer::flat("Ink", 1, 1, [10, 120, 240, 255]).placed((1, 1), (0, 0))];
+        // 63 folders and one layer is the full `LayerStack::MAX`, so this is
+        // also the worst a legal stack can be filed.
+        for _ in 0..63 {
+            layers.push(ClipLayer::folder("Group", Vec::new()));
+        }
+        let bytes = fixtures::clip(10000, 10000, &layers);
+
+        let doc = read(&bytes).expect("a 10000² document with 63 folders on it should open");
+        assert_eq!(doc.size, UVec2::new(10000, 10000));
+        assert_eq!(doc.layers.iter().filter(|l| !l.folder).count(), 1);
+        assert_eq!(doc.layers.iter().filter(|l| l.folder).count(), 63);
+    }
 
     /// **Bottom first, and the folder above its own contents.**
     ///
