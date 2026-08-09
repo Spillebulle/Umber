@@ -631,20 +631,25 @@ impl Palette {
     /// the selected sub-tool row, the selected document tab and the selected
     /// layer row.
     ///
-    /// **That blue-grey is the theme.** It is the one saturated thing in a
-    /// Clip Studio window that is not the picture, it is the same colour in
-    /// all four of those places, and it is what tells this preset from the
-    /// other three at a glance — Photoslop is neutral, Krita is a flatter mid
-    /// grey and MediaBog is warm, and not one of them puts a colour on a
-    /// selected row. So `control_active` is the measured value with nothing
-    /// done to it.
+    /// That blue-grey is the one saturated thing in a Clip Studio window that
+    /// is not the picture, and it is the same colour in all four of those
+    /// places, so `control_active` is the measured value with nothing done to
+    /// it.
     ///
     /// This was built light first, from a brief that said the reference showed
     /// Clip Studio's light interface. It does not, and the light draft was
     /// defended on the reasoning that a fourth dark preset would be hard to
-    /// tell from the other three — which the blue-grey answers, and which was
-    /// never ours to decide in place of the person who asked for the reference
-    /// to be followed.
+    /// tell from the other three — which was never ours to decide in place of
+    /// somebody asking for the reference to be followed. **The worry was real
+    /// and is answered by the ladder rather than by the selection**, and the
+    /// distinction is worth stating because the obvious answer is wrong:
+    /// Krita's selected row is `#54718E` and MediaBog's is `#3E7EB2`, so "the
+    /// only preset with a colour on a selected row" would be false. What is
+    /// true is that this one's is **grey** — 24% saturated against their 41%
+    /// and 65% — and that `#4E4E4E` is the lightest chrome of any preset here
+    /// (Photoslop `#383838`, Krita `#474747`, MediaBog `#4A4747`), over
+    /// `#3F3F3F` panels and a `#2E2E2E` pit. A brighter, wider ladder with a
+    /// flat slate on it is what a Clip Studio window looks like across a room.
     ///
     /// Two departures, both forced by contrast and both stated.
     /// `control` is `#5C5C5C` where the measured button fill is `#676767`: at
