@@ -1155,11 +1155,27 @@ impl<'a> NumberRow<'a> {
 ///
 /// And the rule: a typed figure is **clamped to [`Rail::limit`] and snapped to
 /// nothing**. The point of typing it is to say something the rail cannot.
-fn typed_value(text: &str, value: f32, escaped: bool, rail: &Rail<'_>) -> Option<f32> {
+///
+/// **The comparison is against the `seed` and never against the value**, and
+/// that is the whole of the second refusal rather than a detail of it. The
+/// value can move while the field is holding a buffer — a click on the rail
+/// beneath it, an Alt-drag on the canvas, a shortcut — and egui surrenders a
+/// `TextEdit`'s focus on a click, so the commit frame is exactly the frame the
+/// rail was dragged in. Comparing the untouched buffer against the *new* value
+/// says "somebody typed something", and what it then applies is the reading the
+/// field was seeded with: the click on the rail did nothing and the value was
+/// silently rounded back. Reachable on every typable rail, and worse on the
+/// size rail than anywhere else because that is the value with four other ways
+/// in.
+///
+/// The cost of comparing text is that typing the digits the readout already
+/// shows is not a change — type "25" over a size of 24.7 and it stays 24.7.
+/// That is invisible on the readout and is the far smaller of the two.
+fn typed_value(text: &str, seed: &str, escaped: bool, rail: &Rail<'_>) -> Option<f32> {
     if escaped {
         return None;
     }
-    if text.trim() == rail.figure.bare(value) {
+    if text.trim() == seed.trim() {
         return None;
     }
     let typed = rail.figure.parse(text)?;
@@ -1420,9 +1436,18 @@ fn number_field(
             .rect_filled(rect.expand2(vec2(4.0, 1.0)), metrics::RADIUS, p.control);
     }
 
-    let held: Option<String> = ui.ctx().data(|d| d.get_temp(buffer_id));
+    // The buffer *and* what it was seeded with. Both, because the value can
+    // move while the field holds it — a click on the rail beneath, an Alt-drag
+    // on the canvas, a shortcut — and `typed_value` has to be able to tell "the
+    // text is still what it was handed" from "the text now differs from the
+    // value". The second reading is not the question and answering it wrote a
+    // stale seed over whatever the rail had just been dragged to.
+    let held: Option<(String, String)> = ui.ctx().data(|d| d.get_temp(buffer_id));
     let editing = held.is_some();
-    let mut text = held.unwrap_or_else(|| rail.figure.format(value));
+    let (mut seed, mut text) = held.unwrap_or_else(|| {
+        let shown = rail.figure.format(value);
+        (shown.clone(), shown)
+    });
 
     // The field is as wide as the widest figure its rail can show, so the
     // figure has to be pinned to whichever end of that box faces the rail — a
@@ -1451,9 +1476,11 @@ fn number_field(
     if edit.gained_focus() {
         // Start from the bare figure, whole and selected: the first keystroke
         // then replaces it, which is what somebody who clicked a number and
-        // typed "90" meant. It is also the reading `typed_value` compares
-        // against to decide whether anything was typed at all.
+        // typed "90" meant. This is the seed as well as the text, and it is the
+        // seed `typed_value` compares against to decide whether anything was
+        // typed at all.
         text = rail.figure.bare(value);
+        seed = text.clone();
         let mut state = egui::TextEdit::load_state(child.ctx(), edit_id).unwrap_or_default();
         state
             .cursor
@@ -1465,18 +1492,22 @@ fn number_field(
     }
 
     if edit.has_focus() {
-        child.ctx().data_mut(|d| d.insert_temp(buffer_id, text));
+        child
+            .ctx()
+            .data_mut(|d| d.insert_temp(buffer_id, (seed, text)));
         return None;
     }
     if !editing {
         return None;
     }
-    child.ctx().data_mut(|d| d.remove::<String>(buffer_id));
+    child
+        .ctx()
+        .data_mut(|d| d.remove::<(String, String)>(buffer_id));
     // Off the context rather than off the response: egui's default
     // `EventFilter` has `escape: false`, so the caret is already gone by the
     // time the field is drawn and the widget never sees the key.
     let escaped = child.input(|i| i.key_pressed(egui::Key::Escape));
-    typed_value(&text, value, escaped, rail)
+    typed_value(&text, &seed, escaped, rail)
 }
 
 /// A read-only bordered pill showing a name and its value.
@@ -3937,22 +3968,56 @@ mod tests {
              cannot tell the two apart"
         );
         // Past the rail's top and well inside the value's own bound.
-        assert_eq!(typed_value("1500", 24.0, false, &rail), Some(1500.0));
+        assert_eq!(typed_value("1500", "24", false, &rail), Some(1500.0));
         // Exactly on the rail's top is not a boundary of anything.
-        assert_eq!(typed_value("1000", 24.0, false, &rail), Some(1000.0));
+        assert_eq!(typed_value("1000", "24", false, &rail), Some(1000.0));
         // And past the *value's* bound is clamped, because the engine clamps
         // there too and a field that promised 5000 would be lying.
-        assert_eq!(typed_value("5000", 24.0, false, &rail), Some(2000.0));
+        assert_eq!(typed_value("5000", "24", false, &rail), Some(2000.0));
         assert_eq!(
-            typed_value("-40", 24.0, false, &rail),
+            typed_value("-40", "24", false, &rail),
             Some(Brush::MIN_SIZE)
         );
 
         // A rail whose two ends do agree still clamps to them: percentages stop
         // at 100 because that is what the value's bound is, not because that is
         // where the rail happens to end.
-        assert_eq!(typed_value("150", 0.5, false, &opacity_rail()), Some(1.0));
-        assert_eq!(typed_value("-3", 0.5, false, &opacity_rail()), Some(0.0));
+        assert_eq!(typed_value("150", "50", false, &opacity_rail()), Some(1.0));
+        assert_eq!(typed_value("-3", "50", false, &opacity_rail()), Some(0.0));
+    }
+
+    /// A buffer nobody touched is refused, however far the value has moved
+    /// since it was seeded.
+    ///
+    /// This was a live bug and it is the one worth reading twice. The gate
+    /// compared the buffer against the value *now* rather than against what the
+    /// buffer was seeded with — and the value moves under a held buffer far
+    /// more often than it looks. egui surrenders a `TextEdit`'s focus on a
+    /// click, so clicking the rail beneath a focused field is a commit and a
+    /// drag in the *same* frame; on the strip, the brush size can also be moved
+    /// by an Alt-drag on the canvas or by a shortcut while the field sits
+    /// there. Under the old reading the untouched buffer then read as "somebody
+    /// typed something", the drag was thrown away, and the seed was written
+    /// back over it: the click on the rail did nothing and the size was
+    /// silently rounded.
+    ///
+    /// Driven from a seed and a value that **disagree**, because where the
+    /// value has not moved "compare against the seed" and "compare against the
+    /// value" are the same answer — which is exactly why the first draft of the
+    /// gate passed every test written for it.
+    #[test]
+    fn a_buffer_nobody_touched_is_refused_however_far_the_value_has_moved() {
+        let rail = size_rail();
+        // Focused at 24.7, so the seed is "25"; the rail is then dragged to 300
+        // in the frame the click takes the focus away. Nothing about 300
+        // appears below, and that is the repair: the value is not consulted.
+        assert_eq!(rail.figure.bare(24.7), "25");
+        assert_ne!(rail.figure.bare(300.0), "25", "the two would agree anyway");
+        assert_eq!(typed_value("25", "25", false, &rail), None);
+        // Something actually typed over that seed still commits.
+        assert_eq!(typed_value("40", "25", false, &rail), Some(40.0));
+        // Including a figure that happens to be what the rail was dragged to.
+        assert_eq!(typed_value("300", "25", false, &rail), Some(300.0));
     }
 
     /// A field applies what was typed, not what it holds.
@@ -3975,13 +4040,14 @@ mod tests {
             Some(24.7),
             "the readout states this value exactly, so nothing here is being tested"
         );
-        assert_eq!(typed_value("25", 24.7, false, &rail), None);
+        let seed = rail.figure.bare(24.7);
+        assert_eq!(typed_value(&seed, &seed, false, &rail), None);
         // Whitespace round the untouched buffer is still an untouched buffer.
-        assert_eq!(typed_value("  25 ", 24.7, false, &rail), None);
+        assert_eq!(typed_value("  25 ", &seed, false, &rail), None);
         // And something actually typed still writes, or the guard above would
         // be satisfied by a field that never applies anything at all.
-        assert_eq!(typed_value("26", 24.7, false, &rail), Some(26.0));
-        assert_eq!(typed_value("1200", 24.7, false, &rail), Some(1200.0));
+        assert_eq!(typed_value("26", &seed, false, &rail), Some(26.0));
+        assert_eq!(typed_value("1200", &seed, false, &rail), Some(1200.0));
     }
 
     /// Escape abandons what was typed, and it has to be read off the context
@@ -3994,8 +4060,8 @@ mod tests {
     #[test]
     fn escape_abandons_a_typed_figure_that_a_blur_would_have_applied() {
         let rail = size_rail();
-        assert_eq!(typed_value("999", 24.0, false, &rail), Some(999.0));
-        assert_eq!(typed_value("999", 24.0, true, &rail), None);
+        assert_eq!(typed_value("999", "24", false, &rail), Some(999.0));
+        assert_eq!(typed_value("999", "24", true, &rail), None);
     }
 
     /// A line that means nothing on a rail leaves the value alone as well.
@@ -4003,7 +4069,7 @@ mod tests {
     fn a_rail_refuses_a_line_that_means_nothing() {
         let rail = size_rail();
         for text in ["", "  ", "wide", "2 4", "1/2", "nan", "inf", "--3"] {
-            assert_eq!(typed_value(text, 24.0, false, &rail), None, "{text:?}");
+            assert_eq!(typed_value(text, "24", false, &rail), None, "{text:?}");
         }
     }
 
