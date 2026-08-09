@@ -308,9 +308,10 @@ const DROPDOWN_GAP: f32 = 4.0;
 /// ends. A label flush against an outline reads as clipped, and a chevron flush
 /// against one reads as part of it.
 ///
-/// Zero for every other trigger, which is what makes [`Dropdown::outlined`] add
-/// a variant rather than move the ones that already exist: with no outline this
-/// is `0.0` and every measurement below reduces to exactly what it was.
+/// [`dropdown`] passes this only where a trigger is outlined and passes zero
+/// otherwise, which is what makes [`Dropdown::outlined`] add a variant rather
+/// than move the fourteen triggers that already exist: at zero every
+/// measurement below reduces to exactly the one it was.
 const DROPDOWN_PAD: f32 = 8.0;
 
 /// How wide a [`dropdown`] draws itself.
@@ -3841,7 +3842,7 @@ pub(crate) mod tests {
     /// An outlined trigger costs its own margin and nothing else.
     ///
     /// This is what makes [`Dropdown::outlined`] a *variant* rather than a
-    /// change to the twelve triggers that already exist: at `pad` zero every
+    /// change to the fourteen bare triggers beside it: at `pad` zero every
     /// measurement is the one it was, so a bare trigger is byte for byte where
     /// it used to be. Stated as a difference for the reason the test below is —
     /// asserting the total would restate the formula.
