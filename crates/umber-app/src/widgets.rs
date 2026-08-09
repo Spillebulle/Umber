@@ -949,10 +949,15 @@ impl<'a> Figure<'a> {
         Some(typed / self.per_unit)
     }
 
-    /// `value <= 0.0` rather than `== 0.0`, matching what the airbrush readout
-    /// has always said: a rate of 0.4 rounds to "0" at no decimals and is still
-    /// a rate nobody set on purpose, and a rail that starts at zero cannot
-    /// produce a negative.
+    /// `<= 0.0` rather than `== 0.0`, which is what the airbrush readout has
+    /// always compared on.
+    ///
+    /// **It is not a rounding rule.** A rate of 0.4 shows as "0/s" and not as
+    /// "off", because it is a rate somebody set and the readout has no decimals
+    /// to say so with. What the comparison covers is a negative, which a rail
+    /// whose floor is zero cannot produce — [`from_t`] clamps — so the `<=` is
+    /// defensive and carries the original's exact spelling rather than
+    /// improving on it.
     fn reads_as_zero(&self, value: f32) -> bool {
         !self.zero.is_empty() && value <= 0.0
     }
