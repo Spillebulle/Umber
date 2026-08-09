@@ -3167,13 +3167,13 @@ mod tests {
     /// controls drawn over each other. It also answers the one question the
     /// maths cannot: whether four markers on a ring can be told apart.
     ///
-    /// A seventh shot is taken at **zero saturation**, which is the case the
-    /// markers' own comment argues from and the one that cannot be reasoned
-    /// about — the swatch row is six identical greys there, so the ring is the
-    /// only thing left saying which member is the colour in hand. It is written
-    /// in each of the six themes rather than only in Graphite, because the
-    /// relation trigger's outline is `Palette::border` and a border invisible
-    /// against `Palette::dock` would put the picker back where it started.
+    /// Six more shots are taken at **zero saturation**, one per theme. That is
+    /// the case the markers' own comment argues from and the one that cannot be
+    /// reasoned about: the swatch row is four identical greys there, so the ring
+    /// is the only thing left saying which member is the colour in hand. Every
+    /// theme rather than only Graphite, because the relation trigger's outline
+    /// is derived from `Palette::dock` and each theme derives its own — a shot
+    /// in one theme says nothing about the other five.
     ///
     /// ```sh
     /// cargo test -p umber-app harmony_picker_preview -- --ignored --nocapture
