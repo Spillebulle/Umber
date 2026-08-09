@@ -233,17 +233,15 @@ pub fn parse_hex(text: &str) -> Option<Color32> {
 }
 
 fn base_id(kind: ThemeKind) -> &'static str {
-    // The same ids `prefs` writes, deliberately: a theme file and a preferences
-    // file naming the same built-in by two different words is a thing somebody
-    // would eventually have to reconcile by hand.
-    match kind {
-        ThemeKind::Graphite => "graphite",
-        ThemeKind::Paper => "paper",
-    }
+    // The same ids `prefs` writes, and now literally the same function: a theme
+    // file and a preferences file naming the same built-in by two different
+    // words is a thing somebody would eventually have to reconcile by hand, and
+    // two `match`es that agree by comment is exactly how that happens.
+    kind.id()
 }
 
 fn base_from_id(id: &str) -> Option<ThemeKind> {
-    ThemeKind::ALL.into_iter().find(|k| base_id(*k) == id)
+    ThemeKind::from_id(id)
 }
 
 /// A name with anything that would break the line format taken out, cut to

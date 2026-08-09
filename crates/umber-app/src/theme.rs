@@ -10,21 +10,95 @@
 
 use egui::Color32;
 
+/// The themes compiled into Umber.
+///
+/// The first two are the design's own. The other four are drawn from the
+/// interfaces of four other painting applications, sampled from screenshots of
+/// each: they exist because "which greys does a painter already know" is a
+/// better answer to "give me a second dark theme" than another set invented
+/// here. They are still nothing but a [`Palette`] — no branch anywhere that
+/// draws, no second door into egui's styling — which is the whole reason a
+/// theme is a table of values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeKind {
     /// Near-black flat workbench. The design's default.
     Graphite,
     /// Warm paper neutrals.
     Paper,
+    /// Adobe Photoshop's neutral greys.
+    Photoslop,
+    /// Clip Studio Paint's light neutrals.
+    ShitStudio,
+    /// Krita's mid grey and its slate-blue selection.
+    Krita,
+    /// MediBang Paint Pro's warm-dark chrome and bright blue.
+    MediaBog,
 }
 
 impl ThemeKind {
-    pub const ALL: [ThemeKind; 2] = [Self::Graphite, Self::Paper];
+    pub const ALL: [ThemeKind; 6] = [
+        Self::Graphite,
+        Self::Paper,
+        Self::Photoslop,
+        Self::ShitStudio,
+        Self::Krita,
+        Self::MediaBog,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Graphite => "Graphite",
             Self::Paper => "Paper",
+            Self::Photoslop => "Photoslop",
+            Self::ShitStudio => "Shit Studio Paint",
+            Self::Krita => "Krita",
+            Self::MediaBog => "MediaBog Pro",
+        }
+    }
+
+    /// What a file calls this theme.
+    ///
+    /// One statement of it, read by `prefs` for the preferences file and by
+    /// `themelib` for a `.umbertheme`'s `base` line. Those two used to hold a
+    /// `match` each with a comment saying they were deliberately the same
+    /// words, which is a thing that has to be true and nothing making it so.
+    ///
+    /// A `match` rather than a derive, for the reason `prefs::accent_id` gives:
+    /// it is the point at which somebody adding a theme is forced to choose the
+    /// name it will be stored under, instead of discovering later that renaming
+    /// the variant silently reset everyone's theme. Stable for ever, and
+    /// deliberately **not** [`ThemeKind::label`] lower-cased — a label is what
+    /// the interface shows and is free to be reworded.
+    /// `the_stored_name_of_every_theme_is_this_exact_string` pins them.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Graphite => "graphite",
+            Self::Paper => "paper",
+            Self::Photoslop => "photoslop",
+            Self::ShitStudio => "shitstudio",
+            Self::Krita => "krita",
+            Self::MediaBog => "mediabog",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.id() == id)
+    }
+
+    /// Whether this theme's interface is dark.
+    ///
+    /// Stated per theme rather than measured off the palette, because it is
+    /// asked by [`Accent::ink`] and by [`Palette::with_accent`] to decide how a
+    /// re-hued accent and its muted twin are derived — and a theme somebody
+    /// edits into the opposite lightness must not change what its *authored*
+    /// derivation was. [`Palette::is_dark`] is the other reading, off the
+    /// colours, and is what egui's own styling follows;
+    /// `every_theme_agrees_with_itself_about_being_dark` holds the two
+    /// together for the six compiled in.
+    pub fn is_dark(self) -> bool {
+        match self {
+            Self::Graphite | Self::Photoslop | Self::Krita | Self::MediaBog => true,
+            Self::Paper | Self::ShitStudio => false,
         }
     }
 }
@@ -70,17 +144,29 @@ impl Accent {
 
     /// The accent as it should read against a given theme's surface.
     ///
-    /// Umber's two values are the design's own hand-picked pair and are used
-    /// verbatim. The other three exist only as a single dark swatch, so the
-    /// light variant is derived — darkened towards black far enough to clear
-    /// text contrast on Paper, which is the same relationship Umber's two
-    /// authored values already have (`#C08A4E` to `#9C622F`).
+    /// [`Accent::Umber`] is the *theme's own authored accent*, whatever that
+    /// theme is: Graphite's and Paper's are the design's hand-picked pair
+    /// (`#C08A4E` to `#9C622F`), and each preset theme carries the blue its
+    /// application uses. Read off the palette rather than restated here, so the
+    /// two cannot drift — and this used to spell Graphite's and Paper's out,
+    /// which for a preset theme would have handed back the design's ochre for a
+    /// theme that has never worn it.
+    ///
+    /// The other three accents exist only as a single dark swatch, so the light
+    /// variant is derived — darkened towards black far enough to clear text
+    /// contrast on a light surface, which is the same relationship Umber's two
+    /// authored values already have. Keyed on
+    /// [`ThemeKind::is_dark`], which is itself an exhaustive `match`, so a
+    /// seventh theme still fails the build somewhere rather than quietly
+    /// taking the dark answer here.
     pub fn ink(self, kind: ThemeKind) -> Color32 {
-        match (self, kind) {
-            (Self::Umber, ThemeKind::Graphite) => Color32::from_rgb(0xC0, 0x8A, 0x4E),
-            (Self::Umber, ThemeKind::Paper) => Color32::from_rgb(0x9C, 0x62, 0x2F),
-            (_, ThemeKind::Graphite) => self.swatch(),
-            (_, ThemeKind::Paper) => mix(self.swatch(), Color32::BLACK, 0.30),
+        if self == Self::Umber {
+            return Palette::of(kind).accent;
+        }
+        if kind.is_dark() {
+            self.swatch()
+        } else {
+            mix(self.swatch(), Color32::BLACK, 0.30)
         }
     }
 }
@@ -370,6 +456,38 @@ pub struct Palette {
     pub link_colours: [Color32; umber_core::LayerStack::LINK_GROUPS],
 }
 
+/// The link marks the four preset themes share, for a dark surface.
+///
+/// Shared rather than copied four times, and that is not a token left carrying
+/// another theme's value: a link colour is a position on the hue wheel and not
+/// a property of the interface it sits on — Graphite's and Paper's own sets are
+/// the same six hues at two lightnesses. What decides them here is the one
+/// thing all four presets have in common: **every one of them accents in blue**,
+/// so the blue Graphite leads with would sit a few units from the accent on the
+/// row beside it. Orange takes its place, and the remaining five are Graphite's
+/// unchanged.
+/// `link_colours_are_told_apart_from_each_other_and_from_every_accent` is the
+/// measurement, and it runs over every theme.
+const PRESET_LINKS_DARK: [Color32; umber_core::LayerStack::LINK_GROUPS] = [
+    Color32::from_rgb(0xE8, 0x6B, 0x32), // orange
+    Color32::from_rgb(0x46, 0xB0, 0x4A), // green
+    Color32::from_rgb(0xA9, 0x6B, 0xE8), // violet
+    Color32::from_rgb(0x1F, 0xB5, 0xB5), // teal
+    Color32::from_rgb(0xEE, 0x5A, 0xA8), // rose
+    Color32::from_rgb(0xF0, 0xD5, 0x3C), // yellow
+];
+
+/// The same six taken dark enough to read as ink on a light surface — the
+/// relationship Paper's set has to Graphite's.
+const PRESET_LINKS_LIGHT: [Color32; umber_core::LayerStack::LINK_GROUPS] = [
+    Color32::from_rgb(0xC0, 0x56, 0x1A),
+    Color32::from_rgb(0x2E, 0x7C, 0x33),
+    Color32::from_rgb(0x77, 0x42, 0xAE),
+    Color32::from_rgb(0x13, 0x7F, 0x7F),
+    Color32::from_rgb(0xB0, 0x32, 0x6E),
+    Color32::from_rgb(0x6E, 0x6A, 0x0A),
+];
+
 impl Palette {
     pub const fn graphite() -> Self {
         Self {
@@ -453,6 +571,190 @@ impl Palette {
         }
     }
 
+    /// Adobe Photoshop's neutral greys.
+    ///
+    /// Every grey here is sampled from the reference screenshot, which carries
+    /// five distinct ones: `#282828` behind the document, then `#383838`,
+    /// `#424242`, `#454545`, `#4A4A4A`, `#4D4D4D` and `#535353` up through the
+    /// panels and strips. What is *not* the screenshot is where the panel
+    /// surface sits in that ladder. That shot is Photoshop's lighter "Medium"
+    /// interface, whose chrome is `#535353`; taken at face value it would put
+    /// this theme's panels above Krita's `#474747` and MediBang's `#4A4747`,
+    /// and three neutral greys within six units of each other are three themes
+    /// nobody can tell apart. So the surface is pitched at the deeper end of
+    /// the same ladder — which is also Photoshop's own default interface, the
+    /// one most people picture — and the theme comes out dark, neutral and
+    /// several greys deep, which is what it is for.
+    ///
+    /// The accent is Adobe's blue rather than a grey, because Umber draws
+    /// hyperlinks, dashed marks and focus in it and a grey accent is no accent.
+    /// It is restrained where Photoshop is restrained: nothing in the *palette*
+    /// wears it, so the only places it appears are the ones the design already
+    /// says are accented.
+    pub const fn photoslop() -> Self {
+        Self {
+            accent: Color32::from_rgb(0x4A, 0x96, 0xF0),
+            accent_dim: Color32::from_rgb(0x38, 0x5F, 0x8D),
+            warning: Color32::from_rgb(0xE0, 0x87, 0x6A),
+            warning_bg: Color32::from_rgb(0x3A, 0x26, 0x20),
+            warning_border: Color32::from_rgb(0x6E, 0x40, 0x34),
+            backdrop: Color32::from_rgb(0x28, 0x28, 0x28),
+            window: Color32::from_rgb(0x2E, 0x2E, 0x2E),
+            dock: Color32::from_rgb(0x32, 0x32, 0x32),
+            chrome: Color32::from_rgb(0x38, 0x38, 0x38),
+            border: Color32::from_rgb(0x4A, 0x4A, 0x4A),
+            popover: Color32::from_rgb(0x42, 0x42, 0x42),
+            popover_border: Color32::from_rgb(0x56, 0x56, 0x56),
+            control: Color32::from_rgb(0x45, 0x45, 0x45),
+            control_hover: Color32::from_rgb(0x51, 0x51, 0x51),
+            // Neutral rather than tinted towards the accent, unlike Graphite's:
+            // a selected tool in Photoshop is a lighter grey and nothing else,
+            // and that restraint is most of what the interface reads as.
+            control_active: Color32::from_rgb(0x5A, 0x5A, 0x5A),
+            text_strong: Color32::from_rgb(0xF1, 0xF0, 0xF0),
+            text: Color32::from_rgb(0xDE, 0xDD, 0xDD),
+            text_muted: Color32::from_rgb(0xAB, 0xAA, 0xAA),
+            text_dim: Color32::from_rgb(0x8F, 0x8F, 0x8F),
+            rail: Color32::from_rgb(0x26, 0x26, 0x26),
+            knob: Color32::from_rgb(0xC6, 0xC6, 0xC6),
+            link_colours: PRESET_LINKS_DARK,
+        }
+    }
+
+    /// Clip Studio Paint's light neutrals.
+    ///
+    /// **The reference screenshot is Clip Studio's *dark* interface** — panels
+    /// `#3F3F3F`, menu bar `#4E4E4E`, canvas surround `#2E2E2E`, a `#606B7F`
+    /// selected row — and these values are not it. The brief this was built to
+    /// asked for the light one, and it is the better answer whichever way the
+    /// screenshot had gone: the other three presets are all dark neutrals, and
+    /// a fourth beside them at `#3F3F3F` would have been a theme told from
+    /// Photoslop and Krita only by reading the name on its card.
+    ///
+    /// So the greys are Clip Studio's light interface rather than sampled, and
+    /// they are cool where Paper is warm — the two light themes have to be
+    /// told apart at a glance, and Paper's cream against this one's neutral
+    /// grey is the difference. The canvas surround is the mid grey Clip Studio
+    /// shows a page on, which is the second thing that distinguishes them:
+    /// Paper's pit is nearly the colour of its panels.
+    pub const fn shit_studio() -> Self {
+        Self {
+            accent: Color32::from_rgb(0x1E, 0x6F, 0xD9),
+            accent_dim: Color32::from_rgb(0xA6, 0xC3, 0xE8),
+            warning: Color32::from_rgb(0xA8, 0x48, 0x2C),
+            warning_bg: Color32::from_rgb(0xF6, 0xE4, 0xDC),
+            warning_border: Color32::from_rgb(0xDD, 0xBA, 0xA8),
+            backdrop: Color32::from_rgb(0xA0, 0xA0, 0xA0),
+            window: Color32::from_rgb(0xE4, 0xE4, 0xE4),
+            dock: Color32::from_rgb(0xEA, 0xEA, 0xEA),
+            chrome: Color32::from_rgb(0xF0, 0xF0, 0xF0),
+            border: Color32::from_rgb(0xB8, 0xB8, 0xB8),
+            popover: Color32::from_rgb(0xFA, 0xFA, 0xFA),
+            popover_border: Color32::from_rgb(0xA8, 0xA8, 0xA8),
+            control: Color32::from_rgb(0xE0, 0xE0, 0xE0),
+            control_hover: Color32::from_rgb(0xD2, 0xD2, 0xD2),
+            // The pale blue a selected row wears, which is the one saturated
+            // thing in a Clip Studio window that is not the picture.
+            control_active: Color32::from_rgb(0xC6, 0xDC, 0xF5),
+            text_strong: Color32::from_rgb(0x1E, 0x1E, 0x1E),
+            text: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+            text_muted: Color32::from_rgb(0x5C, 0x5C, 0x5C),
+            text_dim: Color32::from_rgb(0x82, 0x82, 0x82),
+            rail: Color32::from_rgb(0xCC, 0xCC, 0xCC),
+            knob: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            link_colours: PRESET_LINKS_LIGHT,
+        }
+    }
+
+    /// Krita's mid grey and its slate-blue selection.
+    ///
+    /// `#474747` panels, `#414141` docker headers and `#383838` list wells are
+    /// all sampled, and so is the one thing that makes a Krita window
+    /// recognisable across a room: **the canvas surround is lighter than the
+    /// interface**, a flat 50% `#808080`. That inverts the ordering Graphite
+    /// and Paper both keep, where the pit is the recessive extreme — which is
+    /// why [`Palette::with_accent`] derives a muted accent towards `window`
+    /// rather than towards `backdrop` for every theme but Graphite. Mixed
+    /// towards this pit a "muted" accent would come out louder than the accent
+    /// it mutes.
+    ///
+    /// `control_active` is the measured selection fill; `accent` is the same
+    /// slate blue lifted until it reads as ink on `#474747`, which is the
+    /// relationship Graphite's `control_active` and `accent` already have.
+    pub const fn krita() -> Self {
+        Self {
+            accent: Color32::from_rgb(0x6E, 0x9B, 0xC8),
+            accent_dim: Color32::from_rgb(0x53, 0x6B, 0x81),
+            warning: Color32::from_rgb(0xE0, 0x8A, 0x6E),
+            warning_bg: Color32::from_rgb(0x3B, 0x29, 0x24),
+            warning_border: Color32::from_rgb(0x71, 0x44, 0x39),
+            backdrop: Color32::from_rgb(0x80, 0x80, 0x80),
+            window: Color32::from_rgb(0x38, 0x38, 0x38),
+            dock: Color32::from_rgb(0x41, 0x41, 0x41),
+            chrome: Color32::from_rgb(0x47, 0x47, 0x47),
+            border: Color32::from_rgb(0x57, 0x57, 0x57),
+            popover: Color32::from_rgb(0x3F, 0x3F, 0x3F),
+            popover_border: Color32::from_rgb(0x5C, 0x5C, 0x5C),
+            control: Color32::from_rgb(0x52, 0x52, 0x52),
+            control_hover: Color32::from_rgb(0x5E, 0x5E, 0x5E),
+            control_active: Color32::from_rgb(0x54, 0x71, 0x8E),
+            text_strong: Color32::from_rgb(0xF0, 0xF0, 0xF0),
+            text: Color32::from_rgb(0xDC, 0xDC, 0xDC),
+            text_muted: Color32::from_rgb(0xB0, 0xB0, 0xB0),
+            text_dim: Color32::from_rgb(0x96, 0x96, 0x96),
+            rail: Color32::from_rgb(0x30, 0x30, 0x30),
+            knob: Color32::from_rgb(0xB8, 0xB8, 0xB8),
+            link_colours: PRESET_LINKS_DARK,
+        }
+    }
+
+    /// MediBang Paint Pro's warm-dark chrome and bright blue.
+    ///
+    /// The panels are a faintly warm `#4A4747` — 74, 71, 71, and the three
+    /// channels being unequal is the whole of what separates this from Krita's
+    /// flat `#474747` at a glance — over near-black `#252525` strips, with
+    /// `#393737` panel headers. That near-black is this theme's *hairline*:
+    /// MediBang separates by a dark line where Photoshop separates by tone, so
+    /// `border` is darker than the surface here and lighter than it there.
+    ///
+    /// The pit is one step below the measured `#4A4747`, which the reference
+    /// shares exactly with the panels. Faithful would be the same grey on both,
+    /// and a canvas surround indistinguishable from the panel beside it is a
+    /// document with no edge.
+    pub const fn mediabog() -> Self {
+        Self {
+            accent: Color32::from_rgb(0x4F, 0xA8, 0xE8),
+            accent_dim: Color32::from_rgb(0x40, 0x6C, 0x8D),
+            warning: Color32::from_rgb(0xE8, 0x89, 0x6B),
+            warning_bg: Color32::from_rgb(0x3A, 0x2A, 0x24),
+            warning_border: Color32::from_rgb(0x7A, 0x4A, 0x38),
+            backdrop: Color32::from_rgb(0x44, 0x41, 0x41),
+            window: Color32::from_rgb(0x30, 0x2E, 0x2E),
+            dock: Color32::from_rgb(0x39, 0x37, 0x37),
+            chrome: Color32::from_rgb(0x4A, 0x47, 0x47),
+            border: Color32::from_rgb(0x26, 0x24, 0x24),
+            popover: Color32::from_rgb(0x39, 0x37, 0x37),
+            popover_border: Color32::from_rgb(0x5C, 0x5C, 0x5C),
+            control: Color32::from_rgb(0x5A, 0x57, 0x57),
+            control_hover: Color32::from_rgb(0x66, 0x62, 0x62),
+            // The blue a selected row wears, taken deeper than the measured
+            // `#559CD1` so that `text_strong` on it clears 3:1 — MediBang draws
+            // white on its own lighter fill and gets 2.97, and this palette's
+            // strong ink is not white. Measured: 3.61 here, 2.85 at `#4A90C8`,
+            // which is the value this was until
+            // `text_reads_against_every_surface_it_is_drawn_on` was pointed at
+            // a selected row.
+            control_active: Color32::from_rgb(0x3E, 0x7E, 0xB2),
+            text_strong: Color32::from_rgb(0xEA, 0xEA, 0xEA),
+            text: Color32::from_rgb(0xC8, 0xC8, 0xC8),
+            text_muted: Color32::from_rgb(0xAD, 0xAD, 0xAD),
+            text_dim: Color32::from_rgb(0x94, 0x94, 0x94),
+            rail: Color32::from_rgb(0x30, 0x2E, 0x2E),
+            knob: Color32::from_rgb(0xC8, 0xC8, 0xC8),
+            link_colours: PRESET_LINKS_DARK,
+        }
+    }
+
     /// One token, by name.
     ///
     /// The exhaustive `match` is the point — see [`Token`].
@@ -528,8 +830,19 @@ impl Palette {
     }
 
     /// The theme in its authored accent.
-    pub fn of(kind: ThemeKind) -> Self {
-        Self::with_accent(kind, Accent::Umber)
+    ///
+    /// The one place a [`ThemeKind`] becomes colours, which is what lets
+    /// [`Accent::ink`] read a theme's own accent off its palette without the
+    /// two of them calling each other in a circle.
+    pub const fn of(kind: ThemeKind) -> Self {
+        match kind {
+            ThemeKind::Graphite => Self::graphite(),
+            ThemeKind::Paper => Self::paper(),
+            ThemeKind::Photoslop => Self::photoslop(),
+            ThemeKind::ShitStudio => Self::shit_studio(),
+            ThemeKind::Krita => Self::krita(),
+            ThemeKind::MediaBog => Self::mediabog(),
+        }
     }
 
     /// The theme, re-hued to one of the design's four accents.
@@ -545,18 +858,28 @@ impl Palette {
     /// Umber itself keeps its hand-picked pair, so the default is exactly the
     /// design's and only the three alternates are computed.
     pub fn with_accent(kind: ThemeKind, accent: Accent) -> Self {
-        let mut palette = match kind {
-            ThemeKind::Graphite => Self::graphite(),
-            ThemeKind::Paper => Self::paper(),
-        };
+        let mut palette = Self::of(kind);
         if accent == Accent::Umber {
             return palette;
         }
         palette.accent = accent.ink(kind);
-        palette.accent_dim = match kind {
-            ThemeKind::Graphite => mix(palette.accent, palette.backdrop, 0.49),
-            ThemeKind::Paper => mix(palette.accent, palette.window, 0.60),
+        // Which surface a muted accent recedes towards. Graphite keeps its
+        // backdrop, exactly as it always did; every other theme takes `window`,
+        // because Krita's pit is *lighter* than its panels and an accent mixed
+        // towards it would come out louder than the accent it mutes — which is
+        // the one thing `accent_dim` may never be, and what
+        // `a_derived_dim_recedes_towards_its_own_surface` measures. Paper's
+        // recessive surface was already `window`, so nothing shipped moves.
+        let recessive = match kind {
+            ThemeKind::Graphite => palette.backdrop,
+            ThemeKind::Paper
+            | ThemeKind::Photoslop
+            | ThemeKind::ShitStudio
+            | ThemeKind::Krita
+            | ThemeKind::MediaBog => palette.window,
         };
+        let towards = if kind.is_dark() { 0.49 } else { 0.60 };
+        palette.accent_dim = mix(palette.accent, recessive, towards);
         palette
     }
 
@@ -1055,19 +1378,151 @@ mod tests {
 
     /// A derived `accent_dim` has to stay on the recessive side of its accent,
     /// or the "muted" tint would come out louder than the thing it mutes.
+    ///
+    /// Over **every** theme and not the shipped pair, and that is what the
+    /// recessive-surface `match` in `with_accent` exists for: Krita's canvas
+    /// pit is lighter than its panels, so a dim mixed towards `backdrop`
+    /// — which is what this did before there were six themes — comes out
+    /// *brighter* than the accent for all four alternates. It also covers the
+    /// authored pairs, since `Accent::Umber` returns them untouched.
     #[test]
     fn a_derived_dim_recedes_towards_its_own_surface() {
         let luma = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
-        for accent in Accent::ALL {
-            let dark = Palette::with_accent(ThemeKind::Graphite, accent);
-            assert!(
-                luma(dark.accent_dim) < luma(dark.accent),
-                "{accent:?} dim is not darker on Graphite",
+        for kind in ThemeKind::ALL {
+            for accent in Accent::ALL {
+                let p = Palette::with_accent(kind, accent);
+                if kind.is_dark() {
+                    assert!(
+                        luma(p.accent_dim) < luma(p.accent),
+                        "{accent:?} dim is not darker on {kind:?}",
+                    );
+                } else {
+                    assert!(
+                        luma(p.accent_dim) > luma(p.accent),
+                        "{accent:?} dim is not lighter on {kind:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// What a file calls each theme, as literal text.
+    ///
+    /// These reach two files — the preferences file's `theme` line and a
+    /// `.umbertheme`'s `base` line — so they are a *format* and not a name. A
+    /// round trip is self-consistent under any rename, which is why the pin has
+    /// to be the strings themselves; the same remedy `BlendMode`'s serialised
+    /// names take, for the same mechanism.
+    #[test]
+    fn the_stored_name_of_every_theme_is_this_exact_string() {
+        let stored: Vec<&str> = ThemeKind::ALL.into_iter().map(ThemeKind::id).collect();
+        assert_eq!(
+            stored,
+            [
+                "graphite",
+                "paper",
+                "photoslop",
+                "shitstudio",
+                "krita",
+                "mediabog"
+            ],
+        );
+        for kind in ThemeKind::ALL {
+            assert_eq!(ThemeKind::from_id(kind.id()), Some(kind));
+        }
+        assert_eq!(ThemeKind::from_id("no such theme"), None);
+        // A label is free to be reworded and an id is not, so nothing may be
+        // reading one for the other.
+        for kind in ThemeKind::ALL {
+            assert_ne!(kind.id(), kind.label(), "{kind:?}");
+        }
+    }
+
+    /// The two readings of "is this theme dark" — the stated one on
+    /// [`ThemeKind`] and the measured one on the palette, which is what egui's
+    /// own light/dark styling follows — must agree, or a theme would derive its
+    /// accents as a dark theme and be styled as a light one.
+    #[test]
+    fn every_theme_agrees_with_itself_about_being_dark() {
+        for kind in ThemeKind::ALL {
+            assert_eq!(
+                kind.is_dark(),
+                Palette::of(kind).is_dark(),
+                "{kind:?} disagrees with its own palette",
             );
-            let light = Palette::with_accent(ThemeKind::Paper, accent);
+        }
+    }
+
+    /// A theme nobody can read is worse than no theme.
+    ///
+    /// WCAG relative luminance, which is the only reading of "can this be
+    /// read" that is not somebody's opinion — the crude channel sum the link
+    /// marks are measured by answers a different question and would pass a
+    /// theme printing mid-grey on mid-grey.
+    ///
+    /// It runs over all six rather than the four added, deliberately: a bound
+    /// the shipped pair does not meet is a bound stated wrongly, and finding
+    /// that out is worth more than a guard that only ever looks at new code.
+    /// **It found one.** The floors were 4.5 / 4.5 / 3.0 / 3.0 and Paper's
+    /// `text_dim` on its own `window` is **2.92** — the design's dimmest label
+    /// on its palest inset, shipped and looked at by somebody. So the dim floor
+    /// is what Paper actually reaches rather than the round number, and the
+    /// four themes added here clear it by a margin: nothing new may be dimmer
+    /// than the dimmest thing already on screen.
+    ///
+    /// `control_active` is here too, and is the one token that is a background
+    /// rather than a mark — a selected row draws `text_strong` on it. That is
+    /// what caught MediaBog's selection blue at 2.85.
+    #[test]
+    fn text_reads_against_every_surface_it_is_drawn_on() {
+        // sRGB byte to linear, WCAG's own piecewise curve.
+        fn channel(b: u8) -> f64 {
+            let c = b as f64 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(c: Color32) -> f64 {
+            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+        }
+        fn ratio(a: Color32, b: Color32) -> f64 {
+            let (x, y) = (luminance(a), luminance(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+
+        for kind in ThemeKind::ALL {
+            let p = Palette::of(kind);
+            for (surface, where_) in [
+                (p.chrome, "chrome"),
+                (p.dock, "dock"),
+                (p.window, "window"),
+                (p.popover, "popover"),
+            ] {
+                for (ink, name, floor) in [
+                    (p.text_strong, "text_strong", 4.5),
+                    (p.text, "text", 4.5),
+                    (p.text_muted, "text_muted", 3.0),
+                    // Paper's own figure — see above.
+                    (p.text_dim, "text_dim", 2.9),
+                ] {
+                    let r = ratio(ink, surface);
+                    assert!(
+                        r >= floor,
+                        "{kind:?}: {name} on {where_} is {r:.2}:1, under {floor}:1",
+                    );
+                }
+            }
+            // The accent is ink too — it is what a hyperlink is drawn in.
+            let r = ratio(p.accent, p.chrome);
+            assert!(r >= 3.0, "{kind:?}: the accent on chrome is {r:.2}:1");
+            // And a selected row has to be readable, which is the one place
+            // `control_active` is a background rather than a mark.
+            let r = ratio(p.text_strong, p.control_active);
             assert!(
-                luma(light.accent_dim) > luma(light.accent),
-                "{accent:?} dim is not lighter on Paper",
+                r >= 3.0,
+                "{kind:?}: text_strong on control_active is {r:.2}:1",
             );
         }
     }
@@ -1083,6 +1538,62 @@ mod tests {
                 (luma(p.warning) - luma(p.warning_bg)).abs() > 200,
                 "{kind:?} warning ink is too close to its fill",
             );
+        }
+    }
+
+    /// A picture of every theme, so a palette is judged by looking at it.
+    ///
+    /// Written rather than asserted, for the reason `themes_pane_preview` is:
+    /// the tests above measure separation and contrast, which are the two
+    /// things arithmetic can settle, and neither of them can say whether a
+    /// theme looks like the application it was sampled from. The Settings
+    /// dialog is the subject because it puts most of the tokens on one screen —
+    /// every surface, both borders, all three control states, the four text
+    /// ranks, the accent, a rail and a knob — and because its own Themes pane
+    /// draws each theme as a card, so one shot per theme is also six shots of
+    /// all six.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app every_theme_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn every_theme_preview() {
+        use crate::docshot;
+        use crate::editor::Editor;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/themes");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        for kind in ThemeKind::ALL {
+            let mut ed = Editor::default();
+            ed.layout = crate::dock::Layout::default();
+            ed.ui.settings_open = true;
+            ed.ui.settings_tab = crate::settings::SettingsTab::Themes;
+            ed.ui.theme = kind;
+            let palette = ed.palette();
+            let image = stage.shoot(
+                egui::vec2(1048.0, 688.0),
+                1.5,
+                &palette,
+                palette.backdrop,
+                |ui| {
+                    crate::settings::show(
+                        ui,
+                        &palette,
+                        &mut ed,
+                        &mut crate::ui::UiActions::default(),
+                    )
+                },
+            );
+            let written =
+                docshot::write_png(&dir.join(format!("{}.png", kind.id())), &image).expect("write");
+            println!("{}", written.0.display());
         }
     }
 

@@ -689,14 +689,15 @@ fn parse_bool(value: &str) -> Option<bool> {
 
 /// Stable names for the themes.
 ///
-/// A `match` rather than a derive: it is the point at which someone adding a
-/// third theme is forced to choose the name it will be stored under, instead of
-/// discovering later that renaming the variant silently reset everyone's theme.
+/// [`ThemeKind::id`]'s, and deliberately not a second table: `themelib` writes
+/// the same words into a `.umbertheme`'s `base` line, and the two used to be a
+/// `match` each with a comment saying they were meant to agree. The reason for
+/// the match is unchanged and now lives on the enum — it is the point at which
+/// somebody adding a theme is forced to choose the name it will be stored
+/// under, rather than discovering later that renaming the variant silently
+/// reset everyone's theme.
 fn theme_id(kind: ThemeKind) -> &'static str {
-    match kind {
-        ThemeKind::Graphite => "graphite",
-        ThemeKind::Paper => "paper",
-    }
+    kind.id()
 }
 
 /// Stable names for the accents, for the same reason as `theme_id`.
