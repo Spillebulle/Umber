@@ -1524,7 +1524,10 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
         p,
         crate::widgets::Dropdown::new(harmony.label())
             .width(crate::widgets::DropdownWidth::Fill)
-            .outlined(),
+            // The panel body's own surface, which is what the border is derived
+            // against. `dock` rather than `window`: this picker is drawn in a
+            // module body, and the theme editor can set either to anything.
+            .outlined(p.dock),
         |ui| {
             for option in Harmony::ALL {
                 if ui
@@ -3258,6 +3261,49 @@ mod tests {
                     reach - half_band,
                 );
             }
+        }
+    }
+
+    /// The relation picker is *drawn* outlined, in every theme.
+    ///
+    /// **A guard on the widget is not a guard on the panel**, and this whole
+    /// defect is that lesson twice over: `widgets`'
+    /// `an_outlined_trigger_draws_a_line_that_reads_on_its_surface` measures
+    /// what `Dropdown::outlined` produces and cannot see whether anything asks
+    /// for it — drop the one call below and every ratio it checks still passes.
+    /// So this measures the ink that reached the pass, off the whole
+    /// `harmony_wheel`, which is where a revert would land.
+    ///
+    /// It names the exact derived colour rather than asking for "some ink that
+    /// reads", because this pass draws a hue ring: nearly every vivid hue on it
+    /// clears 3:1 against a panel, so the weaker question would be answered by
+    /// the wheel and would hold whatever the trigger did.
+    #[test]
+    fn the_relation_picker_is_drawn_outlined() {
+        use crate::theme::contrast::{self, Ink};
+        use crate::theme::{ThemeKind, metrics};
+        use crate::widgets::tests::inks_drawn;
+
+        for kind in ThemeKind::ALL {
+            let ctx = egui::Context::default();
+            let q = Palette::of(kind);
+            let want = contrast::ink_on(q.dock, Ink::Dim);
+            let field = vec2(metrics::PANEL - 2.0 * metrics::PANEL_PAD as f32, 300.0);
+            // Twice, for the font atlas: the label is what a first pass has no
+            // glyphs for, and the outline is drawn beside it either way.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let mut harmony = Harmony::Tetrad;
+                let mut hsv = Hsv::new(28.0, 0.72, 0.86);
+                seen = inks_drawn(&ctx, field, |ui| {
+                    harmony_wheel(ui, &q, &mut harmony, &mut hsv);
+                });
+            }
+            assert!(
+                seen.contains(&want),
+                "{kind:?}: the relation picker drew no {want:?} — the outline \
+                 derived from this theme's own panel surface",
+            );
         }
     }
 
