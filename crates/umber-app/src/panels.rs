@@ -506,10 +506,12 @@ pub(crate) fn panel(
     // less means there is no room for a title at all, and the galley comes back
     // empty rather than the first letter being drawn under a button.
     let room = (controls_at.left() - metrics::BUTTON_GAP - title_at.x).max(0.0);
-    // One row, clipped rather than elided: egui's overflow character is `…`,
-    // and Archivo carries no such glyph — a title too long for its header would
-    // end in the blank box the "never put a Unicode symbol in the UI" rule
-    // exists to prevent.
+    // One row, elided with egui's own overflow character, which is what
+    // `egui::Label::truncate` uses and therefore what a layer name too long for
+    // its row already ends in. Archivo does carry the glyph — see any narrow
+    // shot of the layer list — so the "never put a Unicode symbol in the UI"
+    // rule is satisfied by leaving this alone rather than by suppressing it, and
+    // a clipped title reads as clipped rather than as a shorter word.
     let mut job = egui::text::LayoutJob::simple_singleline(
         kind.title().to_owned(),
         FontId::proportional(text::SMALL),
@@ -517,7 +519,6 @@ pub(crate) fn panel(
     );
     job.wrap.max_width = room;
     job.wrap.max_rows = 1;
-    job.wrap.overflow_character = None;
     let galley = ui.painter().layout_job(job);
     let title = Align2::LEFT_CENTER.anchor_size(title_at, galley.size());
     ui.painter().galley(title.min, galley, p.text_strong);
