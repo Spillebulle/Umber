@@ -413,7 +413,7 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
                         SettingsTab::General => general_pane(ui, p, ed, actions),
                         SettingsTab::InputAndPen => input_pane(ui, p, ed),
                         SettingsTab::Themes => themes_pane(ui, p, ed),
-                        SettingsTab::Shortcuts => shortcuts_pane(ui, p),
+                        SettingsTab::Shortcuts => shortcuts_pane(ui, p, ed),
                         // The rail cannot select this; a preferences file naming
                         // it could, so it lands somewhere rather than on a blank
                         // pane.
@@ -2813,12 +2813,13 @@ fn stop_listening(ctx: &egui::Context) {
     ctx.data_mut(|d| d.remove::<Editing>(editing_id()));
 }
 
-fn shortcuts_pane(ui: &mut egui::Ui, p: &Palette) {
+fn shortcuts_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let mut bindings = shortcuts::published();
     let mut editing = ui
         .ctx()
         .data_mut(|d| d.get_temp::<Editing>(editing_id()).unwrap_or_default());
     let mut changed = false;
+    let mut keymap = None;
 
     // 1. Anything the user typed since the last frame.
     if let Some((action, nth)) = editing.listening {
@@ -2850,12 +2851,18 @@ fn shortcuts_pane(ui: &mut egui::Ui, p: &Palette) {
         // Right to left, so Export goes on first to end up on the right —
         // reading Import then Export, as the design has them.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let _ = controls::text_button(ui, p, "Export", false, false).on_hover_text(
-                "Your bindings are already kept in the preferences file named at the \
-                 foot of this dialog, which is plain text and can be copied.",
-            );
-            let _ = controls::text_button(ui, p, "Import", false, false)
-                .on_hover_text("Reading a keymap needs a file format; there is none yet.");
+            if controls::text_button(ui, p, "Export", false, true)
+                .on_hover_text("Write every shortcut to a file you can carry to another machine")
+                .clicked()
+            {
+                keymap = Some(KeymapRequest::Export);
+            }
+            if controls::text_button(ui, p, "Import", false, true)
+                .on_hover_text("Read a keymap written here or on another machine")
+                .clicked()
+            {
+                keymap = Some(KeymapRequest::Import);
+            }
         });
     });
     if let Some(why) = editing.refused {
@@ -2961,11 +2968,154 @@ fn shortcuts_pane(ui: &mut egui::Ui, p: &Palette) {
         });
     });
 
+    // 5. The file dialogs, last: both block, and `rfd` opening a window in the
+    //    middle of the pane's own body would leave half of it drawn against a
+    //    binding table the other half no longer agrees with.
+    match keymap {
+        Some(KeymapRequest::Export) => export_keymap(&bindings, ed),
+        Some(KeymapRequest::Import) => {
+            if let Some(imported) = import_keymap(&bindings, ed) {
+                bindings = imported;
+                changed = true;
+            }
+        }
+        None => {}
+    }
+
     if changed {
         shortcuts::publish(bindings);
         prefs::mark_dirty();
     }
     store_editing(ui.ctx(), editing);
+}
+
+/// What the Shortcuts header's pair asked for. At most one per frame, since
+/// either opens a blocking file dialog.
+enum KeymapRequest {
+    Export,
+    Import,
+}
+
+/// Write every shortcut to a file.
+///
+/// `export_theme`'s shape, and `palettelib::export`'s rule that a *suggested*
+/// name is built from something that is already a filename. There is no id here
+/// to borrow, so the name is a constant: nothing about a keymap identifies whose
+/// it is.
+fn export_keymap(bindings: &[shortcuts::Binding], ed: &mut Editor) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Export shortcuts")
+        .add_filter("Umber keymap", &[shortcuts::KEYMAP_EXTENSION])
+        .set_file_name(format!("umber.{}", shortcuts::KEYMAP_EXTENSION))
+        .save_file()
+    else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, shortcuts::to_keymap(bindings)) {
+        ed.notice = Some(Notice {
+            title: "Could not export the shortcuts".to_owned(),
+            lines: vec![e.to_string()],
+        });
+    }
+}
+
+/// Read a keymap over the bindings in force, and say what it cost.
+///
+/// Answers `None` where nothing was changed, which is every refusal *and* a
+/// cancelled dialog — so the caller cannot publish a table that was never built.
+/// Every other route out raises a notice: **an import that loses something must
+/// say so**, and the one thing that is not a loss but still has to be said is a
+/// key the file has given to two commands.
+fn import_keymap(over: &[shortcuts::Binding], ed: &mut Editor) -> Option<Vec<shortcuts::Binding>> {
+    let path = rfd::FileDialog::new()
+        .set_title("Import shortcuts")
+        .add_filter("Umber keymap", &[shortcuts::KEYMAP_EXTENSION])
+        .pick_file()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            ed.notice = Some(Notice {
+                title: "Could not import the shortcuts".to_owned(),
+                lines: vec![format!("{}: {e}", path.display())],
+            });
+            return None;
+        }
+    };
+    let Some(keymap) = shortcuts::read_keymap(&text, over) else {
+        ed.notice = Some(Notice {
+            title: "Could not import the shortcuts".to_owned(),
+            lines: vec![format!(
+                "{} names no command Umber knows, so it is not a keymap.",
+                path.display()
+            )],
+        });
+        return None;
+    };
+
+    let mut lines = Vec::new();
+    if keymap.unknown_actions > 0 {
+        lines.push(plural(
+            keymap.unknown_actions,
+            "One line names a command this Umber does not have, and was skipped.",
+            "lines name commands this Umber does not have, and were skipped.",
+        ));
+    }
+    if keymap.unreadable_chords > 0 {
+        lines.push(plural(
+            keymap.unreadable_chords,
+            "One line names a key Umber could not read, so that command kept the \
+             shortcut it had.",
+            "lines name keys Umber could not read, so those commands kept the \
+             shortcuts they had.",
+        ));
+    }
+    if keymap.unreadable_lines > 0 {
+        lines.push(plural(
+            keymap.unreadable_lines,
+            "One line was not a shortcut at all and was skipped.",
+            "lines were not shortcuts at all and were skipped.",
+        ));
+    }
+    if keymap.untouched > 0 {
+        lines.push(plural(
+            keymap.untouched,
+            "One command is not in the file and kept the shortcut it had.",
+            "commands are not in the file and kept the shortcuts they had.",
+        ));
+    }
+    // Not a loss, and it still has to be said: the file may bind one key to two
+    // commands, or bind a key that something the file did not mention already
+    // holds. Both are kept, exactly as they are when somebody types a clash into
+    // a row, and the list below marks them.
+    let clashes = shortcuts::shadowed(&keymap.bindings).len();
+    if clashes > 0 {
+        lines.push(plural(
+            clashes,
+            "One key now does two things. The list below marks it, and the \
+             command listed first wins.",
+            "keys now each do two things. The list below marks them, and the \
+             command listed first wins.",
+        ));
+    }
+    if !lines.is_empty() {
+        ed.notice = Some(Notice {
+            title: "Imported, with notes".to_owned(),
+            lines,
+        });
+    }
+    Some(keymap.bindings)
+}
+
+/// One of two sentences, with the count in front of the second.
+///
+/// The singular is written out rather than assembled, because "1 lines" is the
+/// tell that nobody read the message they were shown.
+fn plural(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        one.to_owned()
+    } else {
+        format!("{count} {many}")
+    }
 }
 
 /// The design's section rule: small, wide-tracked, upper case.
