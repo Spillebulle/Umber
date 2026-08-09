@@ -109,7 +109,14 @@ const SETTINGS_FIELD: Vec2 = vec2(1048.0, 688.0);
 /// depends on the number being right — [`Image::trim`] takes the slack off, and
 /// each mode ends up as tall as it happens to be rather than needing a constant
 /// per mode that would go stale the first time a control moved.
-const PICKER_FIELD: Vec2 = vec2(theme::metrics::PANEL, 400.0);
+///
+/// The slack is generous and it is not unbounded: a body taller than this is
+/// *clipped*, and the picture is committed, so the clipping would reach the
+/// README rather than a test. `panels`' own measurement of the Colour body
+/// asserts against this figure — there rather than here, because that is where
+/// the body is already measured and nothing in this module runs without a
+/// device.
+pub(crate) const PICKER_FIELD: Vec2 = vec2(theme::metrics::PANEL, 400.0);
 
 /// Space left under the last thing a panel draws, in points — the panel's own
 /// horizontal padding, so the trimmed edge matches the two beside it.
