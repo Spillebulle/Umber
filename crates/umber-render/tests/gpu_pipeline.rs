@@ -4027,9 +4027,22 @@ fn drive_to_completion(
 ) -> (DocumentCapture, std::time::Duration, usize) {
     let mut worst = std::time::Duration::ZERO;
     let mut frames = 0usize;
-    // Generous: a few frames per step, and a step is one layer. A capture that
-    // has not finished inside this is a bug, not a slow machine.
-    for _ in 0..2000 {
+    // **This loop is a wall-clock budget in disguise, and saying it was not is
+    // what made it flaky.** The comment here used to read "a capture that has
+    // not finished inside this is a bug, not a slow machine" — but the sleep at
+    // the foot of the body is what paces it, so 2000 iterations was about two
+    // seconds of real time, and a machine building six other things does not
+    // finish a banded capture of a large document in two. Measured: twelve runs
+    // green on an idle machine and six failures in ten under load, on code that
+    // had not changed. That is the shape CLAUDE.md's "nothing here may assert
+    // wall-clock time on CI" warns about, arriving through a *frame count*
+    // rather than through a `Duration`, which is why it was not recognised.
+    //
+    // So the bound is deliberately far past anything a real capture needs, and
+    // the frame count is kept only to catch a genuine hang — a capture that has
+    // stopped making progress will never come home however long it is given.
+    const FRAME_BUDGET: usize = 40_000;
+    for _ in 0..FRAME_BUDGET {
         frames += 1;
         let mut enc = gpu
             .device
@@ -4059,7 +4072,11 @@ fn drive_to_completion(
         // capture's.
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    panic!("the capture never came home");
+    panic!(
+        "the capture never came home in {frames} frames — it has stopped making \
+         progress rather than merely being slow, since the budget is far past \
+         what any real capture needs"
+    );
 }
 
 #[test]
