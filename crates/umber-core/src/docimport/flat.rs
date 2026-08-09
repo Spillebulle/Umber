@@ -87,7 +87,8 @@ fn widen(src: &[u8], stride: usize, f: impl Fn(&[u8]) -> [u8; 4]) -> Vec<u8> {
 pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let format = SourceFormat::Png;
     let image = decode_png(bytes, format)?;
-    check_bounds(format, image.size.x, image.size.y, 1)?;
+    // A flat picture is one entry and one buffer, so the two counts coincide.
+    check_bounds(format, image.size.x, image.size.y, 1, 1)?;
 
     let mut pixels = image.rgba;
     srgb::encode_buffer(&mut pixels);

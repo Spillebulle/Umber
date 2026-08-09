@@ -130,7 +130,10 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     }
 
     let size = UVec2::new(psd.width(), psd.height());
-    check_bounds(FORMAT, size.x, size.y, psd.layers().len().max(1))?;
+    // This reader makes no folders — a PSD group arrives as nothing at all —
+    // so every entry it will produce holds pixels and the two counts coincide.
+    let entries = psd.layers().len().max(1);
+    check_bounds(FORMAT, size.x, size.y, entries, entries)?;
 
     let mut warnings = Vec::new();
 

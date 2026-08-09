@@ -148,7 +148,12 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
 
     let layers = Tables::read(&db)?;
     let nodes = layers.tree(canvas.root, &mut warnings)?;
-    check_bounds(FORMAT, canvas.size.x, canvas.size.y, nodes.len())?;
+    // Folders are entries and hold no pixels, so they count towards the stack's
+    // size and not towards its bytes. `.clip` is where that matters most: a
+    // Clip Studio document is usually filed into groups, and charging each one
+    // a canvas is what made a 15000×5000 file refuse itself.
+    let painted = nodes.iter().filter(|n| !n.folder).count();
+    check_bounds(FORMAT, canvas.size.x, canvas.size.y, nodes.len(), painted)?;
 
     let mut out = Vec::with_capacity(nodes.len());
     for node in &nodes {

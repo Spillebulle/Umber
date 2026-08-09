@@ -117,7 +117,8 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let maindoc = container::read_entry(&mut zip, "maindoc.xml", FORMAT)?;
     let mut warnings = Vec::new();
     let doc = parse_maindoc(&maindoc, &mut warnings)?;
-    check_bounds(FORMAT, doc.size.x, doc.size.y, doc.layers.len())?;
+    let painted = doc.layers.iter().filter(|l| !l.folder).count();
+    check_bounds(FORMAT, doc.size.x, doc.size.y, doc.layers.len(), painted)?;
 
     if doc.colourspace != SUPPORTED_COLOURSPACE {
         return flattened_fallback(

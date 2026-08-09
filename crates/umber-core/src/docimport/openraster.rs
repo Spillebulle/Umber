@@ -169,7 +169,8 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
             .background
             .map_or(Background::Transparent, Background::opaque);
     }
-    check_bounds(FORMAT, size.x, size.y, specs.len())?;
+    let painted = specs.iter().filter(|spec| !spec.folder).count();
+    check_bounds(FORMAT, size.x, size.y, specs.len(), painted)?;
 
     let mut layers = Vec::with_capacity(specs.len());
     // Tracked against the layers that actually loaded, not against the specs:

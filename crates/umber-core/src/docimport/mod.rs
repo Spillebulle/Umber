@@ -546,7 +546,33 @@ impl ImportedDocument {
     pub const MAX_DIMENSION: u32 = 16384;
 
     /// Total layer bytes an import will accept, across the whole stack.
-    pub const MAX_TOTAL_BYTES: u64 = 2 << 30;
+    ///
+    /// **It was 2 GiB, and at that figure the reader was stricter than the
+    /// writer.** Umber will make a canvas up to [`Document::MAX_EDGE`] on a
+    /// side and put [`LayerStack::MAX`] layers on it, so it could save a
+    /// document it then refused to reopen: 15000×5000 is 300 MB a layer, and
+    /// the eighth layer put it past 2 GiB. That is the failure the mask
+    /// paragraph on [`check_bounds`] already argues against, arriving through
+    /// the byte total instead.
+    ///
+    /// **It cannot be raised all the way, and the tension is real rather than
+    /// an oversight.** The bound that would never refuse Umber's own work is
+    /// `MAX_DIMENSION² × 4 × LayerStack::MAX`, which is 68.7 GB — and at that
+    /// figure the check is exactly what the dimension and count checks already
+    /// permit, so it stops guarding anything. What it guards is a header: a
+    /// layer's buffer is allocated canvas-sized whatever the source data
+    /// weighs, so a few kilobytes of hostile file can ask for tens of
+    /// gigabytes before a single pixel is decoded. A finite figure is what
+    /// turns that into a sentence instead of the process being killed.
+    ///
+    /// 16 GiB is where the two meet. It admits every document anybody has
+    /// actually brought here — a 10000² canvas at 40 layers is 16.0 GB, a
+    /// 15000×5000 at 50 is 15.0 GB — and still refuses the absurd. Past it the
+    /// artist is told the figure and told to reduce the stack, which is
+    /// something they can act on; see [`ImportError::StackTooLarge`].
+    ///
+    /// [`Document::MAX_EDGE`]: crate::document::Document::MAX_EDGE
+    pub const MAX_TOTAL_BYTES: u64 = 16 << 30;
 
     /// Check what [`open`](Self::open) relies on.
     ///
@@ -814,9 +840,31 @@ pub enum ImportError {
         found: usize,
         max: usize,
     },
+    /// One edge is past [`ImportedDocument::MAX_DIMENSION`].
     CanvasTooLarge {
         width: u32,
         height: u32,
+    },
+    /// The canvas is fine and the *stack* is not: every layer is canvas-sized
+    /// and they are all held in host memory at once, so a legal canvas with
+    /// enough layers on it is past [`ImportedDocument::MAX_TOTAL_BYTES`].
+    ///
+    /// **Separate from `CanvasTooLarge`, and that is the whole point of it.**
+    /// Both refusals used to be that one variant, so a 15000×5000 Clip Studio
+    /// document — an edge well inside `MAX_DIMENSION`, refused for its twenty
+    /// layers — told the artist their canvas was larger than Umber can open.
+    /// It is not, and no amount of shrinking it would have helped: what they
+    /// had to do was reduce the *stack*, which the sentence never mentioned.
+    /// A refusal that names the wrong bound is worse than a vague one, because
+    /// it sends somebody to fix the thing that is not broken.
+    StackTooLarge {
+        width: u32,
+        height: u32,
+        /// Layers holding pixels. Folders are not counted — one allocates
+        /// nothing, so it cannot be part of what does not fit.
+        layers: usize,
+        /// What those layers come to, which is the figure actually compared.
+        bytes: u64,
     },
     /// A well-formed file with nothing to paint on.
     Empty {
@@ -866,7 +914,22 @@ impl fmt::Display for ImportError {
             ),
             Self::CanvasTooLarge { width, height } => write!(
                 f,
-                "The canvas is {width}×{height}, which is larger than Umber can open."
+                "The canvas is {width}×{height}, which is larger than Umber can open. \
+                 Umber opens canvases up to {max} pixels on a side.",
+                max = ImportedDocument::MAX_DIMENSION,
+            ),
+            Self::StackTooLarge {
+                width,
+                height,
+                layers,
+                bytes,
+            } => write!(
+                f,
+                "This document has {layers} layers at {width}×{height}, which comes to \
+                 {held} of pixels. Umber holds at most {max} of a document at once. \
+                 Flattening or removing some layers will bring it within reach.",
+                held = gigabytes(*bytes),
+                max = gigabytes(ImportedDocument::MAX_TOTAL_BYTES),
             ),
             Self::Empty { format } => {
                 write!(f, "The {} file contains no layers.", format.label())
@@ -938,12 +1001,36 @@ fn disable_effects_over_budget(layers: &mut [ImportedLayer]) -> usize {
     disabled
 }
 
+/// Bytes as a figure an artist reads, for a refusal that has to be acted on.
+///
+/// Decimal GB rather than GiB, because the sentence is telling somebody how big
+/// their picture is and not how a buffer was sized. One decimal place: the
+/// difference between 6.0 and 6.4 GB is worth showing when the bound is 17.2,
+/// and a second place is noise on a figure nobody can hit exactly.
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+}
+
 /// Reject canvases and stacks an import could never open, before decoding any
 /// pixels.
 ///
 /// Called by each reader as soon as it knows the header, which is the point of
 /// it: decoding sixty 8000² layers and *then* refusing would allocate several
 /// gigabytes to reach the same answer.
+///
+/// **Two counts, because the two bounds are counting different things.**
+/// `entries` is what a [`LayerStack`] will hold and folders are in it, because
+/// `LayerStack::MAX` bounds entries and a folder occupies one. `pixel_layers`
+/// is what the *bytes* are, and folders are not in it, because a folder holds
+/// no slot and no buffer — `ImportedLayer::folder` allocates nothing at all.
+/// One count served both and the byte total was therefore charging a folder
+/// for a canvas: a Clip Studio document filed into groups paid for its own
+/// filing, and the deeper the artist's tidying the sooner the refusal came.
+///
+/// The two are deliberately not derived from one another here. A reader knows
+/// which of its entries are folders before it decodes anything, which is the
+/// whole reason this can be called off the header, and asking it for both is
+/// what keeps that true.
 ///
 /// **Masks are deliberately not counted, and the bound is therefore what a
 /// stack of layers costs rather than what a document costs.** A mask is another
@@ -961,7 +1048,8 @@ fn check_bounds(
     format: SourceFormat,
     width: u32,
     height: u32,
-    layers: usize,
+    entries: usize,
+    pixel_layers: usize,
 ) -> Result<(), ImportError> {
     if width == 0 || height == 0 {
         return Err(ImportError::Malformed {
@@ -972,15 +1060,20 @@ fn check_bounds(
     if width > ImportedDocument::MAX_DIMENSION || height > ImportedDocument::MAX_DIMENSION {
         return Err(ImportError::CanvasTooLarge { width, height });
     }
-    if layers > LayerStack::MAX {
+    if entries > LayerStack::MAX {
         return Err(ImportError::TooManyLayers {
-            found: layers,
+            found: entries,
             max: LayerStack::MAX,
         });
     }
-    let total = width as u64 * height as u64 * 4 * layers.max(1) as u64;
+    let total = width as u64 * height as u64 * 4 * pixel_layers.max(1) as u64;
     if total > ImportedDocument::MAX_TOTAL_BYTES {
-        return Err(ImportError::CanvasTooLarge { width, height });
+        return Err(ImportError::StackTooLarge {
+            width,
+            height,
+            layers: pixel_layers,
+            bytes: total,
+        });
     }
     Ok(())
 }
@@ -1079,23 +1172,140 @@ mod tests {
     fn bounds_are_checked_before_any_decoding() {
         let f = SourceFormat::Photoshop;
         assert!(matches!(
-            check_bounds(f, 0, 10, 1),
+            check_bounds(f, 0, 10, 1, 1),
             Err(ImportError::Malformed { .. })
         ));
         assert!(matches!(
-            check_bounds(f, 40000, 10, 1),
+            check_bounds(f, 40000, 10, 1, 1),
             Err(ImportError::CanvasTooLarge { .. })
         ));
         assert!(matches!(
-            check_bounds(f, 100, 100, LayerStack::MAX + 1),
+            check_bounds(f, 100, 100, LayerStack::MAX + 1, LayerStack::MAX + 1),
             Err(ImportError::TooManyLayers { .. })
         ));
-        // 64 layers of 8192² is 17 GB — plausible in Photoshop, hopeless here.
+        // 16384² is a legal canvas and 64 of them is 68.7 GB, which is the
+        // document the byte bound exists for: a header asking for tens of
+        // gigabytes before a pixel has been decoded.
         assert!(matches!(
-            check_bounds(f, 8192, 8192, 64),
-            Err(ImportError::CanvasTooLarge { .. })
+            check_bounds(f, 16384, 16384, 64, 64),
+            Err(ImportError::StackTooLarge { .. })
         ));
-        assert!(check_bounds(f, 2048, 2048, 8).is_ok());
+        assert!(check_bounds(f, 2048, 2048, 8, 8).is_ok());
+    }
+
+    /// The refusal the artist actually met, and the two things wrong with it.
+    ///
+    /// A 15000×5000 Clip Studio document was refused with "the canvas is larger
+    /// than Umber can open" — a canvas 1384 px inside `MAX_DIMENSION` on its
+    /// long edge, so the sentence named a bound the file was nowhere near and
+    /// the artist had nothing to act on.
+    #[test]
+    fn a_canvas_within_bounds_is_never_refused_for_its_size() {
+        let f = SourceFormat::ClipStudio;
+        // Every edge Umber will open, at the full stack. None of these may ever
+        // come back as `CanvasTooLarge`: the canvas is legal in all of them.
+        for (w, h) in [(15000, 5000), (5000, 5000), (16384, 16384), (10000, 10000)] {
+            for layers in [1, 8, 22, LayerStack::MAX] {
+                assert!(
+                    !matches!(
+                        check_bounds(f, w, h, layers, layers),
+                        Err(ImportError::CanvasTooLarge { .. })
+                    ),
+                    "{w}×{h} at {layers} layers was refused for its canvas size"
+                );
+            }
+        }
+    }
+
+    /// The figure that was wrong, driven at the sizes it was wrong at.
+    ///
+    /// At the old 2 GiB, 15000×5000 refused its eighth layer and 5000² its
+    /// twenty-second. Both are ordinary illustration documents.
+    #[test]
+    fn an_ordinary_large_document_opens() {
+        let f = SourceFormat::ClipStudio;
+        assert!(check_bounds(f, 15000, 5000, 8, 8).is_ok());
+        assert!(check_bounds(f, 15000, 5000, 50, 50).is_ok());
+        assert!(check_bounds(f, 5000, 5000, 22, 22).is_ok());
+        assert!(check_bounds(f, 5000, 5000, LayerStack::MAX, LayerStack::MAX).is_ok());
+        assert!(check_bounds(f, 10000, 10000, 40, 40).is_ok());
+    }
+
+    /// **A reader must never be stricter than the writer** is the rule the mask
+    /// paragraph on [`check_bounds`] states, and `MAX_TOTAL_BYTES` does not
+    /// fully meet it. This says exactly how far it gets, because a guard
+    /// written to the rule rather than to the code would be asserting something
+    /// that does not ship — and one quietly narrowed until it passed would be
+    /// the bound loosened to admit the thing it exists to catch.
+    ///
+    /// Where it holds: every canvas up to 8192², at the full stack. That covers
+    /// what Umber's own dialog offers and every document anybody has brought
+    /// here.
+    ///
+    /// Where it does not, and it is a **known gap** rather than an oversight:
+    /// a full 64-layer stack needs 16 GiB from 8192² upwards, so a 10000²
+    /// document at 40 layers opens and the same canvas at 64 does not. The
+    /// argument for stopping somewhere is on `MAX_TOTAL_BYTES` — every figure
+    /// that admits a real 25.6 GB document also admits a malformed header
+    /// asking for 25.6 GB, because the two are the same header. Raising it to
+    /// `MAX_DIMENSION² × 4 × LayerStack::MAX` closes the gap and retires the
+    /// check; that is a product decision, and this test is where its terms are
+    /// written down so it can be taken deliberately.
+    #[test]
+    fn a_document_umber_could_save_can_be_reopened() {
+        let f = SourceFormat::OpenRaster;
+        for edge in [2048u32, 4096, 8192] {
+            assert!(
+                check_bounds(f, edge, edge, LayerStack::MAX, LayerStack::MAX).is_ok(),
+                "a full stack on a {edge}² canvas could be saved and not reopened"
+            );
+        }
+
+        // The gap, pinned so that closing it is a change to this test and not a
+        // silent one. Whichever way it moves, both halves move together.
+        assert!(
+            check_bounds(f, 10000, 10000, 64, 64).is_err(),
+            "if this now opens, MAX_TOTAL_BYTES was raised and its docs must say so"
+        );
+        assert!(check_bounds(f, 10000, 10000, 40, 40).is_ok());
+    }
+
+    /// A folder holds no slot and no buffer, so it may not be charged a canvas.
+    ///
+    /// The counts are read separately by construction — see [`check_bounds`] —
+    /// and this is what says the byte half actually uses the second one. Driven
+    /// from a case where the two readings *disagree*: 60 folders over 4 painted
+    /// layers on a 10000² canvas is 9.6 GB read correctly and 25.6 GB read off
+    /// the entry count, so a version taking `entries` for both fails here.
+    #[test]
+    fn folders_are_not_charged_for_pixels_they_do_not_hold() {
+        let f = SourceFormat::ClipStudio;
+        assert!(check_bounds(f, 10000, 10000, 64, 4).is_ok());
+        // And the entry bound still counts them, because a folder does occupy
+        // a stack entry even though it occupies no memory.
+        assert!(matches!(
+            check_bounds(f, 100, 100, LayerStack::MAX + 1, 1),
+            Err(ImportError::TooManyLayers { .. })
+        ));
+    }
+
+    /// A refusal has to send somebody somewhere useful, so the sentence names
+    /// the stack rather than the canvas and carries the figure to act on.
+    #[test]
+    fn a_stack_refusal_names_the_stack_and_not_the_canvas() {
+        let f = SourceFormat::ClipStudio;
+        let err = check_bounds(f, 16384, 16384, 64, 64).unwrap_err();
+        let said = err.to_string();
+        assert!(said.contains("64 layers"), "{said}");
+        assert!(said.contains("68.7 GB"), "{said}");
+        assert!(
+            said.contains("17.2 GB"),
+            "the sentence must say what the bound is: {said}"
+        );
+        assert!(
+            !said.contains("larger than Umber can open"),
+            "a stack refusal must not wear the canvas refusal's words: {said}"
+        );
     }
 
     #[test]
