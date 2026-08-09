@@ -62,6 +62,9 @@ pub(crate) struct PanelEvents {
 ///
 /// In egui's temporary store rather than on [`PanelEvents`] for the plain reason
 /// that a field no caller reads is a warning, and `-D warnings` is what CI runs.
+/// Written only under `cfg(test)`: the drawing path must not take a lock and
+/// insert a value, once per module per frame, for a reading nobody takes.
+#[cfg(test)]
 fn header_geometry_id(kind: PanelKind) -> Id {
     Id::new(("panel-header-geometry", kind))
 }
@@ -460,14 +463,17 @@ pub(crate) fn panel(
     // Header controls, right-aligned. Added after the drag handle, so they win.
     //
     // **Drawn before the title, though they sit to the right of it.** A header
-    // holding four marks and a close mark wants 122 points and this rect is 120
-    // at [`metrics::PANEL`] and 83 at `limits::SIDEBAR_MIN_WIDTH`, so the strip
-    // overruns leftwards — which is fine, there is nothing there — right up
-    // until it reaches the title, and then it is the "3 ticked" label and the
-    // six bulk buttons drawn over each other again, one storey up. So the
-    // controls claim their room first and the title takes what is left, which is
-    // the arrangement the Layers body's own heading row already had to make for
-    // the same reason.
+    // holding four marks and a close mark wants 114 points — `ui::icon_button`
+    // is 18 and `metrics::BUTTON_GAP` is 6 — against a rect that is 120 at
+    // [`metrics::PANEL`], 83 at `limits::SIDEBAR_MIN_WIDTH` and 38 at
+    // `metrics::TOOL_RAIL`, which is what a Tools column may be dragged to. So
+    // at the design's width it fits with six points spare, and at every narrower
+    // one the strip overruns leftwards — which is fine, there is nothing there,
+    // right up until it reaches the title, and then it is the "3 ticked" label
+    // and the six bulk buttons drawn over each other again, one storey up. So
+    // the controls claim their room first and the title takes what is left,
+    // which is the arrangement the Layers body's own heading row already had to
+    // make for the same reason.
     let controls = Rect::from_min_max(
         pos2(rect.center().x, header.top()),
         pos2(rect.right() - pad, header.bottom()),
@@ -502,9 +508,13 @@ pub(crate) fn panel(
     let controls_at = placed.response.rect;
 
     let title_at = pos2(dots.right() + 6.0, header.center().y);
-    // What the controls left, less the gap two controls sit apart by. Zero or
-    // less means there is no room for a title at all, and the galley comes back
-    // empty rather than the first letter being drawn under a button.
+    // What the controls left, less the gap two controls sit apart by. **A room
+    // of zero still draws one glyph**, not nothing: epaint keeps a character
+    // when it can find no place to break, which is the one input at which a
+    // title can reach past `room` at all. It cannot arise here — `panel`
+    // returns early on a rect too narrow to hold `pad * 2 + 8`, and the marks
+    // never leave less than a glyph's worth — and it is worth knowing before
+    // anybody reads the guard below as promising more than it does.
     let room = (controls_at.left() - metrics::BUTTON_GAP - title_at.x).max(0.0);
     // One row, elided with egui's own overflow character, which is what
     // `egui::Label::truncate` uses and therefore what a layer name too long for
@@ -520,10 +530,17 @@ pub(crate) fn panel(
     job.wrap.max_width = room;
     job.wrap.max_rows = 1;
     let galley = ui.painter().layout_job(job);
+    let rows = galley.rows.len();
     let title = Align2::LEFT_CENTER.anchor_size(title_at, galley.size());
     ui.painter().galley(title.min, galley, p.text_strong);
+    // Test-only, and gated so it is: this is the drawing path, and every module
+    // in the layout would otherwise take an `IdTypeMap` lock and do an insert
+    // every frame to feed a guard nothing in the application reads.
+    #[cfg(test)]
     ui.ctx()
-        .data_mut(|d| d.insert_temp(header_geometry_id(kind), (title, controls_at)));
+        .data_mut(|d| d.insert_temp(header_geometry_id(kind), (title, controls_at, rows)));
+    #[cfg(not(test))]
+    let _ = rows;
 
     // Body. Clipped and scrollable, because a panel dragged down to its minimum
     // height still has to show something rather than spilling over its
@@ -3352,7 +3369,8 @@ mod tests {
         );
     }
 
-    /// A module header never draws its title under its own controls.
+    /// A module header never draws its title under its own controls, and never
+    /// on a second line.
     ///
     /// The failure this pins has happened once already, one storey down: a
     /// "3 ticked" label and an All/None pair shared a line with six icon
@@ -3360,18 +3378,38 @@ mod tests {
     /// [`metrics::PANEL`]'s real 264 points. Moving the Layers module's group,
     /// up, down and delete marks into the header puts four marks and — in
     /// layout edit mode — a close mark into a strip whose rect is 120 points at
-    /// that width and 83 at `limits::SIDEBAR_MIN_WIDTH`. Five controls want 122.
+    /// that width, 83 at `limits::SIDEBAR_MIN_WIDTH` and 38 at
+    /// `metrics::TOOL_RAIL`. Five controls want 114.
     ///
-    /// So it is *measured*, and measured off what was actually drawn:
-    /// `header_geometry_id` parks the two rectangles the header laid out, and
-    /// this compares them. A test that recomputed the room the title was given
-    /// would be checking its own arithmetic, which is the shape
-    /// `palettelib::drop_ring_rect` exists to refuse.
+    /// **What the first assertion catches, exactly.** `room` is derived from
+    /// where the controls actually landed, so epaint cannot lay a row out past
+    /// it and the inequality holds structurally for as long as that derivation
+    /// stands. Its value is that it fails the moment the derivation is broken —
+    /// an unbounded `max_width`, or a `room` taken from the *max* rect the strip
+    /// was offered rather than the one it used, which are the two ways this
+    /// regresses. Demonstrated by mutation rather than argued: `max_width` set
+    /// to infinity fails it at Brushes, 190 points, edit mode, with the title
+    /// reaching 66 and the controls starting at 56.
     ///
-    /// Every kind, both widths, and in and out of edit mode — the domain the
-    /// code sees rather than the one the constants describe. Brushes is in it
-    /// deliberately: its header already held four marks, so it was one point
-    /// past the same edge before any of this was touched.
+    /// **The row count is the second assertion and is not decoration.** A header
+    /// is [`metrics::PANEL_HEADER`]'s 32 points and two rows of `text::SMALL`
+    /// fit inside that, so dropping `max_rows` wraps a title onto a second line
+    /// while every width assertion here still passes. Also demonstrated by
+    /// mutation.
+    ///
+    /// **What neither catches**: losing the [`metrics::BUTTON_GAP`] between the
+    /// title and the marks. That leaves the two touching, which is ugly and is
+    /// not a control drawn over another, and no inequality over these two
+    /// rectangles can tell "as much room as there is" from "six points less".
+    ///
+    /// Every kind, in and out of edit mode, at the design's width and at each
+    /// kind's *own* floor — `PanelKind::min_width`, which is
+    /// [`metrics::TOOL_RAIL`]'s 100 for the tool rail and not
+    /// `SIDEBAR_MIN_WIDTH`. That is CLAUDE.md's "a guard's inputs must span the
+    /// domain the code sees, not the one the constants describe", and the first
+    /// draft of this test got it wrong in exactly that way. Brushes is in it
+    /// deliberately: its header already held four marks, so it was past the same
+    /// edge before any of this was touched.
     #[test]
     fn a_module_header_never_draws_its_title_under_its_controls() {
         use crate::dock::{Layout, PanelKind, limits};
@@ -3379,9 +3417,9 @@ mod tests {
         use crate::theme::{Palette, ThemeKind, metrics};
         use egui::{Pos2, Rect, vec2};
 
-        for width in [metrics::PANEL, limits::SIDEBAR_MIN_WIDTH] {
-            for editing in [false, true] {
-                for kind in PanelKind::ALL {
+        for kind in PanelKind::ALL {
+            for width in [metrics::PANEL, limits::SIDEBAR_MIN_WIDTH, kind.min_width()] {
+                for editing in [false, true] {
                     let ctx = egui::Context::default();
                     let field = vec2(width, 400.0);
                     let input = egui::RawInput {
@@ -3410,9 +3448,9 @@ mod tests {
                             );
                         });
                     }
-                    let placed: Option<(Rect, Rect)> =
+                    let placed: Option<(Rect, Rect, usize)> =
                         ctx.data(|d| d.get_temp(super::header_geometry_id(kind)));
-                    let (title, controls) =
+                    let (title, controls, rows) =
                         placed.expect("the header drew nothing, so nothing here was measured");
                     assert!(
                         title.right() <= controls.left(),
@@ -3420,6 +3458,13 @@ mod tests {
                          {} and its controls in from {}",
                         title.right(),
                         controls.left()
+                    );
+                    assert_eq!(
+                        rows,
+                        1,
+                        "{kind:?} at {width} (edit mode {editing}) laid its title out on \
+                         {rows} rows of a {} point header",
+                        metrics::PANEL_HEADER
                     );
                 }
             }

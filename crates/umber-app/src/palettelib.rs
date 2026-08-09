@@ -153,8 +153,10 @@ struct State {
     /// palette cannot be undone — the history covers painting only — so it
     /// asks.
     confirming: Option<String>,
-    /// Whether the grid may be changed at all: added to, named, rearranged or
-    /// taken from. Off by default, and see [`editing_tip`] for why.
+    /// Whether the grid may be **changed** at all: added to, named, rearranged
+    /// or removed from. Taking a colour is not on that list and is not gated —
+    /// with this off the module is a palette you can paint out of and cannot
+    /// damage. Off by default; [`EDITING_OFF`] carries the reason.
     ///
     /// **It resets, and that is the whole point of it.** Off is the safe state,
     /// and a mode that persisted would be one somebody left on months ago — the
@@ -327,6 +329,18 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // something you have to go and hover for. So the mark itself becomes the
     // harmony mark, and the tooltip names the relation and how many colours it
     // is — which it did before and still does.
+    //
+    // **The mode it follows is set in another module, and that module may not be
+    // on screen.** `PickerMode` is written by the Colour panel's own header and
+    // kept in `prefs`, so it survives a restart and it survives Colour being
+    // taken out of the layout — somebody could meet a Palette header whose
+    // adding mark is a harmony mark with nothing anywhere saying why. Three
+    // things make that answerable rather than silent, and they are the reason
+    // this is a glyph swap rather than a hidden branch: the mark is visibly not
+    // a plus, its tooltip names the relation and the count, and it does nothing
+    // at all until editing is switched on beside it. What lands is then in the
+    // grid directly below, which is the same answer `Palette::add`'s duplicates
+    // get: something the artist can see and take out.
     let harmony = ed.ui.picker == PickerMode::Harmony;
     // `room_for(1)` rather than `has_room` so the count is stated once: the two
     // are the same function, and asking the same question two ways is how the
@@ -338,10 +352,16 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     };
     let fits = state.writable() && state.current().is_some_and(|q| q.room_for(hues));
     let can_add = state.editing && fits;
-    let tip = if !state.editing {
-        EDITING_OFF.to_owned()
-    } else if !fits {
+    // **A state of the machine is named before the mode is.** `no_room_because`'s
+    // three reasons are nowhere to write, no palette made yet, and no room, and
+    // turning editing on fixes none of them — so a dead mark over a `Broken`
+    // library saying "turn editing on" would send somebody to press a control
+    // that changes nothing, while the panel body two lines below already says
+    // "Make a palette first".
+    let tip = if !fits {
         no_room_because(&state, hues)
+    } else if !state.editing {
+        EDITING_OFF.to_owned()
     } else if harmony {
         format!(
             "{} harmony: add its {hues} colours to this palette",
@@ -2264,10 +2284,18 @@ mod tests {
     /// that restated the layout would be probing pixels the grid had moved away
     /// from and passing for it.
     ///
-    /// The editing-on pass is not decoration either. A test of a two-state
-    /// reading has to start from a case where the two readings disagree, or it
-    /// is testing the reading it happens to like — so the same sweep has to
-    /// *change* the palette with the mode on, and the assertion says so.
+    /// **Two readings are taken, not one.** A remove and a move change the
+    /// swatches; opening the naming field does not — it sets `State::naming` —
+    /// so a sweep that compared colours alone would go green with the name
+    /// mark's gate taken off and a field standing open over a read-only grid.
+    ///
+    /// The editing-on pass is not decoration either, and it is counted **per
+    /// gesture kind**. A test of a two-state reading has to start from a case
+    /// where the two readings disagree, or it is testing the reading it happens
+    /// to like — and one counter shared between the click and the drag would be
+    /// satisfied for ever by a single remove, so the day the synthetic hold
+    /// stopped registering as `is_decidedly_dragging` the drag half would go
+    /// vacuous in both modes with nothing to say so.
     #[test]
     fn a_read_only_palette_cannot_be_changed_by_any_gesture() {
         use crate::theme::{Palette as Theme, ThemeKind};
@@ -2356,7 +2384,9 @@ mod tests {
         }
         let elsewhere = cells[cells.len() - 1].center();
 
-        let mut changed_with_editing_on = 0;
+        // Indexed by gesture kind: [click, drag].
+        let mut changed = [0usize; 2];
+        let mut named = [0usize; 2];
         for editing in [false, true] {
             for &at in &probes {
                 for slow in [false, true] {
@@ -2398,28 +2428,61 @@ mod tests {
                             |ui| panel(ui, &theme, &mut ed),
                         );
                     }
-                    let after: Vec<Swatch> = ctx
+                    let settled = ctx
                         .data(|d| d.get_temp::<State>(state_id()))
-                        .and_then(|s| s.current().cloned())
+                        .expect("the module kept its state");
+                    let after: Vec<Swatch> = settled
+                        .current()
+                        .cloned()
                         .expect("the palette is still in front")
                         .swatches;
+                    // **Two readings, because two of the four things the mode
+                    // gates leave the swatches alone.** A remove and a move
+                    // change the palette; opening the naming field does not, so
+                    // a sweep that only compared colours would go green with the
+                    // name mark's gate taken off and a field standing open over
+                    // a read-only grid.
+                    let opened = settled.naming.is_some();
+                    let kind = usize::from(slow);
                     if editing {
-                        changed_with_editing_on += usize::from(after != before);
+                        changed[kind] += usize::from(after != before);
+                        named[kind] += usize::from(opened);
                     } else {
+                        let gesture = if slow { "drag" } else { "click" };
                         assert_eq!(
-                            after,
-                            before,
-                            "a {} at {at:?} changed a palette whose module is read-only",
-                            if slow { "drag" } else { "click" }
+                            after, before,
+                            "a {gesture} at {at:?} changed a palette whose module is \
+                             read-only"
+                        );
+                        assert!(
+                            !opened,
+                            "a {gesture} at {at:?} opened the naming field on a palette \
+                             whose module is read-only"
                         );
                     }
                 }
             }
         }
+        // **Per gesture kind, not one counter over both.** A single remove from
+        // a click would satisfy a shared counter for ever, so the day the
+        // synthetic hold stopped registering as `is_decidedly_dragging` — an
+        // egui change to `max_click_duration`, or to how this feeds `time` — the
+        // drag half would go vacuous in *both* modes and the read-only
+        // assertions above would pass by never having been asked anything.
         assert!(
-            changed_with_editing_on > 0,
-            "the same sweep changed nothing with editing *on* either, so the \
-             assertion above is passing for the wrong reason"
+            changed[0] > 0,
+            "no click changed the palette with editing on either, so the \
+             read-only assertion about clicks is passing for the wrong reason"
+        );
+        assert!(
+            changed[1] > 0,
+            "no drag changed the palette with editing on either, so the \
+             read-only assertion about drags is passing for the wrong reason"
+        );
+        assert!(
+            named[0] > 0,
+            "no click opened the naming field with editing on either, so the \
+             read-only assertion about it is passing for the wrong reason"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
