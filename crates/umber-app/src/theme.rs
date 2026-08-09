@@ -681,7 +681,16 @@ impl Palette {
     pub const fn shit_studio() -> Self {
         Self {
             accent: Color32::from_rgb(0x8F, 0xB8, 0xE6),
-            accent_dim: Color32::from_rgb(0x54, 0x63, 0x7A),
+            // `mix(accent, window, 0.49)` exactly — the derivation
+            // `with_accent` applies to the other three accents, which Krita's
+            // and MediaBog's authored values also sit on and Photoslop's within
+            // 12. This was `#54637A`, hand-picked and **61** off it, in the
+            // direction of `control_active`: `accent_dim` is the border
+            // `icon_toggle` and `layer_row` stroke round a selected row, and at
+            // 25 from that row's own `#606B7F` fill it was a border nobody
+            // could see. The derived value is 36 away and consistent with the
+            // rest of the file.
+            accent_dim: Color32::from_rgb(0x64, 0x79, 0x91),
             warning: Color32::from_rgb(0xE8, 0x90, 0x7A),
             warning_bg: Color32::from_rgb(0x3C, 0x28, 0x23),
             warning_border: Color32::from_rgb(0x78, 0x49, 0x3C),
@@ -701,8 +710,18 @@ impl Palette {
             // the resting state.
             control_hover: Color32::from_rgb(0x67, 0x67, 0x67),
             control_active: Color32::from_rgb(0x60, 0x6B, 0x7F),
-            text_strong: Color32::from_rgb(0xF0, 0xF0, 0xF0),
-            text: Color32::from_rgb(0xDC, 0xDC, 0xDC),
+            // The whole type ramp is a step above Krita's, and the reason is
+            // this palette's own `chrome`: `#4E4E4E` against Krita's `#474747`
+            // is 21 channel-sum units lighter, so every ink has that much less
+            // headroom. The two strongest ranks were Krita's byte for byte —
+            // `#F0F0F0` and `#DCDCDC` — which is the shape `photoslop`'s
+            // `warning_border` and `mediabog`'s `popover_border` are both
+            // commented as: a token nobody re-chose after the surfaces moved.
+            // Neither is a measurement of Clip Studio's own text, which peaks
+            // around `#B2B2B2` in the menu strip; these are Umber's ranks, and
+            // they are pitched at this theme's surfaces.
+            text_strong: Color32::from_rgb(0xF4, 0xF4, 0xF4),
+            text: Color32::from_rgb(0xE2, 0xE2, 0xE2),
             text_muted: Color32::from_rgb(0xB4, 0xB4, 0xB4),
             // Held up to `#9C` by the `#4E4E4E` menu bar, which is the
             // lightest surface any theme here draws text on: at `#949494` it
@@ -712,7 +731,7 @@ impl Palette {
             // check that it can still see this palette at all.
             text_dim: Color32::from_rgb(0x9C, 0x9C, 0x9C),
             rail: Color32::from_rgb(0x2C, 0x2C, 0x2C),
-            knob: Color32::from_rgb(0xC8, 0xC8, 0xC8),
+            knob: Color32::from_rgb(0xCE, 0xCE, 0xCE),
             link_colours: PRESET_LINKS_DARK,
         }
     }
