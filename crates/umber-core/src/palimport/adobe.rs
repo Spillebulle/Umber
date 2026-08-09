@@ -360,7 +360,7 @@ fn from_lab(l: f32, a: f32, b: f32) -> Swatch {
     let z = WHITE[2] * inverse(fz);
 
     let (r, g, blue) = (
-        3.133_856_1 * x - 1.616_866_7 * y - 0.490_614_6 * z,
+        3.133_856 * x - 1.616_866_7 * y - 0.490_614_6 * z,
         -0.978_768_4 * x + 1.916_141_5 * y + 0.033_454_0 * z,
         0.071_945_3 * x - 0.228_991_4 * y + 1.405_242_7 * z,
     );
@@ -415,8 +415,16 @@ mod tests {
     #[test]
     fn an_rgb_ase_reads_with_its_names_and_loses_nothing() {
         let file = ase(&[
-            ase_colour_block("Eerie black", b"RGB ", &[16.0 / 255.0, 18.0 / 255.0, 28.0 / 255.0]),
-            ase_colour_block("Ochre", b"RGB ", &[204.0 / 255.0, 119.0 / 255.0, 34.0 / 255.0]),
+            ase_colour_block(
+                "Eerie black",
+                b"RGB ",
+                &[16.0 / 255.0, 18.0 / 255.0, 28.0 / 255.0],
+            ),
+            ase_colour_block(
+                "Ochre",
+                b"RGB ",
+                &[204.0 / 255.0, 119.0 / 255.0, 34.0 / 255.0],
+            ),
         ]);
         let (swatches, losses) = read_ase(&file, "test").expect("a palette");
         assert_eq!(swatches.len(), 2);
@@ -437,11 +445,7 @@ mod tests {
     #[test]
     fn an_ase_rgb_value_is_the_byte_it_was_written_as() {
         for byte in 0..=255u8 {
-            let file = ase(&[ase_colour_block(
-                "",
-                b"RGB ",
-                &[byte as f32 / 255.0; 3],
-            )]);
+            let file = ase(&[ase_colour_block("", b"RGB ", &[byte as f32 / 255.0; 3])]);
             let (swatches, _) = read_ase(&file, "test").expect("a palette");
             assert_eq!(swatches[0].rgb, [byte, byte, byte], "{byte}");
         }
@@ -660,10 +664,10 @@ mod tests {
     #[test]
     fn every_aco_colour_space_lands_where_it_should() {
         let entries = [
-            (1u16, [0, 0xFFFF, 0xFFFF], [255, 0, 0]),        // HSB red
-            (1u16, [0x5555, 0xFFFF, 0xFFFF], [0, 255, 0]),   // HSB green
-            (8u16, [10000, 0, 0], [255, 255, 255]),          // full grey
-            (8u16, [0, 0, 0], [0, 0, 0]),                    // no grey
+            (1u16, [0, 0xFFFF, 0xFFFF], [255, 0, 0]),      // HSB red
+            (1u16, [0x5555, 0xFFFF, 0xFFFF], [0, 255, 0]), // HSB green
+            (8u16, [10000, 0, 0], [255, 255, 255]),        // full grey
+            (8u16, [0, 0, 0], [0, 0, 0]),                  // no grey
         ];
         for (space, values, want) in entries {
             let mut file = Vec::from(1u16.to_be_bytes());
@@ -688,7 +692,10 @@ mod tests {
         let (swatches, losses) = read_aco(&file, "test").expect("a palette");
         assert_eq!(losses.lab, 1);
         let green = swatches[0].rgb;
-        assert!(green[1] > green[0], "a negative a is towards green: {green:?}");
+        assert!(
+            green[1] > green[0],
+            "a negative a is towards green: {green:?}"
+        );
     }
 
     /// A count is a number in a file a stranger wrote, and this one is the

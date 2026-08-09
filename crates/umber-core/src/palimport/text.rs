@@ -650,9 +650,11 @@ mod tests {
         // More than one statement: a `{` says this was a block.
         assert_eq!(colours("body { color: #fff; background: red }")[0].name, "");
         // Two colours have no way to divide one piece of text between them.
-        assert!(colours("Warm pair #CC7722 #10121C")
-            .iter()
-            .all(|s| s.name.is_empty()));
+        assert!(
+            colours("Warm pair #CC7722 #10121C")
+                .iter()
+                .all(|s| s.name.is_empty())
+        );
         // Prose past the limit is prose, not a name.
         let long = format!("{} #CC7722", "word ".repeat(30));
         assert_eq!(colours(&long)[0].name, "");

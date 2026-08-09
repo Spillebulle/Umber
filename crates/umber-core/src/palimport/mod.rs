@@ -71,7 +71,7 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use crate::palette::{MAX_SWATCHES, PaletteError, Palette, Swatch};
+use crate::palette::{MAX_SWATCHES, Palette, PaletteError, Swatch};
 
 pub mod adobe;
 pub mod text;
@@ -507,7 +507,9 @@ fn read_riff_pal(bytes: &[u8], source: &str) -> Result<(Vec<Swatch>, Losses), Pa
         at = start + len + (len & 1);
     };
     if body.len() < 4 {
-        return Err(bad("its “data” chunk is too short to hold a palette header"));
+        return Err(bad(
+            "its “data” chunk is too short to hold a palette header",
+        ));
     }
     // The count is read for the diagnostic below and never used to size an
     // allocation: what bounds the loop is the bytes that are actually there.
@@ -516,7 +518,11 @@ fn read_riff_pal(bytes: &[u8], source: &str) -> Result<(Vec<Swatch>, Losses), Pa
     let mut out = Vec::new();
     let mut losses = Losses::default();
     for entry in entries.chunks_exact(4) {
-        push(&mut out, Swatch::new([entry[0], entry[1], entry[2]]), source)?;
+        push(
+            &mut out,
+            Swatch::new([entry[0], entry[1], entry[2]]),
+            source,
+        )?;
     }
     // A file claiming more colours than it carries has lost them somewhere, and
     // that is a loss rather than a refusal — the ones that are there are good.
@@ -813,7 +819,7 @@ mod tests {
         }
         let text = "JASC-PAL\n0100\n2\n1 2 3\n4 5 6\n";
         for cut in 0..text.len() {
-            let _ = read_pal(text[..cut].as_bytes(), "test");
+            let _ = read_pal(&text.as_bytes()[..cut], "test");
         }
     }
 
@@ -866,7 +872,11 @@ mod tests {
         assert_eq!(reader.u16(), Some(2));
         assert!(reader.is_done());
         assert_eq!(reader.take(usize::MAX), None);
-        assert_eq!(reader.utf16(usize::MAX), None, "a length that would overflow");
+        assert_eq!(
+            reader.utf16(usize::MAX),
+            None,
+            "a length that would overflow"
+        );
 
         // A NUL terminator is counted by both formats and kept by neither.
         let mut named = BigEndian::new(&[0x00, 0x52, 0x00, 0x00]);
