@@ -710,6 +710,15 @@ fn wheel(
             centre,
             inner,
             wheel_base(*shape, *rotate, *angles, hsv.h),
+            // The swap makes no difference to *this* hub and is handed over
+            // anyway. It is a reflection about the axis through the hue corner,
+            // so the three points are the same three points and
+            // `Hub::contains` cannot tell them apart — demonstrated by
+            // mutation: pass `false` here and all 689 tests stay green. What it
+            // buys is that the press is judged against the shape that is
+            // drawn, by construction rather than by an argument about
+            // symmetry — which is exactly what `Hub` exists for, and what would
+            // stop holding the day somebody makes the swap a rotation.
             *mirrored,
         ),
     );
@@ -2528,20 +2537,26 @@ mod tests {
 
     /// The setting reaches the canvas, and not only [`triangle_corners`].
     ///
-    /// A guard on a model is not a guard on the panel. `wheel` has to hand
-    /// `mirrored` to `hub_of` at **both** of its call sites — the one that
-    /// judges a press and the one that paints the shape and reads the drag —
-    /// and every test above passes with either of them dropped. So this drives
-    /// the shipped [`show`], and it starts from the case where the two readings
-    /// disagree, which is the only kind of test of a two-state reading that is
-    /// worth anything.
+    /// A guard on a model is not a guard on the panel: every test above passes
+    /// with `wheel` never handing the setting to `hub_of` at all. So this
+    /// drives the shipped [`show`], and it starts from the case where the two
+    /// readings disagree, which is the only kind of test of a two-state reading
+    /// that is worth anything.
+    ///
+    /// **It covers one of `wheel`'s two `hub_of` calls, and that is measured
+    /// rather than claimed.** Mutating the one that *paints the shape and reads
+    /// the drag* fails this test; mutating the one that *judges the press*
+    /// leaves the whole suite green — because the swap is a reflection about
+    /// the axis through the hue corner, so both hubs hold the same three points
+    /// and [`Hub::contains`] cannot tell them apart. That call site is
+    /// therefore correct-by-construction rather than guarded, and the comment
+    /// there says so.
     ///
     /// A sweep rather than an aimed press at the white corner: working out
     /// where that corner lands on the panel would be a second copy of the
     /// geometry [`Hub`] exists to be the only statement of. What is asserted is
     /// that *some* press on the wheel reads a different colour with the corners
-    /// swapped — which is exactly what "the setting arrives" means, and is
-    /// false the moment either call site drops it.
+    /// swapped, which is exactly what "the setting reaches the shape" means.
     ///
     /// Presses stay inside the wheel's own square, and the flag is checked
     /// afterwards: the toggle that sets it is a few points below, and a sweep
@@ -2618,8 +2633,7 @@ mod tests {
         assert!(
             disagreed > 0,
             "the swap changed no colour anywhere on the wheel: the setting is \
-             not reaching the shape the press is judged against, or the one it \
-             is read from"
+             not reaching the shape the drag is read from"
         );
     }
 
