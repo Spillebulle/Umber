@@ -3264,6 +3264,86 @@ mod tests {
         }
     }
 
+    /// No marker on the harmony wheel is filled, and the base is the one
+    /// wearing two rings.
+    ///
+    /// This is the artist's complaint pinned rather than paraphrased: a member
+    /// used to be a *filled* disc of its own colour at the current saturation
+    /// and value, painted over the vivid hue it was pointing at. So the
+    /// assertion is about the fill — `Color32::TRANSPARENT` on every circle this
+    /// pass draws — and not about which colour was chosen, because "it drew the
+    /// right muddy orange" is the defect passing its own test.
+    ///
+    /// The counts are the other half. Every member has to wear the *same* mark,
+    /// which is `HARMONY_MARKER` exactly `hues.len()` times, and exactly one
+    /// second ring says which one is in hand. Both directions matter: dropping
+    /// the second ring leaves nothing saying which member is the colour in hand,
+    /// which is what the fill used to say and is the thing this change had to
+    /// replace rather than remove.
+    #[test]
+    fn every_harmony_marker_is_an_open_ring_and_only_the_base_wears_two() {
+        use crate::theme::metrics;
+
+        fn circles(shape: &egui::Shape, into: &mut Vec<egui::epaint::CircleShape>) {
+            match shape {
+                egui::Shape::Circle(c) => into.push(*c),
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        circles(s, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let p = Palette::of(crate::theme::ThemeKind::Graphite);
+        let field = vec2(metrics::PANEL - 2.0 * metrics::PANEL_PAD as f32, 300.0);
+        for relation in Harmony::ALL {
+            let ctx = egui::Context::default();
+            let mut harmony = relation;
+            let mut hsv = Hsv::new(28.0, 0.72, 0.86);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), field)),
+                    ..Default::default()
+                },
+                |ui| {
+                    harmony_wheel(ui, &p, &mut harmony, &mut hsv);
+                },
+            );
+            let mut seen = Vec::new();
+            for clipped in &output.shapes {
+                circles(&clipped.shape, &mut seen);
+            }
+
+            for circle in &seen {
+                assert_eq!(
+                    circle.fill,
+                    Color32::TRANSPARENT,
+                    "{relation:?}: a marker at radius {} is filled with {:?}",
+                    circle.radius,
+                    circle.fill,
+                );
+            }
+            let members = relation.hues(hsv.h).as_slice().len();
+            let at = |r: f32| seen.iter().filter(|c| c.radius == r).count();
+            assert_eq!(
+                at(HARMONY_MARKER),
+                members,
+                "{relation:?}: {} members but {} markers at the shared radius",
+                members,
+                at(HARMONY_MARKER),
+            );
+            assert_eq!(
+                at(HARMONY_MARKER + HARMONY_BASE_GAP),
+                1,
+                "{relation:?}: {} second rings, so nothing or more than one thing \
+                 claims to be the colour in hand",
+                at(HARMONY_MARKER + HARMONY_BASE_GAP),
+            );
+        }
+    }
+
     /// The relation picker is *drawn* outlined, in every theme.
     ///
     /// **A guard on the widget is not a guard on the panel**, and this whole
