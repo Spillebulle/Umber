@@ -200,6 +200,15 @@ pub enum Icon {
     /// italic. The bars are what stop a lone oblique stroke reading as a
     /// divider. See [`Icon::Bold`] for why these two are letters.
     Italic,
+    /// A pipette: the eyedropper tool. At the end for the reason every group
+    /// above it is — this enum is shared, and inserting into the middle of it
+    /// is a merge that compiles and draws the wrong marks.
+    ///
+    /// A pipette rather than the other common spelling, a dropper *over a
+    /// swatch*: at 18 px the swatch is three pixels of flat colour and reads as
+    /// a shadow under the mark. The pipette alone is what Photoshop, GIMP,
+    /// Krita and Affinity all draw, so it is a shape somebody already knows.
+    Eyedropper,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -284,6 +293,22 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
         Icon::Zoom => {
             painter.circle_stroke(at(10.0, 10.0), 5.5 * scale, stroke);
             line(at(14.2, 14.2), at(20.0, 20.0));
+        }
+
+        Icon::Eyedropper => {
+            // Read from the tip up: a filled point where the colour is taken,
+            // the barrel, the collar that stops the barrel reading as a plain
+            // diagonal — which is what `Icon::Brush` already is — and the bulb.
+            // Everything sits on the 45° line the diagonal marks in this set
+            // are drawn on.
+            painter.add(Shape::convex_polygon(
+                vec![at(3.5, 20.5), at(8.0, 19.0), at(5.0, 16.0)],
+                colour,
+                Stroke::NONE,
+            ));
+            line(at(6.5, 17.5), at(15.0, 9.0));
+            line(at(12.6, 8.0), at(16.0, 11.4));
+            path(rotated_rect(&at, 17.9, 6.1, 2.6, 3.7, 45.0));
         }
 
         Icon::Rotate => {

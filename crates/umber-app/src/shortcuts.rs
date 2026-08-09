@@ -29,6 +29,7 @@ pub enum Action {
     EraserTool,
     SelectTool,
     TransformTool,
+    EyedropperTool,
     PanTool,
     ZoomTool,
     SizeDown,
@@ -66,7 +67,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 38] = [
+    pub const ALL: [Action; 39] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
@@ -82,6 +83,7 @@ impl Action {
         Action::EraserTool,
         Action::SelectTool,
         Action::TransformTool,
+        Action::EyedropperTool,
         Action::PanTool,
         Action::ZoomTool,
         Action::SizeDown,
@@ -130,6 +132,7 @@ impl Action {
             Action::EraserTool => "Eraser tool",
             Action::SelectTool => "Selection tool",
             Action::TransformTool => "Transform tool",
+            Action::EyedropperTool => "Eyedropper tool",
             Action::PanTool => "Pan tool",
             Action::ZoomTool => "Zoom tool",
             Action::SizeDown => "Decrease brush size",
@@ -183,6 +186,7 @@ impl Action {
             | Action::EraserTool
             | Action::SelectTool
             | Action::TransformTool
+            | Action::EyedropperTool
             | Action::PanTool
             | Action::ZoomTool => "Tools",
             // Every temporary brush change, in one run — see `Action::ALL`.
@@ -384,6 +388,10 @@ pub fn defaults() -> Vec<Binding> {
         // tool keys are unmodified throughout and a rail that was consistent
         // everywhere except here would be worse than following the crowd.
         binding(Action::TransformTool, KeyCode::KeyT, false, false, false),
+        // I for the eyedropper, which is Photoshop's, Krita's, GIMP's and
+        // Affinity's. `E` would be the other reading of the word and is the
+        // eraser here; Photoshop uses `I` for exactly this reason.
+        binding(Action::EyedropperTool, KeyCode::KeyI, false, false, false),
         binding(Action::PanTool, KeyCode::KeyH, false, false, false),
         binding(Action::ZoomTool, KeyCode::KeyZ, false, false, false),
         // Brush

@@ -21,6 +21,7 @@ use crate::editor::{self, BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::panels;
 use crate::shortcuts::{self, Action};
+use crate::syspick;
 use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::tweaks::Tweak;
@@ -380,6 +381,13 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
             // measurement anchored where the gesture began, the dot is where
             // the nib is now, and watching the second cross the first is how
             // the size is judged.
+            // Before `pen_cursor` and not after it. Neither paints the other's
+            // cursor — they are exclusive on `Editor::pen_pointer` — but
+            // egui's cursor is whichever was asked for *last*, so putting the
+            // pen's request second means that if the exclusivity ever broke,
+            // the pen's own dot would still win over a crosshair rather than
+            // the window ending up with both.
+            aiming_cursor(ui, ed);
             pen_cursor(ui, &p, ed);
             rect
         })
@@ -1216,6 +1224,45 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
         .circle_filled(ed.to_points(at), metrics::PEN_DOT, p.text_dim);
 }
 
+/// A crosshair over the canvas while the eyedropper is in hand.
+///
+/// **The one tool that gets a cursor of its own, and that is deliberate rather
+/// than the start of a set.** Every other tool paints a mark whose own size is
+/// what the hand is aiming with — a brush has a stroke, a selection has a
+/// marquee, a transform has a box — and the arrow is a fine pointer at all of
+/// them. A pick has no mark at all and its target is exactly one pixel, so the
+/// arrow, whose hotspot is its tip and whose body covers the pixels below and
+/// to the right, is the worst possible thing to aim it with. That is why every
+/// application draws a crosshair here and none of them draws one for a brush.
+///
+/// **Never with a pen**, which draws its own dot: a crosshair and a dot would
+/// be two pointers. That is `Editor::pen_pointer` below, so the two are
+/// exclusive by construction and not by ordering — but this is called *before*
+/// [`pen_cursor`] anyway, because egui takes whichever cursor was asked for
+/// last and being second is what a safeguard would need to be.
+///
+/// It is a per-frame request like every other cursor in this interface, so
+/// nothing has to remember to put the arrow back: change tool, cross onto a
+/// panel, open a dialog, and it is gone on the next frame. See
+/// [`Editor::pen_dot`](crate::Editor::pen_dot) for why that shape was chosen
+/// over a latch.
+fn aiming_cursor(ui: &egui::Ui, ed: &Editor) {
+    if ed.ui.tool != Tool::Eyedropper || ed.pen_pointer {
+        return;
+    }
+    // The same two readings `pen_cursor` hands to `Editor::pen_dot`, and for
+    // the same reasons: over a panel or a modal the ordinary cursor is the
+    // right one, and asking for a shape while another application has the
+    // keyboard would set it across the whole desktop.
+    if editor::over_egui_area(ed, ui.ctx(), ed.cursor)
+        || !ui.ctx().input(|i| i.focused)
+        || !ed.pointer_over_canvas(ed.cursor)
+    {
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+}
+
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     ui.horizontal_centered(|ui| {
         let (mark, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
@@ -1693,6 +1740,18 @@ mod strip_budget {
     /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn` declines to
     /// sweep and says why.
     pub const FEATHER: f32 = 185.0;
+    /// The eyedropper's second sentence: what a drag off the window does, or
+    /// why it does nothing here. Both readings are within a few characters of
+    /// each other, so unlike the navigation pair one figure covers them.
+    ///
+    /// **Bisected against its own guard rather than estimated**, which is what
+    /// the estimate was worth: 305 came from `ZOOM`'s points-per-character and
+    /// `the_eyedroppers_hint_does_not_overrun_the_strip_it_is_drawn_on` fails
+    /// at it, by four points — which is exactly the margin a font metric moves
+    /// by. It also fails at 295 and passes at 320, so what the sentence
+    /// actually needs is somewhere in `(305, 320]` and the `ui::add_space(6.0)`
+    /// before the label is part of it.
+    pub const EYEDROPPER: f32 = 320.0;
     // Pan's and Zoom's second sentence are budgeted per tool, on
     // `navigate_hint`'s own third field, because the two lines are a third
     // apart in width and one figure for both drops Pan's while it still fits.
@@ -1731,15 +1790,17 @@ mod strip_budget {
 /// `neither_navigation_hint_overruns_the_strip_it_is_drawn_on`.
 ///
 /// **Exhaustive over [`Tool`] rather than a wildcard**, for the reason
-/// `panels::edit_icon` is exhaustive over `EditKind`: ten of the design's
+/// `panels::edit_icon` is exhaustive over `EditKind`: nine of the design's
 /// sixteen tools are not built, and the first navigation tool added would
-/// otherwise silently draw Pan's two sentences. The four that never reach this
+/// otherwise silently draw Pan's two sentences. The five that never reach this
 /// branch are named so that `Tool` growing is a compile error and not a wrong
 /// sentence — `options_strip` handles them above, and if one ever fell through
 /// to here saying nothing is better than saying something false.
 const fn navigate_hint(tool: Tool) -> (&'static str, &'static str, f32) {
     match tool {
-        Tool::Brush | Tool::Eraser | Tool::Select | Tool::Transform => ("", "", f32::INFINITY),
+        Tool::Brush | Tool::Eraser | Tool::Select | Tool::Transform | Tool::Eyedropper => {
+            ("", "", f32::INFINITY)
+        }
         Tool::Zoom => (
             "Drag right or up to zoom in, left or down to zoom out.",
             if cfg!(target_os = "macos") {
@@ -1867,6 +1928,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Tool::Eraser => (Icon::Eraser, "Eraser"),
             Tool::Select => (Icon::Select, "Select"),
             Tool::Transform => (Icon::Transform, "Transform"),
+            Tool::Eyedropper => (Icon::Eyedropper, "Eyedropper"),
             Tool::Pan => (Icon::Pan, "Pan"),
             Tool::Zoom => (Icon::Zoom, "Zoom"),
         };
@@ -1986,6 +2048,36 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 ) {
                     ed.deselect();
                 }
+            }
+        } else if ed.ui.tool == Tool::Eyedropper {
+            // Two sentences and no controls, in the Transform hint's register
+            // and for the same reason: there is nothing here to set, the whole
+            // gesture is the pointer's.
+            //
+            // The second one is the only place in the interface that says a
+            // colour can be taken from outside the window — and on a platform
+            // where it cannot, it is the only place that says so. The tool
+            // itself is *not* disabled there: picking inside the window works
+            // everywhere, so disabling it would take away the half that does
+            // work. `syspick::outside_line` is where the two readings
+            // live, so the strip cannot say one thing and the module do
+            // another.
+            ui.label(
+                egui::RichText::new("Press on the canvas to take the colour under the pointer.")
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+            // Read afresh rather than against the room measured earlier, for
+            // the reason the navigation and selection hints do: the sentence
+            // above is drawn unconditionally and is in no budget.
+            if ui.available_width() >= strip_budget::EYEDROPPER {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(syspick::outside_line())
+                        .size(text::SMALL)
+                        .color(p.text_dim),
+                )
+                .on_hover_text(syspick::outside_detail());
             }
         } else {
             // Pan and Zoom. Two sentences in the Transform hint's register
@@ -3991,6 +4083,76 @@ mod tests {
                 worst.unwrap().0
             );
         }
+    }
+
+    /// The eyedropper's second sentence does not run off the strip either.
+    ///
+    /// The same failure `neither_navigation_hint_overruns_the_strip_it_is_
+    /// drawn_on` guards and the same sweep, against [`strip_budget::EYEDROPPER`]
+    /// rather than a per-tool figure. A separate test because the sentence does
+    /// not come from `navigate_hint` — it comes from `syspick`, and *which* of
+    /// its two readings is drawn depends on the platform. Both are within a few
+    /// characters of each other, so one budget covers them; what this asserts
+    /// is that whichever one this build carries fits.
+    #[test]
+    fn the_eyedroppers_hint_does_not_overrun_the_strip_it_is_drawn_on() {
+        use crate::editor::Tool;
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+
+        let sentence = crate::syspick::outside_line();
+        let mut widest_overrun: Option<(f32, f32)> = None;
+        let mut ever_drew_it = false;
+        for step in 0..140 {
+            let width = 200.0 + step as f32 * 5.0;
+            let mut ed = Editor::default();
+            ed.ui.tool = Tool::Eyedropper;
+            // Two passes, for the reason the navigation sweep takes two: text
+            // measured against a half-built font atlas is not the width it
+            // settles at.
+            let mut drawn = Vec::new();
+            for _ in 0..2 {
+                drawn.clear();
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(width, metrics::OPTIONS_STRIP),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                        .show(ui, |ui| {
+                            ui.set_height(metrics::OPTIONS_STRIP);
+                            super::options_strip(ui, &palette, &mut ed);
+                        });
+                });
+                for clipped in &output.shapes {
+                    strings_in(&clipped.shape, &mut drawn);
+                }
+            }
+            if let Some(second) = drawn.iter().find(|d| d.text == sentence) {
+                ever_drew_it = true;
+                if second.rect.right() > width {
+                    widest_overrun = Some((width, second.rect.right()));
+                }
+            }
+        }
+        assert!(
+            ever_drew_it,
+            "the eyedropper's second sentence was never drawn at any width, so \
+             this test proved nothing"
+        );
+        assert!(
+            widest_overrun.is_none(),
+            "it runs to {:.0} points on a {:.0} point strip",
+            widest_overrun.unwrap().1,
+            widest_overrun.unwrap().0
+        );
     }
 
     /// Every category [`Action::category`] can answer with is either a menu

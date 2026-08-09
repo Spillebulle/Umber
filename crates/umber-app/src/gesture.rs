@@ -41,7 +41,7 @@ pub fn is_tap(distance: f32) -> bool {
 /// Everything the decision below is allowed to read.
 ///
 /// Deliberately a snapshot of observations rather than a borrow of the editor:
-/// it is what makes the whole matrix — six tools times two pointers times the
+/// it is what makes the whole matrix — every tool times two pointers times the
 /// modifiers — statable in a test.
 #[derive(Clone, Copy, Debug)]
 pub struct Pointer {
@@ -157,6 +157,11 @@ pub fn press(p: Pointer) -> Press {
         Tool::Brush | Tool::Eraser => Press::Paint,
         Tool::Select => Press::Select,
         Tool::Transform => Press::Transform,
+        // The same answer Alt gives above, deliberately — one gesture, reached
+        // two ways. A second `Press` variant for the tool would be a second
+        // thing `app.rs` had to route to `pick_colour`, which is exactly the
+        // duplicate path the composite pass's single reader exists to prevent.
+        Tool::Eyedropper => Press::Eyedropper,
         Tool::Pan => Press::Pan,
         Tool::Zoom => Press::Zoom,
     }
@@ -328,14 +333,116 @@ mod tests {
         }
     }
 
-    const TOOLS: [Tool; 6] = [
+    /// Every tool.
+    ///
+    /// Written out here rather than iterated off a list in `editor.rs`, and
+    /// therefore checked by `every_tool_is_in_this_modules_own_list` below —
+    /// which is the shape CLAUDE.md's rule for an `ALL` array prescribes: a
+    /// hand-written array is exactly the thing a new variant does not appear
+    /// in, so something has to fail the build when one is added. The arms
+    /// there index this array rather than returning a literal, which is the
+    /// half of the rule that makes a short array an out-of-bounds panic; the
+    /// first draft returned literals and could not have caught it.
+    const TOOLS: [Tool; 7] = [
         Tool::Brush,
         Tool::Eraser,
         Tool::Select,
         Tool::Transform,
+        Tool::Eyedropper,
         Tool::Pan,
         Tool::Zoom,
     ];
+
+    #[test]
+    fn every_tool_is_in_this_modules_own_list() {
+        // The exhaustive `match` is what the *compiler* catches: a tool added
+        // to the enum cannot get past this without an arm. The arm indexing
+        // `TOOLS` is what catches the array being left short, which the
+        // compiler cannot see — a fixed-size array of the right length
+        // compiles whatever is in it. Neither half covers the other, and the
+        // known hole is an arm that indexes somebody else's position; that is
+        // what the equality is for.
+        for (i, tool) in TOOLS.iter().enumerate() {
+            // Each arm *indexes* `TOOLS`, which is CLAUDE.md's rule and not a
+            // stylistic choice: with literal integers here — which is what the
+            // first draft wrote — adding `Tool::Fill => 7` and forgetting the
+            // array compiles and passes, and every sweep built on `TOOLS`
+            // quietly stops covering the new tool. Indexing makes that an
+            // out-of-bounds panic instead.
+            let expected = match tool {
+                Tool::Brush => TOOLS[0],
+                Tool::Eraser => TOOLS[1],
+                Tool::Select => TOOLS[2],
+                Tool::Transform => TOOLS[3],
+                Tool::Eyedropper => TOOLS[4],
+                Tool::Pan => TOOLS[5],
+                Tool::Zoom => TOOLS[6],
+            };
+            assert_eq!(*tool, expected, "{tool:?} is filed in the wrong place");
+            assert_eq!(TOOLS[i], *tool, "the sweep is walking its own array");
+        }
+    }
+
+    #[test]
+    fn the_eyedropper_tool_and_alt_are_one_gesture() {
+        // Two ways in, one answer — which is what keeps `pick_colour` the
+        // single route from a pixel to a colour. If these ever differ, `app.rs`
+        // has grown a second path and the canvas read and the desktop read can
+        // start disagreeing about what a pick is.
+        assert_eq!(press(mouse(Tool::Eyedropper)), Press::Eyedropper);
+        assert_eq!(press(pen(Tool::Eyedropper)), Press::Eyedropper);
+        assert_eq!(
+            press(Pointer {
+                alt: true,
+                ..mouse(Tool::Brush)
+            }),
+            press(mouse(Tool::Eyedropper)),
+        );
+    }
+
+    #[test]
+    fn the_eyedropper_tool_still_gives_way_to_the_pan_overrides_and_the_interface() {
+        // A tool that swallowed Space or a middle-drag would be the one place
+        // in the rail where navigation stopped working, and one that picked a
+        // colour out of a panel would be reading the theme's own ink.
+        assert_eq!(
+            press(Pointer {
+                space: true,
+                ..mouse(Tool::Eyedropper)
+            }),
+            Press::Pan
+        );
+        assert_eq!(
+            press(Pointer {
+                pan_button: true,
+                ..mouse(Tool::Eyedropper)
+            }),
+            Press::Pan
+        );
+        assert_eq!(
+            press(Pointer {
+                ui_owns: true,
+                ..mouse(Tool::Eyedropper)
+            }),
+            Press::Ignored
+        );
+    }
+
+    #[test]
+    fn the_eyedropper_tool_does_not_take_the_brush_resize_off_a_tablet() {
+        // Alt with the nib down and moving is the resize, whatever tool is in
+        // hand — which has to keep being true for this one, or a pen user who
+        // reached for the eyedropper would find Alt-drag had stopped resizing
+        // the brush there and only there.
+        assert_eq!(
+            press(Pointer {
+                alt: true,
+                resizing: true,
+                ..pen(Tool::Eyedropper)
+            }),
+            Press::ResizeBrush
+        );
+    }
 
     #[test]
     fn a_pen_press_resolves_to_what_a_mouse_press_would() {
