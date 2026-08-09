@@ -4365,4 +4365,114 @@ mod tests {
             }
         }
     }
+
+    /// Every colour one headless pass actually put down.
+    ///
+    /// Read off the **tessellated** vertices rather than the shapes, because a
+    /// shape is a dozen types with a stroke of three different shapes among
+    /// them, where a vertex is one field. A feathered edge contributes the same
+    /// colour at alpha zero, which is why only fully opaque vertices are kept:
+    /// what these tests ask is which ink a control *chose*, and a transparent
+    /// vertex is a rounded corner rather than a choice.
+    fn inks_drawn(ctx: &egui::Context, field: Vec2, add: impl FnMut(&mut Ui)) -> Vec<Color32> {
+        use egui::epaint::Primitive;
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), field)),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, add);
+        let mut seen = Vec::new();
+        for job in ctx.tessellate(output.shapes, output.pixels_per_point) {
+            if let Primitive::Mesh(mesh) = &job.primitive {
+                for vertex in &mesh.vertices {
+                    if vertex.color.a() == 255 && !seen.contains(&vertex.color) {
+                        seen.push(vertex.color);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    /// The selected tool is inked in [`Palette::active_ink`], in the theme
+    /// where that is the accent *and* in one where it is not.
+    ///
+    /// **A guard on the palette is not a guard on the control**, which is the
+    /// generalisable half of this. `theme`'s
+    /// `an_active_mark_reads_on_the_fill_it_is_drawn_on` measures `active_ink`
+    /// and cannot see whether anything calls it: revert this one line to
+    /// `p.accent` and every ratio it checks still passes, because the palette
+    /// did not move. So this measures the ink that reached the pass.
+    ///
+    /// Both themes, because a rule with two answers tested against one answer
+    /// is a rule nothing tests. Graphite must still draw the ochre — the fix
+    /// must not cost the design its selected tool — and MediaBog must not,
+    /// because the accent on its selection blue is 1.88:1.
+    #[test]
+    fn the_selected_tool_is_inked_in_what_reads_on_its_fill() {
+        use crate::theme::ThemeKind;
+
+        for kind in [ThemeKind::Graphite, ThemeKind::MediaBog] {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            // Twice: the first pass through a fresh context builds the font
+            // atlas, which is what the tooltip's galley wants.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen = inks_drawn(&ctx, vec2(200.0, 200.0), |ui| {
+                    tool_button(ui, &p, Icon::Brush, true, "Brush");
+                });
+            }
+            assert!(
+                seen.contains(&p.active_ink()),
+                "{kind:?}: the selected tool did not draw {:?}",
+                p.active_ink(),
+            );
+            if p.active_ink() != p.accent {
+                assert!(
+                    !seen.contains(&p.accent),
+                    "{kind:?}: the selected tool still draws the accent",
+                );
+            }
+        }
+    }
+
+    /// The canvas scrollbar's thumb reads against the pit it lies on, in every
+    /// theme — measured off the pass rather than off the palette.
+    ///
+    /// Same reason as the tool button above: `theme`'s
+    /// `a_mark_on_the_canvas_pit_reads_in_every_theme` measures
+    /// `contrast::ink_on` and would stay green with this widget reverted to
+    /// `text_dim`, which is the ink that reads 1.34:1 on Krita's pit. What it
+    /// asks is only that *some* opaque ink in the pass clears 3:1, so it is
+    /// indifferent to which rank the thumb is drawn at and to the thumb moving
+    /// — and it would still catch the revert, because `text_dim` is the only
+    /// thing this widget draws.
+    #[test]
+    fn the_scrollbar_thumb_reads_against_every_canvas_pit() {
+        use crate::theme::{ThemeKind, contrast};
+
+        for kind in ThemeKind::ALL {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            let span = ScrollSpan {
+                doc: 2048.0,
+                extent: 700.0,
+                centre: 700.0,
+            };
+            let seen = inks_drawn(&ctx, vec2(400.0, 400.0), |ui| {
+                let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(11.0, 300.0));
+                canvas_scrollbar(ui, &p, rect, span, true, true);
+            });
+            let best = seen
+                .iter()
+                .map(|ink| contrast::ratio(*ink, p.backdrop))
+                .fold(0.0f64, f64::max);
+            assert!(
+                best >= contrast::READABLE,
+                "{kind:?}: the thumb's best ink is {best:.2}:1 on the pit",
+            );
+        }
+    }
 }
