@@ -141,9 +141,15 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         // A folder holds no pixels and takes no slot, so there is nothing to
         // read out of the archive for one.
         if spec.folder {
-            let mut folder = ImportedLayer::folder(spec.name.clone(), spec.depth, spec.visible);
-            folder.locked = false;
-            layers.push(folder);
+            // Krita's `locked` attribute is not read for any layer, folder or
+            // otherwise, so nothing is set here — `ImportedLayer::folder`
+            // already leaves it unlocked and a line saying so would read as a
+            // lock deliberately dropped.
+            layers.push(ImportedLayer::folder(
+                spec.name.clone(),
+                spec.depth,
+                spec.visible,
+            ));
             continue;
         }
         match load_layer(&mut zip, &doc.name, spec, doc.size, &mut warnings) {
@@ -456,11 +462,13 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
                                         layer: layer.clone(),
                                         what,
                                     },
-                                    // Groups are flattened away here, so a
-                                    // transparency mask on one has nowhere to
-                                    // go and every layer inside it now covers
-                                    // more than it did — which is exactly what
-                                    // `MaskIgnored` says.
+                                    // A group arrives as a folder now, and a
+                                    // folder holds no slot, so it can hold no
+                                    // mask: every layer inside it still covers
+                                    // more than it did, which is exactly what
+                                    // `MaskIgnored` says. The grouping itself
+                                    // is no longer lost, which is why this is
+                                    // the only thing left to report here.
                                     None => ImportWarning::MaskIgnored {
                                         layer: layer.clone(),
                                     },

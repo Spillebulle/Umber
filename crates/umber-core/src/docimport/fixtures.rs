@@ -1053,6 +1053,15 @@ pub struct ClipLayer {
     /// What an absent *colour* block holds. `None` is what every raster layer
     /// in every real file states; a `Some` is the shape the reader refuses.
     pub pixel_fill: Option<u8>,
+    /// The bitmap's own size, `None` for the canvas's. Smaller is the case
+    /// every real sample happens not to have.
+    pub bitmap_size: Option<(u32, u32)>,
+    /// Where the bitmap's top-left corner sits on the canvas. Split across the
+    /// three column pairs a real file splits it across.
+    pub offset: (i64, i64),
+    /// Whether the mask's own eye is on — `LayerVisibility`'s second bit,
+    /// which a real file only sets on a layer that has a mask.
+    pub mask_visible: bool,
     pub children: Vec<ClipLayer>,
 }
 
@@ -1076,6 +1085,9 @@ impl ClipLayer {
             mask: None,
             mask_fill: Some(255),
             pixel_fill: None,
+            bitmap_size: None,
+            offset: (0, 0),
+            mask_visible: true,
             children: Vec::new(),
         }
     }
@@ -1094,6 +1106,9 @@ impl ClipLayer {
             mask: None,
             mask_fill: None,
             pixel_fill: None,
+            bitmap_size: None,
+            offset: (0, 0),
+            mask_visible: true,
             children,
         }
     }
@@ -1133,6 +1148,13 @@ impl ClipLayer {
         self
     }
 
+    /// A mask Clip Studio has switched off — its eye clear in
+    /// `LayerVisibility`, with the mask itself still in the file.
+    pub fn mask_hidden(mut self) -> Self {
+        self.mask_visible = false;
+        self
+    }
+
     pub fn mask_fill(mut self, fill: Option<u8>) -> Self {
         self.mask_fill = fill;
         self
@@ -1142,6 +1164,16 @@ impl ClipLayer {
     /// what a Clip Studio *fill* layer carries and what the reader refuses.
     pub fn pixel_fill(mut self, fill: u8) -> Self {
         self.pixel_fill = Some(fill);
+        self
+    }
+
+    /// A bitmap smaller than the canvas, placed at `offset`.
+    ///
+    /// `pixels` and `mask` are then that size rather than the canvas's, which
+    /// is what a Clip Studio layer drawn in one corner actually holds.
+    pub fn placed(mut self, size: (u32, u32), offset: (i64, i64)) -> Self {
+        self.bitmap_size = Some(size);
+        self.offset = offset;
         self
     }
 }
@@ -1180,42 +1212,65 @@ impl ClipBuild {
         format!("extrnlid{:032}", self.next_chunk).into_bytes()
     }
 
-    /// Cut a canvas-sized buffer into 256-square blocks and register the
+    /// Cut a `size`-sized buffer into 256-square blocks and register the
     /// `Offscreen` row, the mipmap chain and the external chunk for it.
+    ///
+    /// `size` is the **bitmap's** own size, which is the canvas's for an
+    /// ordinary layer and smaller for one drawn in a corner — the case that
+    /// decides whether the reader clips its blits against the bitmap or only
+    /// against the canvas, and the case every real sample happens not to have.
     ///
     /// A block every byte of which equals `fill` is **not stored**, which is
     /// what a real writer does and what makes the `InitColor` path reachable.
-    fn bitmap(&mut self, source: &[u8], packing: Packing, fill: Option<u8>) -> i64 {
-        let columns = (self.width as usize).div_ceil(256);
-        let rows = (self.height as usize).div_ceil(256);
+    /// The padding outside the bitmap in a partly used block is deliberately
+    /// *not* the fill: a real writer leaves whatever was there, and a reader
+    /// that trusts it writes rubbish over the canvas.
+    fn bitmap(
+        &mut self,
+        source: &[u8],
+        size: (u32, u32),
+        packing: Packing,
+        fill: Option<u8>,
+    ) -> i64 {
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let columns = width.div_ceil(256);
+        let rows = height.div_ceil(256);
         let mut blocks: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns * rows);
         for row in 0..rows {
             for column in 0..columns {
-                let mut block = vec![0u8; packing.block_len()];
+                // `PADDING` rather than zero, so a reader that copies a block's
+                // out-of-bitmap corner onto the canvas is caught rather than
+                // flattered.
+                const PADDING: u8 = 0x5a;
+                let mut block = vec![PADDING; packing.block_len()];
                 let mut painted = false;
                 for y in 0..256 {
                     for x in 0..256 {
                         let (sx, sy) = (column * 256 + x, row * 256 + y);
-                        if sx >= self.width as usize || sy >= self.height as usize {
+                        if sx >= width || sy >= height {
                             continue;
                         }
                         painted = true;
                         let i = y * 256 + x;
                         if packing.second == 0 {
-                            block[i] = source[sy * self.width as usize + sx];
+                            block[i] = source[sy * width + sx];
                         } else {
                             // Straight RGBA in, `[alpha plane][BGRX]` out.
-                            let px = (sy * self.width as usize + sx) * 4;
+                            let px = (sy * width + sx) * 4;
                             block[i] = source[px + 3];
                             let at = 256 * 256 + i * packing.second;
                             block[at] = source[px + 2];
                             block[at + 1] = source[px + 1];
                             block[at + 2] = source[px];
+                            block[at + 3] = 0;
                         }
                     }
                 }
-                let absent = fill.is_some_and(|f| block.iter().all(|b| *b == f))
-                    || (fill.is_none() && block.iter().all(|b| *b == 0));
+                // Only a block that lies wholly inside the bitmap can be left
+                // out, because only then is every byte of it the artist's.
+                let whole = (column + 1) * 256 <= width && (row + 1) * 256 <= height;
+                let uniform = |v: u8| block.iter().all(|b| *b == v);
+                let absent = whole && (fill.is_some_and(uniform) || (fill.is_none() && uniform(0)));
                 blocks.push((!absent && painted).then_some(block));
             }
         }
@@ -1229,12 +1284,7 @@ impl ClipBuild {
         let offscreen = self.id();
         self.offscreens.push(vec![
             Value::Integer(offscreen),
-            Value::Blob(csblocks::fixture::attribute(
-                self.width,
-                self.height,
-                packing,
-                fill,
-            )),
+            Value::Blob(csblocks::fixture::attribute(size.0, size.1, packing, fill)),
             Value::Blob(name),
         ]);
         let info = self.id();
@@ -1255,12 +1305,13 @@ impl ClipBuild {
             } else {
                 self.chain(&layer.children)
             };
+            let size = layer.bitmap_size.unwrap_or((self.width, self.height));
             let render = match &layer.pixels {
-                Some(pixels) => self.bitmap(pixels, CLIP_COLOUR, layer.pixel_fill),
+                Some(pixels) => self.bitmap(pixels, size, CLIP_COLOUR, layer.pixel_fill),
                 None => 0,
             };
             let mask = match &layer.mask {
-                Some(coverage) => self.bitmap(coverage, CLIP_MASK, layer.mask_fill),
+                Some(coverage) => self.bitmap(coverage, size, CLIP_MASK, layer.mask_fill),
                 None => 0,
             };
             self.layers.push(vec![
@@ -1268,7 +1319,12 @@ impl ClipBuild {
                 Value::Text(layer.name.to_string()),
                 Value::Integer(layer.kind),
                 Value::Integer(i64::from(layer.folder)),
-                Value::Integer(i64::from(layer.visible)),
+                // `LayerVisibility`: bit 0 the layer's eye, bit 1 its mask's.
+                // A real file only sets the second on a layer that has one.
+                Value::Integer(
+                    i64::from(layer.visible)
+                        | (i64::from(layer.mask.is_some() && layer.mask_visible) * 2),
+                ),
                 Value::Integer(i64::from(layer.locked)),
                 Value::Integer(i64::from(layer.clipped)),
                 Value::Integer(layer.opacity),
@@ -1277,12 +1333,16 @@ impl ClipBuild {
                 Value::Integer(first_child),
                 Value::Integer(render),
                 Value::Integer(mask),
-                Value::Integer(0),
-                Value::Integer(0),
-                Value::Integer(0),
-                Value::Integer(0),
-                Value::Integer(0),
-                Value::Integer(0),
+                // The six offsets. A real file splits a placement between
+                // `LayerOffset*` and the two `Offscr*` pairs, and the reader
+                // sums them, so the fixture puts half in each — a reader that
+                // read only one of them would land at half the offset.
+                Value::Integer(layer.offset.0 - layer.offset.0 / 2),
+                Value::Integer(layer.offset.1 - layer.offset.1 / 2),
+                Value::Integer(layer.offset.0 / 2),
+                Value::Integer(layer.offset.1 / 2),
+                Value::Integer(layer.offset.0 / 2),
+                Value::Integer(layer.offset.1 / 2),
                 Value::Integer(0),
                 Value::Integer(0),
             ]);

@@ -191,6 +191,14 @@ pub(crate) fn parse_attribute(attribute: &[u8], max_side: u32) -> Option<Bitmap>
 
     // `Parameter`'s remaining sixteen integers describe the pixel packing. The
     // first is the channel order, then the two halves and their sum.
+    //
+    // **Three numbers that disagree make the packing absent, not the bitmap
+    // unreadable**, and the difference belongs to the *other* caller.
+    // `csmaterial` never read these words at all — it takes its channel count
+    // off each block's own declared size — so refusing here would silently
+    // tighten a brush importer over a field it does not use, on real material
+    // files nothing in this repository can test against. The document reader
+    // refuses the absent packing itself, one line from where it would have.
     let packing = match (
         be32(parameter, 20),
         be32(parameter, 24),
@@ -198,12 +206,8 @@ pub(crate) fn parse_attribute(attribute: &[u8], max_side: u32) -> Option<Bitmap>
     ) {
         (Some(first), Some(second), Some(total)) => {
             let (first, second) = (first as usize, second as usize);
-            // Refused rather than repaired: a file whose own three numbers
-            // disagree is not one to guess the layout of.
-            if first + second != total as usize || first + second > MAX_CHANNELS || first == 0 {
-                return None;
-            }
-            Some(Packing { first, second })
+            (first + second == total as usize && first + second <= MAX_CHANNELS && first != 0)
+                .then_some(Packing { first, second })
         }
         _ => None,
     };
@@ -547,12 +551,20 @@ mod tests {
         assert_eq!(ok.packing, Some(COLOUR));
         assert_eq!(COLOUR.block_len(), 5 * PLANE);
 
-        // The sum is what every slice downstream is taken against.
-        assert!(parse_attribute(&build(1, 4, 6), 16384).is_none());
-        // Wider than anything Clip Studio writes.
-        assert!(parse_attribute(&build(2, 4, 6), 16384).is_none());
-        // No first plane at all is not a shape this reader knows.
-        assert!(parse_attribute(&build(0, 4, 4), 16384).is_none());
+        // A packing that does not add up is **no packing**, and deliberately
+        // not a refused bitmap: `csmaterial` reads the same blob without
+        // reading these words, so a refusal here would tighten a brush
+        // importer over a field it ignores. The three shapes are a sum that
+        // disagrees with its parts, more channels than Clip Studio writes, and
+        // no first plane at all.
+        for bad in [build(1, 4, 6), build(2, 4, 6), build(0, 4, 4)] {
+            assert_eq!(
+                parse_attribute(&bad, 16384)
+                    .expect("the bitmap still reads")
+                    .packing,
+                None
+            );
+        }
     }
 
     /// **An absent block is not always empty**, and the file says which.

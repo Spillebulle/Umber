@@ -54,6 +54,13 @@
 //!   3D object — arrives as the pixels Clip Studio rendered for it and is named
 //!   as rasterised, because it cannot be edited as what it was any more. That
 //!   is what Clip Studio's own PSD export does with them.
+//! - **A folder's opacity, blend mode and mask.** Umber's folders are
+//!   pass-through and carry none of the three, and unlike ORA and Krita there
+//!   is nothing to fold an opacity into: the contents are already built by the
+//!   time the folder is reached. All three are reported.
+//! - **A mask Clip Studio has switched off** is not applied — it bounds nothing
+//!   there either — and is named, as `MaskUnsupported` rather than
+//!   `MaskIgnored`, because the picture is right without it.
 //! - **A layer whose bitmap is filled rather than empty** is refused. The
 //!   `InitColor` section states what an absent block holds and a mask's is
 //!   readable — one channel, and `255` is the "reveal everything" a mask starts
@@ -82,7 +89,11 @@
 //! *materials*, where the five-channel shape it refuses is exactly this one, and
 //! `clip_to_psd`, whose output people use. **The placement of a bitmap smaller
 //! than the canvas is the one thing here taken on somebody else's word alone**
-//! and is where to look first if an imported layer lands in the wrong place.
+//! — which three columns are summed, and in what order — and is where to look
+//! first if an imported layer lands in the wrong place. The *arithmetic* around
+//! that placement is exercised: a bitmap smaller than the canvas, at an offset
+//! split across all three column pairs, with its block padding kept off the
+//! picture.
 
 use std::collections::HashMap;
 
@@ -116,8 +127,10 @@ const FOLDER: i64 = 1;
 const LAYER_IS_PIXEL: i64 = 1;
 const LAYER_IS_CORRECTION: i64 = 4096;
 
-/// `LayerVisibility`'s bit 0. The others are the mask's own eye and the ruler's.
+/// `LayerVisibility`'s bit 0 is the layer's own eye and bit 1 is its **mask's**.
+/// Bit 2 is the ruler's, which Umber has nothing to do with.
 const VISIBLE: i64 = 1;
+const MASK_VISIBLE: i64 = 2;
 
 /// `LayerLock`'s bit 0 — the whole layer. Bit 4 is the alpha lock, which is a
 /// painting aid rather than a property of the picture; see the module docs.
@@ -308,6 +321,9 @@ struct LayerRow {
     kind: i64,
     folder: i64,
     visible: bool,
+    /// Whether the layer's mask is switched on. A mask that is off bounds
+    /// nothing in Clip Studio either.
+    mask_visible: bool,
     locked: bool,
     clipped: bool,
     opacity: f32,
@@ -362,6 +378,7 @@ impl Tables {
                     kind: int("LayerType"),
                     folder: int("LayerFolder"),
                     visible: int("LayerVisibility") & VISIBLE != 0,
+                    mask_visible: int("LayerVisibility") & MASK_VISIBLE != 0,
                     locked: int("LayerLock") & LOCK_ALL != 0,
                     clipped: int("LayerClip") != 0,
                     opacity: (int("LayerOpacity") as f32 / OPACITY_FULL).clamp(0.0, 1.0),
@@ -452,7 +469,11 @@ impl Tables {
                 // Nested deeper than Umber can hold. The depth is capped, which
                 // merges this folder into the one outside it; said out loud,
                 // because the grouping is the only thing a folder *is*.
-                if depth > LayerStack::MAX_DEPTH as usize {
+                // `>=`, not `>`: a folder *at* the cap has its children capped
+                // to the same depth, so they stop being its contents and the
+                // grouping is gone. `openraster` and `krita` have the same
+                // comparison and the same off-by-one.
+                if depth >= LayerStack::MAX_DEPTH as usize {
                     warnings.push(ImportWarning::GroupFlattened {
                         group: row.name.clone(),
                     });
@@ -569,8 +590,44 @@ fn build(
 ) -> Option<ImportedLayer> {
     let name = clean_name(&row.name, node.folder);
     if node.folder {
+        // **A folder carries less than a layer does, and each thing it drops is
+        // named.** Umber's folders are pass-through and hold no opacity and no
+        // blend mode of their own, so a Clip Studio folder at half opacity or
+        // set to Multiply cannot arrive as it was — and unlike ORA and Krita
+        // there is nothing to fold it into, because the contents were built
+        // before this entry and a fold would have to reach back through the
+        // whole subtree. So it is reported rather than applied, which is the
+        // honest half of what those two readers do.
+        if row.opacity < 1.0 {
+            warnings.push(ImportWarning::GroupOpacityFolded {
+                group: name.clone(),
+            });
+        }
+        // **A folder's mode is lost whether or not Umber has it**, which is not
+        // the test a layer's takes. Every Umber folder is pass-through, so a
+        // Clip Studio folder set to Multiply loses the Multiply even though a
+        // *layer* set to Multiply keeps it — asking `blend::nearest` here would
+        // report the modes Umber lacks and stay silent about the four it has.
+        // Composite 0 and 30 are the two that arrive intact: Clip Studio's
+        // "Through" is pass-through, and Normal over an ordinary group is the
+        // same picture.
+        if !matches!(row.composite, 0 | 30) {
+            warnings.push(ImportWarning::BlendDropped {
+                layer: name.clone(),
+                source: composite_name(row.composite).to_string(),
+            });
+        }
+        // A folder holds no slot, so it can hold no mask either, and every
+        // layer inside it now covers more than it did — which is exactly what
+        // `MaskIgnored` says. Krita's reader says the same about the same case.
+        if row.mask_mipmap != 0 {
+            warnings.push(ImportWarning::MaskIgnored {
+                layer: name.clone(),
+            });
+        }
         let mut folder = ImportedLayer::folder(name, node.depth, row.visible);
         folder.locked = row.locked;
+        folder.clipped = row.clipped;
         return Some(folder);
     }
 
@@ -616,10 +673,15 @@ fn build(
     // Not made of pixels in the file, and made of pixels here. Clip Studio's
     // own PSD export does the same; what is lost is that it can no longer be
     // edited as text, as a curve or as a tone.
+    // Named in words rather than by `LayerType`'s bits. The number is out of a
+    // private schema and there is nothing a painter can do with it; what they
+    // can act on is that the thing they typed is now paint, so they can go back
+    // and export it separately. Which *kind* it was cannot be told apart
+    // reliably here, so the sentence does not pretend to.
     if row.kind & LAYER_IS_PIXEL == 0 {
         warnings.push(ImportWarning::LayerRasterised {
             layer: name.clone(),
-            what: format!("a Clip Studio layer of type {}", row.kind),
+            what: "a text, vector or similar layer that Clip Studio draws for you".to_string(),
         });
     }
 
@@ -645,7 +707,21 @@ fn build(
     layer.clipped = row.clipped;
     layer.depth = node.depth;
 
-    if row.mask_mipmap != 0 {
+    // **A mask Clip Studio has switched off bounds nothing there either**, so
+    // applying it would hide pixels the artist can see. The eye is
+    // `LayerVisibility`'s second bit, beside the layer's own; `LayerMasking`'s
+    // first bit says the same thing and is deliberately not also required,
+    // because two readings that have to agree is one more way to drop a mask
+    // that was live. It is `MaskUnsupported` rather than `MaskIgnored` for the
+    // reason Krita's disabled mask is: the picture is right without it and only
+    // the mask itself is lost, where `MaskIgnored` would claim the layer covers
+    // more than it did.
+    if row.mask_mipmap != 0 && !row.mask_visible {
+        warnings.push(ImportWarning::MaskUnsupported {
+            layer: name,
+            what: "a layer mask that was switched off".to_string(),
+        });
+    } else if row.mask_mipmap != 0 {
         match tables.offscreen(row.mask_mipmap) {
             Some((attribute, chunk)) => match coverage(
                 attribute,
@@ -691,8 +767,24 @@ fn read_bitmap<'a>(
     attribute: &[u8],
     chunk: &[u8],
     container: &'a Container<'a>,
+    canvas: UVec2,
 ) -> Result<(Bitmap, Packing, &'a [u8]), String> {
-    let bitmap = csblocks::parse_attribute(attribute, ImportedDocument::MAX_DIMENSION)
+    // **Bounded by the canvas rather than by `MAX_DIMENSION`.** A layer may
+    // legitimately hang off the page, so the bound has slack; what it must not
+    // be is the global ceiling, because nothing else ties a bitmap to the
+    // document it is in. A 1×1 canvas with sixty-four layers passes
+    // `check_bounds` at 256 bytes, and each of those layers could still declare
+    // 16384² — a 64×64 grid, 4096 blocks, 1.3 GB of inflate each, every byte of
+    // it thrown away by the blit. Worse, nothing stops all of them naming the
+    // *same* external chunk, so one small blob would be inflated a hundred and
+    // twenty-eight times.
+    let bound = canvas
+        .x
+        .max(canvas.y)
+        .saturating_mul(2)
+        .max(BLOCK as u32 * 2)
+        .min(ImportedDocument::MAX_DIMENSION);
+    let bitmap = csblocks::parse_attribute(attribute, bound)
         .ok_or_else(|| "Umber could not read the shape of its bitmap".to_string())?;
     let packing = bitmap
         .packing
@@ -714,7 +806,7 @@ fn colour(
     origin: (i64, i64),
     canvas: UVec2,
 ) -> Result<Vec<u8>, String> {
-    let (bitmap, packing, data) = read_bitmap(attribute, chunk, container)?;
+    let (bitmap, packing, data) = read_bitmap(attribute, chunk, container, canvas)?;
     if packing.first != 1 || !matches!(packing.second, 1 | 4) {
         return Err(format!(
             "its pixels are packed {} and {} channels at a time, which Umber cannot read",
@@ -746,11 +838,11 @@ fn colour(
         bitmap.columns * bitmap.rows,
         |index, block| {
             let (column, row) = (index % bitmap.columns, index / bitmap.columns);
-            for y in 0..BLOCK {
+            for y in 0..within(row, bitmap.height) {
                 let Some(dst_y) = canvas_at(origin.1, row, y, canvas.y) else {
                     continue;
                 };
-                for x in 0..BLOCK {
+                for x in 0..within(column, bitmap.width) {
                     let Some(dst_x) = canvas_at(origin.0, column, x, canvas.x) else {
                         continue;
                     };
@@ -787,7 +879,7 @@ fn coverage(
     origin: (i64, i64),
     canvas: UVec2,
 ) -> Result<Vec<u8>, String> {
-    let (bitmap, packing, data) = read_bitmap(attribute, chunk, container)?;
+    let (bitmap, packing, data) = read_bitmap(attribute, chunk, container, canvas)?;
     if packing.first != 1 || packing.second != 0 {
         return Err("its mask is not a single channel".to_string());
     }
@@ -809,11 +901,11 @@ fn coverage(
         bitmap.columns * bitmap.rows,
         |index, block| {
             let (column, row) = (index % bitmap.columns, index / bitmap.columns);
-            for y in 0..BLOCK {
+            for y in 0..within(row, bitmap.height) {
                 let Some(dst_y) = canvas_at(origin.1, row, y, canvas.y) else {
                     continue;
                 };
-                for x in 0..BLOCK {
+                for x in 0..within(column, bitmap.width) {
                     let Some(dst_x) = canvas_at(origin.0, column, x, canvas.x) else {
                         continue;
                     };
@@ -824,6 +916,18 @@ fn coverage(
     )
     .ok_or_else(|| "its mask could not be read".to_string())?;
     Ok(out)
+}
+
+/// How much of one block's row or column is inside the **bitmap**.
+///
+/// A bitmap is padded out to whole blocks, so the last column and the last row
+/// hold texels that are not the artist's — and a reader that clipped only
+/// against the *canvas* would copy that padding over the picture wherever the
+/// bitmap is smaller than the canvas. On a mask that is the difference between
+/// the `InitColor` fill the file states and whatever Clip Studio left in the
+/// corner of the block.
+fn within(block: usize, extent: u32) -> usize {
+    (extent as usize).saturating_sub(block * BLOCK).min(BLOCK)
 }
 
 /// Where one texel of one block lands on the canvas, or `None` for one that
@@ -953,8 +1057,13 @@ mod tests {
     ///
     /// The canvas is deliberately not a multiple of 256, so the block grid has
     /// a partial column and a partial row — the case an off-by-one in the blit
-    /// survives. A colour is chosen whose three channels differ, because
-    /// `[alpha][B G R X]` and `[alpha][R G B X]` cannot be told apart by grey.
+    /// survives, and what this actually pins.
+    ///
+    /// It does **not** pin the channel order, and the colour's three differing
+    /// channels buy nothing: the fixture writes `B G R` because the reader
+    /// reads `B G R`, so a file that were really `R G B` would pass this
+    /// identically. Nothing in this repository can settle that; the module docs
+    /// say where the reading came from instead.
     #[test]
     fn a_layers_pixels_arrive_in_the_right_channels_and_the_right_places() {
         let (w, h) = (300u32, 260u32);
@@ -1079,12 +1188,20 @@ mod tests {
     /// absent block for zero would blank the layer everywhere nobody painted.
     /// The same mask is built twice, once against each fill, and the corner
     /// nobody touched has to follow the file.
+    ///
+    /// **The canvas is a whole number of blocks, and that is the point of the
+    /// test rather than tidiness.** At 300 square every block but the first
+    /// overhangs the canvas, so the fixture cannot leave any of them out and
+    /// the sampled corner comes from a *stored* block whatever the fill says —
+    /// which is how the first draft of this test passed under a reader that
+    /// ignored `InitColor` entirely. At 512 the three other blocks are wholly
+    /// inside, uniform, and therefore genuinely absent.
     #[test]
     fn what_an_unstored_mask_block_holds_follows_the_file() {
-        let (w, h) = (300u32, 300u32);
+        let (w, h) = (512u32, 512u32);
         let corner = |fill: u8| {
-            // Everything the stated fill, except one patch — so every block but
-            // the first is omitted by the fixture and has to be filled in.
+            // Everything the stated fill, except a patch confined to the first
+            // block — so the other three are omitted and have to be filled in.
             let mut coverage = vec![fill; (w * h) as usize];
             for y in 0..100usize {
                 for x in 0..100usize {
@@ -1100,11 +1217,121 @@ mod tests {
             );
             let doc = read(&bytes).expect("a document");
             let mask = doc.layers[0].mask.clone().expect("a mask");
-            mask[(290 * w as usize + 290) * 4]
+            mask[(400 * w as usize + 400) * 4]
         };
 
         assert_eq!(corner(255), 255, "an unstored block of a revealing mask");
         assert_eq!(corner(0), 0, "an unstored block of a hiding mask");
+    }
+
+    /// **A bitmap smaller than the canvas lands where the file puts it, and
+    /// nothing outside it reaches the canvas.**
+    ///
+    /// Two rules and each was a defect. The placement is the sum of three
+    /// column pairs — `LayerOffset*`, `LayerRenderOffscrOffset*` and, for a
+    /// mask, `LayerMaskOffset*` — which no test reached at all while every
+    /// fixture bitmap was canvas-sized at the origin; the fixture splits the
+    /// offset across them so a reader that read one pair would land at half of
+    /// it. And a bitmap is padded out to whole blocks, so the last block's
+    /// corner is not the artist's: clipping only against the canvas copies that
+    /// padding over the picture, which on a mask is a band of rubbish where the
+    /// file states a fill.
+    #[test]
+    fn a_bitmap_smaller_than_the_canvas_lands_where_the_file_puts_it() {
+        let (w, h) = (512u32, 512u32);
+        // A 300-square bitmap at (100, 60): two blocks across, so its right and
+        // bottom edges fall inside a block and the padding is live.
+        let (bw, bh) = (300u32, 300u32);
+        let (ox, oy) = (100i64, 60i64);
+        let bytes = fixtures::clip(
+            w,
+            h,
+            &[ClipLayer::flat("Ink", bw, bh, [10, 120, 240, 255])
+                .placed((bw, bh), (ox, oy))
+                .mask(vec![200u8; (bw * bh) as usize])],
+        );
+        let doc = read(&bytes).expect("a document");
+        let layer = &doc.layers[0];
+        let mask = layer.mask.as_ref().expect("a mask");
+        let at = |x: usize, y: usize| {
+            let i = (y * w as usize + x) * 4;
+            (&layer.pixels[i..i + 4], mask[i])
+        };
+
+        // Inside the placed rectangle.
+        assert_eq!(at(100, 60).0, [10, 120, 240, 255], "its top-left corner");
+        assert_eq!(at(399, 359).0, [10, 120, 240, 255], "its bottom-right");
+        // One pixel outside it on each side: the layer is transparent and the
+        // mask holds the stated fill, never the block's padding.
+        assert_eq!(at(99, 60).0, [0, 0, 0, 0], "left of the bitmap");
+        assert_eq!(at(100, 59).0, [0, 0, 0, 0], "above the bitmap");
+        assert_eq!(at(400, 359).0, [0, 0, 0, 0], "right of the bitmap");
+        assert_eq!(at(399, 360).0, [0, 0, 0, 0], "below the bitmap");
+        assert_eq!(at(400, 359).1, 255, "the mask's fill, not the padding");
+        assert_eq!(at(399, 360).1, 255, "the mask's fill, not the padding");
+    }
+
+    /// A mask Clip Studio has switched off bounds nothing there either, so
+    /// applying it would hide pixels the artist can see. The mask is still in
+    /// the file, so this is a loss and is named — as `MaskUnsupported` rather
+    /// than `MaskIgnored`, because the picture is right without it.
+    #[test]
+    fn a_mask_that_is_switched_off_is_not_applied_and_is_named() {
+        let (w, h) = (300u32, 300u32);
+        let bytes = fixtures::clip(
+            w,
+            h,
+            &[ClipLayer::flat("Ink", w, h, [0, 0, 0, 255])
+                .mask(vec![0u8; (w * h) as usize])
+                .mask_hidden()],
+        );
+        let doc = read(&bytes).expect("a document");
+        assert!(
+            doc.layers[0].mask.is_none(),
+            "a mask that hides everything must not be applied when it is off"
+        );
+        assert!(
+            matches!(
+                doc.warnings.as_slice(),
+                [ImportWarning::MaskUnsupported { layer, .. }] if layer == "Ink"
+            ),
+            "{:?}",
+            doc.warnings
+        );
+    }
+
+    /// **A folder carries less than a layer does, and every difference is
+    /// named.** Umber's folders are pass-through: no opacity, no blend mode,
+    /// no mask. A Clip Studio folder has all three, and a half-opaque folder
+    /// arriving at full opacity with nothing said is the silent kind of wrong.
+    #[test]
+    fn a_folders_opacity_blend_and_mask_are_reported_rather_than_dropped() {
+        let mut folder = ClipLayer::folder(
+            "Ink",
+            vec![ClipLayer::flat("Line", 300, 300, [1, 2, 3, 255])],
+        );
+        folder.opacity = 128;
+        folder.composite = 2;
+        folder.mask = Some(vec![255u8; 300 * 300]);
+        let bytes = fixtures::clip(300, 300, &[folder]);
+
+        let doc = read(&bytes).expect("a document");
+        assert_eq!(doc.layers.len(), 2);
+        assert!(doc.layers[1].folder);
+        for wanted in [
+            ImportWarning::GroupOpacityFolded {
+                group: "Ink".into(),
+            },
+            ImportWarning::BlendDropped {
+                layer: "Ink".into(),
+                source: "multiply".into(),
+            },
+            ImportWarning::MaskIgnored {
+                layer: "Ink".into(),
+            },
+        ] {
+            assert!(doc.warnings.contains(&wanted), "{:?}", doc.warnings);
+        }
     }
 
     /// A correction layer is an operation on what is below it, not a picture.
@@ -1197,6 +1424,7 @@ mod tests {
                 kind: 1,
                 folder: i64::from(folder),
                 visible: true,
+                mask_visible: true,
                 locked: false,
                 clipped: false,
                 opacity: 1.0,
@@ -1358,6 +1586,7 @@ mod tests {
             kind: 1,
             folder: 0,
             visible: true,
+            mask_visible: true,
             locked: false,
             clipped: false,
             opacity: 1.0,
