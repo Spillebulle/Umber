@@ -46,6 +46,26 @@ pub(crate) struct PanelEvents {
     close: bool,
 }
 
+/// Where a header's two halves landed this frame: the title's own text, and the
+/// strip of controls right-aligned beside it.
+///
+/// **Nothing in the application reads this.** The title is laid out against
+/// whatever room the controls left, so an overlap is impossible by construction
+/// — and "impossible by construction" is exactly the claim this codebase has
+/// been caught making before. `palettelib::drop_ring_rect` records the lesson: a
+/// guard that recomputes the expression is checking its own arithmetic, so
+/// widening the real mark to swallow its neighbour left every assertion passing.
+/// So the *drawn* rectangles are parked here for
+/// `a_module_header_never_draws_its_title_under_its_controls` to read, which is
+/// the only reading worth taking about a layout that has already been drawn over
+/// itself once at [`metrics::PANEL`]'s real width.
+///
+/// In egui's temporary store rather than on [`PanelEvents`] for the plain reason
+/// that a field no caller reads is a warning, and `-D warnings` is what CI runs.
+fn header_geometry_id(kind: PanelKind) -> Id {
+    Id::new(("panel-header-geometry", kind))
+}
+
 /// Draw every docked column, its panels and its splitters.
 ///
 /// One `egui::Panel` per column, claimed in the model's own order — outermost
@@ -437,20 +457,22 @@ pub(crate) fn panel(
             p.text_dim.gamma_multiply(0.5)
         },
     );
-    painter.text(
-        pos2(dots.right() + 6.0, header.center().y),
-        Align2::LEFT_CENTER,
-        kind.title(),
-        FontId::proportional(text::SMALL),
-        p.text_strong,
-    );
-
     // Header controls, right-aligned. Added after the drag handle, so they win.
+    //
+    // **Drawn before the title, though they sit to the right of it.** A header
+    // holding four marks and a close mark wants 122 points and this rect is 120
+    // at [`metrics::PANEL`] and 83 at `limits::SIDEBAR_MIN_WIDTH`, so the strip
+    // overruns leftwards — which is fine, there is nothing there — right up
+    // until it reaches the title, and then it is the "3 ticked" label and the
+    // six bulk buttons drawn over each other again, one storey up. So the
+    // controls claim their room first and the title takes what is left, which is
+    // the arrangement the Layers body's own heading row already had to make for
+    // the same reason.
     let controls = Rect::from_min_max(
         pos2(rect.center().x, header.top()),
         pos2(rect.right() - pad, header.bottom()),
     );
-    ui.scope_builder(
+    let placed = ui.scope_builder(
         UiBuilder::new()
             .id_salt(("panel-controls", kind))
             .max_rect(controls)
@@ -470,8 +492,37 @@ pub(crate) fn panel(
             if kind == PanelKind::Palette {
                 palettelib::header_controls(ui, p, ed);
             }
+            // The four marks that used to head the panel *body* — group, up,
+            // down, delete. See `layers_header_controls` for why they moved.
+            if kind == PanelKind::Layers {
+                layers_header_controls(ui, p, ed, actions);
+            }
         },
     );
+    let controls_at = placed.response.rect;
+
+    let title_at = pos2(dots.right() + 6.0, header.center().y);
+    // What the controls left, less the gap two controls sit apart by. Zero or
+    // less means there is no room for a title at all, and the galley comes back
+    // empty rather than the first letter being drawn under a button.
+    let room = (controls_at.left() - metrics::BUTTON_GAP - title_at.x).max(0.0);
+    // One row, clipped rather than elided: egui's overflow character is `…`,
+    // and Archivo carries no such glyph — a title too long for its header would
+    // end in the blank box the "never put a Unicode symbol in the UI" rule
+    // exists to prevent.
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        kind.title().to_owned(),
+        FontId::proportional(text::SMALL),
+        p.text_strong,
+    );
+    job.wrap.max_width = room;
+    job.wrap.max_rows = 1;
+    job.wrap.overflow_character = None;
+    let galley = ui.painter().layout_job(job);
+    let title = Align2::LEFT_CENTER.anchor_size(title_at, galley.size());
+    ui.painter().galley(title.min, galley, p.text_strong);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(header_geometry_id(kind), (title, controls_at)));
 
     // Body. Clipped and scrollable, because a panel dragged down to its minimum
     // height still has to show something rather than spilling over its
@@ -1192,157 +1243,168 @@ enum Bulk {
     Delete,
 }
 
-fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
+/// The four marks in the Layers panel's header: group, move up, move down and
+/// delete.
+///
+/// **They used to head the panel body, and that is the wrong place for the same
+/// reason the brush editor's link was.** A panel body is a scroll area, so a
+/// column dragged short scrolls its first line out of sight — and with a stack
+/// of any size the list fills the body immediately, so the four commands that
+/// act on a layer were exactly the thing that went first. The Brushes module
+/// moved its Edit mark into its header on that argument and this is the same
+/// one; `brushlib::panel`'s own doc comment states it.
+///
+/// **Which of them is a bulk control and which means "this layer" is the
+/// substantive question here, and it is not changed by the move.** Group
+/// reaches [`LayerStack::targets`] — every ticked layer, or the selected one
+/// alone — because gathering entries into a folder is a statement about several
+/// of them and always was. The other three mean *this layer*, and each for its
+/// own reason:
+///
+/// - The chevrons, because `LayerStack::reorder` moves one entry. A bulk
+///   chevron could only be a loop of single reorders, which is precisely the
+///   shape `remove_many` exists to refuse — every step shifts the indices the
+///   later ones were resolved against.
+/// - Delete, because the *bulk* delete already exists and is in the ticked
+///   strip beside the other five bulk marks, where it says what it reaches by
+///   only being drawn once something is ticked. Two trash marks with two
+///   meanings is what this panel already had; moving the single-layer one into
+///   the header puts a step between them rather than beside them.
+///
+/// Every one of the four keeps the `can_` it drew itself from — `can_remove`,
+/// `can_reorder`, `can_group` — so none can light up promising something
+/// `LayerStack` will then decline.
+fn layers_header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     let count = ed.layers.len();
     let active = ed.layers.active_index();
+    let locked = ed.layers.active_is_locked();
+
+    // Right-to-left: added first lands furthest right, next to the close mark.
+    // So the order on screen reads group, up, down, delete, which is the order
+    // these four sat in on the body row they came off.
+    if icon_button(
+        ui,
+        p,
+        Icon::Trash,
+        // Asked of the model rather than counted here: a folder is not
+        // somewhere to paint, so "more than one entry" is not the same
+        // question as "something would be left to paint on", and deleting a
+        // folder takes every layer inside it.
+        ed.layers.can_remove(&[active]) && !locked,
+        match (
+            ed.layers.can_remove(&[active]),
+            locked,
+            ed.layers.active_is_folder(),
+        ) {
+            (_, true, _) => "Unlock the layer to delete it",
+            (false, _, _) => "A document needs a layer to paint on",
+            (_, _, true) => "Delete the group and everything in it",
+            _ => "Delete layer",
+        },
+    ) {
+        actions.delete_layer = Some(active);
+    }
+    // Enabled by what the move would actually do, not by the index: a folder
+    // steps over its whole subtree, and one at the top of a group has nowhere
+    // to go without changing its nesting, which is something dragging says and
+    // a chevron cannot.
+    let span = ed.layers.subtree(active);
+    let depth = depth_of(ed, active);
+    let can_down = span.start > 0 && ed.layers.can_reorder(active, span.start - 1, depth);
+    let can_up = span.end < count && ed.layers.can_reorder(active, span.end, depth);
+    // The tooltip says why when it is dead, and names the gesture that *can* do
+    // it — a step keeps the nesting it has, so leaving a group is something only
+    // a drag can say.
+    let step_tip = |can: bool, way: &'static str| {
+        if can {
+            if way == "up" {
+                "Move layer up"
+            } else {
+                "Move layer down"
+            }
+        } else if depth > 0 {
+            "Nowhere to go inside this group. Drag it sideways to leave."
+        } else {
+            "Already at the end of the stack"
+        }
+    };
+    if icon_button(
+        ui,
+        p,
+        Icon::ChevronDown,
+        can_down,
+        step_tip(can_down, "down"),
+    ) {
+        actions.move_layer_down = Some(active);
+    }
+    if icon_button(ui, p, Icon::ChevronUp, can_up, step_tip(can_up, "up")) {
+        actions.move_layer_up = Some(active);
+    }
+    // Grouping reaches the same set every other bulk control does —
+    // `LayerStack::targets`, so the ticked layers or the selected one. Nothing
+    // about a folder is drawn beyond its name and its eye: a pass-through folder
+    // has no opacity and no blend mode, and a slider that did nothing would be
+    // exactly the control that lies. See `docs/layer-folders.md`.
+    // Asked of the model, like the chevrons above: a full stack and a set that
+    // would nest too deep are both refusals `group` makes and neither is visible
+    // from here.
+    let can_group = ed.layers.can_group(&ed.layers.targets());
+    if icon_button(
+        ui,
+        p,
+        Icon::Folder,
+        can_group,
+        if can_group {
+            "Group the ticked layers, or the selected one"
+        } else if count >= LayerStack::MAX {
+            "The stack is full. A group counts as an entry too."
+        } else {
+            "That would nest deeper than Umber can hold"
+        },
+    ) {
+        actions.group_layers = true;
+    }
+}
+
+/// The mark that adds a layer, at the head of the flags row.
+///
+/// **It came off the panel's own heading row and did not travel into the header
+/// with the other four.** Those four act on the *selected* entry or on the
+/// ticked set; adding a layer acts on neither, and it belongs beside the flags
+/// because that row is the one about the layer in front of you rather than
+/// about the stack. First from the left, where the mask toggle used to be.
+///
+/// Drawn on the folder branch as well as the layer branch, because "add a layer
+/// inside the selected group" is exactly what a folder wants it for. One
+/// function rather than two copies, so the tooltip and the cap cannot come to
+/// disagree between the two rows.
+///
+/// The row's height does not move as the selection walks from a layer to a
+/// folder: [`icon_button`] and [`widgets::icon_toggle`] are both 20 points, so
+/// the two branches were already the same height and adding the same mark to
+/// each keeps them so.
+fn add_layer_button(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
+    if icon_button(
+        ui,
+        p,
+        Icon::Plus,
+        ed.layers.len() < LayerStack::MAX,
+        if ed.layers.active_is_folder() {
+            "Add a layer inside the selected group"
+        } else {
+            "Add a layer above the current one"
+        },
+    ) {
+        actions.add_layer = true;
+    }
+}
+
+fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
+    let count = ed.layers.len();
     // Read once: half a dozen controls below answer to it, and a lock read
     // twice is a lock that can be read differently twice.
     let locked = ed.layers.active_is_locked();
-
-    ui.horizontal(|ui| {
-        // Whose settings these are. The blend picker and the opacity slider
-        // below edit the *selected* layer — `Layer::blend` and `Layer::opacity`
-        // have always been per-layer — and with nothing saying so the pair read
-        // as a document-wide setting, which is the one thing they are not.
-        // Typography is `controls::section`'s, so the panel gains a heading and
-        // not a second heading style; it is inline rather than a call to it
-        // because that helper is a block with its own spacing and this shares
-        // the icon row.
-        //
-        // **The buttons are laid out first and the heading takes what is
-        // left.** A label in a horizontal layout defaults to
-        // `TextWrapMode::Extend`, so putting it first let it claim the whole
-        // line on a narrow panel; the right-to-left group after it was then
-        // handed a rect starting off the end of the panel and drew its buttons
-        // back over the words. Same failure the brush browser's notice bar had,
-        // and the panel can be dragged narrow enough to reach it in a way a
-        // dialog cannot. Truncated rather than wrapped, because a heading that
-        // became two lines would move the whole list down as the panel narrows.
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if icon_button(
-                ui,
-                p,
-                Icon::Trash,
-                // Asked of the model rather than counted here: a folder is not
-                // somewhere to paint, so "more than one entry" is not the same
-                // question as "something would be left to paint on", and
-                // deleting a folder takes every layer inside it.
-                ed.layers.can_remove(&[active]) && !locked,
-                match (
-                    ed.layers.can_remove(&[active]),
-                    locked,
-                    ed.layers.active_is_folder(),
-                ) {
-                    (_, true, _) => "Unlock the layer to delete it",
-                    (false, _, _) => "A document needs a layer to paint on",
-                    (_, _, true) => "Delete the group and everything in it",
-                    _ => "Delete layer",
-                },
-            ) {
-                actions.delete_layer = Some(active);
-            }
-            // Enabled by what the move would actually do, not by the index:
-            // a folder steps over its whole subtree, and one at the top of a
-            // group has nowhere to go without changing its nesting, which is
-            // something dragging says and a chevron cannot.
-            let span = ed.layers.subtree(active);
-            let depth = depth_of(ed, active);
-            let can_down = span.start > 0 && ed.layers.can_reorder(active, span.start - 1, depth);
-            let can_up = span.end < count && ed.layers.can_reorder(active, span.end, depth);
-            // The tooltip says why when it is dead, and names the gesture that
-            // *can* do it — a step keeps the nesting it has, so leaving a group
-            // is something only a drag can say.
-            let step_tip = |can: bool, way: &'static str| {
-                if can {
-                    if way == "up" {
-                        "Move layer up"
-                    } else {
-                        "Move layer down"
-                    }
-                } else if depth > 0 {
-                    "Nowhere to go inside this group. Drag it sideways to leave."
-                } else {
-                    "Already at the end of the stack"
-                }
-            };
-            if icon_button(
-                ui,
-                p,
-                Icon::ChevronDown,
-                can_down,
-                step_tip(can_down, "down"),
-            ) {
-                actions.move_layer_down = Some(active);
-            }
-            if icon_button(ui, p, Icon::ChevronUp, can_up, step_tip(can_up, "up")) {
-                actions.move_layer_up = Some(active);
-            }
-            if icon_button(
-                ui,
-                p,
-                Icon::Plus,
-                count < LayerStack::MAX,
-                if ed.layers.active_is_folder() {
-                    "Add a layer inside the selected group"
-                } else {
-                    "Add a layer above the current one"
-                },
-            ) {
-                actions.add_layer = true;
-            }
-            // Grouping reaches the same set every other bulk control does —
-            // `LayerStack::targets`, so the ticked layers or the selected one.
-            // Nothing about a folder is drawn beyond its name and its eye: a
-            // pass-through folder has no opacity and no blend mode, and a slider
-            // that did nothing would be exactly the control that lies. See
-            // `docs/layer-folders.md`.
-            // Asked of the model, like the chevrons above: a full stack and a
-            // set that would nest too deep are both refusals `group` makes and
-            // neither is visible from here.
-            let can_group = ed.layers.can_group(&ed.layers.targets());
-            if icon_button(
-                ui,
-                p,
-                Icon::Folder,
-                can_group,
-                if can_group {
-                    "Group the ticked layers, or the selected one"
-                } else if count >= LayerStack::MAX {
-                    "The stack is full. A group counts as an entry too."
-                } else {
-                    "That would nest deeper than Umber can hold"
-                },
-            ) {
-                actions.group_layers = true;
-            }
-            // Whose settings these are. The blend picker and the opacity slider
-            // below edit the *selected* layer — `Layer::blend` and
-            // `Layer::opacity` have always been per-layer — and with nothing
-            // saying so the pair read as a document-wide setting, which is the
-            // one thing they are not. Typography is `controls::section`'s, so
-            // the panel gains a heading and not a second heading style; it is
-            // inline rather than a call to it because that helper is a block
-            // with its own spacing and this shares the icon row.
-            //
-            // Turned back left-to-right inside the right-to-left group, so the
-            // heading reads from the left edge of whatever room the buttons
-            // left it rather than being pushed up against them.
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Layer settings")
-                            .size(text::SMALL)
-                            .color(p.text_dim)
-                            .strong(),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text("Blend mode and opacity apply to the selected layer");
-            });
-        });
-    });
-
-    ui.add_space(4.0);
+    let active = ed.layers.active_index();
 
     // The selected layer's flags, on one compact row of their own.
     //
@@ -1363,6 +1425,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     let is_folder = ed.layers.active_is_folder();
     if !is_folder {
         ui.horizontal(|ui| {
+            add_layer_button(ui, p, ed, actions);
             let has_mask = ed.layers.active_mask().is_some();
             if widgets::icon_toggle(
                 ui,
@@ -1453,6 +1516,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         });
     } else {
         ui.horizontal(|ui| {
+            add_layer_button(ui, p, ed, actions);
             let layer = ed.layers.active_mut();
             let is_locked = layer.locked;
             if widgets::icon_toggle(
@@ -3264,6 +3328,80 @@ mod tests {
             none,
             "ticking every layer changed the height of the Layers body"
         );
+    }
+
+    /// A module header never draws its title under its own controls.
+    ///
+    /// The failure this pins has happened once already, one storey down: a
+    /// "3 ticked" label and an All/None pair shared a line with six icon
+    /// buttons, fit in the abstract, and were drawn over each other at
+    /// [`metrics::PANEL`]'s real 264 points. Moving the Layers module's group,
+    /// up, down and delete marks into the header puts four marks and — in
+    /// layout edit mode — a close mark into a strip whose rect is 120 points at
+    /// that width and 83 at `limits::SIDEBAR_MIN_WIDTH`. Five controls want 122.
+    ///
+    /// So it is *measured*, and measured off what was actually drawn:
+    /// `header_geometry_id` parks the two rectangles the header laid out, and
+    /// this compares them. A test that recomputed the room the title was given
+    /// would be checking its own arithmetic, which is the shape
+    /// `palettelib::drop_ring_rect` exists to refuse.
+    ///
+    /// Every kind, both widths, and in and out of edit mode — the domain the
+    /// code sees rather than the one the constants describe. Brushes is in it
+    /// deliberately: its header already held four marks, so it was one point
+    /// past the same edge before any of this was touched.
+    #[test]
+    fn a_module_header_never_draws_its_title_under_its_controls() {
+        use crate::dock::{Layout, PanelKind, limits};
+        use crate::editor::Editor;
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Pos2, Rect, vec2};
+
+        for width in [metrics::PANEL, limits::SIDEBAR_MIN_WIDTH] {
+            for editing in [false, true] {
+                for kind in PanelKind::ALL {
+                    let ctx = egui::Context::default();
+                    let field = vec2(width, 400.0);
+                    let input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, field)),
+                        ..Default::default()
+                    };
+                    let mut ed = Editor::default();
+                    ed.layout = Layout::default();
+                    if editing {
+                        ed.layout.set_edit_mode(true);
+                    }
+                    let palette = Palette::of(ThemeKind::Graphite);
+                    // Twice: the first pass through a fresh context builds the
+                    // font atlas, and a title laid out against a half-built one
+                    // is not the width it will settle at.
+                    for _ in 0..2 {
+                        let _ = ctx.run_ui(input.clone(), |ui| {
+                            let mut actions = crate::ui::UiActions::default();
+                            super::panel(
+                                ui,
+                                &palette,
+                                &mut ed,
+                                &mut actions,
+                                kind,
+                                Rect::from_min_size(Pos2::ZERO, field),
+                            );
+                        });
+                    }
+                    let placed: Option<(Rect, Rect)> =
+                        ctx.data(|d| d.get_temp(super::header_geometry_id(kind)));
+                    let (title, controls) =
+                        placed.expect("the header drew nothing, so nothing here was measured");
+                    assert!(
+                        title.right() <= controls.left(),
+                        "{kind:?} at {width} (edit mode {editing}) drew its title out to \
+                         {} and its controls in from {}",
+                        title.right(),
+                        controls.left()
+                    );
+                }
+            }
+        }
     }
 
     /// The Layers module at the panel's real width, in each of the three states
