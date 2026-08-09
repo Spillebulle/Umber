@@ -905,7 +905,31 @@ fn budget_field(ui: &mut egui::Ui, p: &Palette, header: Rect, held: u32) -> Opti
     if child.input(|i| i.key_pressed(egui::Key::Escape)) {
         return None;
     }
-    parse_budget(&text, held >= GIGABYTE)
+    committed_budget(&text, held)
+}
+
+/// What a budget field's buffer means when the caret leaves it, or `None` where
+/// it means nothing and the figure is left exactly as it was.
+///
+/// A pure function for the reason `widgets::track_value` is one: the decision is
+/// testable and the `egui::Response` around it is not, so a rule buried in one
+/// is a rule nobody checks.
+///
+/// **A buffer nobody typed into is not a figure, and re-applying it is not the
+/// identity.** `budget_bare` says a gigabyte figure to one decimal place, so a
+/// budget of 1100 MB opens the field on "1.1" — and reading that back is 1126.
+/// Clicking into the readout and out again would therefore move the setting, on
+/// a control whose whole job is to say what it set. That is the hex readout's
+/// recorded defect in different clothes, and the remedy is the same one: gate
+/// the write on somebody having actually typed. The label is accepted as well as
+/// the bare figure, so a blur that lands before the field has been opened on the
+/// bare form is silent too.
+fn committed_budget(text: &str, held: u32) -> Option<u32> {
+    let typed = text.trim();
+    if typed == budget_bare(held) || typed == budget_label(held) {
+        return None;
+    }
+    parse_budget(typed, held >= GIGABYTE)
 }
 
 /// Where the readout stops counting in megabytes and starts counting in
@@ -3460,6 +3484,32 @@ mod tests {
         // makes "select 8 GB, type 16" mean sixteen gigabytes.
         assert_eq!(parse_budget("16", true), Some(16384));
         assert_eq!(parse_budget("256", false), Some(256));
+    }
+
+    /// Opening the budget field and leaving it without typing changes nothing,
+    /// including at a figure its own readout cannot say exactly.
+    ///
+    /// 1100 MB is the case that matters: the readout rounds it to "1.1 GB" and
+    /// reading that back is 1126, so a field that applied whatever its buffer
+    /// held would move the setting every time somebody clicked into it. Driven
+    /// through every rung *and* the figures between them, because a test over
+    /// rungs alone passes under a rule that only works on exact gigabytes.
+    #[test]
+    fn opening_the_budget_field_and_leaving_it_changes_nothing() {
+        for held in [64u32, 512, 1000, 1100, 1024, 1536, 3072, 30000, 32768] {
+            assert_eq!(
+                committed_budget(&budget_bare(held), held),
+                None,
+                "the figure {held} MB opens the field on moved when nobody typed",
+            );
+            assert_eq!(
+                committed_budget(&budget_label(held), held),
+                None,
+                "the readout for {held} MB moved when nobody typed",
+            );
+            // And something actually typed still lands.
+            assert_eq!(committed_budget("2048 MB", held), Some(2048));
+        }
     }
 
     /// A figure the rail could not reach is clamped, never refused, and nonsense
