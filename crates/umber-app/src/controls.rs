@@ -361,16 +361,24 @@ pub fn capture_hint(ui: &mut Ui, p: &Palette) {
     // design.
     ui.ctx().request_repaint();
 
+    // This is drawn **only** while the row is armed, and an armed row is filled
+    // `control_active` — `settings::shortcut_row`. So both lines are on that
+    // fill and neither may be a token that cannot be read on it: the accent is
+    // 1.88:1 there in MediaBog and `text_dim` is 1.43:1. `keycap`, five lines
+    // up this file and on the same row of the same page, was moved off the
+    // first of those pairings; missing its sibling is why the ranks are stated
+    // here rather than left to each call.
     let font = FontId::proportional(text::TINY);
     let armed = "press keys";
     let escape = "esc to cancel";
+    let (lit, quiet) = (p.active_ink(), p.text);
     let painter = ui.painter();
     let armed_w = painter
-        .layout_no_wrap(armed.to_owned(), font.clone(), p.accent)
+        .layout_no_wrap(armed.to_owned(), font.clone(), lit)
         .size()
         .x;
     let escape_w = painter
-        .layout_no_wrap(escape.to_owned(), font.clone(), p.text_dim)
+        .layout_no_wrap(escape.to_owned(), font.clone(), quiet)
         .size()
         .x;
 
@@ -381,14 +389,14 @@ pub fn capture_hint(ui: &mut Ui, p: &Palette) {
         Align2::LEFT_CENTER,
         armed,
         font.clone(),
-        p.accent.gamma_multiply(alpha),
+        lit.gamma_multiply(alpha),
     );
     painter.text(
         rect.right_center(),
         Align2::RIGHT_CENTER,
         escape,
         font,
-        p.text_dim.gamma_multiply(alpha),
+        quiet.gamma_multiply(alpha),
     );
 }
 

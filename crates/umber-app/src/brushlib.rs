@@ -2079,7 +2079,12 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
                         )
                     })
                     .size(text::TINY)
-                    .color(p.text_dim),
+                    // `text`, not `text_dim`: the strip is filled
+                    // `control_active`, where `text_dim` is 1.43:1 in MediaBog
+                    // — and this sentence is the only thing that says what a
+                    // tip canvas is for. Same rank `panels::edit_bar` takes on
+                    // the identical fill.
+                    .color(p.text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controls::text_button(ui, p, "Use as tip", true, true)

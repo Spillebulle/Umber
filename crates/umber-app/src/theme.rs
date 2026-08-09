@@ -205,6 +205,20 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 ///
 /// So the ink is *derived from the surface* instead, and what a call site picks
 /// is how loudly the mark should speak rather than which grey it should be.
+///
+/// **Two of those four are as often over the picture as over the pit**, and
+/// that is worth saying because the derivation cannot see it: the pen dot
+/// follows the nib, which is usually over the document, and a scrollbar is
+/// drawn precisely when the document runs past the view. No opaque colour reads
+/// on arbitrary paint — that is what [`Palette::accent_underlay`] exists for,
+/// and it costs a second pass these small marks are not worth — so the question
+/// is only which surface to favour. Favouring the pit is right because it is
+/// the one surface that is *always* there and always known, and it is not paid
+/// for at the other end: swept over every artwork colour, the worst case
+/// **improves**, from 1.34:1 to 1.48 in Krita and from 1.15 to 1.66 in Paper.
+/// What moves against the change is the *common* case over a dark painting in a
+/// theme with a light pit — 7.10:1 to 1.48 in Krita — and nothing here can fix
+/// that without making the marks two-tone.
 pub mod contrast {
     use egui::Color32;
 
@@ -1127,7 +1141,10 @@ impl Palette {
     /// those are *saturated*: the accent on one reads 2.60:1 in Clip Studio's
     /// slate, 2.27 in Photoshop's grey, 2.06 in Krita's blue and 1.88 in
     /// MediBang's — under the 3:1 the accent is already held to on `control`,
-    /// and worse for every one of the other three accents, down to 1.24.
+    /// and under it for all four accents in each, down to 1.24. (Not
+    /// *monotonically* worse, which this said first: Photoslop's Sage reads
+    /// 2.50 and its Steel 2.29, both above its authored 2.27. All three still
+    /// fail, which is what the rule turns on.)
     ///
     /// Neither fixed answer will do. Always-accent is the defect. Always-
     /// `text_strong` would take the ochre off the default theme's tool rail,
@@ -1145,10 +1162,45 @@ impl Palette {
     /// tests.
     pub fn active_ink(&self) -> Color32 {
         if contrast::ratio(self.accent, self.control_active) >= contrast::READABLE {
-            self.accent
-        } else {
-            self.text_strong
+            return self.accent;
         }
+        if contrast::ratio(self.text_strong, self.control_active) >= contrast::READABLE {
+            return self.text_strong;
+        }
+        // A theme somebody wrote can put both of those on its own selection
+        // fill; nothing shipped reaches here. Without this the rule would rest
+        // on the same authorability argument its own docs use against a table
+        // and answer with a second *token*, which has no floor — where
+        // `contrast` exists precisely to give one on any surface at all.
+        contrast::ink_on(self.control_active, contrast::Ink::Strong)
+    }
+
+    /// What is drawn *under* the accent where a mark lies over the artwork:
+    /// the selection marquee, the transform box, its handles and the rotation
+    /// mark.
+    ///
+    /// Those are dark-then-light pairs, and the pair is the whole point — no
+    /// single opaque colour reads on a painting, so one of the two has to. It
+    /// used to be `backdrop`, on the reasoning that `backdrop` and `accent` are
+    /// "each dark in one theme and light in the other". **Krita's real canvas
+    /// surround is a 50% grey, so that stopped being true the moment this
+    /// palette was made faithful**: the pair's two halves came within 1.60:1 of
+    /// each other and the dark line read 1.00:1 against mid-grey paint.
+    ///
+    /// So it is derived from the *accent* rather than borrowed from a surface —
+    /// the far end of the lightness axis from whatever the accent is, which is
+    /// what "dark in one theme and light in the other" was reaching for. It is
+    /// better than `backdrop` was in **all** twenty-four theme-and-accent
+    /// pairs, not only in Krita's. `the_marquees_pair_reads_over_any_artwork`
+    /// is the guard, and it sweeps artwork rather than surfaces, because that
+    /// is what these marks lie on.
+    ///
+    /// It does **not** reach 3:1 on every artwork and cannot: a saturated
+    /// mid-luminance colour defeats any pair of one extreme and one mid tone,
+    /// and the worst here is Paper's 2.24. What a guard can hold is that it is
+    /// never worse than the token it replaced, which for Krita was 1.06.
+    pub fn accent_underlay(&self) -> Color32 {
+        contrast::ink_on(self.accent, contrast::Ink::Strong)
     }
 
     /// The theme in its authored accent.
@@ -1915,15 +1967,20 @@ mod tests {
             // The accent is ink too — it is what a hyperlink is drawn in.
             let r = ratio(p.accent, p.chrome);
             assert!(r >= 3.0, "{kind:?}: the accent on chrome is {r:.2}:1");
-            // And a selected row has to be readable, which is the one place
-            // `control_active` is a background rather than a mark.
+            // And a selected row has to be readable. `control_active` is a
+            // *fill* at eleven sites — both mode strips, the layer, brush,
+            // history and stamp rows, the armed shortcut row, the tool button,
+            // the icon toggle and the modulation row — and `text_strong` is the
+            // primary ink on all of them.
             let r = ratio(p.text_strong, p.control_active);
             assert!(
                 r >= 3.0,
                 "{kind:?}: text_strong on control_active is {r:.2}:1",
             );
-            // `text` is the *secondary* line on such a row — the modulation
-            // list's range figure is the one place it lands there — and 2.59 is
+            // `text` is the *secondary* rank on those fills — the modulation
+            // list's range figure, `edit_bar`'s sentence and its two links,
+            // `tip_bar`'s sentence, a selected brush row's credit line, the
+            // capture hint's way out — and 2.59 is
             // what this palette actually reaches rather than a round number,
             // exactly as `text_dim` on `window` above. MediaBog's is 2.5976,
             // and the figure is written to the place it fails at rather than
@@ -1990,10 +2047,86 @@ mod tests {
                     "{kind:?}/{accent:?}: the active mark is {r:.2}:1",
                 );
                 let took_accent = ink == p.accent;
-                let expected = matches!(kind, ThemeKind::Graphite | ThemeKind::Paper);
+                // An exhaustive `match` and not a `matches!`, which this file
+                // has a rule against: a seventh theme has to be given an answer
+                // here rather than silently falling into the `false` arm.
+                let expected = match kind {
+                    ThemeKind::Graphite | ThemeKind::Paper => true,
+                    ThemeKind::Photoslop
+                    | ThemeKind::ShitStudio
+                    | ThemeKind::Krita
+                    | ThemeKind::MediaBog => false,
+                };
                 assert_eq!(
                     took_accent, expected,
                     "{kind:?}/{accent:?}: took the accent? {took_accent}",
+                );
+            }
+        }
+    }
+
+    /// The marquee's dark-then-light pair reads over *artwork*, which is the
+    /// only surface it is ever on.
+    ///
+    /// **The sweep is over paintings, not over palettes, and that is the whole
+    /// finding.** Every other guard in this file measures an ink against a
+    /// surface the theme names. The selection outline, the transform box, its
+    /// handles and the rotation mark lie over pixels somebody painted, so what
+    /// has to be true is that *one of the two passes* reads against any colour
+    /// at all — and no guard asked that, which is how the under-pass came to be
+    /// `backdrop` and how making Krita's palette faithful broke it: at
+    /// `#808080` the pair's two halves were 1.60:1 apart and the "dark" line
+    /// was 1.00:1 against mid-grey paint.
+    ///
+    /// Two bounds, and neither is 3:1, because 3:1 is not reachable here: a
+    /// saturated mid-luminance colour defeats any pair made of one extreme and
+    /// one mid tone, and the best any of the twenty-four theme-and-accent pairs
+    /// manages is Paper's **2.24**. So the floor is what the worst of them
+    /// actually reaches, exactly as `text_dim` on `window` is Paper's own
+    /// figure — and the second bound is the one that catches a regression
+    /// rather than a threshold: the pair must be at least as good as
+    /// `backdrop` gave it, in every theme, which is what Krita failed by a
+    /// factor of two.
+    #[test]
+    fn the_marquees_pair_reads_over_any_artwork() {
+        for kind in ThemeKind::ALL {
+            for accent in Accent::ALL {
+                let p = Palette::with_accent(kind, accent);
+                let under = p.accent_underlay();
+                // The underlay is an end of the axis, so it is one of two
+                // colours; asserting that is what says it is a *counterpart*
+                // rather than a second mid tone.
+                assert!(
+                    under == Color32::WHITE || under == Color32::BLACK,
+                    "{kind:?}/{accent:?}: the underlay is {under:?}",
+                );
+
+                let mut worst = (f64::MAX, Color32::BLACK);
+                let mut worst_backdrop = f64::MAX;
+                for r in 0..=255u8 {
+                    for g in (0..=255u8).step_by(15) {
+                        for b in (0..=255u8).step_by(15) {
+                            let art = Color32::from_rgb(r, g, b);
+                            let pair =
+                                contrast::ratio(p.accent, art).max(contrast::ratio(under, art));
+                            if pair < worst.0 {
+                                worst = (pair, art);
+                            }
+                            let was = contrast::ratio(p.accent, art)
+                                .max(contrast::ratio(p.backdrop, art));
+                            worst_backdrop = worst_backdrop.min(was);
+                        }
+                    }
+                }
+                let (seen, art) = worst;
+                assert!(
+                    seen >= 2.2,
+                    "{kind:?}/{accent:?}: the pair is {seen:.3}:1 on {art:?}",
+                );
+                assert!(
+                    seen >= worst_backdrop,
+                    "{kind:?}/{accent:?}: the underlay is {seen:.3}:1 where \
+                     `backdrop` was {worst_backdrop:.3}:1",
                 );
             }
         }
@@ -2065,6 +2198,15 @@ mod tests {
     /// reason above, and it is a real risk rather than a formality: a mid-grey
     /// surface has only 5.32:1 in it altogether, so the three ranks are packed
     /// into a fifth of the room a near-black pit gives them.
+    ///
+    /// **This one strides all three axes**, unlike the floor above, and does
+    /// not inherit that test's "the red axis is whole" argument: three ranks
+    /// are three `ink_on` calls, so it is three times the work per surface.
+    /// What the stride can hide is a hole narrower than three levels of red,
+    /// and the only reading that rules one out is an exhaustive sweep, which
+    /// was run by hand over all 16.7 million surfaces and found none. Said
+    /// rather than implied, because a guard that borrows a neighbour's
+    /// justification is the failure this file has a section about.
     #[test]
     fn a_stronger_rank_is_a_stronger_mark() {
         for r in (0..=255u8).step_by(3) {

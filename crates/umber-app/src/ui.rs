@@ -450,11 +450,16 @@ const ANT_FRAME_MS: u64 = 60;
 /// painting is being clipped.
 ///
 /// Two passes, dark then light, so the outline reads over both a white canvas
-/// and a black one. Neither colour is a literal: `backdrop` and `accent` are
-/// each dark in one theme and light in the other, which is what makes the pair
-/// work on any artwork. **Only the accent dashes move.** The dark line under
-/// them stays solid, so the pair still reads on any artwork at every instant of
-/// the animation rather than only when a dash happens to be over a dark pixel.
+/// and a black one. Neither colour is a literal, and the under-pass is
+/// [`Palette::accent_underlay`] rather than `backdrop`: that token was chosen
+/// because "`backdrop` and `accent` are each dark in one theme and light in the
+/// other", and Krita's canvas surround is a 50% grey, so the two halves came
+/// within 1.60:1 of each other and the dark line read 1.00:1 on mid-grey paint.
+/// The underlay is the far end of the lightness axis from the accent, which is
+/// what that sentence was reaching for. **Only the accent dashes move.** The
+/// line under them stays solid, so the pair still reads on any artwork at every
+/// instant of the animation rather than only when a dash happens to be over a
+/// dark pixel.
 fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
     if ed.selection.is_none() && ed.selection_draft.is_none() {
         return;
@@ -519,7 +524,7 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         // Segment by segment rather than one `Shape::line`, which would want
         // the points by value and so a copy of them per ring per frame.
         for pair in screen.windows(2) {
-            painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.backdrop));
+            painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.accent_underlay()));
         }
         dashes.clear();
         egui::Shape::dashed_line_many_with_offset(
@@ -612,18 +617,19 @@ fn transform_box(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
     let painter = ui.painter().with_clip_rect(rect);
     let quad = float.xf.quad();
     let corners: Vec<egui::Pos2> = quad.iter().copied().map(to_screen).collect();
+    // Two passes, dark then light, so the box reads over both a white canvas
+    // and a black one — the same trick the selection outline uses, and the
+    // under-pass is the same `accent_underlay`. It was `backdrop`; see there.
+    let under = p.accent_underlay();
     for i in 0..4 {
-        // Two passes, dark then light, so the box reads over both a white
-        // canvas and a black one — the same trick the selection outline uses,
-        // and neither colour is a literal.
         let (a, b) = (corners[i], corners[(i + 1) % 4]);
-        painter.line_segment([a, b], Stroke::new(2.0, p.backdrop));
+        painter.line_segment([a, b], Stroke::new(2.0, under));
         painter.line_segment([a, b], Stroke::new(1.0, p.accent));
     }
 
     for handle in umber_core::Handle::BOX {
         let at = to_screen(float.xf.handle_at(handle));
-        painter.circle_filled(at, 4.0, p.backdrop);
+        painter.circle_filled(at, 4.0, under);
         painter.circle_filled(at, 3.0, p.accent);
     }
 
@@ -672,8 +678,9 @@ fn rotate_mark(
     let centre = edge + away * (to + ROTATE_MARK * 0.5);
     let at = Rect::from_center_size(centre, vec2(ROTATE_MARK, ROTATE_MARK));
     // Dark under light, as the box's own outline is: the mark lies over the
-    // artwork and neither colour can be assumed to read against it.
-    icons::draw(painter, at.expand(1.0), Icon::Rotate, p.backdrop);
+    // artwork and neither colour can be assumed to read against it. The
+    // under-pass is `accent_underlay` for the reason the outline's is.
+    icons::draw(painter, at.expand(1.0), Icon::Rotate, p.accent_underlay());
     icons::draw(painter, at, Icon::Rotate, p.accent);
 }
 

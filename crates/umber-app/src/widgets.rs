@@ -1664,6 +1664,15 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     // rename and delete. On a selected row it sits on `control_active`, where
     // the accent is 1.88:1 in MediaBog, so it takes `active_ink` there; on
     // every other row the accent reads against the panel and stays.
+    //
+    // **The cost is real and is the lesser of two.** In the four preset themes
+    // `active_ink` is `text_strong`, which is what the name beside it is
+    // already drawn in on a selected row — so the dot stops being a *colour*
+    // that says "yours" and becomes a bullet. It is still a mark in a place
+    // nothing else occupies, and a dot nobody can see says nothing at all,
+    // which is why legibility wins here. Carrying the meaning through would
+    // need a different shape or position rather than a different colour, and
+    // that is a design change rather than a contrast fix.
     let mut right = rect.right() - 7.0 - row.trailing;
     if row.user {
         let dot = if row.selected {
@@ -1699,7 +1708,11 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
             Align2::LEFT_CENTER,
             elide(painter, row.detail, 9.5, width),
             FontId::proportional(9.5),
-            p.text_dim,
+            // The credit line steps up on the selected row for the reason the
+            // name above it does: that row is filled `control_active`, where
+            // `text_dim` is 1.43:1 in MediaBog. `text` is the dimmest rank that
+            // fill can carry.
+            if row.selected { p.text } else { p.text_dim },
         );
     }
 
@@ -2643,8 +2656,18 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     let pick = Rect::from_min_size(rect.left_top() + PICK_AT, Vec2::splat(PICK_HIT));
     let pick_response = ui.interact(pick, ui.id().with(("pick", key)), Sense::click());
     let box_rect = Rect::from_center_size(pick.center(), Vec2::splat(PICK_MARK));
+    // On the *active* row this whole column sits on `control_active`, so both
+    // states take the ink that reads on it rather than the one that reads on a
+    // panel: a filled box is 1.88:1 in MediaBog in the accent and an empty
+    // one's stroke is 1.43:1 in `text_dim`. The check inside the filled box is
+    // still `window`, which is the darkest surface either way round.
+    let (ticked, empty) = if active {
+        (p.active_ink(), p.text)
+    } else {
+        (p.accent, p.text_dim)
+    };
     if row.picked {
-        ui.painter().rect_filled(box_rect, 2.0, p.accent);
+        ui.painter().rect_filled(box_rect, 2.0, ticked);
         icons::draw(ui.painter(), box_rect.shrink(1.0), Icon::Check, p.window);
     } else {
         ui.painter().rect_stroke(
@@ -2653,7 +2676,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
             Stroke::new(
                 1.0,
                 if pick_response.hovered() {
-                    p.text_dim
+                    empty
                 } else {
                     p.border
                 },
