@@ -97,14 +97,44 @@ const MIN_ROUNDNESS: f32 = 0.05;
 
 /// Where the **size rail** stops, which is not where a brush size stops.
 ///
-/// `Brush::MAX_SIZE` is 2000 and this is 400: the rail is a hand's instrument
+/// `Brush::MAX_SIZE` is 2000 and this is 1000: the rail is a hand's instrument
 /// and the value's bound is the engine's, which is the distinction
 /// [`Tweak::range`] has always drawn and [`Tweak::span`] now names on the other
 /// side. Typing 1500 into either size rail means 1500.
 ///
+/// It was 400, and widening it costs granularity. A *logarithmic* rail loses
+/// it uniformly: the whole travel is `ln(hi/lo)`, so one point of track is
+/// worth a factor of `exp(ln(hi/lo) / track)` whatever the size, and
+/// `ln 1000 / ln 400` is 1.153. One point of the strip's 80-point track is
+/// therefore worth 9.02% of the size rather than 7.78%, and one point of the
+/// brush editor's ~259-point track 2.70% rather than 2.34% — **13.3% fewer
+/// distinguishable sizes**, at every size on both rails. On the strip that is
+/// 1.80 px per point at a 20 px brush where it was 1.55, and 9.0 px per point
+/// at 100 px where it was 7.8.
+///
+/// It is a deliberate trade and it is the *other* half of the figure being
+/// typable. Widening a rail was measured and refused once before, when the
+/// only way to state a figure was to land the knob on it; the exactness this
+/// gives up is exactness the keyboard now hands back. What it buys is that
+/// the sizes between 400 and 1000 px are on the rail at all rather than
+/// reachable only by an Alt-drag on the canvas — 15 of the 252 shipped
+/// presets carry a size past 400, and 14 of those 15 are inside 1000. The
+/// fifteenth is the 1045 px brush the tap refusal in `widgets::track_value`
+/// was written for, and it is still off the end, which is the case that has
+/// to keep working rather than the case to widen the rail for.
+///
 /// One constant rather than two literals, because two rails for one setting
 /// that stop in different places is a control that disagrees with itself.
-pub const SIZE_RAIL_TOP: f32 = 400.0;
+pub const SIZE_RAIL_TOP: f32 = 1000.0;
+
+/// A rail that reached the whole range would make [`Tweak::span`] and
+/// [`Tweak::range`] the same answer and retire the distinction a typed figure
+/// rests on — silently, since every test of "a size may be more than the rail
+/// says" would go on passing by being vacuous.
+///
+/// A `const` assert rather than a test because the failure is **directional**:
+/// only raising this needs saying, and nothing that runs would say it.
+const _: () = assert!(SIZE_RAIL_TOP < Brush::MAX_SIZE);
 
 /// A brush setting a painter changes without meaning to change the brush.
 ///
@@ -807,6 +837,55 @@ mod tests {
         for tweak in Tweak::PANEL {
             assert!(Tweak::ALL.contains(&tweak));
         }
+    }
+
+    /// The size rail stops short of what a size may be, and it is the only one
+    /// that does.
+    ///
+    /// Two figures for one setting is a thing to state rather than to notice:
+    /// [`Tweak::span`] is what the rail lays out and [`Tweak::range`] is what a
+    /// typed figure — or a shortcut, or the canvas's Alt-drag — is held to.
+    /// Where the two agree there is nothing to get wrong, so this asserts both
+    /// that they *disagree* for Size and that they agree for everything else.
+    #[test]
+    fn only_the_size_rail_stops_short_of_what_its_setting_may_be() {
+        assert_eq!(*Tweak::Size.span().end(), SIZE_RAIL_TOP);
+        assert_eq!(*Tweak::Size.range().end(), Brush::MAX_SIZE);
+        // That the two differ at all is a `const` assert beside the constant,
+        // for the reason written there.
+        assert_eq!(*Tweak::Size.span().start(), *Tweak::Size.range().start());
+
+        for tweak in Tweak::ALL {
+            if tweak == Tweak::Size {
+                continue;
+            }
+            assert_eq!(
+                tweak.span(),
+                tweak.range(),
+                "{tweak:?} draws a rail that cannot reach its own setting"
+            );
+        }
+    }
+
+    /// The readout is exactly what it always was.
+    ///
+    /// `format` is `widgets::Figure`'s now rather than four match arms, which
+    /// is what makes the field's parser the exact inverse of it — and is
+    /// therefore also where a wrong scale or a lost suffix would be silent, on
+    /// every rail at once. Golden strings rather than a round trip, because a
+    /// round trip is self-consistent under any pair of mistakes that cancel.
+    #[test]
+    fn the_readout_of_every_setting_is_the_string_it_has_always_been() {
+        assert_eq!(Tweak::Size.format(24.0), "24 px");
+        assert_eq!(Tweak::Size.format(1045.08), "1045 px");
+        assert_eq!(Tweak::Angle.format(90.0), "90°");
+        assert_eq!(Tweak::AirbrushRate.format(0.0), "off");
+        assert_eq!(Tweak::AirbrushRate.format(60.0), "60/s");
+        assert_eq!(Tweak::Opacity.format(0.5), "50%");
+        assert_eq!(Tweak::Hardness.format(1.0), "100%");
+        assert_eq!(Tweak::Spacing.format(0.075), "8%");
+        assert_eq!(Tweak::Roundness.format(0.25), "25%");
+        assert_eq!(Tweak::ColourPickup.format(0.0), "0%");
     }
 
     #[test]

@@ -3847,6 +3847,90 @@ mod tests {
         }
     }
 
+    /// Every rail the brush strip draws fits the room its budget claims.
+    ///
+    /// [`strip_budget`]'s figures are hand-measured, and the strip is a single
+    /// unwrapped row — so a budget a few points short does not reflow, it draws
+    /// the rail off the right edge of the window. That went from a theoretical
+    /// risk to a live one when the readouts became fields: a painted label is
+    /// as wide as the figure showing, and a field is as wide as the *widest*
+    /// figure its rail can produce, so every one of the three grew.
+    ///
+    /// Swept rather than sampled, for `neither_navigation_hint_overruns_the_
+    /// strip_it_is_drawn_on`'s reason: a budget is wrong over a *band* of
+    /// widths — from the budget up to what the group actually costs — and a
+    /// two-point sample can miss the whole band. Every shape is read rather
+    /// than every string, because a rail's track and its knob are not text and
+    /// the field's fill is not either.
+    #[test]
+    fn every_brush_rail_fits_the_budget_that_lets_it_be_drawn() {
+        use crate::editor::Tool;
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+
+        let mut worst: Option<(f32, f32)> = None;
+        let mut ever_drew_three = false;
+        for step in 0..170 {
+            let width = 200.0 + step as f32 * 5.0;
+            let mut ed = Editor::default();
+            ed.ui.tool = Tool::Brush;
+            // Two passes: the first through a fresh context builds the font
+            // atlas, and a field measured against a half-built one is not the
+            // width it settles at.
+            let mut edge = f32::NEG_INFINITY;
+            let mut rails = 0;
+            for _ in 0..2 {
+                edge = f32::NEG_INFINITY;
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(width, metrics::OPTIONS_STRIP),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                        .show(ui, |ui| {
+                            ui.set_height(metrics::OPTIONS_STRIP);
+                            super::options_strip(ui, &palette, &mut ed);
+                        });
+                });
+                let mut drawn = Vec::new();
+                for clipped in &output.shapes {
+                    strings_in(&clipped.shape, &mut drawn);
+                    edge = edge.max(clipped.shape.visual_bounding_rect().right());
+                }
+                rails = ["Size", "Opacity", "Stabiliser"]
+                    .iter()
+                    .filter(|label| drawn.iter().any(|d| d.text == **label))
+                    .count();
+            }
+            if rails == 3 {
+                ever_drew_three = true;
+            }
+            // The right margin is the strip's own, so a rail ending exactly on
+            // it is inside. Half a point of slack for the frame's rounding.
+            let room = width - f32::from(metrics::STRIP_PAD);
+            if edge.is_finite() && edge > room + 0.5 {
+                worst = Some((width, edge));
+            }
+        }
+        assert!(
+            ever_drew_three,
+            "the stabiliser was never drawn at any width, so this proved nothing"
+        );
+        assert!(
+            worst.is_none(),
+            "the brush strip draws to {:.1} points on a {:.0} point strip",
+            worst.unwrap().1,
+            worst.unwrap().0
+        );
+    }
+
     /// Every category [`Action::category`] can answer with is either a menu
     /// this test knows or a category deliberately not on the menu bar.
     ///

@@ -3871,6 +3871,167 @@ mod tests {
         }
     }
 
+    /// The tool options strip's Size rail, as `ui::options_strip` states it.
+    ///
+    /// The one rail in Umber whose span and limit are different numbers, which
+    /// is what makes it the fixture every test below about that distinction has
+    /// to use: on a rail where they agree, either rule passes.
+    fn size_rail() -> Rail<'static> {
+        Rail {
+            label: "Size",
+            span: crate::tweaks::Tweak::Size.span(),
+            limit: crate::tweaks::Tweak::Size.range(),
+            log: true,
+            snap: 0.0,
+            deferred: false,
+            figure: Figure::new(1.0, "", 0),
+        }
+    }
+
+    /// And one where they agree, for the half of each rule that still has to
+    /// hold there.
+    fn opacity_rail() -> Rail<'static> {
+        Rail {
+            label: "Opacity",
+            span: 0.0..=1.0,
+            limit: 0.0..=1.0,
+            log: false,
+            snap: 0.0,
+            deferred: false,
+            figure: Figure::new(100.0, "", 0),
+        }
+    }
+
+    /// A typed brush size is held to what a size may be, not to where the rail
+    /// stops.
+    ///
+    /// The point of typing a figure is to say something the rail cannot, and
+    /// the size rail is the one that cannot say everything: it stops at
+    /// `tweaks::SIZE_RAIL_TOP` where `Brush::MAX_SIZE` is twice that. The two
+    /// ends are asserted to *disagree* first, or this would be a test of
+    /// whichever reading happened to be taken.
+    #[test]
+    fn a_typed_brush_size_is_not_clamped_to_the_rail_it_was_typed_on() {
+        let rail = size_rail();
+        assert!(
+            *rail.span.end() < *rail.limit.end(),
+            "the size rail's span and limit are the same figure, so this test \
+             cannot tell the two apart"
+        );
+        // Past the rail's top and well inside the value's own bound.
+        assert_eq!(typed_value("1500", 24.0, false, &rail), Some(1500.0));
+        // Exactly on the rail's top is not a boundary of anything.
+        assert_eq!(typed_value("1000", 24.0, false, &rail), Some(1000.0));
+        // And past the *value's* bound is clamped, because the engine clamps
+        // there too and a field that promised 5000 would be lying.
+        assert_eq!(typed_value("5000", 24.0, false, &rail), Some(2000.0));
+        assert_eq!(
+            typed_value("-40", 24.0, false, &rail),
+            Some(Brush::MIN_SIZE)
+        );
+
+        // A rail whose two ends do agree still clamps to them: percentages stop
+        // at 100 because that is what the value's bound is, not because that is
+        // where the rail happens to end.
+        assert_eq!(typed_value("150", 0.5, false, &opacity_rail()), Some(1.0));
+        assert_eq!(typed_value("-3", 0.5, false, &opacity_rail()), Some(0.0));
+    }
+
+    /// A field applies what was typed, not what it holds.
+    ///
+    /// The buffer is seeded from [`Figure::bare`] when focus is gained, so a
+    /// blur with nothing typed hands back a *rounded* reading of the value —
+    /// and writing that is a silent edit made by clicking a number and clicking
+    /// away from it. The size rail is where it bites: a drag produces fractional
+    /// sizes and the readout has no decimals, so 24.7 is shown as "25".
+    ///
+    /// The two readings are asserted to disagree first, exactly as the rule
+    /// above requires: on a value the readout states exactly, "apply the
+    /// buffer" and "apply nothing" are the same answer.
+    #[test]
+    fn a_field_nobody_typed_into_leaves_a_rounded_value_exactly_where_it_was() {
+        let rail = size_rail();
+        assert_eq!(rail.figure.bare(24.7), "25");
+        assert_ne!(
+            rail.figure.parse(&rail.figure.bare(24.7)),
+            Some(24.7),
+            "the readout states this value exactly, so nothing here is being tested"
+        );
+        assert_eq!(typed_value("25", 24.7, false, &rail), None);
+        // Whitespace round the untouched buffer is still an untouched buffer.
+        assert_eq!(typed_value("  25 ", 24.7, false, &rail), None);
+        // And something actually typed still writes, or the guard above would
+        // be satisfied by a field that never applies anything at all.
+        assert_eq!(typed_value("26", 24.7, false, &rail), Some(26.0));
+        assert_eq!(typed_value("1200", 24.7, false, &rail), Some(1200.0));
+    }
+
+    /// Escape abandons what was typed, and it has to be read off the context
+    /// because the field never sees the key.
+    ///
+    /// egui's default `EventFilter` has `escape: false`, so `Focus::begin_pass`
+    /// drops the caret before the `TextEdit` is ever added — the widget then
+    /// sees an ordinary blur, and applying the buffer on one is how Escape over
+    /// a half-typed `#C08` came to paint `#CC0088`.
+    #[test]
+    fn escape_abandons_a_typed_figure_that_a_blur_would_have_applied() {
+        let rail = size_rail();
+        assert_eq!(typed_value("999", 24.0, false, &rail), Some(999.0));
+        assert_eq!(typed_value("999", 24.0, true, &rail), None);
+    }
+
+    /// A line that means nothing on a rail leaves the value alone as well.
+    #[test]
+    fn a_rail_refuses_a_line_that_means_nothing() {
+        let rail = size_rail();
+        for text in ["", "  ", "wide", "2 4", "1/2", "nan", "inf", "--3"] {
+            assert_eq!(typed_value(text, 24.0, false, &rail), None, "{text:?}");
+        }
+    }
+
+    /// The airbrush rate reads "off" at zero, and a readout its own field
+    /// refuses is a readout the control cannot reproduce.
+    ///
+    /// It is the one figure in Umber whose zero is a word. Every `Tweak` is
+    /// driven through its own round trip here rather than only that one,
+    /// because the whole point of [`Figure`] is that the two directions are one
+    /// statement and a table with one exception is where an exception hides.
+    #[test]
+    fn every_figure_reads_back_the_readout_it_wrote() {
+        use crate::tweaks::Tweak;
+        let airbrush = Tweak::AirbrushRate.figure();
+        assert_eq!(airbrush.format(0.0), "off");
+        assert_eq!(airbrush.bare(0.0), "off");
+        assert_eq!(airbrush.format(60.0), "60/s");
+        assert_eq!(airbrush.parse("off"), Some(0.0));
+        assert_eq!(airbrush.parse("OFF"), Some(0.0));
+        assert_eq!(airbrush.parse(" off "), Some(0.0));
+        assert_eq!(airbrush.parse("60"), Some(60.0));
+
+        for tweak in Tweak::ALL {
+            let figure = tweak.figure();
+            let range = tweak.range();
+            for value in [*range.start(), *range.end(), 0.0, 1.0] {
+                let value = value.clamp(*range.start(), *range.end());
+                // Only where the readout states the value exactly, which is
+                // what a round trip can promise at nought decimal places.
+                let Some(back) = figure.parse(&figure.format(value)) else {
+                    panic!(
+                        "{tweak:?} showed {value} as {:?} and refused it",
+                        figure.format(value)
+                    );
+                };
+                if (back - value).abs() > 1e-4 {
+                    assert!(
+                        (figure.format(back)) == figure.format(value),
+                        "{tweak:?}: {value} showed as {:?} and read back as {back}",
+                        figure.format(value)
+                    );
+                }
+            }
+        }
+    }
+
     /// The brush library panel's own sample, at the size it is actually drawn
     /// at, so the assertions below are about the picture the rows show.
     fn sample_box() -> MarkBox {
