@@ -1525,6 +1525,33 @@ mod tests {
                     );
                 }
             }
+            // The two control fills are surfaces as well, and they take the
+            // inks `style_from` actually pairs them with rather than the whole
+            // product above: `widgets.inactive.fg_stroke` is `text_muted` over
+            // `control`, and hovered, active and open are all `text_strong`
+            // over `control_hover`. Nothing anywhere draws `text_dim` on a
+            // button, and a floor set by a pair that does not exist is a floor
+            // set by nothing — this domain was a cross-product first, and
+            // `text_dim` on `control` would have failed at 2.36 for a reading
+            // no artist can ever take.
+            for (ink, ink_name, surface, where_, floor) in [
+                (p.text_muted, "text_muted", p.control, "control", 3.0),
+                (p.text_strong, "text_strong", p.control, "control", 4.5),
+                (
+                    p.text_strong,
+                    "text_strong",
+                    p.control_hover,
+                    "control_hover",
+                    4.5,
+                ),
+            ] {
+                let r = ratio(ink, surface);
+                assert!(
+                    r >= floor,
+                    "{kind:?}: {ink_name} on {where_} is {r:.2}:1, under {floor}:1",
+                );
+            }
+
             // The accent is ink too — it is what a hyperlink is drawn in.
             let r = ratio(p.accent, p.chrome);
             assert!(r >= 3.0, "{kind:?}: the accent on chrome is {r:.2}:1");
