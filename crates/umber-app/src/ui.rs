@@ -21,6 +21,7 @@ use crate::editor::{self, BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::panels;
 use crate::shortcuts::{self, Action};
+use crate::syspick;
 use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
@@ -380,6 +381,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
             // the nib is now, and watching the second cross the first is how
             // the size is judged.
             pen_cursor(ui, &p, ed);
+            aiming_cursor(ui, ed);
             rect
         })
         .inner;
@@ -1215,6 +1217,45 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
         .circle_filled(ed.to_points(at), metrics::PEN_DOT, p.text_dim);
 }
 
+/// A crosshair over the canvas while the eyedropper is in hand.
+///
+/// **The one tool that gets a cursor of its own, and that is deliberate rather
+/// than the start of a set.** Every other tool paints a mark whose own size is
+/// what the hand is aiming with — a brush has a stroke, a selection has a
+/// marquee, a transform has a box — and the arrow is a fine pointer at all of
+/// them. A pick has no mark at all and its target is exactly one pixel, so the
+/// arrow, whose hotspot is its tip and whose body covers the pixels below and
+/// to the right, is the worst possible thing to aim it with. That is why every
+/// application draws a crosshair here and none of them draws one for a brush.
+///
+/// After [`pen_cursor`], which asks for `CursorIcon::None` and must win: a pen
+/// draws its own dot, and a crosshair *and* a dot would be two pointers. The
+/// pen answers to `pen_pointer`, so the two conditions are exclusive by
+/// construction rather than by ordering — this is belt and braces, and the
+/// order is the cheap half of it.
+///
+/// It is a per-frame request like every other cursor in this interface, so
+/// nothing has to remember to put the arrow back: change tool, cross onto a
+/// panel, open a dialog, and it is gone on the next frame. See
+/// [`Editor::pen_dot`](crate::Editor::pen_dot) for why that shape was chosen
+/// over a latch.
+fn aiming_cursor(ui: &egui::Ui, ed: &Editor) {
+    if ed.ui.tool != Tool::Eyedropper || ed.pen_pointer {
+        return;
+    }
+    // The same two readings `pen_cursor` hands to `Editor::pen_dot`, and for
+    // the same reasons: over a panel or a modal the ordinary cursor is the
+    // right one, and asking for a shape while another application has the
+    // keyboard would set it across the whole desktop.
+    if editor::over_egui_area(ed, ui.ctx(), ed.cursor)
+        || !ui.ctx().input(|i| i.focused)
+        || !ed.pointer_over_canvas(ed.cursor)
+    {
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+}
+
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     ui.horizontal_centered(|ui| {
         let (mark, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
@@ -1680,6 +1721,12 @@ mod strip_budget {
     pub const SELECT_OP: f32 = 105.0;
     /// The feather rail, its label and its readout.
     pub const FEATHER: f32 = 165.0;
+    /// The eyedropper's second sentence: what a drag off the window does, or
+    /// why it does nothing here. Both readings are within a few characters of
+    /// each other, so unlike the navigation pair one figure covers them —
+    /// measured at the same points-per-character `ZOOM`'s 370 for seventy-four
+    /// characters gives.
+    pub const EYEDROPPER: f32 = 305.0;
     // Pan's and Zoom's second sentence are budgeted per tool, on
     // `navigate_hint`'s own third field, because the two lines are a third
     // apart in width and one figure for both drops Pan's while it still fits.
@@ -1720,13 +1767,15 @@ mod strip_budget {
 /// **Exhaustive over [`Tool`] rather than a wildcard**, for the reason
 /// `panels::edit_icon` is exhaustive over `EditKind`: ten of the design's
 /// sixteen tools are not built, and the first navigation tool added would
-/// otherwise silently draw Pan's two sentences. The four that never reach this
+/// otherwise silently draw Pan's two sentences. The five that never reach this
 /// branch are named so that `Tool` growing is a compile error and not a wrong
 /// sentence — `options_strip` handles them above, and if one ever fell through
 /// to here saying nothing is better than saying something false.
 const fn navigate_hint(tool: Tool) -> (&'static str, &'static str, f32) {
     match tool {
-        Tool::Brush | Tool::Eraser | Tool::Select | Tool::Transform => ("", "", f32::INFINITY),
+        Tool::Brush | Tool::Eraser | Tool::Select | Tool::Transform | Tool::Eyedropper => {
+            ("", "", f32::INFINITY)
+        }
         Tool::Zoom => (
             "Drag right or up to zoom in, left or down to zoom out.",
             if cfg!(target_os = "macos") {
@@ -1785,6 +1834,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Tool::Eraser => (Icon::Eraser, "Eraser"),
             Tool::Select => (Icon::Select, "Select"),
             Tool::Transform => (Icon::Transform, "Transform"),
+            Tool::Eyedropper => (Icon::Eyedropper, "Eyedropper"),
             Tool::Pan => (Icon::Pan, "Pan"),
             Tool::Zoom => (Icon::Zoom, "Zoom"),
         };
@@ -1933,6 +1983,36 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 ) {
                     ed.deselect();
                 }
+            }
+        } else if ed.ui.tool == Tool::Eyedropper {
+            // Two sentences and no controls, in the Transform hint's register
+            // and for the same reason: there is nothing here to set, the whole
+            // gesture is the pointer's.
+            //
+            // The second one is the only place in the interface that says a
+            // colour can be taken from outside the window — and on a platform
+            // where it cannot, it is the only place that says so. The tool
+            // itself is *not* disabled there: picking inside the window works
+            // everywhere, so disabling it would take away the half that does
+            // work. `syspick::unreadable_reason` is where the two readings
+            // live, so the strip cannot say one thing and the module do
+            // another.
+            ui.label(
+                egui::RichText::new("Press on the canvas to take the colour under the pointer.")
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+            // Read afresh rather than against the room measured earlier, for
+            // the reason the navigation and selection hints do: the sentence
+            // above is drawn unconditionally and is in no budget.
+            if ui.available_width() >= strip_budget::EYEDROPPER {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(syspick::unreadable_reason())
+                        .size(text::SMALL)
+                        .color(p.text_dim),
+                )
+                .on_hover_text(syspick::unreadable_detail());
             }
         } else {
             // Pan and Zoom. Two sentences in the Transform hint's register

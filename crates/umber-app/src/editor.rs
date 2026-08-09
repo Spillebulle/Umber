@@ -34,6 +34,16 @@ pub enum Interaction {
     Selecting,
     Panning,
     Zooming,
+    /// A colour is being taken, and the pointer is still down.
+    ///
+    /// It exists so that the eyedropper is a *drag* rather than a click, which
+    /// is what lets the sample follow the pointer out of the window and onto
+    /// the desktop — winit keeps delivering moves while a button is held, see
+    /// [`crate::syspick`]. One interaction rather than a flag on the tool,
+    /// because the same drag has to work for the tool in hand and for Alt held
+    /// with any other tool: both resolve to `gesture::Press::Eyedropper`, and
+    /// this is where that one answer lands.
+    Picking,
 }
 
 /// A brush-size drag in progress: Alt held down with no button pressed.
@@ -53,20 +63,38 @@ pub struct BrushResize {
 }
 
 /// The selected tool. Brush and eraser paint, select marks out where they may,
-/// transform moves what they marked, and pan and zoom navigate.
+/// transform moves what they marked, the eyedropper takes a colour, and pan and
+/// zoom navigate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Brush,
     Eraser,
     Select,
     Transform,
+    /// Take the colour under the pointer. Alt with any other tool in hand does
+    /// the same thing for one press; this is the tool for when that is the
+    /// whole of what somebody is doing, and it is the only way to reach a
+    /// colour that is *outside* the window — see [`crate::syspick`].
+    Eyedropper,
     Pan,
     Zoom,
 }
 
 impl Tool {
+    /// Whether a press with this tool lays paint down.
+    ///
+    /// **A `match` and not a `matches!`**, which is this codebase's standing
+    /// rule and was earned rather than guessed: `matches!` answers *false* for
+    /// a variant it has never heard of, so a tool added later silently becomes
+    /// one that does not paint — and the options strip, which asks this to
+    /// decide whether to draw the size and opacity rails, would go quiet about
+    /// it with nothing failing to build. See CLAUDE.md, "Partial
+    /// exhaustiveness is worse than none".
     pub fn paints(self) -> bool {
-        matches!(self, Self::Brush | Self::Eraser)
+        match self {
+            Self::Brush | Self::Eraser => true,
+            Self::Select | Self::Transform | Self::Eyedropper | Self::Pan | Self::Zoom => false,
+        }
     }
 }
 
@@ -910,7 +938,7 @@ impl Editor {
         match tool {
             Tool::Brush => self.brush.mode = BrushMode::Paint,
             Tool::Eraser => self.brush.mode = BrushMode::Erase,
-            Tool::Select | Tool::Transform | Tool::Pan | Tool::Zoom => {}
+            Tool::Select | Tool::Transform | Tool::Eyedropper | Tool::Pan | Tool::Zoom => {}
         }
     }
 

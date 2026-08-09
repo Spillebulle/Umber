@@ -12,6 +12,7 @@ use crate::splash::{self, Splash};
 use crate::swapchain;
 use crate::sysclip::{self, Paste};
 use crate::syscursor;
+use crate::syspick;
 use crate::tabs::{self, Notice};
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 use crate::taskbar;
@@ -2410,6 +2411,7 @@ impl UmberApp {
             Action::EraserTool => self.pick_tool(Tool::Eraser),
             Action::SelectTool => self.pick_tool(Tool::Select),
             Action::TransformTool => self.pick_tool(Tool::Transform),
+            Action::EyedropperTool => self.pick_tool(Tool::Eyedropper),
             Action::PanTool => self.pick_tool(Tool::Pan),
             Action::ZoomTool => self.pick_tool(Tool::Zoom),
             Action::SwapColours => self.editor.swap_colors(),
@@ -2527,7 +2529,70 @@ impl UmberApp {
     }
 
     /// Take the colour under the cursor as the painting colour.
+    ///
+    /// The one route in, from `gesture::Press::Eyedropper` — which is Alt with
+    /// any tool in hand, the eyedropper tool's own press, and the pen's
+    /// Alt-tap — and from every frame of the drag that follows. Where the
+    /// pointer has left the window it reads the desktop instead; see
+    /// [`syspick`], and note that this is a second source of *pixels* and not
+    /// a second route to a colour, because both ends come back through
+    /// `Color::from_srgb_u8` here.
     fn pick_colour_at_cursor(&mut self) {
+        let aim = self.pick_aim(self.editor.cursor);
+        match aim {
+            // Nothing to say: the pointer is off the window on a platform with
+            // no screen read. Silent rather than a notice, because this fires
+            // once per pointer event and a dialog per mouse move is not a
+            // refusal, it is an assault. The options strip is where the
+            // sentence lives — see `ui::options_strip`.
+            syspick::Aim::Unreachable => {}
+            syspick::Aim::Desktop(x, y) => {
+                if let Some([r, g, b]) = syspick::sample(x, y) {
+                    // The desktop hands over sRGB bytes and the engine is
+                    // linear throughout, so this goes through the one door the
+                    // clipboard and the palette also use. Never a second
+                    // `powf`.
+                    self.editor.set_color(Color::from_srgb_u8(r, g, b, 255));
+                }
+            }
+            syspick::Aim::Canvas => self.pick_colour_off_canvas(),
+        }
+    }
+
+    /// Where the pointer at `pos` is, as far as a pick is concerned.
+    ///
+    /// The window's own geometry is read here and the rule is
+    /// [`syspick::aim`]'s, which is a pure function so that "outside the
+    /// window is the desktop, inside it is the canvas, and a build that cannot
+    /// read the desktop says so" is testable on a machine with no second
+    /// monitor. With no window at all there is nothing outside to be outside
+    /// *of*, so the canvas answers and then declines for want of a renderer.
+    fn pick_aim(&self, pos: Vec2) -> syspick::Aim {
+        let Some(gfx) = self.gfx.as_ref() else {
+            return syspick::Aim::Canvas;
+        };
+        let size = gfx.window.inner_size();
+        let client = Vec2::new(size.width as f32, size.height as f32);
+        let origin = gfx
+            .window
+            .inner_position()
+            .ok()
+            .map(|p| (p.x, p.y))
+            // `inner_position` is `Err` on the platforms that will not say —
+            // Wayland, and Android — which is exactly the set that cannot read
+            // the desktop either, so this never costs a pick that would have
+            // worked.
+            .filter(|_| syspick::DESKTOP_READABLE);
+        syspick::aim(pos, client, origin, syspick::DESKTOP_READABLE)
+    }
+
+    /// The canvas half: the colour the document shows under the cursor.
+    ///
+    /// Straight through `CanvasRenderer::pick_colour`, which reuses the screen
+    /// composite pass — so the eyedropper, the flat PNG export and a smudging
+    /// brush's canvas probe are all one piece of blend maths. Do not add a
+    /// second path here.
+    fn pick_colour_off_canvas(&mut self) {
         let doc = self.editor.screen_to_doc(self.editor.cursor);
         let size = self.editor.doc.size;
         if doc.x < 0.0 || doc.y < 0.0 || doc.x >= size.x as f32 || doc.y >= size.y as f32 {
@@ -4100,7 +4165,17 @@ impl UmberApp {
                 self.editor.selection_press(doc, op);
             }
             gesture::Press::Transform => self.transform_press(pos),
-            gesture::Press::Eyedropper => self.pick_colour_at_cursor(),
+            gesture::Press::Eyedropper => {
+                // A *drag*, not a click, and that is the whole of how a colour
+                // outside the window is reachable: winit keeps the mouse
+                // capture for as long as a button is held, so the moves go on
+                // arriving once the pointer has left. `syspick`'s module docs
+                // have it. Picking once here as well means a plain click still
+                // takes the colour it landed on, which is what an Alt-click
+                // has always done.
+                self.editor.interaction = Interaction::Picking;
+                self.pick_colour_at_cursor();
+            }
         }
         decision
     }
@@ -4121,6 +4196,14 @@ impl UmberApp {
                 let doc = self.editor.screen_to_doc(pos);
                 self.editor.selection_moved(doc);
             }
+            // The colour follows the pointer for the whole drag, applied live
+            // rather than at the release. That is what gives the gesture a
+            // readout at all: the pointer is over somebody else's window, so
+            // there is nowhere near it for Umber to draw one, and the Colour
+            // module's swatch is what moves instead. It is also what every
+            // other application does with this gesture. `Editor::cursor` was
+            // written just above, which is what `pick_colour_at_cursor` reads.
+            Interaction::Picking => self.pick_colour_at_cursor(),
             Interaction::Panning => {
                 let delta = pos - self.editor.last_cursor;
                 self.editor.camera.pan_by_screen(delta);

@@ -808,6 +808,14 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                 shortcuts::labelled("Transform", Action::TransformTool),
             ),
             (
+                Tool::Eyedropper,
+                Icon::Eyedropper,
+                format!(
+                    "{}, or hold Alt with any tool",
+                    shortcuts::labelled("Eyedropper", Action::EyedropperTool)
+                ),
+            ),
+            (
                 Tool::Pan,
                 Icon::Pan,
                 format!(

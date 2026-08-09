@@ -95,6 +95,10 @@ windows-sys = { version = "0.61", features = [
     # pen: winit's own `set_cursor_visible` is gated on a flag that legacy mouse
     # messages alone ever set. See `src/syscursor.rs`.
     "Win32_UI_WindowsAndMessaging",
+    # `GetDC`/`GetPixel`/`ReleaseDC`, which is how the eyedropper reads a pixel
+    # that is not Umber's own. See `src/syspick.rs`. No new system library: GDI
+    # is in every Windows process already.
+    "Win32_Graphics_Gdi",
 ] }
 
 # The desktop's clipboard (`sysclip.rs`), for pictures. Text goes out through

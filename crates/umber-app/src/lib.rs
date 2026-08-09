@@ -55,6 +55,13 @@ mod swapchain;
 mod swatchdrag;
 mod sysclip;
 mod syscursor;
+/// Reading a pixel of the desktop, for the eyedropper's other half.
+///
+/// Public because `examples/measure-screenpick.rs` is what settles the numbers
+/// its docs quote, and an example sees only what the crate exposes — the same
+/// reason [`docshot`] and [`update`] are. Nothing else here is opened up: the
+/// decision `syspick::aim` makes reaches the interface through `app.rs` alone.
+pub mod syspick;
 mod tabs;
 mod taskbar;
 mod textpanel;
