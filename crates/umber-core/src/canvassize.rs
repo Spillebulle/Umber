@@ -1272,15 +1272,24 @@ mod tests {
     #[test]
     fn a_lock_that_saturates_stops_being_the_shape_and_says_so() {
         // The one case the sweep above excludes, and it is not a defect: a 4:3
-        // canvas 12345 pixels tall wants to be 16460 wide, the bound pins it at
-        // 16384, and 16384 x 12345 is genuinely not 4:3 any more. What matters
-        // is that nothing pretends otherwise — the strip settles to Custom
-        // rather than lighting 4:3 over a canvas that has stopped being it.
+        // canvas tall enough wants to be wider than the bound, the bound pins
+        // it, and what is left is genuinely not 4:3 any more. What matters is
+        // that nothing pretends otherwise — the strip settles to Custom rather
+        // than lighting 4:3 over a canvas that has stopped being it.
+        //
+        // **The height is derived from the bound**, and that is this test's own
+        // lesson: it used to be a literal 12345, chosen because 4:3 of it was
+        // 16460 and the ceiling was 16384. Raising the ceiling to 32768 made
+        // 16460 fit, so nothing saturated and the case under test stopped
+        // existing — the assertion failed, which was luck, since a test that
+        // had merely stopped exercising its own case would have passed.
         let limit = CanvasLimit::UNKNOWN;
         let shape = LockedShape::of_aspect(Aspect::Standard).expect("4:3 is a ratio");
-        let width = shape.width_for(12345, limit);
+        // Just past the tallest 4:3 canvas that fits, so the width saturates.
+        let height = Document::MAX_EDGE * 3 / 4 + 100;
+        let width = shape.width_for(height, limit);
         assert_eq!(width, Document::MAX_EDGE);
-        let size = UVec2::new(width, 12345);
+        let size = UVec2::new(width, height);
         assert!(!Aspect::Standard.holds(size, 72));
         assert_eq!(settle(Aspect::Standard, size, 72).aspect, Aspect::Custom);
     }

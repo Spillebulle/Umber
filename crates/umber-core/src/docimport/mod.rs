@@ -575,10 +575,19 @@ impl ImportedDocument {
     /// Largest canvas edge an import will accept.
     ///
     /// Not a GPU limit — `umber-core` cannot see the adapter — but a sanity
-    /// bound: 16384 is the ceiling on current desktop hardware, and one layer
-    /// that size is already a gigabyte. The caller must still check the real
-    /// `max_texture_dimension_2d` before uploading.
-    pub const MAX_DIMENSION: u32 = 16384;
+    /// bound. The caller must still check the real `max_texture_dimension_2d`
+    /// before uploading, and does.
+    ///
+    /// **It tracks [`Document::MAX_EDGE`] and must**, which is the rule
+    /// [`check_bounds`] states as "a reader must never be stricter than the
+    /// writer": Umber can make a canvas that size, so it has to be able to open
+    /// one back. They are two constants rather than one because the two crates
+    /// answer different questions — what a document may be, and what a *file*
+    /// may declare — but a divergence between them is a document Umber saves
+    /// and refuses.
+    ///
+    /// [`Document::MAX_EDGE`]: crate::document::Document::MAX_EDGE
+    pub const MAX_DIMENSION: u32 = crate::document::Document::MAX_EDGE;
 
     /// Total layer bytes an import will accept, across the whole stack.
     ///

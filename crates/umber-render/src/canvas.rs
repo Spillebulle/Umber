@@ -185,8 +185,12 @@ const MAX_DRAWS: usize = MAX_LAYERS + MAX_EFFECT_SLICES;
 /// A *coordinate*, so it has to be exact: an `f16`'s mantissa runs out of whole
 /// integers at 2048, which is a canvas size Umber ships with, and a 2049th
 /// column would flood towards the wrong texel. Sixteen bits of unsigned integer
-/// covers every canvas `max_texture_dimension_2d` permits four times over, which
-/// is also what lets 65535 stand for "no seed" without ever colliding with one.
+/// covers every canvas `max_texture_dimension_2d` permits, which is also what
+/// lets 65535 stand for "no seed" without ever colliding with one — the margin
+/// was four times over at a 16384 ceiling and is twice over at
+/// `Document::MAX_EDGE`'s 32768, where the largest coordinate is 32767. A
+/// device reporting 65536 would be the one that breaks the sentinel, and none
+/// does.
 ///
 /// **A render target on every device, and that was checked rather than
 /// assumed.** `TextureFormat::guaranteed_format_features` gives `Rg16Uint`

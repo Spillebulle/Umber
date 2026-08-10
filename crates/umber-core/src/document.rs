@@ -147,7 +147,28 @@ impl Document {
     /// Same bound the importer holds itself to, so a document made here can
     /// always be saved and reopened. The device's own
     /// `max_texture_dimension_2d` may be lower and is checked by the caller.
-    pub const MAX_EDGE: u32 = 16384;
+    ///
+    /// **32768, and what that is really a ceiling on is the *format*.** The
+    /// machine decides what an artist can actually reach:
+    /// `CanvasLimit::of_device` clamps every size the dialogs offer to
+    /// `max_texture_dimension_2d` and says in a sentence what the machine
+    /// holds, and `Document::new` clamps as a backstop — so raising this
+    /// changes nothing on a device that will not go there. Measured with
+    /// `umber-render`'s `measure-limits` on one real machine: an RTX 3080
+    /// reports **32768 on Vulkan and 16384 on Dx12**, and an Intel iGPU reports
+    /// 16384 on both. 16384 is a hard limit of the D3D12 specification and of
+    /// Metal, so this is a Vulkan ceiling rather than a general one.
+    ///
+    /// **What it costs is the thing to know before using it.** A 32768² layer
+    /// is 4.3 GB of texture, so a 10 GB card holds two of them and a document
+    /// that asks for more fails at `create_texture` — which is fatal, and is a
+    /// refusal Umber does not yet make. `MAX_TOTAL_BYTES` admits three such
+    /// layers on import. And a full-canvas undo patch is 4.3 GB against a
+    /// default budget of 512 MB, so the history holds none of them: the
+    /// panel says "earlier edits discarded" and means it. None of that is new
+    /// — it is the same arithmetic that already applies at 10000² — but it
+    /// arrives four times faster here.
+    pub const MAX_EDGE: u32 = 32768;
 
     /// The resolution a document has when nothing states one.
     ///
