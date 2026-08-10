@@ -64,6 +64,25 @@ const FOOTER: f32 = 36.0;
 /// opened.
 const MIN_BODY: f32 = 120.0;
 
+/// The drawing above the heading, as **coverage** rather than as a picture.
+///
+/// It is the author's own sad cat, and it is stored as one channel of ink
+/// because a crash box is drawn in whichever of the six themes the artist uses.
+/// The original is a black drawing on an opaque white card: shown literally
+/// that card is a bright block in a dark theme, and "never hard-code a colour"
+/// is the rule this project keeps everywhere else. So the *ink* is kept —
+/// darkness times the source alpha, which drops the card and the rounded
+/// surround both — and it is tinted with a palette token at draw time. In a
+/// light theme that is the drawing as it was made; in a dark one it is the same
+/// cat in chalk.
+///
+/// 256 px wide, from a 5000 px original, which is 11 KB against 3.2 MB and
+/// still twice [`CAT_WIDTH`] so it stays crisp on a 2× display.
+const CAT: &[u8] = include_bytes!("../../../../assets/crash-cat.png");
+
+/// How wide the cat is drawn, in points. The height follows the picture.
+const CAT_WIDTH: f32 = 128.0;
+
 /// Show the report. Returns once the window has closed.
 pub fn show(report: &Report, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut reporter = Reporter::new(report, path);
@@ -96,6 +115,14 @@ struct Reporter<'a> {
     /// frame — the one the click already caused.
     copied: bool,
     restart: bool,
+    /// The cat, uploaded once.
+    ///
+    /// Held rather than loaded per frame: `load_texture` uploads, and a crash
+    /// box sits open under `ControlFlow::Wait` for as long as somebody reads
+    /// it. `None` where the asset would not decode, which draws nothing at all
+    /// — a crash reporter that fails to open over its own decoration would be
+    /// an absurd way to lose a report.
+    cat: Option<egui::TextureHandle>,
 }
 
 impl<'a> Reporter<'a> {
@@ -121,6 +148,7 @@ impl<'a> Reporter<'a> {
             expanded: false,
             copied: false,
             restart: false,
+            cat: None,
         }
     }
 }
@@ -139,12 +167,18 @@ impl Page for Reporter<'_> {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui, close: &mut bool) {
+        // Uploaded on the first frame rather than in `new`, because there is no
+        // context until the window exists.
+        if self.cat.is_none() {
+            self.cat = load_cat(ui.ctx());
+        }
         body(
             ui,
             &self.palette,
             self.report,
             &self.details,
             &self.report_path,
+            self.cat.as_ref(),
             Actions {
                 expanded: &mut self.expanded,
                 copied: &mut self.copied,
@@ -171,6 +205,7 @@ fn body(
     report: &Report,
     details: &str,
     report_path: &Path,
+    cat_texture: Option<&egui::TextureHandle>,
     actions: Actions<'_>,
 ) {
     // The dialog frame every modal in the application uses, inset far enough
@@ -183,7 +218,7 @@ fn body(
             ui.set_width(ui.available_width());
             ui.set_min_height(ui.available_height());
 
-            heading(ui, p, report);
+            heading(ui, p, report, cat_texture);
             ui.add_space(12.0);
 
             // The settings dialog's shape, and for its reason: a header, **one**
@@ -245,30 +280,100 @@ fn body(
 /// The heading is the application's own voice and is exactly what it says. The
 /// line under it carries the version, because a crash box that does not say
 /// which build broke is a crash box nobody can act on.
-fn heading(ui: &mut egui::Ui, p: &Palette, report: &Report) {
+fn heading(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    report: &Report,
+    cat_texture: Option<&egui::TextureHandle>,
+) {
+    // The mark and the words on the left, the drawing on the right, on one
+    // row — so the box opens on what happened and what it is about at once,
+    // and the picture is beside the sentence rather than above it pushing the
+    // sentence down.
     ui.horizontal(|ui| {
-        let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(26.0), Sense::hover());
-        icons::draw(ui.painter(), mark, Icon::Alert, p.warning);
-        ui.add_space(10.0);
+        // The cat is placed first from the right, so the words take whatever is
+        // left rather than the picture being squeezed by them. `right_to_left`
+        // inside the row is how this file's own footer already does it.
+        let cat_width = cat_texture.map_or(0.0, |_| CAT_WIDTH);
+        let words = (ui.available_width() - cat_width - 12.0).max(80.0);
+
         ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new("Oh no, oopsy")
-                    .size(text::HEADING)
-                    .color(p.text_strong)
-                    .strong(),
-            );
-            let version = if report.version.is_empty() {
-                "Umber stopped unexpectedly".to_string()
-            } else {
-                format!("Umber {} stopped unexpectedly", report.version)
-            };
-            ui.label(
-                egui::RichText::new(version)
-                    .size(text::SMALL)
-                    .color(p.text_muted),
-            );
+            ui.set_width(words);
+            ui.horizontal(|ui| {
+                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(26.0), Sense::hover());
+                icons::draw(ui.painter(), mark, Icon::Alert, p.warning);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Oh no, oopsy")
+                            .size(text::HEADING)
+                            .color(p.text_strong)
+                            .strong(),
+                    );
+                    let version = if report.version.is_empty() {
+                        "Umber stopped unexpectedly".to_string()
+                    } else {
+                        format!("Umber {} stopped unexpectedly", report.version)
+                    };
+                    ui.label(
+                        egui::RichText::new(version)
+                            .size(text::SMALL)
+                            .color(p.text_muted),
+                    );
+                });
+            });
         });
+
+        if let Some(texture) = cat_texture {
+            cat(ui, p, texture);
+        }
     });
+}
+
+/// Decode the cat into an egui texture, once.
+///
+/// The asset is one greyscale channel of coverage; egui wants RGBA, so the ink
+/// becomes the alpha of a white image and the *colour* comes from the tint at
+/// draw time. That is the whole reason it is stored this way — see [`CAT`].
+fn load_cat(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(CAT));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    // The asset is written as `L8` and nothing else is expected; anything else
+    // is a rebuild that changed it, and drawing nothing beats drawing noise.
+    if info.color_type != png::ColorType::Grayscale {
+        return None;
+    }
+    let pixels: Vec<egui::Color32> = buf[..info.buffer_size()]
+        .iter()
+        .map(|ink| egui::Color32::from_rgba_unmultiplied(255, 255, 255, *ink))
+        .collect();
+    let image = egui::ColorImage {
+        size: [info.width as usize, info.height as usize],
+        pixels,
+        source_size: egui::Vec2::new(info.width as f32, info.height as f32),
+    };
+    Some(ctx.load_texture("crash-cat", image, egui::TextureOptions::LINEAR))
+}
+
+/// Draw the cat, centred, above the heading.
+fn cat(ui: &mut egui::Ui, p: &Palette, texture: &egui::TextureHandle) {
+    let size = texture.size_vec2();
+    let height = CAT_WIDTH * size.y / size.x.max(1.0);
+    // Centred by allocating the whole line and putting the picture in the
+    // middle of it, rather than by a layout — the box is one column and this is
+    // the only thing on its row.
+    let (rect, _) = ui.allocate_exact_size(
+        egui::Vec2::new(ui.available_width(), height),
+        Sense::hover(),
+    );
+    let at = egui::Rect::from_center_size(rect.center(), egui::Vec2::new(CAT_WIDTH, height));
+    // `text` rather than `text_strong`: it is a decoration beside a heading,
+    // and the heading is what should be loudest. The tint is what makes the
+    // coverage a colour at all.
+    egui::Image::new(texture).tint(p.text).paint_at(ui, at);
 }
 
 /// What happened to the artist's work — the single most useful thing this box
