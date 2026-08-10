@@ -484,6 +484,38 @@ struct LayerRow {
     draw_colour: (i64, i64, i64),
 }
 
+/// How much larger than the canvas a layer's own bitmap may be, by area.
+///
+/// Measured rather than picked: over 5,438 bitmaps in 33 real documents the
+/// worst is 15.93×, so this is a little over twice what any of them needs. See
+/// [`read_bitmap`] for why the quantity is area and not a side.
+const BITMAP_AREA_SLACK: u64 = 32;
+
+/// The longest a single edge of a layer's bitmap may be.
+///
+/// **Not [`ImportedDocument::MAX_DIMENSION`]**, which is the bound on a
+/// *canvas* and is the wrong instrument here: a layer's bitmap is intermediate
+/// data that the blit clips into the canvas, so there is no reason it cannot be
+/// wider than the largest document Umber opens. One real 15000×5000 file stores
+/// a layer 19712 px across — 1.2× that ceiling and only 2.1× the canvas by
+/// area — and it was refused for its width alone.
+///
+/// What remains is a bound on *shape* rather than on cost, since
+/// [`BITMAP_AREA_SLACK`] is what bounds the work: it stops a bitmap one pixel
+/// tall and a billion wide, whose area could pass while its block grid is
+/// millions of columns to walk. Four times the largest canvas, which is three
+/// times the worst edge measured in any real document.
+const BITMAP_MAX_SIDE: u32 = 4 * ImportedDocument::MAX_DIMENSION;
+
+/// The smallest area bound, whatever the canvas is.
+///
+/// A very small canvas would otherwise be held to a very small bitmap, which is
+/// exactly backwards — the worst real ratio in the sample is a 1200×480 banner,
+/// because the smaller the page the further a layer reaches past it in relative
+/// terms. 1024² is one megapixel, about 5 MB to inflate, which is the ceiling
+/// the pathological 1×1 canvas is held to.
+const BITMAP_AREA_FLOOR: u64 = 1024 * 1024;
+
 /// `LayerType`'s value for a **vector** layer.
 ///
 /// Zero, which is also what a folder carries — so this alone never decides
@@ -1021,22 +1053,39 @@ fn read_bitmap<'a>(
     container: &'a Container<'a>,
     canvas: UVec2,
 ) -> Result<(Bitmap, Packing, &'a [u8]), String> {
-    // **Bounded by the canvas rather than by `MAX_DIMENSION`.** A layer may
-    // legitimately hang off the page, so the bound has slack; what it must not
-    // be is the global ceiling, because nothing else ties a bitmap to the
-    // document it is in. A 1×1 canvas with sixty-four layers passes
-    // `check_bounds` at 256 bytes, and each of those layers could still declare
-    // 16384² — a 64×64 grid, 4096 blocks, 1.3 GB of inflate each, every byte of
-    // it thrown away by the blit. Worse, nothing stops all of them naming the
-    // *same* external chunk, so one small blob would be inflated a hundred and
-    // twenty-eight times.
-    let bound = canvas
-        .x
-        .max(canvas.y)
-        .saturating_mul(2)
-        .max(BLOCK as u32 * 2)
-        .min(ImportedDocument::MAX_DIMENSION);
-    let bitmap = csblocks::parse_attribute(attribute, bound)
+    // **Bounded by *area* against the canvas, not by each side.** A layer may
+    // legitimately hang off the page, and the bound must still not be the
+    // global ceiling: nothing else ties a bitmap to the document it is in, so a
+    // 1×1 canvas with sixty-four layers passes `check_bounds` at 256 bytes
+    // while each of those layers declares 16384² — a 64×64 grid, 4096 blocks,
+    // 1.3 GB of inflate each, every byte of it thrown away by the blit. Worse,
+    // nothing stops all of them naming the *same* external chunk, so one small
+    // blob would be inflated a hundred and twenty-eight times.
+    //
+    // **It was twice the longer canvas edge, and that refused real documents.**
+    // Five layers of one 3000² file came back as "Umber could not read the
+    // shape of its bitmap" because Clip Studio had stored them 8448×11264 —
+    // 3.75 times the edge. Measured over 5,438 bitmaps in 33 real documents,
+    // eight exceed a 2× *side* bound and the worst is 3.75×.
+    //
+    // Area is the right quantity because area is what costs: the work is
+    // `columns × rows` inflates, so a tall thin bitmap is cheap however far it
+    // hangs off the page, and a side bound charges it as though it were square.
+    // The worst real ratio is **15.93×**, and it is on the *smallest* canvas in
+    // the folder — a 1200×480 banner holding a 2560×3584 layer — which is the
+    // shape of the whole problem: the smaller the page, the further a layer
+    // reaches beyond it in relative terms. So the cap is 32×, a little over
+    // twice the worst seen, with a floor so that a very small canvas is not
+    // squeezed by its own smallness.
+    //
+    // What the pathological case now costs: a 1×1 canvas is held to the floor,
+    // 1024², which is 5 MB of inflate a layer rather than 1.3 GB.
+    let canvas_area = u64::from(canvas.x) * u64::from(canvas.y);
+    let area_bound = canvas_area
+        .saturating_mul(BITMAP_AREA_SLACK)
+        .max(BITMAP_AREA_FLOOR);
+    let bitmap = csblocks::parse_attribute(attribute, BITMAP_MAX_SIDE)
+        .filter(|b| u64::from(b.width) * u64::from(b.height) <= area_bound)
         .ok_or_else(|| "Umber could not read the shape of its bitmap".to_string())?;
     let packing = bitmap
         .packing
@@ -1399,6 +1448,69 @@ mod tests {
             &[ClipLayer::flat("Ink", 1, 1, [255, 0, 0, 255]).placed((1, 1), (0, 0))],
         );
         assert!(matches!(read(&bytes), Err(ImportError::Malformed { .. })));
+    }
+
+    /// **A layer whose bitmap hangs well off the page still arrives.**
+    ///
+    /// The bound used to be twice the longer canvas edge, and five layers of
+    /// one real 3000² document were refused because Clip Studio had stored
+    /// them 8448×11264 — 3.75 times the edge, and a perfectly ordinary raster
+    /// layer. The artist saw "Umber could not read the shape of its bitmap",
+    /// which reads as a damaged file, and lost the layers.
+    ///
+    /// Driven at the real figures rather than at a round number: 8448×11264 on
+    /// 3000², which is 10.57× by area and the second worst of 5,438 bitmaps
+    /// measured across 33 documents.
+    #[test]
+    fn a_layer_reaching_far_past_the_canvas_still_arrives() {
+        // `placed` is what puts a bitmap bigger than the canvas in the file,
+        // which is exactly what a layer dragged off the page produces.
+        //
+        // **Sized past the floor as well as past the ratio**, or this measures
+        // the wrong bound. The first version was 845×1126 on 300², which is
+        // 10.57× by area — the real document's own figure — and was admitted by
+        // `BITMAP_AREA_FLOOR` whatever the slack was: cutting the slack to a
+        // quarter left it green. 1600×2134 on 600² is 9.5× *and* three times
+        // the floor, so only the ratio can let it through.
+        let bytes = fixtures::clip(
+            600,
+            600,
+            &[ClipLayer::flat("Wide", 1600, 2134, [10, 20, 30, 255])
+                .placed((1600, 2134), (-100, -100))],
+        );
+        let doc = read(&bytes).expect("a document");
+        assert_eq!(doc.layers.len(), 1, "warnings: {:?}", doc.warnings);
+        assert!(
+            doc.warnings.is_empty(),
+            "a layer hanging off the page is not a loss: {:?}",
+            doc.warnings
+        );
+    }
+
+    /// The bound is still a bound: a bitmap far past what any real document
+    /// carries is refused rather than inflated.
+    ///
+    /// The case it exists for is a *tiny* canvas — `check_bounds` lets a 1×1
+    /// document through at 256 bytes, and without this each of its layers could
+    /// declare 16384² and cost 1.3 GB of inflate apiece.
+    #[test]
+    fn a_bitmap_far_larger_than_the_canvas_is_still_refused() {
+        // 4096² against the 1024² floor: sixteen times the area a very small
+        // canvas is allowed, so the floor rather than the ratio is what refuses
+        // it.
+        let bytes = fixtures::clip(
+            8,
+            8,
+            &[ClipLayer::flat("Huge", 4096, 4096, [1, 2, 3, 255]).placed((4096, 4096), (0, 0))],
+        );
+        let doc = read(&bytes);
+        match doc {
+            Ok(d) => assert!(
+                d.layers.is_empty() || !d.warnings.is_empty(),
+                "an absurd bitmap must not arrive silently"
+            ),
+            Err(_) => {}
+        }
     }
 
     /// **A vector layer is named as one, not reported as a file with no
