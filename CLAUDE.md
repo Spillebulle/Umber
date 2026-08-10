@@ -1800,6 +1800,40 @@ reporter's own window.
   rather than assumed.** `Canvas.CanvasRootFolder` → `LayerFirstChildIndex` →
   `LayerNextIndex`. A reader that gets this backwards still produces a picture,
   which is why it was worth five real files to settle.
+- **A Clip Studio Paper layer is the document's *background*, not a layer.** It
+  carries a flat colour and no bitmap, so it fell through the "does not hold its
+  pixels" path and was dropped — all 33 real files opened on transparency where
+  the artist had white paper, each with a warning that read like a damaged file.
+  Umber already has `Background` and `openraster` already turns its own
+  `umber-background` layer into one, so this takes that route rather than a new
+  one, and it is taken out *before* `check_bounds`: paper holds no buffer to be
+  charged for and becomes no entry to be counted. Colour and eye are both
+  honoured, a hidden paper meaning somebody worked on transparency. **What marks
+  it is `SpecialRenderType` 20, with `LayerType` 1584 accepted beside it** —
+  the two agreed on every file and neither ever fired on anything else, so
+  either covers a schema missing the other column. **`DrawColorEnable` is
+  deliberately not the test**, though it is set on every paper: two ordinary
+  raster layers carry it too, and keying on it would turn somebody's drawing
+  into the background and delete it from the stack.
+- **`CanvasWidth` is not always pixels, and `CanvasUnit` is what says.** Ignoring
+  it made an A4 page at 600 dpi — 4961×7016 — open as a **21×29** canvas that
+  every layer then missed, whereupon the document was refused as holding no
+  layers. No step of that reads as a unit problem from outside. Only the two
+  codes seen in real files are converted, and 1 is **cross-checked rather than
+  inferred**: 21×29.7 at 600 dpi is exactly the canvas of another file in the
+  same folder holding the same page in pixels. Clip Studio also offers mm,
+  inches and points, and with no sample of any of them those codes are
+  **refused with the code named** — falling back to pixels reproduces the 21×29
+  canvas exactly, and guessing the order is a canvas silently out by a factor of
+  ten or twenty-five. Same rule that keeps the MediaBang reader unwritten.
+- **A guard can be undefeatable rather than absent, and saying which is the
+  honest move.** `LayerRow::colour` divides by `u32::MAX` where masking the low
+  byte would do; every channel a real file holds is a byte spread by
+  `0x01010101`, so the two agree on everything reachable and a mutation to
+  `v & 0xFF` passes the suite. That was checked rather than assumed. The
+  division is right whichever way the format goes and the mask is right by
+  accident, so the division is written and the equivalence is recorded at the
+  function — rather than contriving a test over data no file produces.
 - **What an absent block holds is read out of the file, never assumed.** A raster
   layer's `InitColor` states nothing and a **mask's states all-ones**, because a
   Clip Studio mask begins revealing everything — taking an absent block for zero
