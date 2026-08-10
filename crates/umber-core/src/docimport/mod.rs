@@ -43,6 +43,8 @@
 mod blend;
 mod clipstudio;
 mod container;
+/// The flattened picture a document already carries, for a file manager.
+pub mod preview;
 // Visible inside the crate so `tip::TipMask::from_picture` can read a PNG
 // through the decoder that already exists rather than growing a second one.
 pub(crate) mod flat;

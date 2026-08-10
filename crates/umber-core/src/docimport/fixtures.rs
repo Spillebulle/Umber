@@ -1390,6 +1390,13 @@ fn scale_channel(byte: u8) -> i64 {
     (i64::from(byte) * i64::from(u32::MAX)) / 255
 }
 
+/// The size of the `CanvasPreview` every `.clip` fixture carries, and the one
+/// colour in it. Both are chosen to be unlike anything a layer holds, so a
+/// thumbnail that came from anywhere else is visibly wrong rather than
+/// accidentally right.
+pub const CLIP_PREVIEW: (u32, u32) = (12, 6);
+pub const CLIP_PREVIEW_PIXEL: [u8; 4] = [7, 200, 111, 255];
+
 const CLIP_LAYER_COLUMNS: [&str; 25] = [
     "MainId",
     "LayerName",
@@ -1540,6 +1547,34 @@ fn clip_inner(
         Value::Integer(0),
     ]);
 
+    // The flattened picture Clip Studio keeps beside the layers, which is what
+    // a thumbnail reads. Deliberately a *different* size from the canvas and a
+    // colour no layer in any fixture uses, so a reader that produced the
+    // thumbnail by any other route — compositing, or taking the first layer —
+    // fails rather than coincidentally agreeing.
+    let preview_png = png_rgba(
+        CLIP_PREVIEW.0,
+        CLIP_PREVIEW.1,
+        &solid(CLIP_PREVIEW.0, CLIP_PREVIEW.1, &CLIP_PREVIEW_PIXEL),
+    );
+    let canvas_preview = TableSpec::new(
+        "CanvasPreview",
+        &[
+            "MainId",
+            "ImageType",
+            "ImageWidth",
+            "ImageHeight",
+            "ImageData",
+        ],
+    )
+    .row(vec![
+        Value::Integer(1),
+        Value::Integer(1),
+        Value::Integer(i64::from(CLIP_PREVIEW.0)),
+        Value::Integer(i64::from(CLIP_PREVIEW.1)),
+        Value::Blob(preview_png),
+    ]);
+
     let stated = stated.unwrap_or_else(|| CanvasSize::pixels(width, height));
     let mut canvas = TableSpec::new(
         "Canvas",
@@ -1583,6 +1618,7 @@ fn clip_inner(
 
     let database = damage(crate::sqlite::fixture::database(&[
         canvas,
+        canvas_preview,
         layer_table,
         mipmap,
         info,

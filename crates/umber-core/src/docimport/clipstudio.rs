@@ -436,7 +436,19 @@ fn canvas(db: &Database<'_>) -> Result<Canvas, ImportError> {
     })
 }
 
-fn table(db: &Database<'_>, name: &str) -> Result<Option<Table>, ImportError> {
+/// The SQLite database out of the chunk stream, and nothing else.
+///
+/// [`super::preview`] needs it and must not walk the chunks itself: two copies
+/// of a container's framing is the drift `docformat`'s "there must never be a
+/// second ORA reader" refuses, applied to the format that arrives inside a
+/// wrapper. `split` also collects every external chunk, which a preview does
+/// not need — the picture is in the database — but the walk is one pass and
+/// splitting it further would be two shapes of one loop.
+pub(super) fn database_chunk(bytes: &[u8]) -> Result<&[u8], ImportError> {
+    Ok(split(bytes)?.database)
+}
+
+pub(super) fn table(db: &Database<'_>, name: &str) -> Result<Option<Table>, ImportError> {
     db.table(name).map_err(|e| ImportError::Malformed {
         format: FORMAT,
         detail: e.to_string(),
