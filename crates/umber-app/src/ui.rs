@@ -353,6 +353,9 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     crate::recoverdlg::show(root, &p, ed, &mut actions);
 
     tabs::notice(root, &p, ed);
+    // After the notice, so a document that failed shows why rather than the
+    // bar of the next one over the top of it.
+    tabs::loading(root, &p, ed);
 
     // Whatever is left is the document's. The canvas is drawn by the GPU
     // beneath egui, so this panel only reports its rect and stays transparent.

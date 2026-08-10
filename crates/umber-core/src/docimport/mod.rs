@@ -82,7 +82,38 @@ pub fn supported_extensions() -> &'static [&'static str] {
 /// Dispatches on the file extension. The readers still check the file's own
 /// magic, so a mislabelled file fails with [`ImportError::Malformed`] rather
 /// than by misreading.
+/// How far a decode has got, for something drawing a progress bar.
+///
+/// **Layers rather than bytes**, because layers are what the readers loop over
+/// and what the wait actually is: measured on real documents, reading the file
+/// off disk is 55 ms of a 13.4 second open and building the stack afterwards is
+/// nothing — the whole of it is decoding one layer's blocks after another. See
+/// `examples/measure-open.rs`, which is what settled that and is the thing to
+/// re-run before anybody reports a different shape of wait.
+///
+/// `done` counts layers finished, `total` is how many the file declares. A
+/// caller may be told `total` is zero, which is a reader that has not counted
+/// them yet — a bar must draw that as "no idea" rather than as complete, the
+/// rule `update::Stage::progress` already keeps with its `Option`.
+pub type Progress<'a> = &'a (dyn Fn(u32, u32) + Send + Sync);
+
+/// A `Progress` that discards, for every caller that is not drawing a bar.
+fn silent(_: u32, _: u32) {}
+
 pub fn import(path: &Path) -> Result<ImportedDocument, ImportError> {
+    import_reporting(path, &silent)
+}
+
+/// The same, telling `progress` as each layer lands.
+///
+/// Separate from [`import`] rather than an argument on it, because almost every
+/// caller — the autosave's recovery, the tests, the examples — wants nothing to
+/// do with a bar, and threading `&silent` through all of them would be noise
+/// around the one call site that cares.
+pub fn import_reporting(
+    path: &Path,
+    progress: Progress<'_>,
+) -> Result<ImportedDocument, ImportError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -97,10 +128,12 @@ pub fn import(path: &Path) -> Result<ImportedDocument, ImportError> {
 
     let bytes = std::fs::read(path)?;
     let doc = match ext.as_str() {
-        "ora" => openraster::read(&bytes),
-        "kra" => krita::read(&bytes),
-        "psd" => photoshop::read(&bytes),
-        "clip" => clipstudio::read(&bytes),
+        "ora" => openraster::read(&bytes, progress),
+        "kra" => krita::read(&bytes, progress),
+        "psd" => photoshop::read(&bytes, progress),
+        "clip" => clipstudio::read(&bytes, progress),
+        // A flat picture is one layer and is decoded in one step, so there is
+        // nothing between "started" and "finished" to report.
         "png" => flat::read_png(&bytes),
         _ => unreachable!("extension was checked against supported_extensions"),
     }?;
@@ -116,7 +149,7 @@ pub fn import(path: &Path) -> Result<ImportedDocument, ImportError> {
 /// document round trip — and because a caller with the bytes in hand should not
 /// have to write them to a temporary file to read them.
 pub fn read_openraster(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
-    let doc = openraster::read(bytes)?;
+    let doc = openraster::read(bytes, &silent)?;
     doc.validate()?;
     Ok(doc)
 }

@@ -337,7 +337,7 @@ mod tests {
         let bytes = fixtures::clip(10000, 10000, &layers);
 
         assert!(
-            super::super::clipstudio::read(&bytes).is_err(),
+            super::super::clipstudio::read(&bytes, &|_, _| {}).is_err(),
             "this fixture is meant to be past what an import will accept"
         );
         let preview = from_bytes(&bytes, SourceFormat::ClipStudio).expect("a preview regardless");

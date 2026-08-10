@@ -663,6 +663,42 @@ pub fn quit_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option<
     choice
 }
 
+/// Say that a document is being read, and how far along it is.
+///
+/// **Modal, and deliberately without a Cancel.** The decode runs on a worker
+/// that owns its own buffers and cannot be interrupted part way without either
+/// polling a flag through four readers or leaving a thread running with nothing
+/// watching it. Stopping is not offered rather than offered and ignored, which
+/// is `update::Stage::can_stop`'s rule: a control that is drawn is a promise.
+///
+/// The bar is `None` until the reader has counted the layers — an empty track
+/// rather than a guessed position, for the reason `loading.rs` gives.
+pub fn loading(root: &mut egui::Ui, p: &Palette, ed: &Editor) {
+    let Some(load) = ed.loading.as_ref() else {
+        return;
+    };
+
+    egui::Modal::new(egui::Id::new("document-loading"))
+        .frame(dialog_frame(p))
+        .show(root.ctx(), |ui| {
+            ui.set_width(360.0);
+            ui.label(
+                egui::RichText::new(format!("Opening “{}”", load.name))
+                    .size(text::CONTROL)
+                    .color(p.text_strong)
+                    .strong(),
+            );
+            ui.add_space(10.0);
+            crate::widgets::progress_bar(ui, p, load.fraction());
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(load.detail())
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+        });
+}
+
 /// Show whatever the last import could not do, or could not do at all.
 pub fn notice(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let Some(notice) = ed.notice.clone() else {

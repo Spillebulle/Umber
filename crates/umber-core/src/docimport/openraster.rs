@@ -148,7 +148,7 @@ struct LayerSpec {
     folder: bool,
 }
 
-pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocument, ImportError> {
     let mut zip = container::open(bytes, FORMAT)?;
     container::check_mimetype(&mut zip, "image/openraster", FORMAT)?;
 
@@ -180,7 +180,9 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     // Tracked against the layers that actually loaded, not against the specs:
     // a skipped layer shifts every position after it.
     let mut active = None;
-    for spec in specs {
+    let total = specs.len() as u32;
+    for (done, spec) in specs.into_iter().enumerate() {
+        progress(done as u32, total);
         match load_layer(&mut zip, &spec, size, &mut warnings) {
             Ok(layer) => {
                 if spec.selected {
@@ -830,6 +832,15 @@ fn composite_op(attrs: &Attrs) -> String {
 mod tests {
     use super::super::fixtures::{self, OraLayer};
     use super::*;
+
+    /// `read` with no bar attached, which is what every test here wants.
+    ///
+    /// Shadows the module's own inside this scope, so the progress callback is
+    /// stated once rather than at each of the several dozen call sites — none
+    /// of which is about progress.
+    fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+        super::read(bytes, &|_, _| {})
+    }
     use crate::layer::BlendMode;
 
     fn two_layer_ora() -> Vec<u8> {

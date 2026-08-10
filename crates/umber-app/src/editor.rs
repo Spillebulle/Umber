@@ -432,6 +432,12 @@ pub struct Editor {
     /// A message that has to reach the user rather than the log — an import
     /// that could not be represented in full, or one that failed outright.
     pub notice: Option<Notice>,
+    /// A document being decoded on a worker, if one is.
+    ///
+    /// Above the `--- documents ---` line deliberately: it is not a property of
+    /// any document — it is the one that has not become a document yet — and a
+    /// tab switch must not carry it about or abandon it. See `loading.rs`.
+    pub loading: Option<crate::loading::Loading>,
     pub ui: UiState,
     /// The theme somebody made, when one is in use, or `None` for whichever of
     /// the two built-in themes [`UiState::theme`] names.
@@ -740,6 +746,7 @@ impl Default for Editor {
             thumbs: crate::thumbs::Thumbs::default(),
             session: Session::default(),
             notice: None,
+            loading: None,
             ui: UiState::default(),
             custom_theme: None,
             canvas_form: crate::canvasdlg::CanvasForm::default(),

@@ -138,7 +138,7 @@ const MASK_VISIBLE: i64 = 2;
 /// painting aid rather than a property of the picture; see the module docs.
 const LOCK_ALL: i64 = 1;
 
-pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocument, ImportError> {
     let container = split(bytes)?;
     let db = Database::open(container.database).map_err(|e| ImportError::Malformed {
         format: FORMAT,
@@ -189,7 +189,12 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     check_bounds(FORMAT, canvas.size.x, canvas.size.y, stack)?;
 
     let mut out = Vec::with_capacity(nodes.len());
-    for node in &nodes {
+    let total = nodes.len() as u32;
+    for (done, node) in nodes.iter().enumerate() {
+        // Before the layer rather than after, so a bar shows the work that is
+        // about to take the time rather than the work already finished — the
+        // rule `splash.rs` keeps for its own stages.
+        progress(done as u32, total);
         let Some(row) = layers.rows.get(&node.id) else {
             continue;
         };
@@ -1308,6 +1313,15 @@ fn composite_name(composite: i64) -> &'static str {
 mod tests {
     use super::super::fixtures::{self, ClipLayer};
     use super::*;
+
+    /// `read` with no bar attached, which is what every test here wants.
+    ///
+    /// Shadows the module's own inside this scope, so the progress callback is
+    /// stated once rather than at each of the several dozen call sites — none
+    /// of which is about progress.
+    fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+        super::read(bytes, &|_, _| {})
+    }
     use crate::layer::BlendMode;
 
     /// **The Paper layer is the document's background, not one of its layers.**

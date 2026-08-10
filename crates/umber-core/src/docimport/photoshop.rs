@@ -107,7 +107,7 @@ use crate::layer::BlendMode;
 
 const FORMAT: SourceFormat = SourceFormat::Photoshop;
 
-pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocument, ImportError> {
     let psd = catch(
         || psd::Psd::from_bytes(bytes),
         "the file could not be parsed",
@@ -165,8 +165,10 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     }
 
     let mut layers = Vec::with_capacity(psd.layers().len());
+    let total = psd.layers().len() as u32;
     // Top first in the file; bottom first in a LayerStack.
-    for layer in psd.layers().iter().rev() {
+    for (done, layer) in psd.layers().iter().rev().enumerate() {
+        progress(done as u32, total);
         let name = clean_name(layer.name());
 
         // A group's visibility and opacity apply to everything inside it, and
@@ -381,6 +383,15 @@ fn blend_name(mode: impl std::fmt::Debug) -> &'static str {
 mod tests {
     use super::super::fixtures::{self, PsdLayerSpec, PsdMask};
     use super::*;
+
+    /// `read` with no bar attached, which is what every test here wants.
+    ///
+    /// Shadows the module's own inside this scope, so the progress callback is
+    /// stated once rather than at each of the several dozen call sites — none
+    /// of which is about progress.
+    fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+        super::read(bytes, &|_, _| {})
+    }
 
     fn two_layers() -> Vec<u8> {
         fixtures::psd(

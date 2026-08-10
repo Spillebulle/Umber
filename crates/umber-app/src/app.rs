@@ -5,6 +5,7 @@ use crate::crash;
 use crate::editor::{self, Editor, Floating, Interaction, Tool};
 use crate::gesture;
 use crate::keylayout;
+use crate::loading;
 use crate::logo;
 use crate::loupe;
 use crate::session::{DocId, DocumentState};
@@ -280,6 +281,12 @@ pub struct UmberApp {
     /// is: it is the pointer's state in physical pixels, and nothing about it
     /// survives the release.
     picked_at: Option<Vec2>,
+    /// A way to wake the loop from a worker.
+    ///
+    /// The update check and the autosave were each handed one at construction
+    /// and kept it inside their own waker; the document loader is started and
+    /// stopped per open, so the application holds this one.
+    proxy: EventLoopProxy<Wake>,
     /// A document named on the command line, waiting for a device to open on.
     ///
     /// What a file manager passes when somebody double-clicks a `.clip`. It
@@ -371,6 +378,10 @@ impl UmberApp {
     /// thing that ever answers from off the main thread. Everything else in
     /// Umber reaches the loop through a window event.
     pub fn new(proxy: EventLoopProxy<Wake>, opening: Option<PathBuf>) -> Self {
+        // Kept as well as handed out: opening a document reads it on a worker,
+        // and that worker needs a way to say it has got somewhere. See
+        // `loading.rs`.
+        let keep = proxy.clone();
         let mut editor = Editor::default();
         let updates_proxy = proxy.clone();
         editor.updates.set_waker(std::sync::Arc::new(move || {
@@ -386,6 +397,7 @@ impl UmberApp {
         }));
         Self {
             gfx: None,
+            proxy: keep,
             editor,
             modifiers: ModifiersState::default(),
             last_frame: None,
@@ -3305,6 +3317,13 @@ impl UmberApp {
         // than in the one after it.
         self.editor.updates.poll(std::time::Instant::now());
 
+        // And for the same reason: a document whose worker finished while the
+        // loop was asleep becomes a document in the frame its wake produced.
+        // The GPU half of the open happens here, on the drawing thread, which
+        // is the only one with a device -- and is free, being the 0 ms end of
+        // the measurement in `loading.rs`.
+        self.collect_loading();
+
         // What the panic hook is allowed to say about the artist's documents.
         // The hook cannot borrow the editor — it has no reference to one, and
         // the frame that panicked may be halfway through changing it — so the
@@ -4242,7 +4261,7 @@ impl UmberApp {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        self.open_import(path, name, Some(path.to_path_buf()), false);
+        self.begin_open(path, name, Some(path.to_path_buf()), false);
     }
 
     /// Open `source` as a document, presenting it as `title` and remembering
@@ -4286,7 +4305,96 @@ impl UmberApp {
                 return false;
             }
         };
+        self.install_import(imported, name, record_path, modified)
+    }
 
+    /// Start reading `source` on a worker, and put a bar on screen.
+    ///
+    /// **The route every interactive open takes**, because the blocking one
+    /// froze the application for 13.4 seconds on a real document — see
+    /// `loading.rs` for the measurement. [`Self::open_import`] is still there
+    /// and still blocking, for the callers that are not a person waiting: the
+    /// autosave's own recovery reads a copy Umber wrote, and the tests want an
+    /// answer rather than a frame.
+    ///
+    /// A second request while one is in flight is refused rather than queued.
+    /// Two decodes at once is two documents arriving in an order nobody chose,
+    /// and the dialog is modal, so it cannot happen from the interface — what
+    /// this catches is the command line and a file dropped on the window.
+    fn begin_open(
+        &mut self,
+        source: &Path,
+        name: String,
+        record_path: Option<PathBuf>,
+        modified: bool,
+    ) {
+        if self.editor.loading.is_some() {
+            log::warn!("already opening a document; ignoring {}", source.display());
+            return;
+        }
+        // The document in front is about to be parked, and a float belongs to
+        // it. Done here rather than when the worker answers, so the canvas is
+        // settled before anything else can touch it.
+        self.finish_transform();
+        self.finish_stroke();
+
+        self.editor.loading = Some(loading::Loading::start(
+            source.to_path_buf(),
+            name,
+            record_path,
+            modified,
+            self.proxy.clone(),
+        ));
+        self.request_redraw();
+    }
+
+    /// Collect a finished decode, if there is one.
+    ///
+    /// Called once per frame from [`Self::render`]. The GPU half runs here, on
+    /// the drawing thread, because only this thread has the device — and it is
+    /// free, being the 0 ms end of the measurement.
+    fn collect_loading(&mut self) {
+        let Some(result) = self
+            .editor
+            .loading
+            .as_ref()
+            .and_then(loading::Loading::take)
+        else {
+            return;
+        };
+        // Taken out before either arm, so a refusal cannot leave the dialog up.
+        let Some(load) = self.editor.loading.take() else {
+            return;
+        };
+        match result {
+            Ok(imported) => {
+                self.install_import(imported, load.name, load.record_path, load.modified);
+            }
+            Err(error) => {
+                log::warn!("could not open {}: {error}", load.path.display());
+                self.editor.notice = Some(Notice {
+                    title: format!("Could not open “{}”", load.name),
+                    lines: vec![error.to_string()],
+                });
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Everything that happens once a document has been decoded.
+    ///
+    /// Split out of [`Self::open_import`] so the blocking path and the threaded
+    /// one cannot drift: a document that arrived on a worker is installed by
+    /// the same code as one that arrived in line, which is what stops the
+    /// device-limit check, the warnings and the tab bookkeeping being written
+    /// twice.
+    fn install_import(
+        &mut self,
+        imported: umber_core::docimport::ImportedDocument,
+        name: String,
+        record_path: Option<PathBuf>,
+        modified: bool,
+    ) -> bool {
         // The importer bounds itself at 16384 px, but the device is the
         // authority — and it is asked before any of this becomes a document,
         // so a refusal leaves the session exactly as it was.
@@ -4359,8 +4467,7 @@ impl UmberApp {
         }
 
         log::info!(
-            "opened {} as {format}, {} × {}, {} layer(s)",
-            source.display(),
+            "opened “{name}” as {format}, {} × {}, {} layer(s)",
             size.x,
             size.y,
             uploads.len(),

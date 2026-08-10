@@ -39,6 +39,8 @@ mod inputlog;
 mod installart;
 mod keylayout;
 mod layerdrag;
+/// Decoding a document off the drawing thread.
+mod loading;
 mod localtime;
 mod logo;
 /// The eyedropper's magnifier: what it holds and where it goes.

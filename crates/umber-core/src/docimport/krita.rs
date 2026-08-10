@@ -110,7 +110,7 @@ struct MaskSpec {
     y: i64,
 }
 
-pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocument, ImportError> {
     let mut zip = container::open(bytes, FORMAT)?;
     container::check_mimetype(&mut zip, "application/x-krita", FORMAT)?;
 
@@ -142,7 +142,9 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     }
 
     let mut layers = Vec::with_capacity(doc.layers.len());
-    for spec in &doc.layers {
+    let total = doc.layers.len() as u32;
+    for (done, spec) in doc.layers.iter().enumerate() {
+        progress(done as u32, total);
         // A folder holds no pixels and takes no slot, so there is nothing to
         // read out of the archive for one.
         if spec.folder {
@@ -948,6 +950,15 @@ impl<'a> Lines<'a> {
 mod tests {
     use super::super::fixtures::{self, KraLayer, KraMask};
     use super::*;
+
+    /// `read` with no bar attached, which is what every test here wants.
+    ///
+    /// Shadows the module's own inside this scope, so the progress callback is
+    /// stated once rather than at each of the several dozen call sites — none
+    /// of which is about progress.
+    fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+        super::read(bytes, &|_, _| {})
+    }
 
     /// The mask byte at `(x, y)`, as the composite would read it: the red
     /// channel of the mask slice.
