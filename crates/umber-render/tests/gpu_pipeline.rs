@@ -5655,7 +5655,7 @@ fn a_thumbnail_shows_the_layers_content_and_not_the_whole_canvas() {
 /// 16384 could reach, and it is pinned by arithmetic rather than by ink.
 #[test]
 fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
-    let Some(h) = Harness::new() else { return };
+    let h = harness_or_skip!();
 
     let width = h
         .gpu

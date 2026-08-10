@@ -5515,8 +5515,18 @@ impl CanvasRenderer {
     /// Record the pass this thumbnail is waiting on, into the frame's encoder.
     ///
     /// Costs one draw over 64² fragments and one 16 KB copy. The draw reads
-    /// every texel of the region exactly once between them, which is the same
-    /// bandwidth the composite pass spends on that layer every frame anyway.
+    /// every texel of the region exactly once between them.
+    ///
+    /// **That used to be compared to "the bandwidth the composite pass spends
+    /// on that layer every frame anyway", and the comparison does not hold.**
+    /// The composite samples once per *surface* fragment; this samples once per
+    /// *canvas* texel, so the two agree only where the canvas is about the size
+    /// of the viewport and diverge with the canvas. It went unnoticed while
+    /// `thumbnail.wgsl`'s tap clamp silently capped the work at 268 M texels a
+    /// pass — which is the same clamp that reported painted layers as empty, so
+    /// removing it made this claim load-bearing and false in one step. The real
+    /// figure is now stated where the clamp is: about 1.07 G texels for the
+    /// bounds pass at 32768 and 1.52 G for the picture pass, once per job.
     pub fn drive_thumb(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         let Some(job) = self.thumb.as_ref() else {
             return;
@@ -8252,8 +8262,19 @@ mod tests {
     /// Rust can name a constant that is a string until naga sees it. Strict
     /// about the shape of the line, so a parse that quietly failed and answered
     /// a default could not agree with whatever it was compared against.
+    ///
+    /// Anchored to the start of a line and required to appear **once**. The
+    /// declaration is preceded by forty lines of comment arguing about it, and a
+    /// comment that quoted the line would otherwise be what got parsed — the
+    /// failure `windows_registration_offers_umber_without_taking_the_file_type`
+    /// hit by scanning WiX that argues for itself.
     fn shader_max_taps() -> u64 {
-        const NEEDLE: &str = "const MAX_TAPS: i32 = ";
+        const NEEDLE: &str = "\nconst MAX_TAPS: i32 = ";
+        assert_eq!(
+            THUMBNAIL_WGSL.matches(NEEDLE).count(),
+            1,
+            "thumbnail.wgsl declares `MAX_TAPS` other than exactly once at a line start"
+        );
         let at = THUMBNAIL_WGSL
             .find(NEEDLE)
             .expect("thumbnail.wgsl no longer declares `const MAX_TAPS: i32 = ...`");
@@ -8304,6 +8325,11 @@ mod tests {
     fn the_thumbnail_pass_never_steps_over_a_texel_on_any_canvas_umber_admits() {
         let edge = f64::from(umber_core::Document::MAX_EDGE);
         let grid = f64::from(umber_core::thumbnail::SIZE);
+        // `framed` writes this as `(1 - 2 * PADDING).max(1e-3)`. The floor is
+        // deliberately not repeated: a `PADDING` at or past 0.5 would make the
+        // two disagree, and it would trip the equalities below rather than pass
+        // — which is the direction to fail in, since a padding that consumed the
+        // whole frame is a different bug entirely.
         let inflation = 1.0 / (1.0 - 2.0 * f64::from(umber_core::thumbnail::PADDING));
 
         // `first` is a floor and `last` a ceil, so a span reaches one past the

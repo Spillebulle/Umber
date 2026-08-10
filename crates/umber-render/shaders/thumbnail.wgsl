@@ -38,13 +38,18 @@ struct Thumb {
 
 // The most taps taken along one axis of one destination texel.
 //
-// A full box filter reads every texel of the slice exactly once across the whole
-// target, which is the same bandwidth the composite pass spends every frame — so
-// this is a bound on pathological loops rather than a budget. **Stepping is not
-// a cheaper filter, it is a wrong answer**: the bounds pass reduces by maximum
-// precisely so a one-pixel line survives, and a step of two visits every other
-// column, so that line falls between the taps and the layer reports empty. A
-// painted layer drawing a blank thumbnail is what that looks like.
+// A full box filter reads every texel of the region exactly once across the
+// whole target, so this is a bound on pathological loops rather than a budget.
+//
+// **What stepping costs is not the same in the two passes, and the difference is
+// the whole reason the constant had to move.** In the *picture* pass it is
+// aliasing: the mean divides by `taps`, which counts only what was visited, so a
+// stepped result is a correctly normalised mean of a subsample — worse, not
+// wrong. In the *bounds* pass it is a wrong answer, because that reduction is a
+// maximum taken precisely so a one-pixel line survives being shrunk into a cell.
+// A step of two visits every other column, so the line falls between the taps
+// and the layer reports empty. A painted layer drawing a blank thumbnail is what
+// that looks like, and it is unrecoverable rather than merely soft.
 //
 // So the constant has to be past the widest span any canvas Umber admits can
 // produce, and it is. **It was not, and the comment that stood here explained
@@ -67,13 +72,24 @@ struct Thumb {
 //     **This is the larger of the two and it is the one nobody looked at**: it
 //     bites from a content box of about 13710 px, which is inside 16384 and
 //     therefore reachable on hardware that caps there — every D3D12 and Metal
-//     device, WARP and lavapipe included.
+//     device, WARP and lavapipe included. Only fidelity is lost there, per the
+//     paragraph above, but 611 is the figure the constant has to clear.
 //
 // 1024 is the next power of two above 611, so a change to `SIZE` or `PADDING`
 // does not silently re-arm the clamp. `the_thumbnail_pass_never_steps_over_a_
 // texel_on_any_canvas_umber_admits` in `canvas.rs` computes the real bound from
 // those constants and reads this line back out of the shader text, which is the
 // only way a WGSL constant can be checked against a Rust one.
+//
+// **What it costs, said out loud, because the ceiling moved rather than being
+// removed.** Wherever the clamp used to arm the loop now runs to completion, so
+// the worst pass is four to six times the work it was: at 32768 the bounds pass
+// reads about 1.07 G texels and the picture pass about 1.52 G, against a
+// previous cap near 268 M each. That is the honest cost of a thumbnail that
+// tells the truth, and it is paid once per job rather than per frame — but it is
+// recorded into the *frame's* encoder, so on a canvas of that size it is a hitch
+// somebody would feel. If it ever bites, the answer is a compute reduction or a
+// mip chain, not a step: `content_rect` needs the maximum it is denied by one.
 const MAX_TAPS: i32 = 1024;
 
 @group(0) @binding(0) var<uniform> u: Thumb;
