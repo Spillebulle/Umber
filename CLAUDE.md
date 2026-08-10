@@ -3942,6 +3942,30 @@ half-publish; `.github/workflows/release.yml` does the rest.
   takes `io.github.spillebulle.umber` explicitly, and it must run **before the
   first window exists**: the shell reads the identity when it creates the
   button, and setting it later does not move a button already on screen.
+- **The canvas ceiling is 32768 and it is a ceiling on the *format*, not on
+  what anybody can reach.** `CanvasLimit::of_device` clamps every size the
+  dialogs offer to `max_texture_dimension_2d` and says what the machine holds;
+  `Document::new` clamps as a backstop. So raising it changes nothing on a
+  device that will not go there — and most will not. Measured with
+  `umber-render`'s `measure-limits`: an RTX 3080 reports **32768 on Vulkan and
+  16384 on Dx12**, an Intel iGPU 16384 on both. 16384 is a hard limit of the
+  D3D12 specification and of Metal, so this is a *Vulkan* ceiling.
+  `ImportedDocument::MAX_DIMENSION` **is** `Document::MAX_EDGE` rather than a
+  second literal, because the two diverging is a document Umber saves and then
+  refuses.
+  **The arithmetic is the part to know before using it**: a 32768² layer is
+  4.3 GB, so a 10 GB card holds two; `MAX_TOTAL_BYTES` admits three on import;
+  and a full-canvas undo patch is 4.3 GB against a 512 MB default budget, so
+  the history holds none. A document asking for more than the card has dies at
+  `create_texture`, which is fatal — **Umber does not yet refuse it**, and that
+  is the next thing to build here.
+- **A test whose case is defined by a constant has to derive it from that
+  constant.** `a_lock_that_saturates_stops_being_the_shape_and_says_so` picked
+  a 4:3 canvas 12345 tall because 4:3 of it was 16460 and the ceiling was
+  16384. Raising the ceiling made 16460 simply fit, so the saturation the test
+  is *about* stopped happening. It failed rather than passing vacuously, which
+  was luck — the assertion happened to be an equality against the bound. A test
+  that had merely stopped exercising its own case would have gone green.
 - **A thumbnail never composites, and that is what makes it possible at all.**
   `docs/thumbnails.md` is the design. Every format Umber reads already stores a
   flattened preview — `mergedimage.png` in an `.ora` and a `.kra`, the composite
