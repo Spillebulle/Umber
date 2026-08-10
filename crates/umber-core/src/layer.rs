@@ -463,6 +463,19 @@ pub enum BlendMode {
     Saturation = 20,
     Color = 21,
     Luminosity = 22,
+    /// Clip Studio's **Add (Glow)**, which is not a blend function at all.
+    ///
+    /// It is Porter-Duff `plus` — a straight addition of premultiplied colour —
+    /// so it changes the compositing step rather than supplying a `B(Cb, Cs)`,
+    /// and `blend.wgsl` handles it in `composite_over` with no `blend_rgb` arm.
+    /// OpenRaster's `svg:plus` names exactly this operator, so it is the one
+    /// non-SVG-named mode that nonetheless round-trips through an `.ora`
+    /// exactly.
+    ///
+    /// **It agrees with [`Self::Add`] wherever the backdrop is opaque or
+    /// empty**, which is derived in `composite_over`'s own note, so the two
+    /// differ only at a soft edge.
+    AddGlow = 23,
 }
 
 impl BlendMode {
@@ -475,7 +488,7 @@ impl BlendMode {
     /// numbers are fixed by the shader and by what was here first, and sorting
     /// the menu by them would put Add between Overlay and Darken for no reason
     /// a painter could see.
-    pub const ALL: [BlendMode; 23] = [
+    pub const ALL: [BlendMode; 24] = [
         Self::Normal,
         // Darken
         Self::Darken,
@@ -487,6 +500,7 @@ impl BlendMode {
         Self::Screen,
         Self::ColorDodge,
         Self::Add,
+        Self::AddGlow,
         // Contrast
         Self::Overlay,
         Self::SoftLight,
@@ -538,6 +552,7 @@ impl BlendMode {
             Self::Saturation => "Saturation",
             Self::Color => "Colour",
             Self::Luminosity => "Luminosity",
+            Self::AddGlow => "Add (Glow)",
         }
     }
 

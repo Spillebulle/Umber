@@ -192,7 +192,24 @@ fn blend_rgb(mode: u32, cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
 //   Co = (1 - ab)*Sc + as*ab*B(Cb, Cs) + (1 - as)*Bc
 //   ao = as + ab*(1 - as)
 // For Normal this collapses to plain source-over, as it should.
+//
+// **Add (Glow) is the one mode that is not a blend function**, which is why it
+// is here and not a `blend_rgb` arm. Every other mode is some `B(Cb, Cs)`
+// dropped into the formula above; this one changes the *compositing* step —
+// it is Porter-Duff `plus`, a straight addition of premultiplied colour, which
+// is also exactly what OpenRaster's `svg:plus` names. Clip Studio's own "Add"
+// is the ordinary blend function and is `BlendMode::Add`.
+//
+// **The two agree wherever the backdrop is opaque or empty**, and that is
+// derived rather than assumed. With ab = 1 the general form gives
+// `Cb + as*Cs` before clamping, and `plus` gives `Bc + Sc` = `Cb + as*Cs`;
+// with ab = 0 both give `Sc`. So they can only differ where the backdrop is
+// *partly* transparent — a soft edge — which is what the importer's note about
+// this pair has always said.
 fn composite_over(dst: vec4<f32>, src: vec4<f32>, mode: u32) -> vec4<f32> {
+    if (mode == 23u) {  // Add (Glow)
+        return min(dst + src, vec4<f32>(1.0));
+    }
     if (src.a <= 0.0) {
         return dst;
     }

@@ -6833,3 +6833,80 @@ fn the_colour_modes_keep_the_identities_they_promise() {
         );
     }
 }
+
+/// **Add (Glow) is Porter-Duff `plus`, and it agrees with Add over an opaque
+/// backdrop.**
+///
+/// That agreement is derived rather than hoped for — `composite_over`'s note
+/// works it out — and it is the property worth pinning, because it is what
+/// says the new mode did not change any of the twenty-five real Clip Studio
+/// layers that used to arrive as Add. Where the two *can* differ is a partly
+/// transparent backdrop, which is the second half.
+///
+/// This is also the one mode with no `blend_rgb` arm, so a refactor that moved
+/// it there and dropped the compositing branch would fail here rather than in
+/// somebody's document.
+#[test]
+fn add_glow_matches_add_over_an_opaque_backdrop_and_differs_over_a_soft_one() {
+    let mut h = harness_or_skip!();
+    let rect = whole(&h);
+
+    // Opaque backdrop: the two must agree.
+    reset(&mut h);
+    h.write_block(0, rect, [70, 160, 110, 255]);
+    h.write_block(1, rect, [90, 40, 120, 255]);
+    let as_add = h.composite_pixel(
+        &[
+            layer(0, 1.0, BlendMode::Normal),
+            layer(1, 1.0, BlendMode::Add),
+        ],
+        32,
+        32,
+    );
+    let as_glow = h.composite_pixel(
+        &[
+            layer(0, 1.0, BlendMode::Normal),
+            layer(1, 1.0, BlendMode::AddGlow),
+        ],
+        32,
+        32,
+    );
+    assert_near(
+        as_glow,
+        [as_add[0], as_add[1], as_add[2]],
+        1,
+        "Add (Glow) over an opaque backdrop is Add",
+    );
+
+    // Partly transparent backdrop: this is where the operator shows itself.
+    // `plus` adds the premultiplied backdrop straight on, so the result is
+    // lighter than the general form's, which scales the blend by the backdrop
+    // alpha and then lays the source over what is left.
+    reset(&mut h);
+    h.write_block(0, rect, [70, 160, 110, 128]);
+    h.write_block(1, rect, [90, 40, 120, 128]);
+    let soft_add = h.composite_pixel(
+        &[
+            layer(0, 1.0, BlendMode::Normal),
+            layer(1, 1.0, BlendMode::Add),
+        ],
+        32,
+        32,
+    );
+    let soft_glow = h.composite_pixel(
+        &[
+            layer(0, 1.0, BlendMode::Normal),
+            layer(1, 1.0, BlendMode::AddGlow),
+        ],
+        32,
+        32,
+    );
+    assert_ne!(
+        soft_glow, soft_add,
+        "over a soft edge the two operators have to part company"
+    );
+    assert!(
+        soft_glow[3] >= soft_add[3],
+        "`plus` adds alpha as well as colour: {soft_glow:?} against {soft_add:?}"
+    );
+}

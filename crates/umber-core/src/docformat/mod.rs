@@ -1011,6 +1011,13 @@ pub fn composite_op(mode: BlendMode) -> (&'static str, bool) {
         BlendMode::Screen => ("svg:screen", true),
         BlendMode::Overlay => ("svg:overlay", true),
         BlendMode::Add => ("svg:plus", false),
+        // **The one mode with no SVG *name* that is nonetheless exact.**
+        // `svg:plus` is Porter-Duff addition on premultiplied colour, which is
+        // precisely what Add (Glow) is — so unlike every other entry below, no
+        // fidelity is lost by writing it and another reader draws it correctly.
+        // Add above shares the spelling and is *not* exact, which is why both
+        // still carry `umber-blend` to tell them apart on the way back in.
+        BlendMode::AddGlow => ("svg:plus", true),
         // The rest of the W3C separable set, which OpenRaster names exactly.
         BlendMode::Darken => ("svg:darken", true),
         BlendMode::Lighten => ("svg:lighten", true),
@@ -3343,6 +3350,7 @@ mod tests {
                 "Screen",
                 "ColorDodge",
                 "Add",
+                "AddGlow",
                 "Overlay",
                 "SoftLight",
                 "HardLight",
@@ -3408,20 +3416,21 @@ mod tests {
                 BlendMode::Screen => BlendMode::ALL[6],
                 BlendMode::ColorDodge => BlendMode::ALL[7],
                 BlendMode::Add => BlendMode::ALL[8],
-                BlendMode::Overlay => BlendMode::ALL[9],
-                BlendMode::SoftLight => BlendMode::ALL[10],
-                BlendMode::HardLight => BlendMode::ALL[11],
-                BlendMode::VividLight => BlendMode::ALL[12],
-                BlendMode::LinearLight => BlendMode::ALL[13],
-                BlendMode::PinLight => BlendMode::ALL[14],
-                BlendMode::Difference => BlendMode::ALL[15],
-                BlendMode::Exclusion => BlendMode::ALL[16],
-                BlendMode::Subtract => BlendMode::ALL[17],
-                BlendMode::Divide => BlendMode::ALL[18],
-                BlendMode::Hue => BlendMode::ALL[19],
-                BlendMode::Saturation => BlendMode::ALL[20],
-                BlendMode::Color => BlendMode::ALL[21],
-                BlendMode::Luminosity => BlendMode::ALL[22],
+                BlendMode::AddGlow => BlendMode::ALL[9],
+                BlendMode::Overlay => BlendMode::ALL[10],
+                BlendMode::SoftLight => BlendMode::ALL[11],
+                BlendMode::HardLight => BlendMode::ALL[12],
+                BlendMode::VividLight => BlendMode::ALL[13],
+                BlendMode::LinearLight => BlendMode::ALL[14],
+                BlendMode::PinLight => BlendMode::ALL[15],
+                BlendMode::Difference => BlendMode::ALL[16],
+                BlendMode::Exclusion => BlendMode::ALL[17],
+                BlendMode::Subtract => BlendMode::ALL[18],
+                BlendMode::Divide => BlendMode::ALL[19],
+                BlendMode::Hue => BlendMode::ALL[20],
+                BlendMode::Saturation => BlendMode::ALL[21],
+                BlendMode::Color => BlendMode::ALL[22],
+                BlendMode::Luminosity => BlendMode::ALL[23],
             }
         }
 

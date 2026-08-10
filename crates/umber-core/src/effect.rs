@@ -786,6 +786,7 @@ mod tests {
                 "Screen",
                 "ColorDodge",
                 "Add",
+                "AddGlow",
                 "Overlay",
                 "SoftLight",
                 "HardLight",

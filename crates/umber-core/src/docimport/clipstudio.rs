@@ -1504,12 +1504,14 @@ mod tests {
             &[ClipLayer::flat("Huge", 4096, 4096, [1, 2, 3, 255]).placed((4096, 4096), (0, 0))],
         );
         let doc = read(&bytes);
-        match doc {
-            Ok(d) => assert!(
-                d.layers.is_empty() || !d.warnings.is_empty(),
+        // Refused as a document with nothing in it, or opened having said what
+        // it lost — either is a refusal somebody can see. What must not happen
+        // is the bitmap arriving quietly.
+        if let Ok(opened) = doc {
+            assert!(
+                opened.layers.is_empty() || !opened.warnings.is_empty(),
                 "an absurd bitmap must not arrive silently"
-            ),
-            Err(_) => {}
+            );
         }
     }
 

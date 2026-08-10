@@ -1,8 +1,8 @@
-//! Mapping other applications' blend modes onto Umber's five.
+//! Mapping other applications' blend modes onto Umber's own.
 //!
-//! Umber has Normal, Multiply, Screen, Overlay and Add. Photoshop has
-//! twenty-seven, Krita has rather more than that. Every import therefore has to
-//! choose a nearest mode, and the one thing it must not do is choose silently:
+//! Umber has twenty-four, which is the whole W3C set, Photoshop's own additions
+//! and Clip Studio's Add (Glow). A handful still have no counterpart, and the
+//! one thing an import must not do is choose silently:
 //! a Difference layer arriving as Normal changes the picture completely, and a
 //! user who was not told will conclude the importer is broken rather than
 //! incomplete.
@@ -70,14 +70,13 @@ pub fn nearest(canonical: &str) -> (BlendMode, Fidelity) {
         // that had arrived perfectly.
         "linear-dodge" | "add" => (BlendMode::Add, Exact),
 
-        // `plus` is Porter-Duff addition on premultiplied colour; Umber's Add
-        // clamps the sum of straight colour. The two agree wherever both
-        // layers are opaque, which is most of the time, and differ at soft
-        // edges — so: approximate, not exact.
-        // `add-glow` is Clip Studio's Add that ignores what is under it where
-        // that is transparent — the same direction, one step further from the
-        // formula Umber has.
-        "plus" | "add-glow" => (BlendMode::Add, Approximate),
+        // **`plus` and `add-glow` are the same operator and Umber has it now.**
+        // Porter-Duff addition on premultiplied colour, which is what
+        // `composite_over` does for `AddGlow` and what `svg:plus` names. This
+        // pair used to arrive as `Add`/approximate, which was the largest
+        // single loss in a folder of real Clip Studio documents: 25 layers
+        // across 14 files, every one of them reported.
+        "plus" | "add-glow" => (BlendMode::AddGlow, Exact),
 
         // `glow-dodge` is Clip Studio's dodge that keeps highlights, which is
         // Colour Dodge treating a transparent backdrop differently.
@@ -128,7 +127,7 @@ mod tests {
     /// the set grew, since its label is British and its canonical name is not.
     #[test]
     fn every_umber_mode_is_reachable() {
-        const NAMES: [&str; 23] = [
+        const NAMES: [&str; 24] = [
             "src-over",
             "multiply",
             "screen",
@@ -152,6 +151,7 @@ mod tests {
             "saturation",
             "color",
             "luminosity",
+            "add-glow",
         ];
         for mode in BlendMode::ALL {
             assert!(
