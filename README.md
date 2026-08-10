@@ -338,6 +338,11 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 ## What is not there yet
 
 - **Nine of the sixteen tools**, shapes among them.
+- **Vector and adjustment layers arrive as a note, not as pixels.** A Clip
+  Studio vector layer holds strokes rather than a picture, and Umber has no
+  vector renderer; rasterise it before saving and it comes across. Adjustment
+  layers change what is below them, which Umber cannot do yet. Both are named
+  when the document opens.
 - **Picking a colour from outside the window is Windows only.** Inside the
   window the eyedropper works everywhere. On macOS and Linux the tool options
   strip says so, rather than the drag quietly doing nothing. There is no

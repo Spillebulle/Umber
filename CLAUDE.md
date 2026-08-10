@@ -1277,6 +1277,45 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   record only rides along because of its fingerprint, without which an older
   build could paint over the layer and this one would re-render over the
   brushwork. See "Text".
+- **Umber has twenty-three blend modes and `blend.wgsl` is still the only
+  statement of them.** The whole W3C separable set, Photoshop's linear burn and
+  three light variants, subtract and divide, and the four non-separable modes
+  with `lum`/`set_lum`/`set_sat` behind them. Adding one is an arm in that file
+  and a variant in the enum; nothing else moves, because composite and commit
+  both compile it. Three rules came out of growing it from five:
+  - **The first five discriminants may not move**, and the menu order is not
+    the discriminant order. `BlendMode::ALL` is grouped the way every other
+    application groups it — darken, lighten, contrast, comparison, colour — so
+    `all_lists_every_blend_mode`'s arms index positions that are deliberately
+    not `0..n`.
+  - **`blend_rgb`'s `switch` falls through to Normal**, so a variant with no arm
+    composites silently as Normal and the only symptom is a dropdown entry that
+    does nothing. The Rust guard cannot see the shader;
+    `every_blend_mode_moves_the_picture` drives `ALL` on the GPU and names any
+    mode that came back looking like Normal.
+  - **`linear-dodge` *is* Add and was reported as approximate**, because it
+    shared a match arm with Porter-Duff `plus`, which is not. Eight of thirty-
+    three real documents raised a warning about a layer that had arrived
+    perfectly. A shared arm is a shared *claim*, and fidelity is part of it.
+  - The luma weights are W3C's 0.3/0.59/0.11 applied to **linear** colour, which
+    is a stated deviation rather than an oversight: every other mode here is
+    already not Photoshop's, because the engine blends where it blends.
+- **A widened enum silently breaks a fixed-width control.** `DropdownWidth::
+  Exact` does not grow to fit its label, so the layer row's picker clipped
+  "Colour Dodge" — its `BLEND_WIDTH` had been sized for "Multiply, the longest
+  mode there is", true of five modes and false of twenty-three. The guard walks
+  `BlendMode::ALL` through the real font and measures, rather than restating a
+  number.
+- **A message about a dropped layer must name the *cause*, not the symptom.** A
+  Clip Studio vector layer stores strokes and is rasterised on demand, so no
+  level of its mipmap chain holds a bitmap — the document is intact and Umber
+  merely has no vector renderer. "The file does not hold its pixels" sent
+  artists looking for a corrupt file. **And it has to be said at both drop
+  sites**: a real vector layer has a chain *and* an `Offscreen` row, and what is
+  absent is the external chunk they point at, so it fails at the second site
+  rather than the first — guarding only the first left every real one still
+  reporting damage, and the fixture had to be made to reproduce the real shape
+  before the guard meant anything.
 - **A derived `Debug` or serde spelling that reaches a file is a format, not a
   name.** `docformat::history::kind_id` and `blend_id` are both
   `format!("{:?}")`, and `BlendMode` additionally derives `Serialize` because a
