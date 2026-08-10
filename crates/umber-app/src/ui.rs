@@ -3600,7 +3600,7 @@ fn brush_editor_blending(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui,
             p,
             "How the finished stroke combines with the layer under it: the \
-             same five modes a layer has, and the same maths. Applied once, \
+             same modes a layer has, and the same maths. Applied once, \
              when the stroke is put down, so a mark that crosses itself \
              multiplies with the paint beneath it rather than with itself.",
         );

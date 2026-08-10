@@ -964,6 +964,14 @@ const BRUSH_BLENDS: [BlendMode; 4] = [
     BlendMode::Add,
 ];
 
+/// Every mode the engine has, which is what the layer stack can be set to.
+///
+/// Taken from `BlendMode::ALL` rather than written out, so a mode added to the
+/// enum is one this file starts driving without anybody remembering to add it.
+fn every_blend_mode() -> impl Iterator<Item = BlendMode> {
+    BlendMode::ALL.into_iter()
+}
+
 /// The whole document as a rectangle.
 fn whole(h: &Harness) -> PixelRect {
     let size = h.canvas.doc_size();
@@ -6724,4 +6732,104 @@ fn a_cancelled_stroke_rebakes_the_effect_it_was_showing() {
         0,
         "the cancelled stroke is still in the effect slice"
     );
+}
+
+/// **Every mode the interface offers actually reaches the shader.**
+///
+/// `blend_rgb`'s `switch` falls through to `default`, which is Normal — so a
+/// variant added to `BlendMode` with no `case` for it composites as Normal,
+/// silently, and the only symptom is a dropdown entry that does nothing. The
+/// Rust half of that pair is `all_lists_every_blend_mode`, which cannot see the
+/// shader at all.
+///
+/// Driven off `BlendMode::ALL`, so a mode added to the enum is one this starts
+/// checking without anybody remembering to.
+///
+/// The backdrop and the source are chosen so that **no mode is the identity on
+/// them and no two need to be told apart**: what is asserted is only that each
+/// non-Normal mode moves the picture somewhere Normal does not. Asserting each
+/// mode's own arithmetic here would be restating `blend.wgsl` in Rust, which is
+/// the second implementation this file exists to avoid — the formulas are the
+/// W3C ones and their *identities* are what `a_blended_brush_keeps_the_
+/// identities_its_mode_promises` pins.
+///
+/// Two are expected to agree with Normal and are named rather than skipped
+/// quietly: nothing is a coincidence here.
+#[test]
+fn every_blend_mode_moves_the_picture() {
+    let mut h = harness_or_skip!();
+
+    // Mid greys with all three channels different, so a mode that only touches
+    // luminosity and one that only touches hue both show up.
+    let under = [70u8, 160, 110, 255];
+    let over = [180u8, 90, 200, 255];
+
+    reset(&mut h);
+    let rect = whole(&h);
+    h.write_block(0, rect, under);
+    h.write_block(1, rect, over);
+    let normal = h.composite_pixel(
+        &[
+            layer(0, 1.0, BlendMode::Normal),
+            layer(1, 1.0, BlendMode::Normal),
+        ],
+        32,
+        32,
+    );
+
+    let mut unmoved = Vec::new();
+    for mode in every_blend_mode() {
+        if mode == BlendMode::Normal {
+            continue;
+        }
+        let got = h.composite_pixel(
+            &[layer(0, 1.0, BlendMode::Normal), layer(1, 1.0, mode)],
+            32,
+            32,
+        );
+        if (0..3).all(|i| got[i].abs_diff(normal[i]) <= 1) {
+            unmoved.push(mode);
+        }
+    }
+
+    assert!(
+        unmoved.is_empty(),
+        "these modes composited as Normal, so they have no arm in blend.wgsl: {unmoved:?}"
+    );
+}
+
+/// The four non-separable modes are the ones with helpers behind them, and a
+/// helper that is wrong is easiest to see in the identities the modes promise.
+///
+/// Luminosity of a colour onto itself is that colour; Colour of a colour onto
+/// itself likewise. Both go through `set_lum`, `clip_color` and — for Hue and
+/// Saturation — `set_sat`, so a broken helper cannot pass these.
+#[test]
+fn the_colour_modes_keep_the_identities_they_promise() {
+    let mut h = harness_or_skip!();
+    let same = [120u8, 90, 200, 255];
+
+    reset(&mut h);
+    let rect = whole(&h);
+    h.write_block(0, rect, same);
+    h.write_block(1, rect, same);
+
+    for mode in [
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+    ] {
+        let got = h.composite_pixel(
+            &[layer(0, 1.0, BlendMode::Normal), layer(1, 1.0, mode)],
+            32,
+            32,
+        );
+        assert_near(
+            got,
+            [same[0], same[1], same[2]],
+            2,
+            &format!("{mode:?} of a colour onto itself"),
+        );
+    }
 }

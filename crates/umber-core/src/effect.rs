@@ -774,7 +774,34 @@ mod tests {
             .into_iter()
             .map(|m| ron::to_string(&m).unwrap())
             .collect();
-        assert_eq!(spelled, ["Normal", "Multiply", "Screen", "Overlay", "Add"]);
+        assert_eq!(
+            spelled,
+            [
+                "Normal",
+                "Darken",
+                "Multiply",
+                "ColorBurn",
+                "LinearBurn",
+                "Lighten",
+                "Screen",
+                "ColorDodge",
+                "Add",
+                "Overlay",
+                "SoftLight",
+                "HardLight",
+                "VividLight",
+                "LinearLight",
+                "PinLight",
+                "Difference",
+                "Exclusion",
+                "Subtract",
+                "Divide",
+                "Hue",
+                "Saturation",
+                "Color",
+                "Luminosity"
+            ]
+        );
     }
 
     /// §4's order, for every subset of the effects that exist.

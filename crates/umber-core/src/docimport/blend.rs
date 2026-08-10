@@ -40,6 +40,35 @@ pub fn nearest(canonical: &str) -> (BlendMode, Fidelity) {
         "multiply" => (BlendMode::Multiply, Exact),
         "screen" => (BlendMode::Screen, Exact),
         "overlay" => (BlendMode::Overlay, Exact),
+        "darken" => (BlendMode::Darken, Exact),
+        "lighten" => (BlendMode::Lighten, Exact),
+        "color-dodge" => (BlendMode::ColorDodge, Exact),
+        "color-burn" => (BlendMode::ColorBurn, Exact),
+        "hard-light" => (BlendMode::HardLight, Exact),
+        "soft-light" => (BlendMode::SoftLight, Exact),
+        "difference" => (BlendMode::Difference, Exact),
+        "exclusion" => (BlendMode::Exclusion, Exact),
+        "hue" => (BlendMode::Hue, Exact),
+        "saturation" => (BlendMode::Saturation, Exact),
+        "color" => (BlendMode::Color, Exact),
+        "luminosity" => (BlendMode::Luminosity, Exact),
+
+        // Photoshop's own, which SVG has no name for and Umber now implements
+        // from the same definitions Photoshop and Clip Studio use.
+        "linear-burn" => (BlendMode::LinearBurn, Exact),
+        "vivid-light" => (BlendMode::VividLight, Exact),
+        "linear-light" => (BlendMode::LinearLight, Exact),
+        "pin-light" => (BlendMode::PinLight, Exact),
+        "subtract" => (BlendMode::Subtract, Exact),
+        "divide" => (BlendMode::Divide, Exact),
+
+        // **`linear-dodge` *is* Add**, which is why it is exact and `plus` is
+        // not. Photoshop and Clip Studio both spell the mode "Linear Dodge
+        // (Add)" and it is `min(Cb + Cs, 1)`, the formula `blend_rgb` has.
+        // They shared an arm, so eight of the thirty-three documents this was
+        // measured against raised a `BlendApproximated` warning about a layer
+        // that had arrived perfectly.
+        "linear-dodge" | "add" => (BlendMode::Add, Exact),
 
         // `plus` is Porter-Duff addition on premultiplied colour; Umber's Add
         // clamps the sum of straight colour. The two agree wherever both
@@ -48,15 +77,22 @@ pub fn nearest(canonical: &str) -> (BlendMode, Fidelity) {
         // `add-glow` is Clip Studio's Add that ignores what is under it where
         // that is transparent — the same direction, one step further from the
         // formula Umber has.
-        "plus" | "linear-dodge" | "add" | "add-glow" => (BlendMode::Add, Approximate),
+        "plus" | "add-glow" => (BlendMode::Add, Approximate),
 
-        // Same family, different curve. `glow-dodge` is Clip Studio's spelling
-        // of a dodge that keeps highlights.
-        "darken" | "color-burn" | "linear-burn" => (BlendMode::Multiply, Approximate),
-        "lighten" | "color-dodge" | "glow-dodge" => (BlendMode::Screen, Approximate),
-        "hard-light" | "soft-light" | "vivid-light" | "linear-light" | "pin-light" => {
-            (BlendMode::Overlay, Approximate)
-        }
+        // `glow-dodge` is Clip Studio's dodge that keeps highlights, which is
+        // Colour Dodge treating a transparent backdrop differently.
+        "glow-dodge" => (BlendMode::ColorDodge, Approximate),
+
+        // The two "colour" comparisons pick a whole pixel by luminosity rather
+        // than working per channel, which nothing here does. Lighten and Darken
+        // move the image the same way and are the closest thing Umber has.
+        "darker-color" => (BlendMode::Darken, Approximate),
+        "lighter-color" => (BlendMode::Lighten, Approximate),
+
+        // Hard Mix posterises to the eight corners of the colour cube. Vivid
+        // Light is the curve it is the limit of, so it is the same family —
+        // but the result is so much flatter that this stays approximate.
+        "hard-mix" => (BlendMode::VividLight, Approximate),
 
         // Nothing in Umber moves the image the way these do, and picking a
         // "close" mode would be a worse lie than Normal.
@@ -80,32 +116,63 @@ mod tests {
         }
     }
 
+    /// Every mode Umber has can be *arrived at* by an import.
+    ///
+    /// A mode with no source name mapping to it is a hole in the table: the
+    /// engine can draw it and the interface can set it, but no document will
+    /// ever open as it. The names are the canonical (SVG, `svg:` stripped)
+    /// spellings plus the two Photoshop families OpenRaster never named.
+    ///
+    /// **Driven off `BlendMode::ALL`**, so a mode added to the enum fails here
+    /// until `nearest` can produce it — which is what caught Colour Burn when
+    /// the set grew, since its label is British and its canonical name is not.
     #[test]
     fn every_umber_mode_is_reachable() {
-        // If a mode has no source name mapping to it, an import can never
-        // produce it — which would mean the table has a hole.
+        const NAMES: [&str; 23] = [
+            "src-over",
+            "multiply",
+            "screen",
+            "overlay",
+            "linear-dodge",
+            "darken",
+            "lighten",
+            "color-dodge",
+            "color-burn",
+            "linear-burn",
+            "hard-light",
+            "soft-light",
+            "vivid-light",
+            "linear-light",
+            "pin-light",
+            "difference",
+            "exclusion",
+            "subtract",
+            "divide",
+            "hue",
+            "saturation",
+            "color",
+            "luminosity",
+        ];
         for mode in BlendMode::ALL {
             assert!(
-                [
-                    "src-over",
-                    "multiply",
-                    "screen",
-                    "overlay",
-                    "plus",
-                    "darken",
-                    "hard-light"
-                ]
-                .iter()
-                .any(|n| nearest(n).0 == mode),
+                NAMES.iter().any(|n| nearest(n).0 == mode),
                 "{:?} unreachable",
                 mode.label()
             );
         }
     }
 
+    /// A name nothing here has heard of composites as Normal and says so.
+    ///
+    /// The examples used to be `difference`, `hue` and `luminosity`, which is
+    /// exactly the shape that goes stale: every one of them is now a mode Umber
+    /// implements. What is left has to be things OpenRaster genuinely does not
+    /// define as a *blend* — the Porter-Duff compositing operators, which move
+    /// alpha rather than colour and are a different question — and outright
+    /// invention.
     #[test]
     fn unknown_modes_fall_back_loudly() {
-        for name in ["difference", "hue", "luminosity", "dst-out", "invented"] {
+        for name in ["dst-out", "dst-in", "src-atop", "xor", "invented"] {
             assert_eq!(
                 nearest(name),
                 (BlendMode::Normal, Fidelity::Dropped),

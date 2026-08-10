@@ -1299,9 +1299,17 @@ fn apply_hex(ed: &mut Editor, text: &str) -> bool {
 ///
 /// Fixed, and this is one of the two places a dropdown's width is: the row has
 /// exactly one thing on it that wants the spare room and it is the rail, not the
-/// picker. Wide enough for "Multiply", the longest mode there is, and for the
-/// one after it should the stack ever gain another.
-const BLEND_WIDTH: f32 = 80.0;
+/// picker.
+///
+/// **Wide enough for the widest mode name, which is measured rather than
+/// guessed.** This was 80, sized for "Multiply" and described as "the longest
+/// mode there is" — true of five modes and false of twenty-three. A
+/// `DropdownWidth::Exact` trigger does not grow to fit its label, so the word
+/// is simply clipped: "Colour Dodge" wants 66.8 points and the old width left
+/// 62. `the_layer_blend_picker_fits_every_mode_name` walks `BlendMode::ALL`
+/// through the real font, so the next mode added is checked by the same line
+/// rather than by somebody remembering this paragraph.
+const BLEND_WIDTH: f32 = 88.0;
 
 /// What the ticked-layers strip was pressed for.
 ///
@@ -4075,5 +4083,53 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         println!("wrote 5 edge cases to {}", dir.display());
+    }
+}
+
+#[cfg(test)]
+mod blend_picker_tests {
+    use super::*;
+
+    /// **The layer row's blend picker is wide enough for the widest mode.**
+    ///
+    /// `BLEND_WIDTH` was sized for "Multiply", "the longest mode there is" —
+    /// which was true of five modes and is not true of twenty-three. A trigger
+    /// narrower than its label does not grow: `DropdownWidth::Exact` is exact,
+    /// so the word is clipped and "Luminosity" reads as "Luminosit".
+    ///
+    /// Measured against the font the trigger actually uses rather than
+    /// estimated, and against **every** label, so the next mode added is
+    /// checked by the same line.
+    #[test]
+    fn the_layer_blend_picker_fits_every_mode_name() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut widest: (f32, &str) = (0.0, "");
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(crate::theme::text::TINY);
+            for mode in BlendMode::ALL {
+                let w = ui
+                    .painter()
+                    .layout_no_wrap(mode.label().to_owned(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x;
+                if w > widest.0 {
+                    widest = (w, mode.label());
+                }
+            }
+        });
+
+        // The trigger draws a chevron and padding beside the word; the width
+        // has to hold both. `dropdown_furniture` is what decides that, and it
+        // is private to `widgets`, so this asks for the label to fit inside the
+        // known geometry with the chevron's own column left over.
+        let room = BLEND_WIDTH - crate::theme::metrics::DROPDOWN;
+        assert!(
+            widest.0 <= room,
+            "\"{}\" needs {:.1} points and the picker leaves {:.1}; raise BLEND_WIDTH",
+            widest.1,
+            widest.0,
+            room
+        );
     }
 }

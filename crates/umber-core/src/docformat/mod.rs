@@ -1011,6 +1011,33 @@ pub fn composite_op(mode: BlendMode) -> (&'static str, bool) {
         BlendMode::Screen => ("svg:screen", true),
         BlendMode::Overlay => ("svg:overlay", true),
         BlendMode::Add => ("svg:plus", false),
+        // The rest of the W3C separable set, which OpenRaster names exactly.
+        BlendMode::Darken => ("svg:darken", true),
+        BlendMode::Lighten => ("svg:lighten", true),
+        BlendMode::ColorDodge => ("svg:color-dodge", true),
+        BlendMode::ColorBurn => ("svg:color-burn", true),
+        BlendMode::HardLight => ("svg:hard-light", true),
+        BlendMode::SoftLight => ("svg:soft-light", true),
+        BlendMode::Difference => ("svg:difference", true),
+        BlendMode::Exclusion => ("svg:exclusion", true),
+        // And the non-separable four, which it also names.
+        BlendMode::Hue => ("svg:hue", true),
+        BlendMode::Saturation => ("svg:saturation", true),
+        BlendMode::Color => ("svg:color", true),
+        BlendMode::Luminosity => ("svg:luminosity", true),
+
+        // **Photoshop's, not SVG's.** OpenRaster has no name for any of these,
+        // so each is written as the nearest thing another reader can draw and
+        // is marked inexact — which is what makes the writer add `umber-blend`
+        // beside it, so Umber's own round trip is still exact and only a
+        // foreign reader sees the approximation. Exactly the arrangement Add
+        // has had since `svg:plus`.
+        BlendMode::LinearBurn => ("svg:multiply", false),
+        BlendMode::VividLight => ("svg:hard-light", false),
+        BlendMode::LinearLight => ("svg:hard-light", false),
+        BlendMode::PinLight => ("svg:hard-light", false),
+        BlendMode::Subtract => ("svg:difference", false),
+        BlendMode::Divide => ("svg:color-dodge", false),
     }
 }
 
@@ -3304,7 +3331,34 @@ mod tests {
     #[test]
     fn the_names_written_into_the_blend_attribute_are_these_exact_strings() {
         let spelled: Vec<String> = BlendMode::ALL.into_iter().map(blend_id).collect();
-        assert_eq!(spelled, ["Normal", "Multiply", "Screen", "Overlay", "Add"]);
+        assert_eq!(
+            spelled,
+            [
+                "Normal",
+                "Darken",
+                "Multiply",
+                "ColorBurn",
+                "LinearBurn",
+                "Lighten",
+                "Screen",
+                "ColorDodge",
+                "Add",
+                "Overlay",
+                "SoftLight",
+                "HardLight",
+                "VividLight",
+                "LinearLight",
+                "PinLight",
+                "Difference",
+                "Exclusion",
+                "Subtract",
+                "Divide",
+                "Hue",
+                "Saturation",
+                "Color",
+                "Luminosity"
+            ]
+        );
     }
 
     /// [`BlendMode::ALL`] is a hand-written array, and a mode missing from it
@@ -3340,13 +3394,34 @@ mod tests {
     /// where the hole was measured.
     #[test]
     fn all_lists_every_blend_mode() {
+        // The positions are `ALL`'s, which is grouped for the menu rather than
+        // ordered by discriminant — so these are deliberately not 0..n in
+        // variant order, and an arm that simply counted upwards would fail.
         const fn listed_in_all(mode: BlendMode) -> BlendMode {
             match mode {
                 BlendMode::Normal => BlendMode::ALL[0],
-                BlendMode::Multiply => BlendMode::ALL[1],
-                BlendMode::Screen => BlendMode::ALL[2],
-                BlendMode::Overlay => BlendMode::ALL[3],
-                BlendMode::Add => BlendMode::ALL[4],
+                BlendMode::Darken => BlendMode::ALL[1],
+                BlendMode::Multiply => BlendMode::ALL[2],
+                BlendMode::ColorBurn => BlendMode::ALL[3],
+                BlendMode::LinearBurn => BlendMode::ALL[4],
+                BlendMode::Lighten => BlendMode::ALL[5],
+                BlendMode::Screen => BlendMode::ALL[6],
+                BlendMode::ColorDodge => BlendMode::ALL[7],
+                BlendMode::Add => BlendMode::ALL[8],
+                BlendMode::Overlay => BlendMode::ALL[9],
+                BlendMode::SoftLight => BlendMode::ALL[10],
+                BlendMode::HardLight => BlendMode::ALL[11],
+                BlendMode::VividLight => BlendMode::ALL[12],
+                BlendMode::LinearLight => BlendMode::ALL[13],
+                BlendMode::PinLight => BlendMode::ALL[14],
+                BlendMode::Difference => BlendMode::ALL[15],
+                BlendMode::Exclusion => BlendMode::ALL[16],
+                BlendMode::Subtract => BlendMode::ALL[17],
+                BlendMode::Divide => BlendMode::ALL[18],
+                BlendMode::Hue => BlendMode::ALL[19],
+                BlendMode::Saturation => BlendMode::ALL[20],
+                BlendMode::Color => BlendMode::ALL[21],
+                BlendMode::Luminosity => BlendMode::ALL[22],
             }
         }
 

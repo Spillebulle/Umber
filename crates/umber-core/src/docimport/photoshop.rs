@@ -446,7 +446,7 @@ mod tests {
         let psd = fixtures::psd(
             1,
             1,
-            &[PsdLayerSpec::new("Odd", [0, 0, 0, 255]).blend(*b"diff")],
+            &[PsdLayerSpec::new("Odd", [0, 0, 0, 255]).blend(*b"diss")],
         );
         let doc = read(&psd).unwrap();
         assert_eq!(doc.layers[0].blend, BlendMode::Normal);
@@ -454,7 +454,7 @@ mod tests {
             doc.warnings,
             vec![ImportWarning::BlendDropped {
                 layer: "Odd".into(),
-                source: "difference".into()
+                source: "dissolve".into()
             }]
         );
     }

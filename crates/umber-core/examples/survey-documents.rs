@@ -92,7 +92,7 @@ fn main() {
                     doc.size.y,
                     entries - folders,
                     gigabytes(painted_bytes(&doc)),
-                    note(&doc),
+                    note(&doc, only.is_some()),
                 );
             }
             Err(e) => {
@@ -110,10 +110,23 @@ fn main() {
 
 /// Warnings summarised rather than listed: a forty-layer document with a mask
 /// on every layer should not produce forty lines in a table.
-fn note(doc: &ImportedDocument) -> String {
+///
+/// `--only` is the escape hatch, and it is what makes this tool answer "why is
+/// this one file unhappy" as well as "how is the folder": once the sweep is
+/// down to a handful of documents, every sentence is printed in full. That is
+/// the reading somebody actually wants when they have a warning in front of
+/// them and no idea which layer caused it.
+fn note(doc: &ImportedDocument, verbose: bool) -> String {
     match doc.warnings.len() {
         0 => String::new(),
         1 => format!(" (1 warning: {})", doc.warnings[0]),
+        n if verbose => {
+            let mut out = format!(" ({n} warnings)");
+            for w in &doc.warnings {
+                out.push_str(&format!("\n{:>4}- {w}", ""));
+            }
+            out
+        }
         n => format!(" ({n} warnings)"),
     }
 }

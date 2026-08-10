@@ -891,7 +891,7 @@ mod tests {
         let ora = fixtures::ora(
             1,
             1,
-            &[OraLayer::new("Odd", 1, 1, &[0, 0, 0, 255]).op("svg:difference")],
+            &[OraLayer::new("Odd", 1, 1, &[0, 0, 0, 255]).op("svg:dst-out")],
         );
         let doc = read(&ora).unwrap();
         assert_eq!(doc.layers[0].blend, BlendMode::Normal);
@@ -899,7 +899,7 @@ mod tests {
             doc.warnings,
             vec![ImportWarning::BlendDropped {
                 layer: "Odd".into(),
-                source: "difference".into()
+                source: "dst-out".into()
             }]
         );
     }

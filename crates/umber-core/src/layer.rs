@@ -428,23 +428,91 @@ impl EditRefusal {
 /// two enums would eventually stop agreeing about which modes exist.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlendMode {
+    // **The first five discriminants may not move.** They are what
+    // `composite.wgsl` switches on, and while the *number* is never written to
+    // a file, keeping them fixed means a shader and a document written before
+    // the set grew still mean the same thing. Everything added since is
+    // appended, which is what makes growing the set a safe change.
     #[default]
     Normal = 0,
     Multiply = 1,
     Screen = 2,
     Overlay = 3,
+    /// Photoshop and Clip Studio both call this **Linear Dodge (Add)**, and it
+    /// is the same operation — which is why `blend::nearest` reads their
+    /// `linear-dodge` as this one *exactly* rather than approximately.
     Add = 4,
+    Darken = 5,
+    Lighten = 6,
+    ColorDodge = 7,
+    ColorBurn = 8,
+    LinearBurn = 9,
+    HardLight = 10,
+    SoftLight = 11,
+    VividLight = 12,
+    LinearLight = 13,
+    PinLight = 14,
+    Difference = 15,
+    Exclusion = 16,
+    Subtract = 17,
+    Divide = 18,
+    // The four **non-separable** modes: each channel of the result depends on
+    // all three of the inputs, so they need the hue/saturation/luminosity
+    // helpers in `blend.wgsl` rather than one line of arithmetic.
+    Hue = 19,
+    Saturation = 20,
+    Color = 21,
+    Luminosity = 22,
 }
 
 impl BlendMode {
-    pub const ALL: [BlendMode; 5] = [
+    /// Every mode, in the order the interface offers them.
+    ///
+    /// **Grouped by what they do to the picture** — darkening, lightening,
+    /// contrast, comparison, colour — which is how Photoshop, Clip Studio and
+    /// Krita all arrange the same list, and therefore what somebody coming from
+    /// one of those is looking for. Deliberately *not* discriminant order: the
+    /// numbers are fixed by the shader and by what was here first, and sorting
+    /// the menu by them would put Add between Overlay and Darken for no reason
+    /// a painter could see.
+    pub const ALL: [BlendMode; 23] = [
         Self::Normal,
+        // Darken
+        Self::Darken,
         Self::Multiply,
+        Self::ColorBurn,
+        Self::LinearBurn,
+        // Lighten
+        Self::Lighten,
         Self::Screen,
-        Self::Overlay,
+        Self::ColorDodge,
         Self::Add,
+        // Contrast
+        Self::Overlay,
+        Self::SoftLight,
+        Self::HardLight,
+        Self::VividLight,
+        Self::LinearLight,
+        Self::PinLight,
+        // Comparison
+        Self::Difference,
+        Self::Exclusion,
+        Self::Subtract,
+        Self::Divide,
+        // Colour
+        Self::Hue,
+        Self::Saturation,
+        Self::Color,
+        Self::Luminosity,
     ];
 
+    /// What the interface calls it.
+    ///
+    /// British spelling, as every user-facing string here is — so the label is
+    /// "Colour Dodge" where the variant is `ColorDodge`. The variant keeps the
+    /// American spelling because **its name is a file format**: it is what
+    /// serde writes into `brushes.ron` and into an effect record, and renaming
+    /// it would break every preset that carries one. See the type's own note.
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
@@ -452,6 +520,24 @@ impl BlendMode {
             Self::Screen => "Screen",
             Self::Overlay => "Overlay",
             Self::Add => "Add",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::ColorDodge => "Colour Dodge",
+            Self::ColorBurn => "Colour Burn",
+            Self::LinearBurn => "Linear Burn",
+            Self::HardLight => "Hard Light",
+            Self::SoftLight => "Soft Light",
+            Self::VividLight => "Vivid Light",
+            Self::LinearLight => "Linear Light",
+            Self::PinLight => "Pin Light",
+            Self::Difference => "Difference",
+            Self::Exclusion => "Exclusion",
+            Self::Subtract => "Subtract",
+            Self::Divide => "Divide",
+            Self::Hue => "Hue",
+            Self::Saturation => "Saturation",
+            Self::Color => "Colour",
+            Self::Luminosity => "Luminosity",
         }
     }
 

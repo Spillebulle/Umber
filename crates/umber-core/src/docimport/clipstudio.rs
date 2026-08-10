@@ -484,6 +484,13 @@ struct LayerRow {
     draw_colour: (i64, i64, i64),
 }
 
+/// `LayerType`'s value for a **vector** layer.
+///
+/// Zero, which is also what a folder carries — so this alone never decides
+/// anything: `build` answers the folder question first, off `LayerFolder`, and
+/// only a non-folder reaches [`LayerRow::no_pixels_reason`].
+const VECTOR_KIND: i64 = 0;
+
 /// `SpecialRenderType`'s value for the Paper layer.
 const PAPER_RENDER: i64 = 20;
 
@@ -498,6 +505,34 @@ const PAPER_RENDER: i64 = 20;
 const PAPER_KIND: i64 = 1584;
 
 impl LayerRow {
+    /// Why this layer has no pixels in the file, phrased for the artist.
+    ///
+    /// **"The file does not hold its pixels" reads as damage, and for a vector
+    /// layer it is a lie about the cause.** Clip Studio stores a vector layer
+    /// as *strokes* — that is what it is for — and rasterises them on demand,
+    /// so there is genuinely no bitmap at any level of the mipmap chain. The
+    /// document is perfectly intact; Umber simply has no vector renderer. An
+    /// artist told the first sentence goes looking for a corrupt file, and an
+    /// artist told the second uses Layer → Rasterize and re-saves.
+    ///
+    /// Measured across 33 real documents: 28 of 542 painted layers are vector.
+    /// The only raster Clip Studio keeps for one is a small thumbnail, which is
+    /// no use as a layer — substituting it would be the blurry, plausible,
+    /// subtly wrong output this module refuses everywhere else.
+    ///
+    /// `LayerType` is the reading, and 0 is what a vector layer carries;
+    /// `VectorNormalStrokeIndex` is set beside it on one that has been drawn
+    /// on, but not on an empty one, so the type is the reliable half.
+    fn no_pixels_reason(&self) -> &'static str {
+        if self.kind == VECTOR_KIND {
+            "it is a vector layer, which Clip Studio stores as strokes rather \
+             than pixels; rasterise it in Clip Studio and save again to bring \
+             it across"
+        } else {
+            "the file does not hold its pixels"
+        }
+    }
+
     /// Whether this is the Paper layer: a flat sheet under the whole canvas,
     /// holding a colour and no bitmap.
     ///
@@ -851,7 +886,7 @@ fn build(
     let Some((attribute, chunk)) = tables.offscreen(row.render_mipmap) else {
         warnings.push(ImportWarning::LayerSkipped {
             layer: name,
-            reason: "the file does not hold its pixels".to_string(),
+            reason: row.no_pixels_reason().to_string(),
         });
         return None;
     };
@@ -867,9 +902,21 @@ fn build(
     ) {
         Ok(pixels) => pixels,
         Err(reason) => {
+            // **A vector layer fails here rather than above**, and that is the
+            // case this whole distinction exists for. It *has* a mipmap chain
+            // and an `Offscreen` row — Clip Studio writes the bookkeeping for
+            // one — and what is missing is the external chunk the row points
+            // at, because the strokes were never rasterised into a block. So
+            // the honest sentence has to be reached from both sites, and
+            // guarding only the earlier one left every real vector layer still
+            // reporting a file with something missing.
             warnings.push(ImportWarning::LayerSkipped {
                 layer: name,
-                reason,
+                reason: if row.kind == VECTOR_KIND {
+                    row.no_pixels_reason().to_string()
+                } else {
+                    reason
+                },
             });
             return None;
         }
@@ -1354,6 +1401,50 @@ mod tests {
         assert!(matches!(read(&bytes), Err(ImportError::Malformed { .. })));
     }
 
+    /// **A vector layer is named as one, not reported as a file with no
+    /// pixels.**
+    ///
+    /// Clip Studio stores it as strokes and rasterises on demand, so there is
+    /// no bitmap at any mipmap level — the document is intact and Umber simply
+    /// has no vector renderer. The old wording sent an artist looking for a
+    /// corrupt file; the new one sends them to Layer → Rasterize, which is the
+    /// thing that actually works.
+    ///
+    /// The fixture is a layer with `LayerType` 0 and no stored pixels, which is
+    /// what a real one looks like — 28 of the 542 painted layers across the 33
+    /// documents this was measured against.
+    #[test]
+    fn a_vector_layer_is_named_rather_than_reported_as_missing_pixels() {
+        let bytes = fixtures::clip(
+            64,
+            64,
+            &[
+                ClipLayer::flat("Ink", 64, 64, [255, 0, 0, 255]),
+                ClipLayer::vector("Lines", 64, 64),
+            ],
+        );
+        let doc = read(&bytes).expect("a document");
+
+        let said: Vec<String> = doc.warnings.iter().map(|w| w.to_string()).collect();
+        let about = said
+            .iter()
+            .find(|s| s.contains("Lines"))
+            .unwrap_or_else(|| panic!("nothing said about the vector layer: {said:?}"));
+        assert!(about.contains("vector layer"), "{about}");
+        assert!(
+            about.contains("rasterise") || about.contains("Rasterize"),
+            "the sentence has to say what to do about it: {about}"
+        );
+        assert!(
+            !about.contains("does not hold its pixels"),
+            "that wording reads as a damaged file: {about}"
+        );
+
+        // The rest of the document is untouched by it.
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].name, "Ink");
+    }
+
     /// **A document filed into folders is not charged for its filing**, which
     /// is the bug an artist met: a 15000×5000 `.clip` refused with "the canvas
     /// is larger than Umber can open", a canvas well inside `MAX_DIMENSION`.
@@ -1514,14 +1605,18 @@ mod tests {
     /// fidelity.
     #[test]
     fn blend_modes_are_mapped_and_the_losses_are_named() {
-        let cases: [(i64, BlendMode, bool); 5] = [
+        let cases: [(i64, BlendMode, bool); 6] = [
             (0, BlendMode::Normal, false),
             (2, BlendMode::Multiply, false),
             (8, BlendMode::Screen, false),
-            // Darken has no formula of Umber's; Multiply is the same family.
-            (1, BlendMode::Multiply, true),
-            // Difference moves the picture somewhere Umber cannot follow.
-            (21, BlendMode::Normal, true),
+            // Darken and Difference are Umber's own now, so neither is a loss
+            // and neither may be reported. They were Multiply-with-a-warning
+            // and Normal-with-a-warning, which is what this used to pin.
+            (1, BlendMode::Darken, false),
+            (21, BlendMode::Difference, false),
+            // Hard Mix has no formula here and is still named as a loss, so
+            // this case keeps a mapping that *is* approximate under test.
+            (20, BlendMode::VividLight, true),
         ];
         for (composite, expected, reported) in cases {
             let bytes = fixtures::clip(

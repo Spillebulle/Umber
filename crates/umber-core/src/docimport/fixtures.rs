@@ -1064,6 +1064,9 @@ pub struct ClipLayer {
     pub mask_visible: bool,
     /// `SpecialRenderType`. 20 marks the Paper layer; everything else is 0.
     pub special_render: i64,
+    /// Write the mipmap bookkeeping and withhold the pixels, which is what a
+    /// vector layer in a real `.clip` looks like.
+    pub withhold_chunk: bool,
     /// The flat colour a Paper layer draws, as ordinary sRGB bytes. Stored
     /// scaled up to `u32` by [`scale_channel`], which is what a real file does.
     pub draw_colour: [u8; 3],
@@ -1094,9 +1097,23 @@ impl ClipLayer {
             offset: (0, 0),
             mask_visible: true,
             special_render: 0,
+            withhold_chunk: false,
             draw_colour: [0, 0, 0],
             children: Vec::new(),
         }
+    }
+
+    /// A **vector** layer: `LayerType` 0, and no pixels anywhere.
+    ///
+    /// That is what a real one is. Clip Studio keeps the strokes and rasterises
+    /// them on demand, so no level of the mipmap chain holds a bitmap — which
+    /// is exactly what `pixels: None` produces here, and is why the reader has
+    /// to name the *kind* rather than report a file with something missing.
+    pub fn vector(name: &'static str, width: u32, height: u32) -> Self {
+        let mut layer = Self::flat(name, width, height, [0, 0, 0, 0]);
+        layer.kind = 0;
+        layer.withhold_chunk = true;
+        layer
     }
 
     /// The **Paper** layer: the flat sheet Clip Studio puts under a new
@@ -1134,6 +1151,7 @@ impl ClipLayer {
             offset: (0, 0),
             mask_visible: true,
             special_render: 0,
+            withhold_chunk: false,
             draw_colour: [0, 0, 0],
             children,
         }
@@ -1257,6 +1275,13 @@ impl ClipBuild {
         size: (u32, u32),
         packing: Packing,
         fill: Option<u8>,
+        // `withhold_chunk` writes the `Offscreen` row but **not** the external
+        // chunk it names. That is what a real vector layer looks like: Clip
+        // Studio writes the whole mipmap chain for one and never rasterises the
+        // strokes into a block, so the row is there and the chunk it points at
+        // is not. A different failure from having no chain at all, and the one
+        // the artist's own files actually take.
+        withhold_chunk: bool,
     ) -> i64 {
         let (width, height) = (size.0 as usize, size.1 as usize);
         let columns = width.div_ceil(256);
@@ -1302,10 +1327,12 @@ impl ClipBuild {
         }
 
         let name = self.chunk_name();
-        self.external.push((
-            name.clone(),
-            csblocks::fixture::block_data(&blocks, packing),
-        ));
+        if !withhold_chunk {
+            self.external.push((
+                name.clone(),
+                csblocks::fixture::block_data(&blocks, packing),
+            ));
+        }
 
         let offscreen = self.id();
         self.offscreens.push(vec![
@@ -1333,11 +1360,17 @@ impl ClipBuild {
             };
             let size = layer.bitmap_size.unwrap_or((self.width, self.height));
             let render = match &layer.pixels {
-                Some(pixels) => self.bitmap(pixels, size, CLIP_COLOUR, layer.pixel_fill),
+                Some(pixels) => self.bitmap(
+                    pixels,
+                    size,
+                    CLIP_COLOUR,
+                    layer.pixel_fill,
+                    layer.withhold_chunk,
+                ),
                 None => 0,
             };
             let mask = match &layer.mask {
-                Some(coverage) => self.bitmap(coverage, size, CLIP_MASK, layer.mask_fill),
+                Some(coverage) => self.bitmap(coverage, size, CLIP_MASK, layer.mask_fill, false),
                 None => 0,
             };
             self.layers.push(vec![
