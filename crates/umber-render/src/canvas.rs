@@ -2245,14 +2245,27 @@ pub struct CanvasRenderer {
     /// per document: a second would double the staging cost for a job that is
     /// already going to be repeated in five minutes.
     capture: Option<Capture>,
-    /// The largest staging buffer this device will create, in bytes.
+    /// The largest buffer this device will create, in bytes.
     ///
     /// Taken from the device rather than assumed, and honoured by every
-    /// readback here — see [`band_rows`] — **and now by the one write that can
-    /// carry a whole canvas**, [`CanvasRenderer::write_layer_rect`]. Held as a
-    /// field so a test can lower it and drive the banded path on a document
-    /// small enough to check by hand; on a real device it would take a 8192²
-    /// canvas to reach.
+    /// readback here — see [`band_rows`] — and by
+    /// [`CanvasRenderer::write_layer_rect`]. For a readback it is the *real*
+    /// bound: those go through the validated `create_buffer`. For a write it is
+    /// a **self-imposed proxy**, because a `write_texture` staging buffer is not
+    /// validated against it at all; see `write_layer_rect`.
+    ///
+    /// **It is not the only canvas-sized write in this file, and a comment here
+    /// used to say it was.** `upload_coverage`, reached from `set_selection`,
+    /// puts one byte per document pixel into a coverage texture in a single
+    /// unbanded `write_texture` — 256 MiB of staging for Select All on a 16384²
+    /// canvas and 1.07 GB at 32768², on the same fatal allocation path. It is
+    /// left alone here deliberately: it is a different function with a different
+    /// caller, and one change should not quietly become two. Anybody bounding it
+    /// wants this field and `band_rows` and nothing else new.
+    ///
+    /// Held as a field so a test can lower it and drive the banded path on a
+    /// document small enough to check by hand; on a real device it would take a
+    /// 8192² canvas to reach.
     readback_limit: u64,
 
     dab_bind_group: wgpu::BindGroup,
@@ -7184,12 +7197,24 @@ impl CanvasRenderer {
     /// **Goes a band of rows at a time, for the reason every readback here
     /// does** — see [`band_rows`]. `Queue::write_texture` allocates a staging
     /// buffer the size of the upload and copies the caller's bytes into it, so
-    /// a canvas-sized write asks the device for a canvas-sized buffer: 400 MB
-    /// on a 10000² document, well past the 256 MB `downlevel_defaults` says a
-    /// buffer may be. The reader was banded for exactly that and the writer was
-    /// not, which is the asymmetry this closes. `band_rows` returns the whole
+    /// a canvas-sized write asks for a canvas-sized buffer: 400 MB on a 10000²
+    /// document. The reader was banded for exactly that and the writer was not,
+    /// which is the asymmetry this closes. `band_rows` returns the whole
     /// rectangle whenever it fits, so an ordinary document takes the same
     /// single `write_texture` it always did.
+    ///
+    /// **`readback_limit` is a self-imposed proxy on this side, not a limit the
+    /// allocation is checked against**, and the first draft of this comment got
+    /// that wrong in exactly the way the thumbnail commit beside it is fixing —
+    /// a real bound explained by a mechanism that does not apply.
+    /// `StagingBuffer::new` goes straight to the HAL, with no `max_buffer_size`
+    /// check anywhere on the path, so a 400 MB `write_texture` does not fail
+    /// because `downlevel_defaults` says a buffer may be 256 MB; it fails when
+    /// the driver cannot find that much host-visible memory. Which is the whole
+    /// argument for borrowing the reader's figure: what the device *guarantees*
+    /// for one buffer is the only number here anybody has reason to trust, and
+    /// staging that never outruns it is staging no driver has an excuse to
+    /// refuse.
     ///
     /// **A staging buffer is not released at submit, it is released on that
     /// submission's fence**, so it is not enough to submit between bands: the
@@ -7205,18 +7230,23 @@ impl CanvasRenderer {
     /// banded nothing waits.
     ///
     /// Why it matters more than the megabytes suggest: `StagingBuffer::new`
-    /// reports a failed allocation through wgpu's *fatal* `handle_hal_error`,
-    /// which no error scope can catch and which loses the device outright. What
-    /// is being bounded is whether the document opens at all.
+    /// reports a failed allocation through `Device::handle_hal_error`, which
+    /// calls `lose` on an out-of-memory as well as on a lost device — so no
+    /// error scope can catch it and the device is gone. (wgpu has a
+    /// `handle_hal_error_with_nonfatal_oom` and this path does not use it.)
+    /// What is being bounded is whether the document opens at all.
     ///
     /// **A loop of these still accumulates, and the caller has to know it.**
-    /// The submits here bound one call; several calls with nothing between them
-    /// hold every one of their last bands until the GPU catches up. `App::
-    /// install_import` is the loop that made this visible — twenty-one layers
-    /// of a hundred-megapixel document held 8.4 GB of staging on top of an
-    /// 8.4 GB layer array — and `App::swap_patch` is a second one, bounded by
-    /// the undo budget rather than by a layer count. Anybody writing a third
-    /// should assume the same.
+    /// The submits here bound one call. Several calls with nothing between them
+    /// hold every one of their last bands until the GPU catches up, and on the
+    /// unbanded path nothing waits — so twenty-one layers that each fit one
+    /// staging buffer can still stand together. `install_import` in `app.rs` is
+    /// the loop that made this visible: twenty-one layers of a hundred-
+    /// megapixel document held 8.4 GB of staging on top of an 8.4 GB layer
+    /// array, every one of those allocations succeeding because nothing
+    /// validates them. `swap_patch` in the same file is a second such loop,
+    /// bounded by the undo budget rather than by a layer count. Anybody writing
+    /// a third should assume the same.
     pub fn write_layer_rect(
         &mut self,
         device: &wgpu::Device,
@@ -7261,17 +7291,22 @@ impl CanvasRenderer {
         while first < rect.height {
             let rows = band.min(rect.height - first);
             let start = (first as usize) * stride;
+            let at = wgpu::Origin3d {
+                x: rect.x,
+                y: rect.y + first,
+                z: slot,
+            };
             write_rect(
                 queue,
                 &self.layers.texture,
-                wgpu::Origin3d {
-                    x: rect.x,
-                    y: rect.y + first,
-                    z: slot,
-                },
+                at,
+                // `write_rect` reads only the width and the height off this —
+                // where the band lands is `at`'s. Bound to one name and stated,
+                // because two expressions for the same row would be one edit
+                // away from disagreeing about it.
                 PixelRect {
-                    x: rect.x,
-                    y: rect.y + first,
+                    x: at.x,
+                    y: at.y,
                     width: rect.width,
                     height: rows,
                 },

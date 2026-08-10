@@ -4450,13 +4450,20 @@ impl UmberApp {
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.add_canvas(id, &doc, slots);
             if let Some(canvas) = gfx.canvases.get_mut(&id) {
-                // Each of these submits, and bands itself where the slice is
-                // larger than one staging buffer — which is what stops an
-                // N-layer document holding N canvas-sized staging buffers on
-                // top of the N slices it is filling. It used to hold all of
-                // them: nothing in or after this loop submitted, and
-                // `Queue::write_texture` keeps its staging until something
-                // does. See `CanvasRenderer::write_layer_rect`.
+                // Each of these submits, and waits per band where the slice is
+                // larger than one staging buffer. Nothing in or after this loop
+                // used to submit at all, and `Queue::write_texture` keeps its
+                // staging until something does, so an N-layer document held N
+                // canvas-sized staging buffers on top of the N slices it was
+                // filling.
+                //
+                // **This bounds the loop, it does not empty it.** A submit hands
+                // the staging to that submission's fence rather than freeing it,
+                // and the unbanded path does not wait — so layers small enough
+                // to fit one buffer each can still stand together until the GPU
+                // catches up. What is gone is the unbounded case. See
+                // `CanvasRenderer::write_layer_rect`, which says the same thing
+                // about any loop of it and not only about this one.
                 for upload in &uploads {
                     canvas.write_layer_rect(
                         &gfx.gpu.device,

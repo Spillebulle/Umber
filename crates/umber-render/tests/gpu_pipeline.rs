@@ -232,11 +232,9 @@ impl Harness {
         self.canvas.set_background(background);
     }
 
-    /// Read a layer thumbnail through the real two-pass, non-blocking path.
-    ///
-    /// The loop is what the frame loop does: record whatever pass is due,
-    /// submit, map, collect. Bounded because a job that never answers is a hang
-    /// rather than a failure, which is the worst way for CI to break.
+    /// This harness's canvas, through [`thumbnail_of`] — which is where the
+    /// loop and its reasoning live, because one test drives a renderer of its
+    /// own.
     fn thumbnail(&mut self, slot: u32) -> Thumbnail {
         thumbnail_of(self.gpu, &mut self.canvas, slot)
     }
@@ -4240,13 +4238,22 @@ fn a_document_too_large_for_one_staging_buffer_is_read_back_in_bands() {
 /// `downlevel_defaults` allows, and a failed staging allocation is fatal rather
 /// than catchable. The reader was banded and the writer was not.
 ///
-/// What can go wrong in that change is arithmetic, so that is what this
-/// measures: the same bytes are written twice, once whole and once in five
-/// bands, and the two slices have to come back identical. A band written to the
-/// wrong row, a source offset stepping by the padded stride instead of the
-/// tight one, or a last band sized from the wrong end all show up here and in
-/// nothing else. Driven by lowering the limit, exactly as the readback above
-/// is, because reaching the real one needs a canvas no CI runner can hold.
+/// What can go wrong in the *arithmetic* is what this measures: the same bytes
+/// are written twice, once whole and once in five bands, and the two slices
+/// have to come back identical. A band written to the wrong row, a source
+/// offset stepping by the padded stride instead of the tight one, or a last
+/// band sized from the wrong end all show up here and in nothing else. Driven
+/// by lowering the limit, exactly as the readback above is, because reaching
+/// the real one needs a canvas no CI runner can hold.
+///
+/// **It does not cover the submit or the wait, which are the point of the
+/// change**, and saying so is better than letting the name imply otherwise:
+/// delete both `queue.submit([])` and the `device.poll` and this stays green,
+/// because the pixels are identical either way. What those two lines bound is
+/// how much staging is alive at once, which is a property of the allocator and
+/// not of any picture — there is nothing to read back and no adapter-independent
+/// figure to assert. They are held by the argument at `write_layer_rect`
+/// instead, and by there being one place that writes a band.
 ///
 /// The rectangle is deliberately awkward — off the origin, an odd width whose
 /// row is not a multiple of the copy alignment, and a height that leaves a
