@@ -7,29 +7,45 @@
 //! the same unknown as the thing that decides whether it is worth building:
 //! **what fraction of a real layer's tiles hold anything at all.**
 //!
-//! This answers it, for `.clip` documents, and the whole trick is that it
-//! **decodes nothing**. Clip Studio already stores a layer as a grid of
-//! 256-square blocks with a present/absent word on each — see
-//! [`crate::csblocks`] — so occupancy is a property of the container's framing.
-//! A survey of 1.8 GB of somebody's real work is therefore a few seconds of
-//! record walking rather than the 12.3 GB of canvas buffers one
-//! [`super::import`] of one such file costs. `examples/survey-residency.rs` is
-//! the caller.
+//! This answers it, for `.clip` documents, and it answers it **twice** — which
+//! is the whole shape of the module.
+//!
+//! Clip Studio already stores a layer as a grid of 256-square blocks with a
+//! present/absent word on each — see [`crate::csblocks`] — so a first reading
+//! needs no decode at all: it is a walk of the container's own framing, a few
+//! seconds over 1.8 GB of somebody's real work against the 12.3 GB of canvas
+//! buffers one [`super::import`] of one such file costs.
+//!
+//! **That reading over-reports, and by how much is the thing that has to be
+//! measured rather than assumed.** Clip Studio writes a block where the artist
+//! *touched* the canvas, not where paint survived, so a stored block can be
+//! entirely transparent and a tiled store would not back that tile at all. If
+//! presence and content diverge by two, every figure here moves by two —
+//! precisely where the decision is marginal. So [`Reading::Contents`] decodes
+//! each block, asks whether one texel of its first plane differs from what an
+//! absent block would hold, and throws the block away. That is bounded work
+//! with a fixed footprint: **one 256-square block live at a time, and never a
+//! canvas buffer**, which is the part of "do not decode" that actually mattered.
 //!
 //! # What the numbers do and do not say
 //!
-//! - **`stored` is an upper bound.** A block the file holds may still be
-//!   entirely transparent — Clip Studio writes one where the artist touched the
-//!   canvas, not where paint survived. Telling the two apart needs the inflate
-//!   this module exists to avoid, so a real tiled store would keep *at most*
-//!   this many tiles and possibly fewer. That direction is the safe one: it
-//!   cannot make tiling look better than it is.
+//! - **`stored` is blocks the file holds** — the cheap upper bound. `live` is
+//!   the same count with the blank ones taken out, and is `None` under
+//!   [`Reading::Presence`] rather than being quietly equal to `stored`.
 //! - **`covered` is what Umber would pay, and it is not `stored`.** A layer's
 //!   bitmap is its own rectangle at its own offset, so its grid is not aligned
 //!   with the canvas's — one stored block can straddle four canvas tiles, and a
 //!   block hanging off the page costs nothing at all because the blit clips it.
 //!   `covered` is the union of canvas tiles the stored blocks reach, which is
-//!   the figure `covered × 256² × 4` bytes is a real answer to.
+//!   the figure `covered × 256² × 4` bytes is a real answer to. `live_covered`
+//!   is the same union over the non-blank blocks alone, and is the honest
+//!   answer to what a tiled store would allocate.
+//! - **Blank is measured against the *fill*, not against zero.** An absent
+//!   block of a raster layer is transparent and an absent block of a **mask**
+//!   is all-ones, because a Clip Studio mask begins revealing everything — so a
+//!   mask block of all-ones is exactly as redundant as a layer block of
+//!   all-zeroes, and testing both against zero would report every full-reveal
+//!   mask tile as live.
 //! - **Only `.clip` is read**, and that is scope rather than an oversight. It
 //!   is the format the 33 real documents this was written against are in, and
 //!   its 256 block *is* the tile size the design proposes. `.kra` stores tiles
@@ -44,6 +60,20 @@ use glam::UVec2;
 
 use super::{ImportError, clipstudio};
 use crate::csblocks::BLOCK;
+
+/// How hard a residency walk looks.
+///
+/// Two answers rather than one because they are genuinely different questions
+/// and the gap between them is itself a finding: if they agree, every future
+/// survey can be the cheap one, and if they do not, the cheap one is not
+/// admissible evidence about storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// The container's present/absent words alone. No inflate.
+    Presence,
+    /// Every stored block inflated, tested against the fill and dropped.
+    Contents,
+}
 
 /// How far a residency walk will follow a layer chain.
 ///
@@ -66,8 +96,16 @@ pub struct SliceResidency {
     /// Blocks the file actually holds. See the module docs: an upper bound.
     pub stored: usize,
     /// Canvas tiles those blocks reach, once placed and clipped to the page.
-    /// This is what a tiled Umber would allocate for this slice.
     pub covered: usize,
+    /// Of [`Self::stored`], the blocks that differ from the fill somewhere.
+    ///
+    /// `None` under [`Reading::Presence`], deliberately, rather than a copy of
+    /// `stored` — a caller that cannot tell the two apart would report a number
+    /// it never measured.
+    pub live: Option<usize>,
+    /// Canvas tiles the non-blank blocks reach. This is what a tiled Umber
+    /// would actually allocate for this slice.
+    pub live_covered: Option<usize>,
     /// What an absent block holds, in [`crate::csblocks::Fill`]'s words.
     ///
     /// A mask's states all-ones, which a tiled store answers with a default
@@ -81,6 +119,10 @@ pub struct SliceResidency {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentResidency {
     pub size: UVec2,
+    /// Which of the two readings produced this. Carried rather than left to the
+    /// caller to remember, because every `live_*` figure is `None` under one of
+    /// them and a report has to say which question it answered.
+    pub reading: Reading,
     /// Entries in the stack, folders included.
     pub entries: usize,
     pub folders: usize,
@@ -107,10 +149,35 @@ impl DocumentResidency {
         u64::from(self.size.x) * u64::from(self.size.y) * 4 * self.slices.len() as u64
     }
 
-    /// What a tiled store would allocate for the same slices.
+    /// What a tiled store would allocate for the same slices, charging every
+    /// stored block. The upper bound; [`Self::live_bytes`] is the real answer.
     pub fn tiled_bytes(&self) -> u64 {
-        let per_tile = (BLOCK * BLOCK * 4) as u64;
-        self.slices.iter().map(|s| s.covered as u64).sum::<u64>() * per_tile
+        Self::TILE_BYTES * self.covered() as u64
+    }
+
+    /// The same over the blocks that hold something. `None` under
+    /// [`Reading::Presence`].
+    pub fn live_bytes(&self) -> Option<u64> {
+        Some(Self::TILE_BYTES * self.live_covered()? as u64)
+    }
+
+    /// One tile of a layer slice.
+    pub const TILE_BYTES: u64 = (BLOCK * BLOCK * 4) as u64;
+
+    /// Canvas tiles the stored blocks reach, over every slice.
+    pub fn covered(&self) -> usize {
+        self.slices.iter().map(|s| s.covered).sum()
+    }
+
+    /// The same over the non-blank blocks. `None` — rather than zero — where no
+    /// slice was decoded, so an undecoded document cannot read as an empty one.
+    pub fn live_covered(&self) -> Option<usize> {
+        self.slices.iter().map(|s| s.live_covered).sum()
+    }
+
+    /// Tiles a dense store allocates for the slices that were measured.
+    pub fn dense_tiles(&self) -> usize {
+        self.canvas_tiles() * self.slices.len()
     }
 
     /// Tiles held against tiles a dense store would allocate.
@@ -118,22 +185,29 @@ impl DocumentResidency {
     /// `None` for a document with nothing measurable in it, rather than a zero
     /// that would read as "wonderfully sparse".
     pub fn occupancy(&self) -> Option<f64> {
-        let canvas = self.canvas_tiles();
-        if canvas == 0 || self.slices.is_empty() {
-            return None;
-        }
-        let covered: usize = self.slices.iter().map(|s| s.covered).sum();
-        Some(covered as f64 / (canvas * self.slices.len()) as f64)
+        (self.dense_tiles() > 0).then(|| self.covered() as f64 / self.dense_tiles() as f64)
+    }
+
+    /// The same over the blocks that hold something.
+    pub fn live_occupancy(&self) -> Option<f64> {
+        (self.dense_tiles() > 0)
+            .then(|| Some(self.live_covered()? as f64 / self.dense_tiles() as f64))
+            .flatten()
     }
 }
 
 impl SliceResidency {
-    /// This slice's own share of its canvas.
+    /// This slice's own share of its canvas, charging every stored block.
     pub fn occupancy(&self, canvas_tiles: usize) -> f64 {
         if canvas_tiles == 0 {
             return 0.0;
         }
         self.covered as f64 / canvas_tiles as f64
+    }
+
+    /// The same over the blocks that hold something.
+    pub fn live_occupancy(&self, canvas_tiles: usize) -> Option<f64> {
+        (canvas_tiles > 0).then(|| Some(self.live_covered? as f64 / canvas_tiles as f64))?
     }
 }
 
@@ -144,56 +218,87 @@ impl SliceResidency {
 /// to be told that this question has not been answered for that format, and an
 /// `UnsupportedExtension` out of a function called `survey` would read as a
 /// file that could not be opened.
-pub fn clip_studio(bytes: &[u8]) -> Result<DocumentResidency, ImportError> {
-    clipstudio::residency(bytes)
+pub fn clip_studio(bytes: &[u8], reading: Reading) -> Result<DocumentResidency, ImportError> {
+    clipstudio::residency(bytes, reading)
 }
 
-/// Which canvas tiles one stored block reaches.
+/// The part of one stored block that actually reaches the canvas.
 ///
-/// Split out and given a test of its own because it is the only arithmetic in
-/// this module and every figure above rests on it. The block is 256 square in
-/// the *bitmap*, whose right and bottom edges are padding the blit throws away;
-/// the bitmap sits at `origin` in the document, which is generally not a
-/// multiple of 256; and the canvas clips both ends. Get any of the three wrong
-/// and the occupancy is quietly out.
-///
-/// The answer is a half-open tile range per axis, empty where the block lands
-/// entirely off the page.
-pub(super) fn tiles_touched(
+/// This is the only arithmetic in the module and every figure above rests on
+/// it, which is why **both** readings are derived from one placement rather
+/// than computed twice. The block is 256 square in the *bitmap*, whose right
+/// and bottom edges are padding the blit throws away; the bitmap sits at
+/// `origin` in the document, which is generally not a multiple of 256; and the
+/// canvas clips both ends. Two functions doing that separately is one of them
+/// scanning a region the other did not charge for — a block reported as
+/// covering a tile because of texels nobody can see.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Placed {
+    /// Half-open document span, clipped to the bitmap and to the page.
+    x: std::ops::Range<i64>,
+    y: std::ops::Range<i64>,
+    /// Where this block's own `(0, 0)` sits in the document.
+    at: (i64, i64),
+}
+
+impl Placed {
+    /// Canvas tiles this block reaches. Half-open, per axis.
+    pub(super) fn tiles(&self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let range = |span: &std::ops::Range<i64>| {
+            (span.start as usize / BLOCK)..((span.end as usize - 1) / BLOCK + 1)
+        };
+        (range(&self.x), range(&self.y))
+    }
+
+    /// The same region in the block's **own** coordinates, which is what a scan
+    /// of its decompressed bytes indexes by.
+    pub(super) fn local(&self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let range = |span: &std::ops::Range<i64>, at: i64| {
+            ((span.start - at) as usize)..((span.end - at) as usize)
+        };
+        (range(&self.x, self.at.0), range(&self.y, self.at.1))
+    }
+}
+
+/// Place one block, or `None` where none of it can be seen.
+pub(super) fn place(
     block: (usize, usize),
     bitmap: UVec2,
     origin: (i64, i64),
     canvas: UVec2,
-) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-    let empty = (0..0, 0..0);
-    let axis = |index: usize, extent: u32, at: i64, page: u32| -> Option<std::ops::Range<usize>> {
+) -> Option<Placed> {
+    let axis = |index: usize, extent: u32, at: i64, page: u32| {
         // The block's own span inside the bitmap, with the padding past the
         // bitmap's edge taken off — that padding is not the picture and
         // `colour`'s blit does not copy it.
         let start = (index * BLOCK) as i64;
         let end = i64::from(extent).min(start + BLOCK as i64);
-        if end <= start {
-            return None;
-        }
         // Placed, then clipped to the page.
         let (lo, hi) = ((at + start).max(0), (at + end).min(i64::from(page)));
-        if hi <= lo {
-            return None;
-        }
-        Some((lo as usize / BLOCK)..((hi as usize - 1) / BLOCK + 1))
+        (end > start && hi > lo).then_some(lo..hi)
     };
-    match (
-        axis(block.0, bitmap.x, origin.0, canvas.x),
-        axis(block.1, bitmap.y, origin.1, canvas.y),
-    ) {
-        (Some(x), Some(y)) => (x, y),
-        _ => empty,
-    }
+    Some(Placed {
+        x: axis(block.0, bitmap.x, origin.0, canvas.x)?,
+        y: axis(block.1, bitmap.y, origin.1, canvas.y)?,
+        at: (
+            origin.0 + (block.0 * BLOCK) as i64,
+            origin.1 + (block.1 * BLOCK) as i64,
+        ),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiles_touched(
+        block: (usize, usize),
+        bitmap: UVec2,
+        origin: (i64, i64),
+        canvas: UVec2,
+    ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        place(block, bitmap, origin, canvas).map_or((0..0, 0..0), |p| p.tiles())
+    }
 
     fn count(block: (usize, usize), bitmap: UVec2, origin: (i64, i64), canvas: UVec2) -> usize {
         let (x, y) = tiles_touched(block, bitmap, origin, canvas);
@@ -255,5 +360,31 @@ mod tests {
         // 456..500 and stops inside the second tile.
         let (x, _) = tiles_touched((1, 0), bitmap, (200, 0), canvas);
         assert_eq!(x, 1..2);
+    }
+
+    /// **The scan reads exactly the region the tiles were charged for.**
+    ///
+    /// This is what the two answers coming off one `Placed` buys, and it is not
+    /// cosmetic: a `.clip` block is padded past the bitmap's edge with bytes
+    /// that are nobody's picture — the reader's own fixture writes `0x5a` there
+    /// deliberately — so a content scan over the whole 256 square would call a
+    /// blank layer live on the strength of padding. The same is true of the
+    /// part hanging off the page.
+    #[test]
+    fn the_scanned_region_is_the_one_the_tiles_were_charged_for() {
+        let canvas = UVec2::new(1024, 1024);
+        // A 300-square bitmap: the second column holds 44 real pixels.
+        let placed = place((1, 1), UVec2::new(300, 300), (0, 0), canvas).expect("on the page");
+        assert_eq!(placed.local(), (0..44, 0..44));
+        assert_eq!(placed.tiles(), (1..2, 1..2));
+
+        // Hanging off the left edge: the first 100 columns of the block are off
+        // the page, so the scan starts at 100.
+        let placed = place((0, 0), UVec2::new(512, 512), (-100, 0), canvas).expect("on the page");
+        assert_eq!(placed.local(), (100..256, 0..256));
+
+        // Wholly off the page is no region at all rather than an empty one, so
+        // a caller cannot scan it by mistake.
+        assert!(place((0, 0), UVec2::new(512, 512), (-600, 0), canvas).is_none());
     }
 }
