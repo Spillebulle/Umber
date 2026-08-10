@@ -1,0 +1,19 @@
+# Umber as a thumbnailer, for the four document formats no desktop can already
+# draw. Installed to share/thumbnailers/; Nautilus, Thunar, Nemo, Caja and
+# PCManFM all read this directory.
+#
+# `image/png` is deliberately absent. Every desktop already thumbnails a PNG
+# through gdk-pixbuf, in-process and without spawning anything, so claiming it
+# would make Umber the slower answer to a question already answered. The four
+# here are the ones that otherwise draw a generic page.
+#
+# TryExec is what makes the entry harmless if the binary is gone: a desktop
+# skips a thumbnailer whose command it cannot find, rather than spawning it per
+# file and failing.
+#
+# `umber --thumbnail` writes one PNG and exits without ever building an event
+# loop or touching the GPU. See crates/umber-app/src/thumbnail.rs.
+[Thumbnailer Entry]
+TryExec=umber
+Exec=umber --thumbnail %i %o %s
+MimeType=image/openraster;image/x-krita;image/vnd.adobe.photoshop;image/x-clip-studio-paint;

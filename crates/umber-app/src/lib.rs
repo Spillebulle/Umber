@@ -75,6 +75,8 @@ mod taskbar;
 mod textpanel;
 mod theme;
 mod themelib;
+/// Umber as a command-line thumbnailer, for the freedesktop contract.
+mod thumbnail;
 mod thumbs;
 mod tweaks;
 mod ui;
@@ -117,6 +119,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::env::current_exe().is_ok_and(|exe| update::payload::carried_by(&exe));
     if let Some(job) = update::installer::job(std::env::args(), carries_payload) {
         return update::installwin::show(job);
+    }
+
+    // A thumbnail request, which is the third program this executable is. It
+    // writes one PNG and returns without ever building an event loop, so it
+    // has to be read before anything that would. See `thumbnail`.
+    if let Some(request) = thumbnail::job(std::env::args()) {
+        return match thumbnail::run(&request) {
+            Ok(()) => Ok(()),
+            // Non-zero and a line on stderr, which is what the freedesktop
+            // contract asks for: it stops a desktop caching the failure as
+            // though it were a picture.
+            Err(e) => Err(e.into()),
+        };
     }
 
     // The command line also carries the document a file manager was asked to

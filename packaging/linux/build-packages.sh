@@ -116,6 +116,12 @@ stage_tree() {
     # four types Umber reads are already in shared-mime-info.
     install -Dm644 "$root/packaging/$APP_ID.mime.xml" \
         "$prefix/share/mime/packages/$APP_ID.xml"
+    # Thumbnails for the four formats no desktop can already draw. This one
+    # needs no cache rebuild of its own: a file manager reads
+    # share/thumbnailers directly, which is why there is no third `update-*`
+    # command beside the two in the scriptlets below.
+    install -Dm644 "$root/packaging/$APP_ID.thumbnailer" \
+        "$prefix/share/thumbnailers/$APP_ID.thumbnailer"
     for size in 16 32 48 64 128 256; do
         install -Dm644 "$root/assets/icons/umber-$size.png" \
             "$prefix/share/icons/hicolor/${size}x${size}/apps/$APP_ID.png"
@@ -236,6 +242,7 @@ stage_tree "$buildroot/usr"
     echo "/usr/share/applications/$APP_ID.desktop"
     echo "/usr/share/metainfo/$APP_ID.metainfo.xml"
     echo "/usr/share/mime/packages/$APP_ID.xml"
+    echo "/usr/share/thumbnailers/$APP_ID.thumbnailer"
     echo "/usr/share/icons/hicolor/*/apps/$APP_ID.png"
     echo "/usr/share/doc/umber/"
 } > "$rpmroot/SPECS/umber.spec"

@@ -64,6 +64,14 @@ modules:
       # is what the export is keyed on.
       - install -Dm644 packaging/io.github.spillebulle.umber.mime.xml
         /app/share/mime/packages/io.github.spillebulle.umber.xml
+
+      # Thumbnails. Note this is installed but does **not** work from inside
+      # the sandbox the way it does for a system package: the host's file
+      # manager runs its own thumbnailers and cannot see /app/bin/umber. It is
+      # here so that a Flatpak install is not silently missing a file the other
+      # packages carry, and so the story is one file rather than a special case.
+      - install -Dm644 packaging/io.github.spillebulle.umber.thumbnailer
+        /app/share/thumbnailers/io.github.spillebulle.umber.thumbnailer
       - for s in 16 32 48 64 128 256; do
         install -Dm644 "icons/umber-$s.png"
         "/app/share/icons/hicolor/${s}x${s}/apps/io.github.spillebulle.umber.png";

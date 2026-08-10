@@ -59,6 +59,8 @@ package() {
     # share/applications, so declaring the file is the whole of the work.
     install -Dm644 "${stage}/packaging/io.github.spillebulle.umber.mime.xml" \
         "${pkgdir}/usr/share/mime/packages/io.github.spillebulle.umber.xml"
+    install -Dm644 "${stage}/packaging/io.github.spillebulle.umber.thumbnailer" \
+        "${pkgdir}/usr/share/thumbnailers/io.github.spillebulle.umber.thumbnailer"
     for size in 16 32 48 64 128 256; do
         install -Dm644 "${stage}/icons/umber-${size}.png" \
             "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/io.github.spillebulle.umber.png"

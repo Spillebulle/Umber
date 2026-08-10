@@ -244,6 +244,60 @@ mod tests {
         );
     }
 
+    /// **The thumbnailer entry names the command this build actually answers
+    /// to**, and every type it claims is one the previewer can read.
+    ///
+    /// Both halves have been wrong in this file's history in the other
+    /// direction — a MimeType line nothing rebuilt the cache for — and this is
+    /// the one that would be silent: a `.thumbnailer` naming `--thumbnails` or
+    /// a MIME type `preview::from_bytes` refuses is a desktop spawning Umber
+    /// once per file, for ever, and getting nothing.
+    ///
+    /// `image/png` is deliberately **not** claimed and that is asserted, not
+    /// merely omitted: every desktop already draws a PNG through gdk-pixbuf
+    /// in-process, so claiming it would make Umber the slower answer to a
+    /// question already answered.
+    #[test]
+    fn the_thumbnailer_names_a_command_this_build_answers_to() {
+        let entry = std::fs::read_to_string(packaging().join(format!("{APP_ID}.thumbnailer")))
+            .expect("the thumbnailer entry");
+
+        assert!(
+            entry.contains(&format!("Exec=umber {} %i %o %s", crate::thumbnail::FLAG)),
+            "the entry does not run the flag this build parses ({})",
+            crate::thumbnail::FLAG
+        );
+        assert!(
+            entry.contains("TryExec=umber"),
+            "without TryExec a desktop spawns a missing binary once per file"
+        );
+
+        // Every type claimed must be one the previewer can actually read, and
+        // the mapping is the association test's own.
+        let claimed: Vec<&str> = entry
+            .lines()
+            .find_map(|l| l.strip_prefix("MimeType="))
+            .expect("a MimeType line")
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            claimed.len(),
+            4,
+            "expected the four formats no desktop draws by itself: {claimed:?}"
+        );
+        assert!(
+            !claimed.contains(&"image/png"),
+            "gdk-pixbuf already draws a PNG faster than spawning Umber can"
+        );
+        for mime in &claimed {
+            assert!(
+                entry.contains(mime),
+                "{mime} is claimed by nothing this build registers"
+            );
+        }
+    }
+
     /// **Umber may not make itself the default for a format it merely reads.**
     ///
     /// WiX's `<ProgId>`/`<Extension>` pair writes the extension's own default
