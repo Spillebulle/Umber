@@ -309,6 +309,52 @@ pub(crate) fn for_each_block(
     (seen == expected).then_some(())
 }
 
+/// Which blocks a `BlockData` blob actually stores, **without inflating one**.
+///
+/// The container states presence per block, so "how much of this bitmap does
+/// the file hold" is a property of the *framing* rather than of the pixels —
+/// which is what makes it answerable over gigabytes of somebody's real work in
+/// seconds. [`crate::docimport::residency`] is the caller and says why the
+/// question is worth asking; nothing that decides pixels may use this, because
+/// a stored block may still be entirely transparent and this cannot tell.
+///
+/// The bounds are [`for_each_block`]'s, for the same reasons: a blob naming
+/// more blocks than the grid does is refused before it is walked, and one
+/// naming fewer takes the whole bitmap rather than leaving a hole.
+pub(crate) fn stored_blocks(blob: &[u8], expected: usize) -> Option<Vec<bool>> {
+    // Bounded by the grid the *caller* read out of the `Attribute`, never by a
+    // count the blob itself implies — the rule `parse_attribute`'s `max_side`
+    // keeps one level up.
+    let mut out: Vec<bool> = Vec::with_capacity(expected.min(4096));
+    let mut at = 0usize;
+    while let Some(chunk) = record(blob, at) {
+        at = chunk.end;
+        if chunk.name != "BlockDataBeginChunk" {
+            continue;
+        }
+        if out.len() >= expected {
+            return None;
+        }
+        out.push(block_is_present(chunk.payload)?);
+    }
+    (out.len() == expected).then_some(out)
+}
+
+/// A block record's header, as far as whether it holds anything.
+///
+/// Split out so [`decode_block`] and [`stored_blocks`] read the same five
+/// words — two copies of a header offset is the drift this module exists to
+/// refuse, and the presence walk is worthless if it disagrees with the decoder
+/// about which blocks are there.
+fn block_is_present(payload: &[u8]) -> Option<bool> {
+    let block_width = be32(payload, 8)? as usize;
+    let block_height = be32(payload, 12)? as usize;
+    if block_width != BLOCK || block_height != BLOCK {
+        return None;
+    }
+    Some(be32(payload, 16)? != 0)
+}
+
 /// `[u32 index][u32 uncompressed bytes][u32 block width][u32 block height]
 /// [u32 present]`, then — only where it is present —
 /// `[u32 length + 4][u32 le length][zlib stream]`.
@@ -329,13 +375,7 @@ pub(crate) fn for_each_block(
 /// number happens to be smaller.
 pub(crate) fn decode_block(payload: &[u8], expect: Option<Packing>) -> Option<Option<Vec<u8>>> {
     let declared = be32(payload, 4)? as usize;
-    let block_width = be32(payload, 8)? as usize;
-    let block_height = be32(payload, 12)? as usize;
-    let present = be32(payload, 16)?;
-    if block_width != BLOCK || block_height != BLOCK {
-        return None;
-    }
-    if present == 0 {
+    if !block_is_present(payload)? {
         return Some(None);
     }
     // A block is a whole number of 256-square planes and nothing else. Checked
@@ -624,6 +664,34 @@ mod tests {
         assert!(for_each_block(&blob, packing, 5, |_, _| {}).is_none());
     }
 
+    /// The presence walk and the decoder must name the **same** blocks.
+    ///
+    /// They read one header through one function, so this is a guard on that
+    /// staying true rather than on two implementations agreeing — and it is
+    /// what makes an occupancy figure taken from `stored_blocks` a statement
+    /// about the pixels `for_each_block` would hand over. The mutation to try
+    /// is inverting the `present` test: it moves both, which is exactly why the
+    /// comparison has to be against the decoder rather than against a literal,
+    /// so the written pattern is asserted too.
+    #[test]
+    fn the_presence_walk_names_the_blocks_the_decoder_hands_over() {
+        let written: Vec<Option<Vec<u8>>> = (0..6)
+            .map(|i| (i % 3 != 1).then(|| vec![i as u8; MASK.block_len()]))
+            .collect();
+        let blob = fixture::block_data(&written, MASK);
+
+        let mut decoded = vec![false; 6];
+        for_each_block(&blob, MASK, 6, |i, _| decoded[i] = true).expect("the blocks");
+
+        assert_eq!(stored_blocks(&blob, 6), Some(decoded.clone()));
+        assert_eq!(decoded, vec![true, false, true, true, false, true]);
+
+        // The same bounds the decoder keeps: a grid that does not match the
+        // blob is no answer at all, in either direction.
+        assert_eq!(stored_blocks(&blob, 5), None);
+        assert_eq!(stored_blocks(&blob, 7), None);
+    }
+
     /// A block whose declared size disagrees with the bitmap's stated packing
     /// is refused rather than sliced by whichever number is smaller.
     #[test]
@@ -666,6 +734,7 @@ mod tests {
             let _ = decode_block(&bytes, None);
             let _ = field(&bytes, 0);
             let _ = for_each_block(&bytes, COLOUR, 4, |_, _| {});
+            let _ = stored_blocks(&bytes, 4);
         }
     }
 }

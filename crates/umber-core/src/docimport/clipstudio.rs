@@ -149,7 +149,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let mut warnings = Vec::new();
 
     let layers = Tables::read(&db)?;
-    let all = layers.tree(canvas.root, &mut warnings)?;
+    let all = layers.tree(canvas.root, LayerStack::MAX, &mut warnings)?;
 
     // **The Paper layer is the document's background, not a layer of it.** It
     // carries a flat colour and no bitmap, so it used to fall through the
@@ -453,6 +453,271 @@ pub(super) fn database_chunk(bytes: &[u8]) -> Result<&[u8], ImportError> {
     Ok(split(bytes)?.database)
 }
 
+// ---------------------------------------------------------------------------
+// Residency
+// ---------------------------------------------------------------------------
+
+/// How much of each layer this document actually holds.
+/// [`super::residency`] is the argument and the caller.
+///
+/// It lives here rather than beside those types because everything it needs is
+/// private to this module — the container, the four-table chain, the tree and
+/// its direction, and the bitmap bound. A second walk of any of that is exactly
+/// the drift `docformat`'s "there must never be a second ORA reader" refuses,
+/// and a survey walking its own chain would be measuring a stack Umber does not
+/// read.
+///
+/// Four deliberate departures from [`read`], each because the question is
+/// different:
+///
+/// - **No `check_bounds`.** The document that provoked the tiling design is one
+///   Umber refuses, and refusing to measure it would be answering a question
+///   nobody asked.
+/// - **[`super::residency::MAX_ENTRIES`] rather than [`LayerStack::MAX`]**, for
+///   the same reason, one level up in the walk.
+/// - **The Paper layer is left in the stack** and reported like any other. It
+///   becomes a `Background` on import and allocates no slice, so it is *not*
+///   counted in the occupancy the caller computes — but a survey that dropped
+///   it silently would be one that could not say so.
+/// - **Nothing canvas-sized is ever allocated**, under either reading. The
+///   [`Reading::Contents`] pass hands one 256-square block at a time to
+///   `for_each_block`, which is the bound that function exists for; the only
+///   per-slice allocation is one bit per canvas tile.
+pub(super) fn residency(
+    bytes: &[u8],
+    reading: super::residency::Reading,
+) -> Result<super::residency::DocumentResidency, ImportError> {
+    use super::residency::{DocumentResidency, MAX_ENTRIES, Reading, SliceResidency, place};
+
+    let container = split(bytes)?;
+    let db = Database::open(container.database).map_err(|e| ImportError::Malformed {
+        format: FORMAT,
+        detail: e.to_string(),
+    })?;
+    let canvas = canvas(&db)?;
+    let tables = Tables::read(&db)?;
+    // Warnings are collected and thrown away: every one of them is about how a
+    // layer would *import*, and `skipped` below is this walk's own reporting.
+    let mut warnings = Vec::new();
+    let nodes = tables.tree(canvas.root, MAX_ENTRIES, &mut warnings)?;
+
+    let mut out = DocumentResidency {
+        size: canvas.size,
+        reading,
+        entries: nodes.len(),
+        folders: nodes.iter().filter(|n| n.folder).count(),
+        slices: Vec::new(),
+        skipped: Vec::new(),
+    };
+
+    for node in &nodes {
+        let Some(row) = tables.rows.get(&node.id) else {
+            continue;
+        };
+        if node.folder {
+            continue;
+        }
+        let name = clean_name(&row.name, false);
+        // A paper sheet and a correction layer both hold an `Offscreen` that is
+        // not a picture. Named rather than passed over, so the layer count in
+        // the report adds up.
+        if row.paper() {
+            out.skipped
+                .push((name, "the Paper layer, which becomes the background".into()));
+            continue;
+        }
+        if row.kind & LAYER_IS_CORRECTION != 0 {
+            out.skipped.push((name, "a correction layer".into()));
+            continue;
+        }
+
+        let slice = |mipmap: i64, origin: (i64, i64), mask: bool| {
+            if mipmap == 0 {
+                return None;
+            }
+            let Some((attribute, chunk)) = tables.offscreen(mipmap) else {
+                return Some(Err(row.no_pixels_reason().to_string()));
+            };
+            // `read_bitmap`'s own refusals are kept, packing included — the
+            // survey has to describe the slices Umber would actually store,
+            // not every rectangle the file happens to hold.
+            let (bitmap, packing, data) =
+                match read_bitmap(attribute, chunk, &container, canvas.size) {
+                    Ok(read) => read,
+                    // **A vector layer fails here rather than above**, exactly as
+                    // it does in `build`: it has the whole mipmap chain and what is
+                    // absent is the external chunk, because the strokes were never
+                    // rasterised. Naming the cause at only one of the two sites is
+                    // the bug that made every real vector layer report a damaged
+                    // file, and a survey that miscounts them miscounts what it
+                    // could not measure.
+                    Err(reason) => {
+                        return Some(Err(if row.kind == VECTOR_KIND {
+                            row.no_pixels_reason().to_string()
+                        } else {
+                            reason
+                        }));
+                    }
+                };
+            let grid = bitmap.columns * bitmap.rows;
+            let Some(present) = csblocks::stored_blocks(data, grid) else {
+                return Some(Err("its blocks could not be walked".to_string()));
+            };
+
+            // Every block's placement, worked out once. `None` is a block
+            // nothing can see — off the page, or nothing but the padding past
+            // the bitmap's own edge — and it is the same answer for both
+            // readings, which is what stops a tile being charged for texels the
+            // content scan never looked at.
+            let size = UVec2::new(bitmap.width, bitmap.height);
+            let placed: Vec<_> = (0..grid)
+                .map(|i| {
+                    place(
+                        (i % bitmap.columns, i / bitmap.columns),
+                        size,
+                        origin,
+                        canvas.size,
+                    )
+                })
+                .collect();
+
+            // **Which blocks hold something, measured against the fill rather
+            // than against zero.** An absent block of a raster layer is
+            // transparent and an absent block of a *mask* is all-ones, so a
+            // mask block of all-ones is exactly as redundant as a layer block
+            // of all-zeroes — testing both against zero would call every
+            // full-reveal mask tile live and report a mask as dense.
+            //
+            // The first plane is the one read: alpha for a colour or greyscale
+            // bitmap, coverage for a mask. What is under a zero alpha cannot
+            // be seen, so it cannot make a tile worth backing.
+            let blank_byte = match bitmap.fill {
+                Fill::Stated(v) => v,
+                // `Unknown` is read as empty everywhere else in this reader.
+                Fill::Empty | Fill::Unknown => 0,
+            };
+            let live = match reading {
+                Reading::Presence => None,
+                Reading::Contents => {
+                    let mut held = vec![false; grid];
+                    let walked = csblocks::for_each_block(data, packing, grid, |index, block| {
+                        // One block is live at a time and dropped here, which is
+                        // the whole of what makes this pass affordable.
+                        let Some(placed) = placed.get(index).and_then(Option::as_ref) else {
+                            return;
+                        };
+                        let (xs, ys) = placed.local();
+                        held[index] =
+                            ys.flat_map(|y| xs.clone().map(move |x| y * BLOCK + x))
+                                .any(|i| {
+                                    // The first plane only: alpha, or a mask's own
+                                    // coverage. Bounded by `block_len`, which
+                                    // `decode_block` has already checked against
+                                    // the packing.
+                                    block[i] != blank_byte
+                                });
+                    });
+                    if walked.is_none() {
+                        return Some(Err("its blocks could not be decoded".to_string()));
+                    }
+                    Some(held)
+                }
+            };
+
+            let across = (canvas.size.x as usize).div_ceil(BLOCK);
+            let down = (canvas.size.y as usize).div_ceil(BLOCK);
+            let mut touched = vec![false; across * down];
+            let mut lit = vec![false; across * down];
+            let mut stored = 0usize;
+            let mut live_count = 0usize;
+            for (index, held) in present.iter().enumerate() {
+                if !held {
+                    continue;
+                }
+                stored += 1;
+                let alive = live.as_ref().is_some_and(|live| live[index]);
+                live_count += usize::from(alive);
+                let Some(placed) = placed.get(index).and_then(Option::as_ref) else {
+                    continue;
+                };
+                let (xs, ys) = placed.tiles();
+                for ty in ys {
+                    for tx in xs.clone() {
+                        touched[ty * across + tx] = true;
+                        lit[ty * across + tx] |= alive;
+                    }
+                }
+            }
+
+            Some(Ok(SliceResidency {
+                layer: clean_name(&row.name, false),
+                mask,
+                bitmap: UVec2::new(bitmap.width, bitmap.height),
+                grid: (bitmap.columns, bitmap.rows),
+                stored,
+                covered: touched.iter().filter(|hit| **hit).count(),
+                live: live.as_ref().map(|_| live_count),
+                live_covered: live
+                    .as_ref()
+                    .map(|_| lit.iter().filter(|hit| **hit).count()),
+                fill: match bitmap.fill {
+                    Fill::Empty => "empty",
+                    Fill::Stated(_) => "stated",
+                    Fill::Unknown => "unknown",
+                },
+            }))
+        };
+
+        // The same two origins `build` computes, from the same three column
+        // pairs — the placement is the one thing in this reader taken on
+        // somebody else's word, so a second statement of it would be a second
+        // thing to be wrong.
+        let render = slice(
+            row.render_mipmap,
+            (
+                row.offset.0 + row.render_offset.0,
+                row.offset.1 + row.render_offset.1,
+            ),
+            false,
+        );
+        // A mask Clip Studio has switched off bounds nothing there and is not
+        // imported here, so it would allocate no slice — measuring it would put
+        // a slice in the sample that Umber never stores. Named rather than
+        // passed over, exactly as `build` names it.
+        let mask = if row.mask_mipmap != 0 && !row.mask_visible {
+            Some(Err("a layer mask that was switched off".to_string()))
+        } else {
+            slice(
+                row.mask_mipmap,
+                (
+                    row.offset.0 + row.mask_offset.0 + row.mask_offscreen_offset.0,
+                    row.offset.1 + row.mask_offset.1 + row.mask_offscreen_offset.1,
+                ),
+                true,
+            )
+        };
+        // **A layer naming no render mipmap is reported and a layer with no
+        // mask is not**, which is the one asymmetry here: most layers have no
+        // mask and saying so five hundred times would bury the list, while a
+        // layer with no *picture* is a slice missing from the sample and one
+        // real document in the folder is five of them.
+        match render {
+            Some(Ok(slice)) => out.slices.push(slice),
+            Some(Err(reason)) => out.skipped.push((name.clone(), reason)),
+            None => out
+                .skipped
+                .push((name.clone(), "it names no rendered bitmap".into())),
+        }
+        match mask {
+            Some(Ok(slice)) => out.slices.push(slice),
+            Some(Err(reason)) => out.skipped.push((format!("{name} (mask)"), reason)),
+            None => {}
+        }
+    }
+
+    Ok(out)
+}
+
 pub(super) fn table(db: &Database<'_>, name: &str) -> Result<Option<Table>, ImportError> {
     db.table(name).map_err(|e| ImportError::Malformed {
         format: FORMAT,
@@ -687,12 +952,24 @@ impl Tables {
     }
 
     /// The stack, bottom first, with each folder after its own contents.
-    fn tree(&self, root: i64, warnings: &mut Vec<ImportWarning>) -> Result<Vec<Node>, ImportError> {
+    ///
+    /// `limit` bounds both the entries and the nesting, and it is a parameter
+    /// rather than [`LayerStack::MAX`] for one caller: [`residency`] measures
+    /// documents Umber **refuses**, which is exactly the set of documents worth
+    /// a figure, so it would otherwise be blind to the one file the tiling
+    /// design was written about. Every other caller passes the stack's own cap
+    /// and behaves exactly as before.
+    fn tree(
+        &self,
+        root: i64,
+        limit: usize,
+        warnings: &mut Vec<ImportWarning>,
+    ) -> Result<Vec<Node>, ImportError> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         seen.insert(root);
         let start = self.rows.get(&root).map_or(0, |r| r.first_child);
-        self.chain(start, 0, &mut seen, &mut out, warnings)?;
+        self.chain(start, 0, limit, &mut seen, &mut out, warnings)?;
         Ok(out)
     }
 
@@ -717,14 +994,15 @@ impl Tables {
         &self,
         first: i64,
         depth: usize,
+        limit: usize,
         seen: &mut std::collections::HashSet<i64>,
         out: &mut Vec<Node>,
         warnings: &mut Vec<ImportWarning>,
     ) -> Result<(), ImportError> {
-        if depth >= LayerStack::MAX {
+        if depth >= limit {
             return Err(ImportError::TooManyLayers {
                 found: depth + 1,
-                max: LayerStack::MAX,
+                max: limit,
             });
         }
         let mut id = first;
@@ -735,10 +1013,10 @@ impl Tables {
             let Some(row) = self.rows.get(&id) else {
                 break;
             };
-            if out.len() >= LayerStack::MAX {
+            if out.len() >= limit {
                 return Err(ImportError::TooManyLayers {
                     found: out.len() + 1,
-                    max: LayerStack::MAX,
+                    max: limit,
                 });
             }
             let folder = row.folder & FOLDER != 0;
@@ -757,7 +1035,7 @@ impl Tables {
                 }
                 // Contents first, then the folder — which is where a
                 // `LayerStack` keeps one, above its own subtree.
-                self.chain(row.first_child, depth + 1, seen, out, warnings)?;
+                self.chain(row.first_child, depth + 1, limit, seen, out, warnings)?;
             }
             out.push(Node {
                 id,
@@ -2059,7 +2337,9 @@ mod tests {
             offscreens: HashMap::new(),
         };
         let mut warnings = Vec::new();
-        let nodes = tables.tree(1, &mut warnings).expect("a bounded walk");
+        let nodes = tables
+            .tree(1, LayerStack::MAX, &mut warnings)
+            .expect("a bounded walk");
         assert!(nodes.len() <= 2, "{} nodes", nodes.len());
     }
 
@@ -2092,7 +2372,7 @@ mod tests {
         };
         let mut warnings = Vec::new();
         assert!(matches!(
-            tables.tree(1, &mut warnings),
+            tables.tree(1, LayerStack::MAX, &mut warnings),
             Err(ImportError::TooManyLayers { .. })
         ));
     }
@@ -2180,7 +2460,7 @@ mod tests {
         };
         let mut warnings = Vec::new();
         assert!(matches!(
-            tables.tree(1, &mut warnings),
+            tables.tree(1, LayerStack::MAX, &mut warnings),
             Err(ImportError::TooManyLayers { .. })
         ));
     }
@@ -2268,5 +2548,105 @@ mod tests {
         let opened = doc.open();
         assert_eq!(opened.stack.len(), 1);
         assert_eq!(opened.uploads.len(), 1);
+    }
+
+    /// **A stored block is not a block that holds anything, and the two
+    /// readings have to say so.**
+    ///
+    /// Clip Studio writes a block where the artist *touched* the canvas, not
+    /// where paint survived, so `Reading::Presence` is an upper bound on what a
+    /// tiled store would keep. If that bound is loose the whole tiling argument
+    /// moves with it, which is why both figures exist and why this drives them
+    /// against a case where they **disagree** — a test that only saw a painted
+    /// layer would pass under either rule.
+    ///
+    /// The fixture is a 300-square transparent layer. Its one block wholly
+    /// inside the bitmap is elided as uniform, exactly as Clip Studio elides
+    /// one; the other three overhang the bitmap's edge, so they are *stored*,
+    /// padded with the fixture's deliberate `0x5a`, and hold not one visible
+    /// texel. Presence charges three tiles for them and contents charges none.
+    #[test]
+    fn a_block_the_file_stores_may_still_hold_nothing_and_the_two_readings_differ() {
+        use super::super::residency::Reading;
+
+        let bytes = fixtures::clip(
+            300,
+            300,
+            &[
+                ClipLayer::flat("Blank", 300, 300, [0, 0, 0, 0]),
+                ClipLayer::flat("Ink", 300, 300, [9, 9, 9, 255]),
+            ],
+        );
+
+        let cheap = residency(&bytes, Reading::Presence).expect("a survey");
+        assert_eq!(cheap.canvas_tiles(), 4);
+        let blank = cheap.slices.iter().find(|s| s.layer == "Blank").unwrap();
+        assert_eq!((blank.stored, blank.covered), (3, 3));
+        // Not "the same as stored": absent, so nobody can quote a figure that
+        // was never measured.
+        assert_eq!((blank.live, blank.live_covered), (None, None));
+
+        let full = residency(&bytes, Reading::Contents).expect("a survey");
+        let blank = full.slices.iter().find(|s| s.layer == "Blank").unwrap();
+        assert_eq!((blank.stored, blank.covered), (3, 3));
+        assert_eq!(
+            (blank.live, blank.live_covered),
+            (Some(0), Some(0)),
+            "the padding past a bitmap's edge is nobody's picture"
+        );
+
+        // The painted layer is the control: every block holds paint, so the two
+        // readings agree and the difference above is about content rather than
+        // about the scan being broken.
+        let ink = full.slices.iter().find(|s| s.layer == "Ink").unwrap();
+        assert_eq!((ink.stored, ink.covered), (4, 4));
+        assert_eq!((ink.live, ink.live_covered), (Some(4), Some(4)));
+
+        // And it composes: half the document's slices are empty.
+        assert_eq!(full.occupancy(), Some(7.0 / 8.0));
+        assert_eq!(full.live_occupancy(), Some(0.5));
+    }
+
+    /// **Blank is measured against the fill, and a mask's fill is all-ones.**
+    ///
+    /// A Clip Studio mask begins revealing everything, so a mask block of 255
+    /// is exactly as redundant as a layer block of 0 — a tiled store answers it
+    /// with a default and backs no tile. Testing both against zero is the
+    /// plausible simplification and it reports every full-reveal mask tile as
+    /// live, which on a document of masked layers is a residency figure well
+    /// over the truth.
+    ///
+    /// This is the case that makes the fill rule non-vacuous, and it was
+    /// demonstrated by mutation rather than argued: the layer in the test above
+    /// has a fill of zero, so a change to a bare `!= 0` walks straight through
+    /// it and fails only here.
+    #[test]
+    fn a_mask_is_blank_where_it_reveals_everything_rather_than_where_it_is_zero() {
+        use super::super::residency::Reading;
+
+        let bytes = fixtures::clip(
+            300,
+            300,
+            &[
+                ClipLayer::flat("Ink", 300, 300, [9, 9, 9, 255]).mask(vec![255u8; 300 * 300]),
+                ClipLayer::flat("Hidden", 300, 300, [9, 9, 9, 255]).mask(vec![0u8; 300 * 300]),
+            ],
+        );
+        let full = residency(&bytes, Reading::Contents).expect("a survey");
+
+        let masks: Vec<_> = full.slices.iter().filter(|s| s.mask).collect();
+        assert_eq!(masks.len(), 2, "both masks were measured");
+        for mask in &masks {
+            assert_eq!(mask.fill, "stated", "a Clip Studio mask states its fill");
+            assert!(mask.stored > 0, "the overhanging blocks are stored");
+        }
+        // The revealing mask is the fill everywhere, so nothing needs backing.
+        let reveal = masks.iter().find(|s| s.layer == "Ink").unwrap();
+        assert_eq!(reveal.live, Some(0));
+        // The concealing one differs from the fill everywhere, so all of it
+        // does — and it is the half of the pair a bare `!= 0` gets *wrong the
+        // other way*, which is what makes the pair rather than one case.
+        let conceal = masks.iter().find(|s| s.layer == "Hidden").unwrap();
+        assert_eq!(conceal.live, Some(conceal.stored));
     }
 }
