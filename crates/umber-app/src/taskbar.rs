@@ -153,6 +153,140 @@ mod tests {
         );
     }
 
+    /// The WiX source with its comments taken out.
+    ///
+    /// Every test below asks what the *markup* says, and this file explains
+    /// itself at length — including by quoting the very spellings two of them
+    /// refuse. Scanning the raw text made both of those fail on their own
+    /// rationale, which is a guard reporting the comment that describes it.
+    fn wix_markup() -> String {
+        let raw = wxs();
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw.as_str();
+        while let Some(start) = rest.find("<!--") {
+            out.push_str(&rest[..start]);
+            match rest[start..].find("-->") {
+                Some(end) => rest = &rest[start + end + 3..],
+                // An unterminated comment is a malformed file; nothing after it
+                // is markup, so there is nothing left to check.
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// **Every format the importer reads is offered on both platforms**, and
+    /// the list is read off `docimport` rather than copied, so adding a reader
+    /// fails here until the packaging offers it too.
+    ///
+    /// The two halves are spelled differently and neither can be derived from
+    /// the other: Windows registers *extensions*, the desktop registers **MIME
+    /// types**, and the mapping between them is a fact about the world rather
+    /// than about Umber. So the map is written out once, here, and what is
+    /// checked is that it covers the importer's own list exactly — a format
+    /// added with no MIME type named is a compile-time-visible gap rather than
+    /// a silent omission from one platform.
+    #[test]
+    fn documents_umber_opens_are_registered_on_both_platforms() {
+        let root = packaging();
+
+        // extension -> the MIME type the desktop world calls it. Four are
+        // freedesktop's own; `image/x-clip-studio-paint` is Umber's, defined in
+        // `packaging/io.github.spillebulle.umber.mime.xml` because the shared
+        // database has no name for a `.clip`.
+        let types = [
+            ("ora", "image/openraster"),
+            ("kra", "image/x-krita"),
+            ("psd", "image/vnd.adobe.photoshop"),
+            ("clip", "image/x-clip-studio-paint"),
+            ("png", "image/png"),
+        ];
+
+        let mut named: Vec<&str> = types.iter().map(|(ext, _)| *ext).collect();
+        let mut reads: Vec<&str> = umber_core::docimport::supported_extensions().to_vec();
+        named.sort_unstable();
+        reads.sort_unstable();
+        assert_eq!(
+            named, reads,
+            "the importer reads a format this test has no MIME type for, so one \
+             of the two registrations below is silently missing it"
+        );
+
+        let desktop =
+            std::fs::read_to_string(root.join(format!("{APP_ID}.desktop"))).expect("desktop entry");
+        let mime = std::fs::read_to_string(root.join(format!("{APP_ID}.mime.xml")))
+            .expect("the mime definition for the types freedesktop does not know");
+        let wxs = wix_markup();
+
+        for (ext, mime_type) in types {
+            assert!(
+                desktop.contains(mime_type),
+                "the desktop entry does not offer {mime_type} (.{ext})"
+            );
+            // Windows: registered as a candidate, never as the default. The
+            // `OpenWithProgIds` key is what puts Umber in "Open with" while
+            // leaving whatever owns the type alone.
+            assert!(
+                wxs.contains(&format!(r#"Key=".{ext}\OpenWithProgIds""#)),
+                ".{ext} is not offered in Windows' Open with menu"
+            );
+            assert!(
+                wxs.contains(&format!(r#"Key="Umber.{ext}\shell\open\command""#)),
+                "Umber.{ext} has no command, so choosing it would launch nothing"
+            );
+        }
+
+        // The one type that has to be defined rather than merely referenced.
+        assert!(
+            mime.contains("image/x-clip-studio-paint") && mime.contains("*.clip"),
+            "the .clip type is not defined, so nothing on Linux can match it"
+        );
+    }
+
+    /// **Umber may not make itself the default for a format it merely reads.**
+    ///
+    /// WiX's `<ProgId>`/`<Extension>` pair writes the extension's own default
+    /// value, which is how an application claims a type — and installing Umber
+    /// would then take `.psd` from Photoshop and `.clip` from Clip Studio on a
+    /// machine where those are what the artist actually paints in. The
+    /// `OpenWithProgIds` spelling above is the one that offers without taking.
+    ///
+    /// Written as a refusal rather than left to the reviewer of the next edit,
+    /// because the tempting spelling is also the shorter one.
+    #[test]
+    fn windows_registration_offers_umber_without_taking_the_file_type() {
+        let wxs = wix_markup();
+        assert!(
+            !wxs.contains("<ProgId"),
+            "a <ProgId> element makes Umber the default handler; use OpenWithProgIds"
+        );
+        for ext in umber_core::docimport::supported_extensions() {
+            // The default is the extension key's own unnamed value. Writing one
+            // is the claim this refuses.
+            assert!(
+                !wxs.contains(&format!(r#"Key=".{ext}" Type="string""#)),
+                ".{ext} would be claimed as Umber's by default"
+            );
+        }
+    }
+
+    /// A command with a bare `%1` hands a path with spaces over as several
+    /// arguments, and `crash::parse_args` would open the first word of it.
+    /// Painters' filenames have spaces in them; the one this was found on is
+    /// called "Valorants magical bitches - Copy.clip".
+    #[test]
+    fn the_open_command_quotes_the_path_it_is_given() {
+        let wxs = wix_markup();
+        for line in wxs.lines().filter(|l| l.contains(r"shell\open\command")) {
+            assert!(
+                line.contains("&quot;%1&quot;"),
+                "an unquoted %1 splits a path with spaces: {}",
+                line.trim()
+            );
+        }
+    }
+
     /// Wayland matches the window's app id to the desktop entry's *basename*,
     /// and X11 matches `StartupWMClass` to the window's class. Both are set in
     /// `app.rs` from this module; this pins the half that lives in the file.

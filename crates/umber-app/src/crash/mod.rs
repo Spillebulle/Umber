@@ -116,6 +116,11 @@ const DIR_NAME: &str = "crash";
 pub enum Launch {
     /// Umber, as usual.
     Normal,
+    /// Umber, opening this document as it starts.
+    ///
+    /// What a file manager passes when somebody double-clicks a `.clip`, and
+    /// what the desktop entry's `Exec=umber %f` has always said Umber accepts.
+    Open(PathBuf),
     /// The crash reporter, over the report at this path.
     Report(PathBuf),
 }
@@ -125,12 +130,26 @@ pub enum Launch {
 /// A pure function of the arguments, so the whole of it is tested without
 /// starting anything — the same shape [`crate::update::install::detect`] keeps.
 ///
-/// An argument this does not recognise is **logged and ignored**, not refused.
-/// Umber is a painting application launched by file managers, desktop entries
-/// and `cargo run --`, any of which can pass something unexpected; refusing to
-/// start over a stray word would be a far worse failure than starting normally.
+/// **A bare argument is a document to open**, which is the whole of how a file
+/// association works: Windows' `shell\open\command` and the desktop entry's
+/// `Exec=umber %f` both hand the path over exactly like this. It used to be
+/// logged and ignored, so registering Umber for `.psd` would have put a *blank*
+/// canvas on screen when somebody double-clicked one — an association that
+/// lies, which is worse than not appearing in the menu at all.
+///
+/// **A word that is not a path is still ignored**, and the rest of the original
+/// rule stands with it: Umber is launched by file managers, desktop entries and
+/// `cargo run --`, any of which can pass something unexpected, and refusing to
+/// start over a stray word is a far worse failure than starting. What is *not*
+/// checked here is whether the file exists or can be read — that answer belongs
+/// to the importer, which already has a sentence for every way it can fail and
+/// somewhere to put it. Deciding it here would be a second, worse copy of that.
+///
+/// Only the first is taken. A shell glob can expand to fifty files and opening
+/// all of them unasked is not what a double-click meant; the rest are logged.
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Launch {
     let mut args = args.into_iter().skip(1);
+    let mut open: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         if arg == FLAG {
             return match args.next() {
@@ -143,9 +162,23 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Launch {
                 }
             };
         }
-        log::warn!("ignoring unrecognised argument “{arg}”");
+        // A flag this build does not know stays ignored rather than being read
+        // as a filename: `--colour=always` is not a document, and a future
+        // Umber's option arriving here must not open a canvas called "--thing".
+        if arg.starts_with('-') {
+            log::warn!("ignoring unrecognised argument “{arg}”");
+            continue;
+        }
+        if open.is_none() {
+            open = Some(PathBuf::from(arg));
+        } else {
+            log::warn!("ignoring extra file “{arg}”; only the first is opened");
+        }
     }
-    Launch::Normal
+    match open {
+        Some(path) => Launch::Open(path),
+        None => Launch::Normal,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +562,73 @@ mod tests {
         assert_eq!(
             parse_args(args(&["umber", "--verbose", FLAG, "r.json"])),
             Launch::Report(PathBuf::from("r.json")),
+        );
+    }
+
+    /// **A bare argument is a document to open**, which is the whole of what a
+    /// file association delivers: Windows' `shell\open\command` and the desktop
+    /// entry's `Exec=umber %f` both hand the path over exactly like this.
+    ///
+    /// It was ignored, so registering Umber for `.psd` would have opened a
+    /// *blank* canvas on a double-click — an association that lies, which is
+    /// worse than never appearing in the menu.
+    #[test]
+    fn a_document_on_the_command_line_is_opened() {
+        assert_eq!(
+            parse_args(args(&["umber", "C:\\art\\Study skeleton.clip"])),
+            Launch::Open(PathBuf::from("C:\\art\\Study skeleton.clip")),
+        );
+        assert_eq!(
+            parse_args(args(&["umber", "/home/spill/Desktop/sketch.psd"])),
+            Launch::Open(PathBuf::from("/home/spill/Desktop/sketch.psd")),
+        );
+    }
+
+    /// The extension is not checked and must not be. `docimport::import` has a
+    /// sentence for every way a file can fail to open and somewhere to put it;
+    /// deciding it here would be a second, worse copy of that — and one that
+    /// would have to be kept in step with the reader's own list.
+    #[test]
+    fn a_file_umber_cannot_read_still_reaches_the_importer() {
+        assert_eq!(
+            parse_args(args(&["umber", "notes.txt"])),
+            Launch::Open(PathBuf::from("notes.txt")),
+        );
+    }
+
+    /// The reporter still wins, wherever the document sits relative to it: the
+    /// two are different programs and only one of them may run.
+    #[test]
+    fn the_reporter_beats_a_document_on_the_same_line() {
+        assert_eq!(
+            parse_args(args(&["umber", "a.clip", FLAG, "r.json"])),
+            Launch::Report(PathBuf::from("r.json")),
+        );
+        assert_eq!(
+            parse_args(args(&["umber", FLAG, "r.json", "a.clip"])),
+            Launch::Report(PathBuf::from("r.json")),
+        );
+    }
+
+    /// An option this build does not know stays ignored rather than becoming a
+    /// filename — a future Umber's flag arriving here must not open a canvas
+    /// called `--thing` — and it does not stop the document beside it.
+    #[test]
+    fn an_unknown_flag_is_not_read_as_a_document() {
+        assert_eq!(parse_args(args(&["umber", "--verbose"])), Launch::Normal);
+        assert_eq!(
+            parse_args(args(&["umber", "--verbose", "a.clip"])),
+            Launch::Open(PathBuf::from("a.clip")),
+        );
+    }
+
+    /// A shell glob can expand to fifty files. A double-click meant one
+    /// document, so the rest are logged rather than opened.
+    #[test]
+    fn only_the_first_document_is_opened() {
+        assert_eq!(
+            parse_args(args(&["umber", "a.clip", "b.psd", "c.ora"])),
+            Launch::Open(PathBuf::from("a.clip")),
         );
     }
 

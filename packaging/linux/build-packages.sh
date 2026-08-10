@@ -110,6 +110,12 @@ stage_tree() {
         "$prefix/share/applications/$APP_ID.desktop"
     install -Dm644 "$root/packaging/$APP_ID.metainfo.xml" \
         "$prefix/share/metainfo/$APP_ID.metainfo.xml"
+    # The `.clip` type, which the shared MIME database does not know. Without
+    # it the desktop entry's MimeType line has nothing to match for a Clip
+    # Studio document and Umber never appears in "Open with" for one. The other
+    # four types Umber reads are already in shared-mime-info.
+    install -Dm644 "$root/packaging/$APP_ID.mime.xml" \
+        "$prefix/share/mime/packages/$APP_ID.xml"
     for size in 16 32 48 64 128 256; do
         install -Dm644 "$root/assets/icons/umber-$size.png" \
             "$prefix/share/icons/hicolor/${size}x${size}/apps/$APP_ID.png"
@@ -146,6 +152,39 @@ Description: GPU-accelerated painting application built for latency
  It ships 239 brush presets, reads brushes written for MyPaint, GIMP, Krita and
  Photoshop, and saves documents as OpenRaster.
 EOF
+# **Two caches decide whether Umber is offered for a file, and neither is built
+# by copying files into place.** `update-desktop-database` builds
+# `mimeinfo.cache`, which is what a file manager actually reads to answer "what
+# opens this?" — without it the desktop entry's MimeType line is inert and Umber
+# appears in "Open with" for nothing at all, however correct the entry is. And
+# `update-mime-database` is what folds our `.clip` type into the shared
+# database, without which a `.clip` is `application/octet-stream` and matches
+# nothing. Both are cheap, both are idempotent, and both are guarded with
+# `command -v`: a minimal system may have neither, and a painting application's
+# package must not fail to install over a menu entry.
+cat > "$deb/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+EOF
+# The same on the way out, so a removed Umber stops being offered rather than
+# leaving a dead entry in every file manager's menu.
+cat > "$deb/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+EOF
+chmod 755 "$deb/DEBIAN/postinst" "$deb/DEBIAN/postrm"
 dpkg-deb --build --root-owner-group "$deb" "$outdir/umber_${version}_${arch}.deb" >/dev/null
 
 # --- .rpm --------------------------------------------------------------------
@@ -176,10 +215,27 @@ stage_tree "$buildroot/usr"
     echo "%install"
     echo "cp -a $buildroot/usr %{buildroot}/"
     echo
+    # The same two caches the `.deb` rebuilds, and for the same reason: without
+    # `mimeinfo.cache` the desktop entry's MimeType line is inert, and without
+    # the shared database the `.clip` type does not exist. Guarded, because a
+    # package must not fail to install over a menu entry.
+    echo "%post"
+    echo "command -v update-mime-database >/dev/null 2>&1 && \\"
+    echo "    update-mime-database /usr/share/mime || :"
+    echo "command -v update-desktop-database >/dev/null 2>&1 && \\"
+    echo "    update-desktop-database -q /usr/share/applications || :"
+    echo
+    echo "%postun"
+    echo "command -v update-mime-database >/dev/null 2>&1 && \\"
+    echo "    update-mime-database /usr/share/mime || :"
+    echo "command -v update-desktop-database >/dev/null 2>&1 && \\"
+    echo "    update-desktop-database -q /usr/share/applications || :"
+    echo
     echo "%files"
     echo "/usr/bin/umber"
     echo "/usr/share/applications/$APP_ID.desktop"
     echo "/usr/share/metainfo/$APP_ID.metainfo.xml"
+    echo "/usr/share/mime/packages/$APP_ID.xml"
     echo "/usr/share/icons/hicolor/*/apps/$APP_ID.png"
     echo "/usr/share/doc/umber/"
 } > "$rpmroot/SPECS/umber.spec"

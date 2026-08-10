@@ -57,6 +57,13 @@ modules:
         /app/share/applications/io.github.spillebulle.umber.desktop
       - install -Dm644 packaging/io.github.spillebulle.umber.metainfo.xml
         /app/share/metainfo/io.github.spillebulle.umber.metainfo.xml
+
+      # The `.clip` type. Flatpak exports `share/mime/packages` from the app
+      # to the host and rebuilds both caches itself, so there is no scriptlet
+      # here either — but the file has to be installed under the app id, which
+      # is what the export is keyed on.
+      - install -Dm644 packaging/io.github.spillebulle.umber.mime.xml
+        /app/share/mime/packages/io.github.spillebulle.umber.xml
       - for s in 16 32 48 64 128 256; do
         install -Dm644 "icons/umber-$s.png"
         "/app/share/icons/hicolor/${s}x${s}/apps/io.github.spillebulle.umber.png";

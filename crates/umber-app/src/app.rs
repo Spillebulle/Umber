@@ -280,6 +280,19 @@ pub struct UmberApp {
     /// is: it is the pointer's state in physical pixels, and nothing about it
     /// survives the release.
     picked_at: Option<Vec2>,
+    /// A document named on the command line, waiting for a device to open on.
+    ///
+    /// What a file manager passes when somebody double-clicks a `.clip`. It
+    /// cannot be opened where it is read, because [`Self::open_path`] needs the
+    /// adapter — it asks `max_texture_dimension_2d` whether the canvas can
+    /// exist at all — so it is held here and spent at the end of
+    /// [`Self::resumed`], on the far side of the one place that answer arrives.
+    ///
+    /// Taken rather than cleared, so the Android path cannot reopen it: that
+    /// runs `resumed` again with the session already live, and a second copy of
+    /// the artist's document appearing on a resume is not what the command line
+    /// asked for.
+    opening: Option<PathBuf>,
 }
 
 /// How far the pointer may travel from a press outside the transform box before
@@ -357,7 +370,7 @@ impl UmberApp {
     /// The proxy is handed straight to the update check, which is the only
     /// thing that ever answers from off the main thread. Everything else in
     /// Umber reaches the loop through a window event.
-    pub fn new(proxy: EventLoopProxy<Wake>) -> Self {
+    pub fn new(proxy: EventLoopProxy<Wake>, opening: Option<PathBuf>) -> Self {
         let mut editor = Editor::default();
         let updates_proxy = proxy.clone();
         editor.updates.set_waker(std::sync::Arc::new(move || {
@@ -382,6 +395,7 @@ impl UmberApp {
             put_down_at: None,
             sysclip: sysclip::Board::default(),
             picked_at: None,
+            opening,
         }
     }
 
@@ -4896,6 +4910,21 @@ impl ApplicationHandler<Wake> for UmberApp {
                     gfx.add_canvas(id, &doc, slots);
                 }
             }
+        }
+
+        // A document from the command line, which is what a file association
+        // amounts to once the shell has done its half. Here rather than where
+        // the arguments were read, because `open_path` asks the device whether
+        // the canvas can exist and there was no device until a few lines ago.
+        //
+        // A failure is already a notice on screen — `open_import` says why in
+        // the importer's own words — so nothing is checked first and nothing is
+        // reported twice. Umber still starts, with the blank document it would
+        // have had, which is the same rule `parse_args` follows for a stray
+        // argument: a painting application that refuses to open over a bad path
+        // is a worse failure than one that opens.
+        if let Some(path) = self.opening.take() {
+            self.open_path(&path);
         }
 
         // Ask for the first frame explicitly. The platform usually sends one

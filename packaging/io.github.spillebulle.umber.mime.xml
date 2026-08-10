@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The one document type Umber reads that the shared MIME database does not
+  already know.
+
+  `image/openraster`, `image/x-krita`, `image/vnd.adobe.photoshop` and
+  `image/png` are all in freedesktop.org's own shared-mime-info, so the desktop
+  entry simply names them. Clip Studio Paint's `.clip` is not, which means that
+  without this file a `.clip` is `application/octet-stream` to the desktop, the
+  MimeType line has nothing to match, and Umber never appears in "Open with"
+  however it is registered.
+
+  Installed to `share/mime/packages/`, after which `update-mime-database` folds
+  it into the system database. Every package does that in its post-install
+  step; see `packaging/linux/build-packages.sh`.
+
+  The type name is Umber's invention and says so. There is no registered name
+  for this format, and `x-` is the convention for exactly that case; if
+  freedesktop ever adopts one, this becomes an alias rather than a conflict.
+
+  The magic is what makes it work on more than a filename: a `.clip` opens with
+  the eight bytes `CSFCHUNK`, which is the same signature
+  `docimport::clipstudio::split` checks before it reads anything. Two statements
+  of one constant, in two languages, which is why this comment names the
+  function - a file that stopped starting with those bytes would be one Umber
+  could not read either.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="image/x-clip-studio-paint">
+    <comment>Clip Studio Paint document</comment>
+    <glob pattern="*.clip"/>
+    <magic priority="60">
+      <match type="string" value="CSFCHUNK" offset="0"/>
+    </magic>
+    <!-- `.clip` is a common enough word that a glob alone is worth being
+         careful with: the magic is what settles it either way. -->
+    <sub-class-of type="application/octet-stream"/>
+  </mime-type>
+</mime-info>

@@ -53,6 +53,12 @@ package() {
         "${pkgdir}/usr/share/applications/io.github.spillebulle.umber.desktop"
     install -Dm644 "${stage}/packaging/io.github.spillebulle.umber.metainfo.xml" \
         "${pkgdir}/usr/share/metainfo/io.github.spillebulle.umber.metainfo.xml"
+    # The `.clip` type. No scriptlet is needed here, unlike the .deb and the
+    # .rpm: pacman ships alpm hooks that rebuild the shared MIME database and
+    # `mimeinfo.cache` whenever a package touches share/mime or
+    # share/applications, so declaring the file is the whole of the work.
+    install -Dm644 "${stage}/packaging/io.github.spillebulle.umber.mime.xml" \
+        "${pkgdir}/usr/share/mime/packages/io.github.spillebulle.umber.xml"
     for size in 16 32 48 64 128 256; do
         install -Dm644 "${stage}/icons/umber-${size}.png" \
             "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/io.github.spillebulle.umber.png"

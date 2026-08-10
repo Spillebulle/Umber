@@ -119,9 +119,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return update::installwin::show(job);
     }
 
-    if let crash::Launch::Report(path) = crash::parse_args(std::env::args()) {
-        return crash::show_report(&path);
-    }
+    // The command line also carries the document a file manager was asked to
+    // open, which is what makes a file association more than a menu entry.
+    let opening = match crash::parse_args(std::env::args()) {
+        crash::Launch::Report(path) => return crash::show_report(&path),
+        crash::Launch::Open(path) => Some(path),
+        crash::Launch::Normal => None,
+    };
 
     // Only on the ordinary path. Installing it in the reporter would mean a
     // crash inside the crash box spawning another crash box, for ever.
@@ -146,7 +150,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // happening. Redraws are requested explicitly on input.
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = UmberApp::new(event_loop.create_proxy());
+    let mut app = UmberApp::new(event_loop.create_proxy(), opening);
     event_loop.run_app(&mut app)?;
     // The one place a shutdown is known to have been orderly, and therefore the
     // one place this is said. `run_app` returns only when the loop was told to
@@ -177,7 +181,7 @@ pub extern "C" fn android_main(android_app: winit::platform::android::activity::
         .expect("failed to build event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = UmberApp::new(event_loop.create_proxy());
+    let mut app = UmberApp::new(event_loop.create_proxy(), None);
     let _ = event_loop.run_app(&mut app);
     app.ended_cleanly();
 }

@@ -193,9 +193,84 @@
       </Component>
     </ComponentGroup>
 
+    <!--
+      File associations: Umber as an **option**, never as the default.
+
+      This is deliberately not `<ProgId>` with `<Extension>` under the `File`
+      element, which is WiX's obvious spelling and is the wrong one here. That
+      writes the extension's *default* value, which is how an application makes
+      itself the handler for a type — so installing Umber would take `.psd` away
+      from Photoshop and `.clip` from Clip Studio, silently, on a machine where
+      those are what the artist actually paints in. Umber reads those formats;
+      it is not what somebody bought them to use.
+
+      `OpenWithProgIds` is the registration that means "offer this too". The
+      shell unions it with whatever else claims the type, so Umber appears in
+      Open with and in "Choose another app" while the existing default is
+      untouched. An empty REG_SZ is what the key wants — the value name is the
+      ProgID and the data is deliberately nothing.
+
+      Each ProgID carries its own `shell\open\command` with `"%1"` quoted,
+      because a painter's file is called "Valorants magical bitches - Copy.clip"
+      and an unquoted `%1` hands `crash::parse_args` six separate arguments, of
+      which it would open the first. That parser takes the first bare argument
+      as a document, which is the other half of this working at all: before it
+      did, a double-click opened Umber on a blank canvas.
+
+      `FriendlyAppName` on each ProgID is what the Open with list actually
+      shows. Without it the entry reads "umber.exe".
+
+      One component per ProgID, with the extension key as its keypath, so the
+      whole set is installed, repaired and removed as a unit and an uninstall
+      takes Umber back out of the menu rather than leaving a dead row that
+      launches nothing.
+
+      The five are `docimport::supported_extensions()`. `documents_umber_opens_
+      are_registered_on_windows` reads that list against this file, so a format
+      added to the importer fails `cargo test` until it is offered here too.
+    -->
+    <ComponentGroup Id="FileAssociations" Directory="INSTALLFOLDER">
+      <Component Id="AssocOra" Guid="6f3a1c2e-9b47-4d18-8a52-1c0e77d4b301">
+        <RegistryValue Root="HKCR" Key="Umber.ora" Type="string" Value="OpenRaster document" />
+        <RegistryValue Root="HKCR" Key="Umber.ora" Name="FriendlyAppName" Type="string" Value="Umber" />
+        <RegistryValue Root="HKCR" Key="Umber.ora\DefaultIcon" Type="string" Value="[#UmberExe],0" />
+        <RegistryValue Root="HKCR" Key="Umber.ora\shell\open\command" Type="string" Value="&quot;[#UmberExe]&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKCR" Key=".ora\OpenWithProgIds" Name="Umber.ora" Type="string" Value="" KeyPath="yes" />
+      </Component>
+      <Component Id="AssocKra" Guid="2d84b60f-5e73-4a96-9f21-84b5c6e0a7d2">
+        <RegistryValue Root="HKCR" Key="Umber.kra" Type="string" Value="Krita document" />
+        <RegistryValue Root="HKCR" Key="Umber.kra" Name="FriendlyAppName" Type="string" Value="Umber" />
+        <RegistryValue Root="HKCR" Key="Umber.kra\DefaultIcon" Type="string" Value="[#UmberExe],0" />
+        <RegistryValue Root="HKCR" Key="Umber.kra\shell\open\command" Type="string" Value="&quot;[#UmberExe]&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKCR" Key=".kra\OpenWithProgIds" Name="Umber.kra" Type="string" Value="" KeyPath="yes" />
+      </Component>
+      <Component Id="AssocPsd" Guid="b1e7f394-0c62-4f85-9d47-3ea8250b16c9">
+        <RegistryValue Root="HKCR" Key="Umber.psd" Type="string" Value="Photoshop document" />
+        <RegistryValue Root="HKCR" Key="Umber.psd" Name="FriendlyAppName" Type="string" Value="Umber" />
+        <RegistryValue Root="HKCR" Key="Umber.psd\DefaultIcon" Type="string" Value="[#UmberExe],0" />
+        <RegistryValue Root="HKCR" Key="Umber.psd\shell\open\command" Type="string" Value="&quot;[#UmberExe]&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKCR" Key=".psd\OpenWithProgIds" Name="Umber.psd" Type="string" Value="" KeyPath="yes" />
+      </Component>
+      <Component Id="AssocClip" Guid="7c05d2a8-4318-49be-b6f0-9d21e83c5a4f">
+        <RegistryValue Root="HKCR" Key="Umber.clip" Type="string" Value="Clip Studio Paint document" />
+        <RegistryValue Root="HKCR" Key="Umber.clip" Name="FriendlyAppName" Type="string" Value="Umber" />
+        <RegistryValue Root="HKCR" Key="Umber.clip\DefaultIcon" Type="string" Value="[#UmberExe],0" />
+        <RegistryValue Root="HKCR" Key="Umber.clip\shell\open\command" Type="string" Value="&quot;[#UmberExe]&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKCR" Key=".clip\OpenWithProgIds" Name="Umber.clip" Type="string" Value="" KeyPath="yes" />
+      </Component>
+      <Component Id="AssocPng" Guid="e94a6b71-8d3f-4c02-a15e-62b7f0d4938a">
+        <RegistryValue Root="HKCR" Key="Umber.png" Type="string" Value="PNG image" />
+        <RegistryValue Root="HKCR" Key="Umber.png" Name="FriendlyAppName" Type="string" Value="Umber" />
+        <RegistryValue Root="HKCR" Key="Umber.png\DefaultIcon" Type="string" Value="[#UmberExe],0" />
+        <RegistryValue Root="HKCR" Key="Umber.png\shell\open\command" Type="string" Value="&quot;[#UmberExe]&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKCR" Key=".png\OpenWithProgIds" Name="Umber.png" Type="string" Value="" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
     <Feature Id="Main" Title="Umber" Level="1">
       <ComponentGroupRef Id="Files" />
       <ComponentGroupRef Id="StartMenu" />
+      <ComponentGroupRef Id="FileAssociations" />
     </Feature>
 
     <ComponentGroup Id="Files" Directory="INSTALLFOLDER">
