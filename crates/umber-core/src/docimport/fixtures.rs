@@ -1062,6 +1062,11 @@ pub struct ClipLayer {
     /// Whether the mask's own eye is on — `LayerVisibility`'s second bit,
     /// which a real file only sets on a layer that has a mask.
     pub mask_visible: bool,
+    /// `SpecialRenderType`. 20 marks the Paper layer; everything else is 0.
+    pub special_render: i64,
+    /// The flat colour a Paper layer draws, as ordinary sRGB bytes. Stored
+    /// scaled up to `u32` by [`scale_channel`], which is what a real file does.
+    pub draw_colour: [u8; 3],
     pub children: Vec<ClipLayer>,
 }
 
@@ -1088,8 +1093,27 @@ impl ClipLayer {
             bitmap_size: None,
             offset: (0, 0),
             mask_visible: true,
+            special_render: 0,
+            draw_colour: [0, 0, 0],
             children: Vec::new(),
         }
+    }
+
+    /// The **Paper** layer: the flat sheet Clip Studio puts under a new
+    /// document.
+    ///
+    /// It carries a colour and **no bitmap at all**, which is the whole reason
+    /// it needs its own constructor: `flat` would give it pixels, and a paper
+    /// with pixels is not the thing that was going wrong. A real one names a
+    /// `LayerRenderMipmap` whose offscreen is absent, which is exactly what
+    /// `pixels: None` produces here.
+    pub fn paper(rgb: [u8; 3]) -> Self {
+        let mut layer = Self::folder("Paper", Vec::new());
+        layer.folder = false;
+        layer.kind = 1584;
+        layer.special_render = 20;
+        layer.draw_colour = rgb;
+        layer
     }
 
     pub fn folder(name: &'static str, children: Vec<ClipLayer>) -> Self {
@@ -1109,6 +1133,8 @@ impl ClipLayer {
             bitmap_size: None,
             offset: (0, 0),
             mask_visible: true,
+            special_render: 0,
+            draw_colour: [0, 0, 0],
             children,
         }
     }
@@ -1345,13 +1371,26 @@ impl ClipBuild {
                 Value::Integer(layer.offset.1 / 2),
                 Value::Integer(0),
                 Value::Integer(0),
+                Value::Integer(layer.special_render),
+                // Clip Studio states each channel over the whole of `u32`
+                // rather than as a byte, which is the thing a reader is most
+                // likely to get wrong by a factor of 16 million.
+                Value::Integer(scale_channel(layer.draw_colour[0])),
+                Value::Integer(scale_channel(layer.draw_colour[1])),
+                Value::Integer(scale_channel(layer.draw_colour[2])),
             ]);
         }
         ids.first().copied().unwrap_or(0)
     }
 }
 
-const CLIP_LAYER_COLUMNS: [&str; 21] = [
+/// A byte as Clip Studio stores a colour channel: spread over the whole of
+/// `u32`, so 255 is `0xFFFFFFFF` exactly.
+fn scale_channel(byte: u8) -> i64 {
+    (i64::from(byte) * i64::from(u32::MAX)) / 255
+}
+
+const CLIP_LAYER_COLUMNS: [&str; 25] = [
     "MainId",
     "LayerName",
     "LayerType",
@@ -1373,6 +1412,11 @@ const CLIP_LAYER_COLUMNS: [&str; 21] = [
     "LayerMaskOffsetY",
     "LayerMaskOffscrOffsetX",
     "LayerMaskOffscrOffsetY",
+    // The Paper layer's four: what marks it, and the flat colour it draws.
+    "SpecialRenderType",
+    "DrawColorMainRed",
+    "DrawColorMainGreen",
+    "DrawColorMainBlue",
 ];
 
 /// A whole `.clip`: the database, its external chunks and the chunk stream.
@@ -1380,11 +1424,80 @@ pub fn clip(width: u32, height: u32, layers: &[ClipLayer]) -> Vec<u8> {
     clip_with(width, height, layers, |db| db)
 }
 
+/// How a fixture's `Canvas` row states its size.
+///
+/// A real `.clip` may measure its canvas in physical units and leave the
+/// resolution to turn it into pixels, which is a thing the reader has to be
+/// driven through rather than reasoned about — the file that exposed it opened
+/// at 21×29 instead of 4961×7016.
+pub struct CanvasSize {
+    /// `CanvasWidth`/`CanvasHeight`, in whatever `CanvasUnit` says.
+    pub measure: (f64, f64),
+    /// `CanvasUnit`. 0 is pixels and 1 is centimetres; anything else is a unit
+    /// this build refuses.
+    pub unit: i64,
+    /// `CanvasResolution`, or `None` to leave it out entirely.
+    pub dpi: Option<f64>,
+}
+
+impl CanvasSize {
+    /// Pixels at the usual resolution, which is what most files hold.
+    pub fn pixels(width: u32, height: u32) -> Self {
+        Self {
+            measure: (f64::from(width), f64::from(height)),
+            unit: 0,
+            dpi: Some(350.0),
+        }
+    }
+
+    /// A canvas stated as a physical measurement.
+    pub fn measured(width: f64, height: f64, unit: i64, dpi: Option<f64>) -> Self {
+        Self {
+            measure: (width, height),
+            unit,
+            dpi,
+        }
+    }
+}
+
+/// A `.clip` whose canvas is stated in `size`'s own terms.
+pub fn clip_sized(size: CanvasSize, layers: &[ClipLayer]) -> Vec<u8> {
+    // The layers still need a pixel canvas to be built against, so the bitmaps
+    // are made at whatever the measurement comes to. A fixture whose unit this
+    // build refuses never reaches a layer, so any workable figure will do.
+    let (w, h) = match size.unit {
+        1 => {
+            let dpi = size.dpi.unwrap_or(350.0);
+            (
+                (size.measure.0 * dpi / 2.54).round() as u32,
+                (size.measure.1 * dpi / 2.54).round() as u32,
+            )
+        }
+        _ => (size.measure.0 as u32, size.measure.1 as u32),
+    };
+    clip_inner(w.max(1), h.max(1), Some(size), layers, |db| db)
+}
+
 /// The same, with one hand on the finished database — for a test that has to
 /// damage it.
 pub fn clip_with(
     width: u32,
     height: u32,
+    layers: &[ClipLayer],
+    damage: impl FnOnce(Vec<u8>) -> Vec<u8>,
+) -> Vec<u8> {
+    clip_inner(width, height, None, layers, damage)
+}
+
+/// The builder both entry points share.
+///
+/// `stated` is how the `Canvas` row should describe itself; `width` and
+/// `height` are always the real pixel canvas the layers are built against, so
+/// a fixture measured in centimetres still gets bitmaps of the right size.
+fn clip_inner(
+    width: u32,
+    height: u32,
+    stated: Option<CanvasSize>,
     layers: &[ClipLayer],
     damage: impl FnOnce(Vec<u8>) -> Vec<u8>,
 ) -> Vec<u8> {
@@ -1427,6 +1540,7 @@ pub fn clip_with(
         Value::Integer(0),
     ]);
 
+    let stated = stated.unwrap_or_else(|| CanvasSize::pixels(width, height));
     let mut canvas = TableSpec::new(
         "Canvas",
         &[
@@ -1434,14 +1548,19 @@ pub fn clip_with(
             "CanvasWidth",
             "CanvasHeight",
             "CanvasResolution",
+            "CanvasUnit",
             "CanvasRootFolder",
         ],
     );
     canvas = canvas.row(vec![
         Value::Integer(1),
-        Value::Real(f64::from(width)),
-        Value::Real(f64::from(height)),
-        Value::Real(350.0),
+        Value::Real(stated.measure.0),
+        Value::Real(stated.measure.1),
+        // `Null` rather than a zero, because "states no resolution" and "states
+        // nought" are different files and the reader treats them the same way
+        // only by accident today.
+        stated.dpi.map_or(Value::Null, Value::Real),
+        Value::Integer(stated.unit),
         Value::Integer(root),
     ]);
 

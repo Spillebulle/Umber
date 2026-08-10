@@ -21,7 +21,7 @@
 //!
 //! **This decodes.** [`docimport::import`] is the only public way in and it
 //! reads every layer into a canvas-sized buffer, so a large stack is many
-//! gigabytes of host memory — 13.2 GB for one file in the folder this was
+//! gigabytes of host memory — 12.3 GB for one file in the folder this was
 //! written against. Rows are printed as they finish and each document is freed
 //! before the next is read, so a run that dies names the file that killed it.
 //! `--only <substring>` is how one suspect file gets read on its own.

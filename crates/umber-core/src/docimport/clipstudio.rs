@@ -104,6 +104,7 @@ use super::{
     ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
     check_bounds, srgb,
 };
+use crate::color::Color;
 use crate::csblocks::{self, BLOCK, Bitmap, Fill, Packing};
 use crate::document::Background;
 use crate::layer::LayerStack;
@@ -148,7 +149,38 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let mut warnings = Vec::new();
 
     let layers = Tables::read(&db)?;
-    let nodes = layers.tree(canvas.root, &mut warnings)?;
+    let all = layers.tree(canvas.root, &mut warnings)?;
+
+    // **The Paper layer is the document's background, not a layer of it.** It
+    // carries a flat colour and no bitmap, so it used to fall through the
+    // "the file does not hold its pixels" path and be dropped — every Clip
+    // Studio document opening on transparency where the artist had white paper
+    // under their drawing, with a warning that read like a damaged file. Umber
+    // already has the concept and `openraster` already does exactly this with
+    // its own `umber-background` layer, so this is that route, not a new one.
+    //
+    // Taken out here rather than in `build`, because it must not reach
+    // `check_bounds` either: paper holds no buffer to be charged for and
+    // becomes no entry to be counted.
+    let (paper, nodes): (Vec<Node>, Vec<Node>) = all
+        .into_iter()
+        .partition(|n| layers.rows.get(&n.id).is_some_and(LayerRow::paper));
+    // `tree` is bottom first, so the first is the lowest — the one actually
+    // behind the picture if a file somehow carries more than one.
+    let background =
+        paper
+            .first()
+            .and_then(|n| layers.rows.get(&n.id))
+            .map_or(Background::Transparent, |row| {
+                // A hidden paper is a document the artist was working on
+                // transparency, which is what `Background::Transparent` means.
+                if row.visible {
+                    Background::opaque(row.colour())
+                } else {
+                    Background::Transparent
+                }
+            });
+
     // Folders are entries and hold no pixels, so they count towards the stack's
     // size and not towards its bytes. `.clip` is where that matters most: a
     // Clip Studio document is usually filed into groups, and charging each one
@@ -178,7 +210,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         size: canvas.size,
         layers: out,
         active: None,
-        background: Background::Transparent,
+        background,
         dpi: canvas.dpi,
         history: None,
         warnings,
@@ -274,6 +306,59 @@ struct Canvas {
     root: i64,
 }
 
+/// What `Canvas.CanvasUnit` measures `CanvasWidth` and `CanvasHeight` in.
+///
+/// **Only the two values that were seen in real files are here, and the rest
+/// are refused rather than guessed.** Clip Studio's New Document dialog also
+/// offers millimetres, inches and points, so this enum is certainly incomplete;
+/// what is not available is any evidence of which number means which. Reading
+/// the format's own dialog order and assuming it matches the stored codes is
+/// exactly the guess that keeps the MediaBang reader unwritten — a wrong unit
+/// is a canvas silently out by a factor of ten or twenty-five, which is worse
+/// than a refusal that names the code and can be reported.
+///
+/// The evidence, from 33 documents:
+/// * `0` is pixels in 32 of them, at ordinary figures (5000, 3000, 1920).
+/// * `1` is centimetres in one, and it is **cross-checked** rather than
+///   inferred: 21×29.7 at 600 dpi comes to 4961×7016, which is precisely the
+///   canvas of another file in the same folder that stored the same A4 page in
+///   pixels. Two independent documents agreeing on the arithmetic is what makes
+///   this a reading rather than a plausible story.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanvasUnit {
+    Pixels,
+    Centimetres,
+}
+
+impl CanvasUnit {
+    fn read(code: i64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Pixels),
+            1 => Some(Self::Centimetres),
+            _ => None,
+        }
+    }
+
+    /// How many of this unit make an inch, which is what turns a physical
+    /// measurement into pixels once the resolution is known.
+    fn per_inch(self) -> f64 {
+        match self {
+            // Never asked: the pixel arm does not go through the conversion at
+            // all, because a resolution is not needed to size a canvas already
+            // given in pixels and a file may legitimately state none.
+            Self::Pixels => 1.0,
+            Self::Centimetres => 2.54,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pixels => "pixels",
+            Self::Centimetres => "centimetres",
+        }
+    }
+}
+
 fn canvas(db: &Database<'_>) -> Result<Canvas, ImportError> {
     let malformed = |detail: String| ImportError::Malformed {
         format: FORMAT,
@@ -292,6 +377,46 @@ fn canvas(db: &Database<'_>) -> Result<Canvas, ImportError> {
 
     let width = get("CanvasWidth").and_then(Value::as_f64).unwrap_or(0.0);
     let height = get("CanvasHeight").and_then(Value::as_f64).unwrap_or(0.0);
+    let dpi = get("CanvasResolution")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32)
+        .filter(|v| *v > 0.0);
+
+    // **`CanvasWidth` is not always pixels, and taking it for pixels is silent.**
+    // `CanvasUnit` says which unit it is in, and a document authored in
+    // centimetres arrived as a canvas the size of its own measurement: an A4
+    // page at 600 dpi is 4961×7016 and opened as 21×29, whereupon every layer
+    // missed it and the file was refused as holding no layers. Nothing about
+    // that reads as a unit problem from the outside.
+    let unit = get("CanvasUnit").and_then(Value::as_i64).unwrap_or(0);
+    let (width, height) = match CanvasUnit::read(unit) {
+        Some(CanvasUnit::Pixels) => (width, height),
+        Some(unit) => {
+            // Physical units need the resolution to become pixels, so a file
+            // stating one without the other cannot be sized at all.
+            let dpi = f64::from(dpi.ok_or_else(|| {
+                malformed(format!(
+                    "its canvas is measured in {} and it states no resolution",
+                    unit.label()
+                ))
+            })?);
+            (
+                width * dpi / unit.per_inch(),
+                height * dpi / unit.per_inch(),
+            )
+        }
+        // **Refused rather than read as pixels**, which is the reader-wide rule
+        // that subtly wrong output is worse than a refusal: falling back would
+        // reproduce exactly the 21×29 canvas above, and the sentence names the
+        // code so a file carrying a unit nobody here has seen can be reported.
+        None => {
+            return Err(ImportError::Unsupported {
+                format: FORMAT,
+                detail: format!("a canvas measured in unit {unit}, which Umber cannot convert"),
+            });
+        }
+    };
+
     // Rounded rather than truncated, and refused rather than clamped: a
     // negative or absurd figure out of somebody else's file must not become a
     // canvas by way of an `as` cast.
@@ -304,10 +429,7 @@ fn canvas(db: &Database<'_>) -> Result<Canvas, ImportError> {
 
     Ok(Canvas {
         size: UVec2::new(width as u32, height as u32),
-        dpi: get("CanvasResolution")
-            .and_then(Value::as_f64)
-            .map(|v| v as f32)
-            .filter(|v| *v > 0.0),
+        dpi,
         root: get("CanvasRootFolder")
             .and_then(Value::as_i64)
             .ok_or_else(|| malformed("it names no root folder".into()))?,
@@ -342,6 +464,65 @@ struct LayerRow {
     render_offset: (i64, i64),
     mask_offset: (i64, i64),
     mask_offscreen_offset: (i64, i64),
+    /// `SpecialRenderType`, whose 20 is the **Paper** layer — the flat sheet
+    /// Clip Studio puts under every new document. See [`LayerRow::paper`].
+    special_render: i64,
+    /// `DrawColorMainRed`/`Green`/`Blue`, each `0..=u32::MAX` rather than a
+    /// byte. Only meaningful on a layer that draws a flat colour.
+    draw_colour: (i64, i64, i64),
+}
+
+/// `SpecialRenderType`'s value for the Paper layer.
+const PAPER_RENDER: i64 = 20;
+
+/// `LayerType`'s value for the Paper layer.
+///
+/// Accepted **beside** [`PAPER_RENDER`] rather than instead of it: the two
+/// agreed on every one of the 33 documents this was written against, and
+/// neither ever fired on anything else, so accepting either costs nothing and
+/// covers a file whose schema is missing one of the columns — `int` answers 0
+/// for a column that is not there, which would otherwise read as "not paper"
+/// and silently drop the sheet again.
+const PAPER_KIND: i64 = 1584;
+
+impl LayerRow {
+    /// Whether this is the Paper layer: a flat sheet under the whole canvas,
+    /// holding a colour and no bitmap.
+    ///
+    /// **`DrawColorEnable` is deliberately not the test**, though it is set on
+    /// every paper and reads like the obvious one. Two ordinary raster layers
+    /// among the 33 documents carry it too, so keying on it would turn somebody's
+    /// drawing into the document background and delete it from the stack.
+    fn paper(&self) -> bool {
+        self.special_render == PAPER_RENDER || self.kind == PAPER_KIND
+    }
+
+    /// The flat colour this layer draws, as straight sRGB.
+    ///
+    /// Clip Studio stores each channel over the whole of `u32`, so `0xFFFFFFFF`
+    /// is full. Dividing by that rather than shifting keeps the ends exact —
+    /// white comes back 255 and black 0.
+    ///
+    /// **Taking the low byte instead would be indistinguishable, and the test
+    /// cannot separate the two.** Every value seen in a real file is a byte
+    /// spread by `0x01010101`, whose low byte *is* that byte, so the two
+    /// readings agree on everything reachable; a mutation to `v & 0xFF` passes
+    /// the suite, which was checked rather than assumed. This is the principled
+    /// half of the pair — it is right whether or not Clip Studio ever stores a
+    /// value finer than a byte, where the mask is right only by that accident —
+    /// so it is what is written, and the equivalence is recorded here rather
+    /// than a test being contrived over data no file produces. All 33 sample
+    /// documents are white, so nothing here is exercised by a real colour at
+    /// all; the fixture is what drives it.
+    fn colour(&self) -> Color {
+        let channel = |v: i64| v.clamp(0, i64::from(u32::MAX)) as f64 / f64::from(u32::MAX);
+        Color::from_srgb_u8(
+            (channel(self.draw_colour.0) * 255.0).round() as u8,
+            (channel(self.draw_colour.1) * 255.0).round() as u8,
+            (channel(self.draw_colour.2) * 255.0).round() as u8,
+            255,
+        )
+    }
 }
 
 /// Everything the database says, resolved into lookups.
@@ -402,6 +583,12 @@ impl Tables {
                     mask_offscreen_offset: (
                         int("LayerMaskOffscrOffsetX"),
                         int("LayerMaskOffscrOffsetY"),
+                    ),
+                    special_render: int("SpecialRenderType"),
+                    draw_colour: (
+                        int("DrawColorMainRed"),
+                        int("DrawColorMainGreen"),
+                        int("DrawColorMainBlue"),
                     ),
                 },
             );
@@ -1015,6 +1202,146 @@ mod tests {
     use super::*;
     use crate::layer::BlendMode;
 
+    /// **The Paper layer is the document's background, not one of its layers.**
+    ///
+    /// It holds a colour and no bitmap, so it used to fall through the "the file
+    /// does not hold its pixels" path: all 33 real documents this was written
+    /// against lost their paper and opened on transparency, each with a warning
+    /// that read like a damaged file.
+    ///
+    /// The colour is driven at something that is **not** white deliberately.
+    /// Every real sample is white, so a reader that ignored the columns and
+    /// hard-coded a sheet of white would have passed against every one of them
+    /// — and a channel read as a byte rather than as a fraction of `u32` is
+    /// wrong by a factor of sixteen million, which white also hides.
+    #[test]
+    fn a_paper_layer_becomes_the_documents_background() {
+        let bytes = fixtures::clip(
+            8,
+            8,
+            &[
+                ClipLayer::paper([32, 96, 200]),
+                ClipLayer::flat("Ink", 8, 8, [255, 0, 0, 255]),
+            ],
+        );
+        let doc = read(&bytes).expect("a document");
+
+        let colour = doc
+            .background
+            .colour()
+            .expect("the paper should have become an opaque background");
+        assert_eq!(colour.to_srgb_u8(), [32, 96, 200, 255]);
+
+        // And it is gone from the stack rather than sitting in it twice.
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["Ink"]);
+        assert!(
+            doc.warnings.is_empty(),
+            "the paper is understood, so nothing is lost: {:?}",
+            doc.warnings
+        );
+    }
+
+    /// A hidden paper is somebody working on transparency, and the eye is the
+    /// only thing in the file that says so.
+    #[test]
+    fn a_hidden_paper_layer_leaves_the_document_transparent() {
+        let bytes = fixtures::clip(
+            8,
+            8,
+            &[
+                ClipLayer::paper([255, 255, 255]).hidden(),
+                ClipLayer::flat("Ink", 8, 8, [255, 0, 0, 255]),
+            ],
+        );
+        let doc = read(&bytes).expect("a document");
+        assert_eq!(doc.background, Background::Transparent);
+        assert_eq!(doc.layers.len(), 1);
+    }
+
+    /// A document that is nothing but paper has nothing to paint on, and the
+    /// paper is not a layer that changes that.
+    ///
+    /// The case that made this worth pinning: `Empty` is raised from
+    /// `out.iter().all(|l| l.folder)`, which a stack emptied by the paper
+    /// partition satisfies vacuously — so the arm has to be reached with the
+    /// paper *removed*, not merely skipped.
+    #[test]
+    fn a_document_of_nothing_but_paper_is_still_empty() {
+        let bytes = fixtures::clip(8, 8, &[ClipLayer::paper([255, 255, 255])]);
+        assert!(matches!(read(&bytes), Err(ImportError::Empty { .. })));
+    }
+
+    /// **A canvas measured in centimetres is not a canvas of that many pixels.**
+    ///
+    /// `Study skeleton.clip` is A4 at 600 dpi and opened as a 21×29 canvas,
+    /// whereupon every layer missed it entirely and the document was refused as
+    /// holding no layers. Nothing in that chain reads as a unit problem.
+    ///
+    /// The figures are the real file's, and the expected answer is **not**
+    /// computed by repeating the conversion here — 4961×7016 is the canvas of a
+    /// second real document in the same folder that stored the same A4 page in
+    /// pixels. That is what makes this a reading of the format rather than the
+    /// test agreeing with the code.
+    #[test]
+    fn a_canvas_measured_in_centimetres_becomes_its_real_pixel_size() {
+        let bytes = fixtures::clip_sized(
+            fixtures::CanvasSize::measured(21.0, 29.7, 1, Some(600.0)),
+            &[ClipLayer::flat("Ink", 1, 1, [255, 0, 0, 255]).placed((1, 1), (0, 0))],
+        );
+        let doc = read(&bytes).expect("a document");
+        assert_eq!(doc.size, UVec2::new(4961, 7016));
+        assert_eq!(doc.dpi, Some(600.0));
+    }
+
+    /// Pixels stay pixels, and the resolution does not touch them.
+    ///
+    /// The direction that would break every ordinary document if the conversion
+    /// were applied unconditionally: at 350 dpi a 300×300 canvas would come out
+    /// 41338 square and be refused.
+    #[test]
+    fn a_canvas_measured_in_pixels_is_not_scaled_by_its_resolution() {
+        let bytes = fixtures::clip_sized(
+            fixtures::CanvasSize::pixels(300, 300),
+            &[ClipLayer::flat("Ink", 300, 300, [255, 0, 0, 255])],
+        );
+        let doc = read(&bytes).expect("a document");
+        assert_eq!(doc.size, UVec2::new(300, 300));
+    }
+
+    /// A unit this build has never seen is refused, never read as pixels.
+    ///
+    /// Clip Studio also offers millimetres, inches and points and nobody here
+    /// has a file carrying one, so the codes are unknown. Falling back to pixels
+    /// would reproduce the 21×29 canvas exactly; guessing at the order would be
+    /// a canvas silently out by a factor of ten or twenty-five. Both are worse
+    /// than a sentence naming the code, which is something somebody can report.
+    #[test]
+    fn a_canvas_in_a_unit_this_build_cannot_convert_is_refused() {
+        for unit in [2, 3, 4, 99] {
+            let bytes = fixtures::clip_sized(
+                fixtures::CanvasSize::measured(210.0, 297.0, unit, Some(600.0)),
+                &[ClipLayer::flat("Ink", 1, 1, [255, 0, 0, 255]).placed((1, 1), (0, 0))],
+            );
+            let err = read(&bytes).expect_err("an unknown unit must not be read as pixels");
+            assert!(
+                matches!(err, ImportError::Unsupported { .. }),
+                "unit {unit}: {err:?}"
+            );
+            assert!(err.to_string().contains(&unit.to_string()));
+        }
+    }
+
+    /// A physical measurement with no resolution cannot become pixels at all.
+    #[test]
+    fn a_measured_canvas_with_no_resolution_is_refused() {
+        let bytes = fixtures::clip_sized(
+            fixtures::CanvasSize::measured(21.0, 29.7, 1, None),
+            &[ClipLayer::flat("Ink", 1, 1, [255, 0, 0, 255]).placed((1, 1), (0, 0))],
+        );
+        assert!(matches!(read(&bytes), Err(ImportError::Malformed { .. })));
+    }
+
     /// **A document filed into folders is not charged for its filing**, which
     /// is the bug an artist met: a 15000×5000 `.clip` refused with "the canvas
     /// is larger than Umber can open", a canvas well inside `MAX_DIMENSION`.
@@ -1478,6 +1805,8 @@ mod tests {
                 render_offset: (0, 0),
                 mask_offset: (0, 0),
                 mask_offscreen_offset: (0, 0),
+                special_render: 0,
+                draw_colour: (0, 0, 0),
             }
         }
 
@@ -1640,6 +1969,8 @@ mod tests {
             render_offset: (0, 0),
             mask_offset: (0, 0),
             mask_offscreen_offset: (0, 0),
+            special_render: 0,
+            draw_colour: (0, 0, 0),
         }
     }
 
