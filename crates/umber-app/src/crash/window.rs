@@ -57,7 +57,11 @@ use super::report::Report;
 const WINDOW: [f32; 2] = [560.0, 520.0];
 
 /// What the footer takes: one row of buttons and the space above it.
-const FOOTER: f32 = 36.0;
+///
+/// The gap alone: the row's own height is [`tabs::BUTTON_HEIGHT`], and the
+/// footer is *placed* at the bottom of the box rather than flowed after the
+/// body, so there is no combined figure to keep in step with either.
+const FOOTER_GAP: f32 = 10.0;
 
 /// The least the scrolling body is ever given, however short the window is
 /// dragged. Below this it stops being readable and the box may as well not have
@@ -91,6 +95,13 @@ const CAT_WIDTH: f32 = 128.0;
 /// places for the mark's size to be stated.
 const MARK: f32 = 26.0;
 const MARK_GAP: f32 = 10.0;
+
+/// The gap between the window's edge and the dialog box inside it.
+///
+/// The box is a `dialog_frame` floating on the window's own ground, exactly as
+/// a modal floats on the interface, and this is what makes the ground visible
+/// around it.
+const OUTER_INSET: f32 = 10.0;
 
 /// Space above the heading row.
 ///
@@ -227,15 +238,36 @@ fn body(
     // for the backdrop to show around it — so this reads as the same object as
     // the settings dialog and the module library rather than as a page of text
     // that happens to be in a window.
-    let inset = egui::Frame::NONE.inner_margin(egui::Margin::same(10));
+    // **The window, not `available_height`.** The content has to be exactly
+    // what is left once both insets are paid for, and neither reading from
+    // inside the frames nor reading the root `Ui` gives that. A frame reserves
+    // its top margin before its closure runs and its bottom margin after, so
+    // the figure a caller sees in there is neither the whole nor the remainder;
+    // and the root `Ui` `run_ui` hands over *grows with what the last pass
+    // drew*, so deriving the height from it feeds back on itself — one pass
+    // overflowed by three points and the next by five. `screen_rect` is the
+    // window and is the same on every pass. (`viewport_rect` is egui 0.35's
+    // name for it.)
+    // `the_box_is_inset_equally_on_every_side` measures the four gaps.
+    let room = ui.ctx().viewport_rect().height();
+    let inset = egui::Frame::NONE.inner_margin(egui::Margin::same(OUTER_INSET as i8));
     inset.show(ui, |ui| {
         tabs::dialog_frame(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            // Less the frame's own bottom inset, which the frame applies after
-            // the content is measured — so filling the available height exactly
-            // leaves nothing for it and the box ends up with its full margin at
-            // the sides and the top and only the outer inset at the bottom.
-            ui.set_min_height(ui.available_height() - tabs::DIALOG_MARGIN);
+            // Both insets and the hairline: the frame's stroke is painted
+            // outside its content, so the box on screen is two points taller
+            // than what is set here.
+            let content =
+                (room - 2.0 * OUTER_INSET - 2.0 * tabs::DIALOG_MARGIN - 2.0 * tabs::DIALOG_STROKE)
+                    .max(MIN_BODY);
+            ui.set_min_height(content);
+            // **The cursor, not `min_rect`.** `set_min_height` inflates
+            // `min_rect` on the spot, so measuring the heading against it gives
+            // the whole reserved height instead — which made the body's
+            // reservation negative, clamped it to `MIN_BODY`, and left the box
+            // scrolling at half its height with the last two rows out of sight.
+            // The cursor is where the next thing will actually go.
+            let top = ui.cursor().top();
 
             heading(ui, p, cat_texture);
             ui.add_space(12.0);
@@ -247,10 +279,22 @@ fn body(
             // buttons are off the bottom of the screen. Expanding the details
             // used to do exactly that, which is what this replaces.
             //
-            // The height is what is left after the footer, taken before the
-            // body is drawn rather than after, so the buttons cannot be pushed
-            // anywhere by what goes above them.
-            let room = (ui.available_height() - FOOTER).max(MIN_BODY);
+            // What is left of `content` once the heading and the footer are
+            // paid for. **Measured against the height that was set**, not
+            // against `available_height`: a `set_min_height` is a floor rather
+            // than a ceiling, so a scroll area sized from what egui thinks is
+            // available grows the box past it — which is what left the bottom
+            // inset five points short of the other three.
+            // The footer is *placed*, at the bottom of the height that was
+            // set, and the body gets what is above it. Reserving a figure and
+            // letting the row flow after the scroll area cannot be made exact:
+            // egui puts `item_spacing` between every pair of things, so the
+            // reservation has to predict how many gaps there will be, and each
+            // attempt at that arithmetic left the box a point or two past its
+            // own inset. Nothing here predicts anything.
+            let bottom = top + content;
+            let footer_top = bottom - tabs::BUTTON_HEIGHT;
+            let room = (footer_top - FOOTER_GAP - ui.cursor().top()).max(MIN_BODY);
             egui::ScrollArea::vertical()
                 .max_height(room)
                 .auto_shrink([false, false])
@@ -280,16 +324,28 @@ fn body(
             // they are however long the details run — a control that walks out
             // from under the pointer as the thing above it grows is how a Close
             // becomes a Restart.
-            ui.add_space(10.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if tabs::button(ui, p, "Restart Umber", true) {
-                    *actions.restart = true;
-                    *actions.close = true;
-                }
-                if tabs::button(ui, p, "Close", false) {
-                    *actions.close = true;
-                }
-            });
+            // Drawn into its own rectangle rather than flowed, which is what
+            // makes the box exactly as tall as it said it would be. It
+            // allocates nothing in the parent — ordinarily the thing to be
+            // careful of, since a child taller than its slot paints over its
+            // neighbours — and that is safe here precisely because the parent's
+            // height was set first and the row is the last thing in it.
+            let footer = egui::Rect::from_min_max(
+                egui::pos2(ui.min_rect().left(), footer_top),
+                egui::pos2(ui.min_rect().right(), bottom),
+            );
+            let mut footer_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(footer)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            );
+            if tabs::button(&mut footer_ui, p, "Restart Umber", true) {
+                *actions.restart = true;
+                *actions.close = true;
+            }
+            if tabs::button(&mut footer_ui, p, "Close", false) {
+                *actions.close = true;
+            }
         });
     });
 }
@@ -618,4 +674,124 @@ fn path_line(ui: &mut egui::Ui, p: &Palette, path: &str) {
             .color(p.accent)
             .line_height(Some(13.5)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lay the box out headlessly and hand back every rectangle it filled.
+    ///
+    /// The window is a real one in the shipped build; here it is a context of
+    /// the same size, which is enough to measure a layout — the same trick the
+    /// canvas-dialog guards use to read what egui actually drew rather than
+    /// restating the rule that drew it.
+    fn frames_at(height: f32) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let report = Report::default();
+        let mut reporter = Reporter::new(&report, Path::new("report.json"));
+        let mut close = false;
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(WINDOW[0], height),
+            )),
+            ..Default::default()
+        };
+        // Twice, so the font atlas exists for the second pass and the galleys
+        // are measured rather than guessed — the idiom `widgets`' own layout
+        // tests keep.
+        let mut rects = Vec::new();
+        let mut clips: Vec<egui::Rect> = Vec::new();
+        for _ in 0..2 {
+            let output = ctx.run_ui(input.clone(), |ui| reporter.draw(ui, &mut close));
+            rects = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(rect) => Some(rect.rect),
+                    _ => None,
+                })
+                .collect();
+            clips = output.shapes.iter().map(|c| c.clip_rect).collect();
+        }
+        (rects, clips)
+    }
+
+    /// **The box's inset is the same on all four sides.**
+    ///
+    /// It was not: `dialog_frame` applies its inner margin *after* the content
+    /// is measured, so `set_min_height(available_height())` ran the content to
+    /// the bottom of the space and squeezed that margin off — full inset at the
+    /// sides and the top, and only the outer one at the bottom. Reported from a
+    /// running window, which is exactly the kind of thing a layout test can see
+    /// and a person has to squint at.
+    ///
+    /// Measured against the window rather than asserted about the constants,
+    /// because the constants were already right and the *layout* was not.
+    #[test]
+    fn the_box_is_inset_equally_on_every_side() {
+        let height = WINDOW[1];
+        let (rects, _) = frames_at(height);
+        let dialog = rects
+            .iter()
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .copied()
+            .expect("the dialog frame is drawn");
+
+        let left = dialog.left();
+        let right = WINDOW[0] - dialog.right();
+        let top = dialog.top();
+        let bottom = height - dialog.bottom();
+
+        // One point of tolerance: a frame's stroke is drawn on the boundary and
+        // rounding puts an edge on either side of it.
+        for (name, gap) in [("right", right), ("top", top), ("bottom", bottom)] {
+            assert!(
+                (gap - left).abs() <= 1.0,
+                "the {name} inset is {gap:.1} against {left:.1} on the left \
+                 (dialog {dialog:?} in {}x{height})",
+                WINDOW[0],
+            );
+        }
+    }
+
+    /// **The body gets what is left of the box, not its floor.**
+    ///
+    /// `MIN_BODY` is the height below which the box may as well not have
+    /// opened; it is a floor for a window dragged very short, and it is not
+    /// what a full-size box should ever use. Sizing the body against
+    /// `min_rect` did exactly that — `set_min_height` inflates `min_rect` on
+    /// the spot, so the heading appeared to have used the whole box, the
+    /// reservation went negative and clamped, and the box scrolled at half its
+    /// height with its last two rows out of sight. Reported from a running
+    /// window, again.
+    ///
+    /// Measured off the drawn rectangles: the picture is the heading row and
+    /// the buttons are the footer, so what is between them is the body.
+    #[test]
+    fn the_scrolling_body_fills_what_is_left_of_the_box() {
+        let (rects, clips) = frames_at(WINDOW[1]);
+        // **The scroll area's own viewport**, read off the clip rectangle its
+        // contents are drawn under. Measuring the gap between the heading and
+        // the buttons instead proves nothing: the footer is *placed* at the
+        // bottom of the box, so that distance is the same whether the body
+        // fills it or is collapsed to its floor — a mutation putting the bug
+        // back sailed through exactly that assertion.
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(WINDOW[0], WINDOW[1]));
+        let body = clips
+            .iter()
+            .filter(|c| c.height() < window.height() - 1.0 && c.width() > 100.0)
+            .map(egui::Rect::height)
+            .fold(0.0_f32, f32::max);
+        let _ = rects;
+        assert!(
+            body > MIN_BODY * 2.0,
+            "the scrolling body is {body:.0} points, which is about the              {MIN_BODY} floor rather than the room a {}x{} box leaves it",
+            WINDOW[0],
+            WINDOW[1],
+        );
+    }
 }

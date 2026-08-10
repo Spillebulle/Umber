@@ -779,10 +779,26 @@ pub fn summarise(warnings: &[ImportWarning]) -> Vec<String> {
 pub(crate) fn dialog_frame(p: &Palette) -> Frame {
     Frame::NONE
         .fill(p.popover)
-        .stroke(Stroke::new(1.0, p.popover_border))
+        .stroke(Stroke::new(DIALOG_STROKE, p.popover_border))
         .corner_radius(8)
         .inner_margin(Margin::same(DIALOG_MARGIN as i8))
 }
+
+/// How tall a [`button`] is.
+///
+/// Named because a dialog that reserves room for its footer has to reserve the
+/// right amount: the crash box subtracted a figure of its own and the box came
+/// out two points taller than its own inset allowed.
+pub(crate) const BUTTON_HEIGHT: f32 = 26.0;
+
+/// The hairline around [`dialog_frame`].
+///
+/// Named for the same reason the inset is: egui paints a frame's stroke
+/// *outside* its content, so a box that fills a window is two points taller
+/// than its content and a caller sizing one has to know that. It is what left
+/// the crash box's bottom inset two short of its sides after everything else
+/// had been made exact.
+pub(crate) const DIALOG_STROKE: f32 = 1.0;
 
 /// The inset inside [`dialog_frame`].
 ///
@@ -806,7 +822,8 @@ pub(crate) fn button(ui: &mut egui::Ui, p: &Palette, label: &str, strong: bool) 
         .layout_no_wrap(label.to_owned(), font.clone(), p.text)
         .size()
         .x;
-    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 22.0, 26.0), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(text_w + 22.0, BUTTON_HEIGHT), Sense::click());
 
     let fill = match (strong, response.hovered()) {
         (true, false) => p.accent_dim,
