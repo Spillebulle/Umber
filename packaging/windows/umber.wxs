@@ -267,10 +267,85 @@
       </Component>
     </ComponentGroup>
 
+    <!--
+      Thumbnails in Explorer.
+
+      Windows has no command-line thumbnailer contract — the thing every Linux
+      desktop has — so this is an in-process COM server, `umber_shellext.dll`,
+      which Explorer loads inside its own surrogate and calls once per file.
+      The DLL deliberately exposes no `DllRegisterServer`: self-registration is
+      opaque to the installer's transaction and cannot be rolled back, which is
+      why `regsvr32` state famously outlives uninstalls. The keys are written
+      here instead, so removing Umber removes them.
+
+      **Registered on the extension keys, not on Umber's ProgIDs**, and that is
+      the same "offer, do not take" rule the associations above follow. Explorer
+      resolves a thumbnail handler from the ProgID that actually owns the type
+      first and falls back to the extension. So where Photoshop is installed and
+      supplies its own handler, Photoshop's is used; where nothing does — a
+      `.clip` on the machine this was reported from — Umber's fills the gap.
+      Hanging it off `Umber.psd` instead would do nothing unless somebody had
+      already made Umber the default, which is the thing we refuse to do.
+
+      `{e357fccd-a995-4576-b01f-234630154e96}` is `IThumbnailProvider`'s own
+      interface id, which is the name Explorer looks under. It is not ours and
+      is the same on every machine.
+
+      The CLSID is `umber_shellext`'s `CLSID_THUMBNAIL` and may never change:
+      a new one leaves this key pointing at a class the DLL no longer exposes,
+      which is a handler that fails to load on every file.
+      `the_thumbnail_handler_clsid_matches_the_installer` reads the value back
+      out of this file, so the two cannot drift.
+
+      Apartment threading because that is what a shell extension is called on,
+      and it is what every thumbnail provider Microsoft documents declares.
+    -->
+    <ComponentGroup Id="Thumbnails" Directory="INSTALLFOLDER">
+      <Component Id="ShellExtensionDll" Guid="4a1d8e05-63b2-4c7f-9e18-27fb0a5d3c64">
+        <File Id="UmberShellExt" Source="$(var.BinDir)\umber_shellext.dll" KeyPath="yes" />
+        <RegistryValue Root="HKCR"
+                       Key="CLSID\{9C2F5B31-4DE8-47A6-B0D1-5E3A8F7C26B4}"
+                       Type="string"
+                       Value="Umber thumbnail handler" />
+        <RegistryValue Root="HKCR"
+                       Key="CLSID\{9C2F5B31-4DE8-47A6-B0D1-5E3A8F7C26B4}\InprocServer32"
+                       Type="string"
+                       Value="[#UmberShellExt]" />
+        <RegistryValue Root="HKCR"
+                       Key="CLSID\{9C2F5B31-4DE8-47A6-B0D1-5E3A8F7C26B4}\InprocServer32"
+                       Name="ThreadingModel"
+                       Type="string"
+                       Value="Apartment" />
+      </Component>
+      <!--
+        One component per extension, each keyed on its own registry value, so
+        the set installs and uninstalls cleanly and a repair puts back exactly
+        what is missing.
+
+        `.png` is deliberately absent: Windows has drawn PNG thumbnails since
+        before this application existed, and claiming it would replace a working
+        in-box handler with a slower one. The same decision the `.thumbnailer`
+        entry makes on Linux, for the same reason.
+      -->
+      <Component Id="ThumbOra" Guid="c73e4b19-05af-4d62-8b3e-91d7a4b60e28">
+        <RegistryValue Root="HKCR" Key=".ora\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}" Type="string" Value="{9C2F5B31-4DE8-47A6-B0D1-5E3A8F7C26B4}" KeyPath="yes" />
+      </Component>
+      <Component Id="ThumbKra" Guid="8f0b6d27-4e15-49c3-a7d0-3b26e5c81a94">
+        <RegistryValue Root="HKCR" Key=".kra\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}" Type="string" Value="{9C2F5B31-4DE8-47A6-B0D1-5E3A8F7C26B4}" KeyPath="yes" />
+      </Component>
+      <Component Id="ThumbPsd" Guid="1e5a97c4-8362-4b0d-95fa-6c48d7e230b1">
+        <RegistryValue Root="HKCR" Key=".psd\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}" Type="string" Value="{9C2F5B31-4DE8-47A6-B0D1-5E3A8F7C26B4}" KeyPath="yes" />
+      </Component>
+      <Component Id="ThumbClip" Guid="6b24f8d0-937c-4e51-82a6-04ec1b95d7f3">
+        <RegistryValue Root="HKCR" Key=".clip\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}" Type="string" Value="{9C2F5B31-4DE8-47A6-B0D1-5E3A8F7C26B4}" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
     <Feature Id="Main" Title="Umber" Level="1">
       <ComponentGroupRef Id="Files" />
       <ComponentGroupRef Id="StartMenu" />
       <ComponentGroupRef Id="FileAssociations" />
+      <ComponentGroupRef Id="Thumbnails" />
     </Feature>
 
     <ComponentGroup Id="Files" Directory="INSTALLFOLDER">

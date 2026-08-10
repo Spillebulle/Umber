@@ -85,6 +85,14 @@ jobs:
             lipo -info target/release/umber
           else
             cargo build --release -p umber-desktop
+            # The Explorer thumbnail handler, which only the MSI installs.
+            # Built beside the executable rather than in the packaging step,
+            # because that step has no toolchain of its own — and built only
+            # here, since `umber-shellext` is `#![cfg(windows)]` and would be
+            # an empty library everywhere else.
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              cargo build --release -p umber-shellext
+            fi
           fi
 
       - name: Stage

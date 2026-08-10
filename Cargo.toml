@@ -5,6 +5,7 @@ members = [
     "crates/umber-render",
     "crates/umber-app",
     "crates/umber-desktop",
+    "crates/umber-shellext",
 ]
 
 [workspace.package]

@@ -3077,6 +3077,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "umber-shellext"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "umber-core",
+ "windows",
+ "windows-core",
+ "windows-implement",
+ "windows-interface",
+]
+
+[[package]]
 name = "unicode-general-category"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

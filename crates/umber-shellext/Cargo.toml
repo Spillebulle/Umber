@@ -1,0 +1,39 @@
+[package]
+name = "umber-shellext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A DLL and nothing else. Explorer loads this in-process (inside its own
+# `dllhost.exe` surrogate), so there is no binary here and never will be.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The preview extractor, which is the whole of what this does. Nothing else
+# from the workspace: this must not pull in wgpu, winit or egui, because a
+# thumbnail handler is loaded into a process nobody here controls.
+umber-core = { path = "../umber-core" }
+log = { workspace = true }
+
+# The `windows` crate rather than the `windows-sys` `umber-app` uses, and it is
+# the one thing here that is not a free choice: implementing a COM *server*
+# needs the `#[implement]` macro and the vtable machinery behind it, which
+# `windows-sys` deliberately does not have — it binds the API for calling, not
+# for being called. Confined to this crate so nothing else pays for it.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+windows-core = "0.62"
+windows-implement = "0.60"
+windows-interface = "0.59"
