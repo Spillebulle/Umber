@@ -355,7 +355,7 @@ mod tests {
             .cycle()
             .take((rect.area() * 4) as usize)
             .collect();
-        canvas.write_layer_rect(&gpu.queue, slot, rect, &bytes);
+        canvas.write_layer_rect(&gpu.device, &gpu.queue, slot, rect, &bytes);
 
         spin(&mut editor, &mut canvas);
         assert!(

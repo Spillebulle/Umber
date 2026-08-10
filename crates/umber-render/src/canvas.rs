@@ -2248,9 +2248,11 @@ pub struct CanvasRenderer {
     /// The largest staging buffer this device will create, in bytes.
     ///
     /// Taken from the device rather than assumed, and honoured by every
-    /// readback here — see [`band_rows`]. Held as a field so a test can lower
-    /// it and drive the banded path on a document small enough to check by
-    /// hand; on a real device it would take a 8192² canvas to reach.
+    /// readback here — see [`band_rows`] — **and now by the one write that can
+    /// carry a whole canvas**, [`CanvasRenderer::write_layer_rect`]. Held as a
+    /// field so a test can lower it and drive the banded path on a document
+    /// small enough to check by hand; on a real device it would take a 8192²
+    /// canvas to reach.
     readback_limit: u64,
 
     dab_bind_group: wgpu::BindGroup,
@@ -7178,8 +7180,46 @@ impl CanvasRenderer {
     }
 
     /// Write a previously captured rectangle back into one layer.
+    ///
+    /// **Goes a band of rows at a time, for the reason every readback here
+    /// does** — see [`band_rows`]. `Queue::write_texture` allocates a staging
+    /// buffer the size of the upload and copies the caller's bytes into it, so
+    /// a canvas-sized write asks the device for a canvas-sized buffer: 400 MB
+    /// on a 10000² document, well past the 256 MB `downlevel_defaults` says a
+    /// buffer may be. The reader was banded for exactly that and the writer was
+    /// not, which is the asymmetry this closes. `band_rows` returns the whole
+    /// rectangle whenever it fits, so an ordinary document takes the same
+    /// single `write_texture` it always did.
+    ///
+    /// **A staging buffer is not released at submit, it is released on that
+    /// submission's fence**, so it is not enough to submit between bands: the
+    /// bytes stand until the GPU has consumed them. wgpu triages finished
+    /// submissions with a non-blocking poll at the end of every `submit`, so a
+    /// GPU keeping up retires each band as the next is written — but that is a
+    /// statement about a machine, not a bound. Where the rectangle actually had
+    /// to be banded this therefore **waits** for each band, which makes the
+    /// staging held at any instant exactly one band. That is a blocking call
+    /// and it is confined to the case that earns it: a slice too large for one
+    /// buffer, which today is an import or an undo on a very large canvas, both
+    /// of them paths where the artist is already waiting. Where nothing was
+    /// banded nothing waits.
+    ///
+    /// Why it matters more than the megabytes suggest: `StagingBuffer::new`
+    /// reports a failed allocation through wgpu's *fatal* `handle_hal_error`,
+    /// which no error scope can catch and which loses the device outright. What
+    /// is being bounded is whether the document opens at all.
+    ///
+    /// **A loop of these still accumulates, and the caller has to know it.**
+    /// The submits here bound one call; several calls with nothing between them
+    /// hold every one of their last bands until the GPU catches up. `App::
+    /// install_import` is the loop that made this visible — twenty-one layers
+    /// of a hundred-megapixel document held 8.4 GB of staging on top of an
+    /// 8.4 GB layer array — and `App::swap_patch` is a second one, bounded by
+    /// the undo budget rather than by a layer count. Anybody writing a third
+    /// should assume the same.
     pub fn write_layer_rect(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         slot: u32,
         rect: PixelRect,
@@ -7207,17 +7247,45 @@ impl CanvasRenderer {
             );
             return;
         }
-        write_rect(
-            queue,
-            &self.layers.texture,
-            wgpu::Origin3d {
-                x: rect.x,
-                y: rect.y,
-                z: slot,
-            },
-            rect,
-            bytes,
-        );
+
+        // The staging cost is the *padded* row, because wgpu repacks the
+        // caller's tightly packed rows to the copy alignment on the way in.
+        // `bytes` itself is tight, which is what `stride` below steps by.
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = (rect.width * 4).div_ceil(align) * align;
+        let band = band_rows(self.readback_limit, padded, rect.height);
+        let banded = band < rect.height;
+
+        let stride = (rect.width as usize) * 4;
+        let mut first = 0;
+        while first < rect.height {
+            let rows = band.min(rect.height - first);
+            let start = (first as usize) * stride;
+            write_rect(
+                queue,
+                &self.layers.texture,
+                wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y + first,
+                    z: slot,
+                },
+                PixelRect {
+                    x: rect.x,
+                    y: rect.y + first,
+                    width: rect.width,
+                    height: rows,
+                },
+                &bytes[start..start + (rows as usize) * stride],
+            );
+            // Flushes this band's staging into a submission of its own. On the
+            // unbanded path this is the one call, and it is what stops a loop
+            // of writes holding every layer's staging at once.
+            queue.submit([]);
+            if banded {
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            }
+            first += rows;
+        }
     }
 }
 
