@@ -326,7 +326,7 @@ fn bake_sweep(gpu: &Gpu, size: u32) {
     let rgba: Vec<u8> = std::iter::repeat_n([255u8, 255, 255, 255], (band.area()) as usize)
         .flatten()
         .collect();
-    canvas.write_layer_rect(&gpu.queue, 0, band, &rgba);
+    canvas.write_layer_rect(&gpu.device, &gpu.queue, 0, band, &rgba);
 
     let draw = LayerDraw {
         slot: 0,

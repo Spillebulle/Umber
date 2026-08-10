@@ -1519,7 +1519,7 @@ impl UmberApp {
             log::info!("nothing to cut");
             return;
         };
-        canvas.write_layer_rect(&gfx.gpu.queue, slot, rect, &cut.remainder);
+        canvas.write_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect, &cut.remainder);
         log::info!("cut {} × {}", cut.clip.size().x, cut.clip.size().y);
 
         self.editor.history.record(Edit::new(
@@ -1935,7 +1935,7 @@ impl UmberApp {
         // clearing means in this form.
         let mut buffer = vec![0u8; (union.area() * 4) as usize];
         blit_into(&mut buffer, union, &pixels, new_rect);
-        canvas.write_layer_rect(&gfx.gpu.queue, slot, union, &buffer);
+        canvas.write_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, union, &buffer);
 
         let now = TextObject::new(block, record_face, colour, Placement::of(&xf));
         self.editor.history.record(Edit::new(
@@ -4450,8 +4450,23 @@ impl UmberApp {
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.add_canvas(id, &doc, slots);
             if let Some(canvas) = gfx.canvases.get_mut(&id) {
+                // Each of these submits, and waits per band where the slice is
+                // larger than one staging buffer. Nothing in or after this loop
+                // used to submit at all, and `Queue::write_texture` keeps its
+                // staging until something does, so an N-layer document held N
+                // canvas-sized staging buffers on top of the N slices it was
+                // filling.
+                //
+                // **This bounds the loop, it does not empty it.** A submit hands
+                // the staging to that submission's fence rather than freeing it,
+                // and the unbanded path does not wait — so layers small enough
+                // to fit one buffer each can still stand together until the GPU
+                // catches up. What is gone is the unbounded case. See
+                // `CanvasRenderer::write_layer_rect`, which says the same thing
+                // about any loop of it and not only about this one.
                 for upload in &uploads {
                     canvas.write_layer_rect(
+                        &gfx.gpu.device,
                         &gfx.gpu.queue,
                         upload.slot,
                         umber_core::PixelRect {
@@ -5658,7 +5673,13 @@ fn swap_patch(canvas: &mut CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> Pix
     let rects: Vec<PixelRect> = patch.pieces().iter().map(|p| p.rect).collect();
     let current = canvas.read_layer_pieces(&gpu.device, &gpu.queue, patch.slot, &rects);
     for piece in patch.pieces() {
-        canvas.write_layer_rect(&gpu.queue, patch.slot, piece.rect, &piece.bytes());
+        canvas.write_layer_rect(
+            &gpu.device,
+            &gpu.queue,
+            patch.slot,
+            piece.rect,
+            &piece.bytes(),
+        );
     }
     let pieces = rects
         .iter()

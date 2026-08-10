@@ -2245,12 +2245,27 @@ pub struct CanvasRenderer {
     /// per document: a second would double the staging cost for a job that is
     /// already going to be repeated in five minutes.
     capture: Option<Capture>,
-    /// The largest staging buffer this device will create, in bytes.
+    /// The largest buffer this device will create, in bytes.
     ///
     /// Taken from the device rather than assumed, and honoured by every
-    /// readback here — see [`band_rows`]. Held as a field so a test can lower
-    /// it and drive the banded path on a document small enough to check by
-    /// hand; on a real device it would take a 8192² canvas to reach.
+    /// readback here — see [`band_rows`] — and by
+    /// [`CanvasRenderer::write_layer_rect`]. For a readback it is the *real*
+    /// bound: those go through the validated `create_buffer`. For a write it is
+    /// a **self-imposed proxy**, because a `write_texture` staging buffer is not
+    /// validated against it at all; see `write_layer_rect`.
+    ///
+    /// **It is not the only canvas-sized write in this file, and a comment here
+    /// used to say it was.** `upload_coverage`, reached from `set_selection`,
+    /// puts one byte per document pixel into a coverage texture in a single
+    /// unbanded `write_texture` — 256 MiB of staging for Select All on a 16384²
+    /// canvas and 1.07 GB at 32768², on the same fatal allocation path. It is
+    /// left alone here deliberately: it is a different function with a different
+    /// caller, and one change should not quietly become two. Anybody bounding it
+    /// wants this field and `band_rows` and nothing else new.
+    ///
+    /// Held as a field so a test can lower it and drive the banded path on a
+    /// document small enough to check by hand; on a real device it would take a
+    /// 8192² canvas to reach.
     readback_limit: u64,
 
     dab_bind_group: wgpu::BindGroup,
@@ -5500,8 +5515,18 @@ impl CanvasRenderer {
     /// Record the pass this thumbnail is waiting on, into the frame's encoder.
     ///
     /// Costs one draw over 64² fragments and one 16 KB copy. The draw reads
-    /// every texel of the region exactly once between them, which is the same
-    /// bandwidth the composite pass spends on that layer every frame anyway.
+    /// every texel of the region exactly once between them.
+    ///
+    /// **That used to be compared to "the bandwidth the composite pass spends
+    /// on that layer every frame anyway", and the comparison does not hold.**
+    /// The composite samples once per *surface* fragment; this samples once per
+    /// *canvas* texel, so the two agree only where the canvas is about the size
+    /// of the viewport and diverge with the canvas. It went unnoticed while
+    /// `thumbnail.wgsl`'s tap clamp silently capped the work at 268 M texels a
+    /// pass — which is the same clamp that reported painted layers as empty, so
+    /// removing it made this claim load-bearing and false in one step. The real
+    /// figure is now stated where the clamp is: about 1.07 G texels for the
+    /// bounds pass at 32768 and 1.52 G for the picture pass, once per job.
     pub fn drive_thumb(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         let Some(job) = self.thumb.as_ref() else {
             return;
@@ -7178,8 +7203,63 @@ impl CanvasRenderer {
     }
 
     /// Write a previously captured rectangle back into one layer.
+    ///
+    /// **Goes a band of rows at a time, for the reason every readback here
+    /// does** — see [`band_rows`]. `Queue::write_texture` allocates a staging
+    /// buffer the size of the upload and copies the caller's bytes into it, so
+    /// a canvas-sized write asks for a canvas-sized buffer: 400 MB on a 10000²
+    /// document. The reader was banded for exactly that and the writer was not,
+    /// which is the asymmetry this closes. `band_rows` returns the whole
+    /// rectangle whenever it fits, so an ordinary document takes the same
+    /// single `write_texture` it always did.
+    ///
+    /// **`readback_limit` is a self-imposed proxy on this side, not a limit the
+    /// allocation is checked against**, and the first draft of this comment got
+    /// that wrong in exactly the way the thumbnail commit beside it is fixing —
+    /// a real bound explained by a mechanism that does not apply.
+    /// `StagingBuffer::new` goes straight to the HAL, with no `max_buffer_size`
+    /// check anywhere on the path, so a 400 MB `write_texture` does not fail
+    /// because `downlevel_defaults` says a buffer may be 256 MB; it fails when
+    /// the driver cannot find that much host-visible memory. Which is the whole
+    /// argument for borrowing the reader's figure: what the device *guarantees*
+    /// for one buffer is the only number here anybody has reason to trust, and
+    /// staging that never outruns it is staging no driver has an excuse to
+    /// refuse.
+    ///
+    /// **A staging buffer is not released at submit, it is released on that
+    /// submission's fence**, so it is not enough to submit between bands: the
+    /// bytes stand until the GPU has consumed them. wgpu triages finished
+    /// submissions with a non-blocking poll at the end of every `submit`, so a
+    /// GPU keeping up retires each band as the next is written — but that is a
+    /// statement about a machine, not a bound. Where the rectangle actually had
+    /// to be banded this therefore **waits** for each band, which makes the
+    /// staging held at any instant exactly one band. That is a blocking call
+    /// and it is confined to the case that earns it: a slice too large for one
+    /// buffer, which today is an import or an undo on a very large canvas, both
+    /// of them paths where the artist is already waiting. Where nothing was
+    /// banded nothing waits.
+    ///
+    /// Why it matters more than the megabytes suggest: `StagingBuffer::new`
+    /// reports a failed allocation through `Device::handle_hal_error`, which
+    /// calls `lose` on an out-of-memory as well as on a lost device — so no
+    /// error scope can catch it and the device is gone. (wgpu has a
+    /// `handle_hal_error_with_nonfatal_oom` and this path does not use it.)
+    /// What is being bounded is whether the document opens at all.
+    ///
+    /// **A loop of these still accumulates, and the caller has to know it.**
+    /// The submits here bound one call. Several calls with nothing between them
+    /// hold every one of their last bands until the GPU catches up, and on the
+    /// unbanded path nothing waits — so twenty-one layers that each fit one
+    /// staging buffer can still stand together. `install_import` in `app.rs` is
+    /// the loop that made this visible: twenty-one layers of a hundred-
+    /// megapixel document held 8.4 GB of staging on top of an 8.4 GB layer
+    /// array, every one of those allocations succeeding because nothing
+    /// validates them. `swap_patch` in the same file is a second such loop,
+    /// bounded by the undo budget rather than by a layer count. Anybody writing
+    /// a third should assume the same.
     pub fn write_layer_rect(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         slot: u32,
         rect: PixelRect,
@@ -7207,17 +7287,50 @@ impl CanvasRenderer {
             );
             return;
         }
-        write_rect(
-            queue,
-            &self.layers.texture,
-            wgpu::Origin3d {
+
+        // The staging cost is the *padded* row, because wgpu repacks the
+        // caller's tightly packed rows to the copy alignment on the way in.
+        // `bytes` itself is tight, which is what `stride` below steps by.
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = (rect.width * 4).div_ceil(align) * align;
+        let band = band_rows(self.readback_limit, padded, rect.height);
+        let banded = band < rect.height;
+
+        let stride = (rect.width as usize) * 4;
+        let mut first = 0;
+        while first < rect.height {
+            let rows = band.min(rect.height - first);
+            let start = (first as usize) * stride;
+            let at = wgpu::Origin3d {
                 x: rect.x,
-                y: rect.y,
+                y: rect.y + first,
                 z: slot,
-            },
-            rect,
-            bytes,
-        );
+            };
+            write_rect(
+                queue,
+                &self.layers.texture,
+                at,
+                // `write_rect` reads only the width and the height off this —
+                // where the band lands is `at`'s. Bound to one name and stated,
+                // because two expressions for the same row would be one edit
+                // away from disagreeing about it.
+                PixelRect {
+                    x: at.x,
+                    y: at.y,
+                    width: rect.width,
+                    height: rows,
+                },
+                &bytes[start..start + (rows as usize) * stride],
+            );
+            // Flushes this band's staging into a submission of its own. On the
+            // unbanded path this is the one call, and it is what stops a loop
+            // of writes holding every layer's staging at once.
+            queue.submit([]);
+            if banded {
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            }
+            first += rows;
+        }
     }
 }
 
@@ -8141,6 +8254,104 @@ mod tests {
     /// one file the constant and the arrays are declared in.
     const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
     const EFFECT_WGSL: &str = include_str!("../shaders/effect.wgsl");
+    const THUMBNAIL_WGSL: &str = include_str!("../shaders/thumbnail.wgsl");
+
+    /// The `MAX_TAPS` the thumbnail shader compiles, as an integer.
+    ///
+    /// Parsed out of the WGSL for the reason [`shader_max_draws`] is: nothing in
+    /// Rust can name a constant that is a string until naga sees it. Strict
+    /// about the shape of the line, so a parse that quietly failed and answered
+    /// a default could not agree with whatever it was compared against.
+    ///
+    /// Anchored to the start of a line and required to appear **once**. The
+    /// declaration is preceded by forty lines of comment arguing about it, and a
+    /// comment that quoted the line would otherwise be what got parsed — the
+    /// failure `windows_registration_offers_umber_without_taking_the_file_type`
+    /// hit by scanning WiX that argues for itself.
+    fn shader_max_taps() -> u64 {
+        const NEEDLE: &str = "\nconst MAX_TAPS: i32 = ";
+        assert_eq!(
+            THUMBNAIL_WGSL.matches(NEEDLE).count(),
+            1,
+            "thumbnail.wgsl declares `MAX_TAPS` other than exactly once at a line start"
+        );
+        let at = THUMBNAIL_WGSL
+            .find(NEEDLE)
+            .expect("thumbnail.wgsl no longer declares `const MAX_TAPS: i32 = ...`");
+        let rest = &THUMBNAIL_WGSL[at + NEEDLE.len()..];
+        let end = rest
+            .find(';')
+            .expect("`MAX_TAPS` is no longer a literal ending in `;`");
+        rest[..end]
+            .trim()
+            .parse()
+            .expect("`MAX_TAPS` is not a plain decimal literal")
+    }
+
+    /// **The thumbnail passes visit every texel on every canvas Umber admits**,
+    /// and this is what says so.
+    ///
+    /// `thumbnail.wgsl` clamps the taps per destination texel at `MAX_TAPS` and
+    /// steps over the rest. That is fine as a bound on a pathological loop and
+    /// ruinous as a filter: the bounds pass reduces by **maximum** so that a
+    /// one-pixel line survives being shrunk into a cell, and a step of two
+    /// visits every other column, so the line falls between the taps and a
+    /// painted layer comes back reported as empty.
+    ///
+    /// It was reachable. The comment at that constant argued the clamp could
+    /// never be hit because a canvas over 16384 wide is past
+    /// `max_texture_dimension_2d` — but [`Gpu::using_resolution`] raises exactly
+    /// that limit from the adapter, `Document::MAX_EDGE` is 32768, and an RTX
+    /// 3080 on Vulkan reports 32768. `using_resolution` has now caused three
+    /// bugs by looking as though it raises a limit it does not, or does not
+    /// raise one it does; see the note in `CLAUDE.md`.
+    ///
+    /// **The worst case is the picture pass, not the bounds pass**, which is why
+    /// the arithmetic is here rather than left as a sentence. The bounds pass
+    /// reduces the whole slice, so a texel spans `MAX_EDGE / SIZE`; the picture
+    /// pass reduces what [`umber_core::thumbnail::framed`] chose, which is the
+    /// content inflated by `1 / (1 - 2 * PADDING)` so the mark clears the edge of
+    /// the chip — and content can be the whole canvas. That one bites from a
+    /// content box of about 13710 px, inside 16384 and therefore reachable on
+    /// every device that caps there.
+    ///
+    /// What this does **not** cover: that the shader's own `span` is the
+    /// expression computed below. That is one file away and the only reading of
+    /// it available in Rust is the text. The behavioural half is
+    /// `a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found` in
+    /// `gpu_pipeline.rs`, which measures ink rather than arithmetic — and only
+    /// bites on an adapter that will make a canvas past 16384.
+    #[test]
+    fn the_thumbnail_pass_never_steps_over_a_texel_on_any_canvas_umber_admits() {
+        let edge = f64::from(umber_core::Document::MAX_EDGE);
+        let grid = f64::from(umber_core::thumbnail::SIZE);
+        // `framed` writes this as `(1 - 2 * PADDING).max(1e-3)`. The floor is
+        // deliberately not repeated: a `PADDING` at or past 0.5 would make the
+        // two disagree, and it would trip the equalities below rather than pass
+        // — which is the direction to fail in, since a padding that consumed the
+        // whole frame is a different bug entirely.
+        let inflation = 1.0 / (1.0 - 2.0 * f64::from(umber_core::thumbnail::PADDING));
+
+        // `first` is a floor and `last` a ceil, so a span reaches one past the
+        // exact quotient on each side; taking one whole extra texel is the
+        // cheap bound and is never short of the real one.
+        let bounds_pass = (edge / grid).ceil() as u64 + 1;
+        let picture_pass = (edge * inflation / grid).ceil() as u64 + 1;
+        let worst = bounds_pass.max(picture_pass);
+
+        // The figures the comment at `MAX_TAPS` quotes, so a change to
+        // `MAX_EDGE`, `SIZE` or `PADDING` makes that prose red rather than
+        // merely stale.
+        assert_eq!(bounds_pass, 513, "the bounds pass's worst span moved");
+        assert_eq!(picture_pass, 611, "the picture pass's worst span moved");
+
+        assert!(
+            shader_max_taps() >= worst,
+            "thumbnail.wgsl steps over texels on a canvas Umber admits: \
+             MAX_TAPS is {}, and a destination texel spans up to {worst}",
+            shader_max_taps(),
+        );
+    }
 
     /// **Every shape the planner can ask for is a shape the shader names**, and
     /// with the same number.

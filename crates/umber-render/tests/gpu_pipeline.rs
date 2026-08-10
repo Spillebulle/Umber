@@ -232,24 +232,11 @@ impl Harness {
         self.canvas.set_background(background);
     }
 
-    /// Read a layer thumbnail through the real two-pass, non-blocking path.
-    ///
-    /// The loop is what the frame loop does: record whatever pass is due,
-    /// submit, map, collect. Bounded because a job that never answers is a hang
-    /// rather than a failure, which is the worst way for CI to break.
+    /// This harness's canvas, through [`thumbnail_of`] — which is where the
+    /// loop and its reasoning live, because one test drives a renderer of its
+    /// own.
     fn thumbnail(&mut self, slot: u32) -> Thumbnail {
-        assert!(self.canvas.begin_thumb(slot), "a thumbnail was in flight");
-        for _ in 0..64 {
-            let mut enc = self.encoder();
-            self.canvas.drive_thumb(&self.gpu.device, &mut enc);
-            self.gpu.queue.submit(Some(enc.finish()));
-            self.canvas.submit_thumb();
-            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
-            if let Some(thumb) = self.canvas.take_thumb(&self.gpu.device) {
-                return thumb;
-            }
-        }
-        panic!("the thumbnail never came home");
+        thumbnail_of(self.gpu, &mut self.canvas, slot)
     }
 
     /// Put an exact block of bytes into a layer.
@@ -266,7 +253,7 @@ impl Harness {
             .take((rect.area() * 4) as usize)
             .collect();
         self.canvas
-            .write_layer_rect(&self.gpu.queue, slot, rect, &bytes);
+            .write_layer_rect(&self.gpu.device, &self.gpu.queue, slot, rect, &bytes);
     }
 
     /// Paint a slot solid with `color` around the sample point.
@@ -2542,7 +2529,8 @@ fn layer_readback_and_writeback_round_trip() {
     h.gpu.queue.submit(Some(enc.finish()));
     assert_eq!(h.pixel(32, 32)[3], 0);
 
-    h.canvas.write_layer_rect(&h.gpu.queue, 0, rect, &saved);
+    h.canvas
+        .write_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect, &saved);
     assert_eq!(h.pixel(32, 32)[3], 255, "undo restore lost the pixels");
 }
 
@@ -2587,7 +2575,7 @@ fn a_cut_leaves_the_layer_holding_exactly_what_it_did_not_take() {
         .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect);
     let cut = umber_core::Clip::cut_from_layer(rect, &before, Some(&selection)).expect("a cut");
     h.canvas
-        .write_layer_rect(&h.gpu.queue, 0, rect, &cut.remainder);
+        .write_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect, &cut.remainder);
 
     let after = h
         .canvas
@@ -2898,6 +2886,7 @@ fn a_mask_hides_what_it_covers() {
     // sRGB 188 is linear ~0.5.
     fill_slot(&mut h, 1, [255, 255, 255, 255]);
     h.canvas.write_layer_rect(
+        &h.gpu.device,
         &h.gpu.queue,
         1,
         PixelRect {
@@ -2909,6 +2898,7 @@ fn a_mask_hides_what_it_covers() {
         &[0u8, 0, 0, 255].repeat((20 * DOC) as usize),
     );
     h.canvas.write_layer_rect(
+        &h.gpu.device,
         &h.gpu.queue,
         1,
         PixelRect {
@@ -3175,6 +3165,7 @@ fn a_masked_layer_clips_what_is_clipped_to_it() {
     // The base's mask: white on the left, black on the right.
     fill_slot(&mut h, 1, [255, 255, 255, 255]);
     h.canvas.write_layer_rect(
+        &h.gpu.device,
         &h.gpu.queue,
         1,
         PixelRect {
@@ -3740,7 +3731,7 @@ fn a_layer_copy_beyond_the_array_is_refused_rather_than_fatal() {
         .canvas
         .read_layer_rect(&h.gpu.device, &h.gpu.queue, beyond, rect);
     h.canvas
-        .write_layer_rect(&h.gpu.queue, beyond, rect, &bytes);
+        .write_layer_rect(&h.gpu.device, &h.gpu.queue, beyond, rect, &bytes);
     let error = pollster::block_on(scope.pop());
     assert!(
         error.is_none(),
@@ -4239,6 +4230,87 @@ fn a_document_too_large_for_one_staging_buffer_is_read_back_in_bands() {
     );
 }
 
+/// **A banded write puts the same pixels down as an unbanded one.**
+///
+/// `write_layer_rect` now bands for the reason every readback here does: a
+/// canvas-sized `write_texture` asks the device for a canvas-sized staging
+/// buffer, which is 400 MB on a 10000² document against the 256 MB
+/// `downlevel_defaults` allows, and a failed staging allocation is fatal rather
+/// than catchable. The reader was banded and the writer was not.
+///
+/// What can go wrong in the *arithmetic* is what this measures: the same bytes
+/// are written twice, once whole and once in five bands, and the two slices
+/// have to come back identical. A band written to the wrong row, a source
+/// offset stepping by the padded stride instead of the tight one, or a last
+/// band sized from the wrong end all show up here and in nothing else. Driven
+/// by lowering the limit, exactly as the readback above is, because reaching
+/// the real one needs a canvas no CI runner can hold.
+///
+/// **It does not cover the submit or the wait, which are the point of the
+/// change**, and saying so is better than letting the name imply otherwise:
+/// delete both `queue.submit([])` and the `device.poll` and this stays green,
+/// because the pixels are identical either way. What those two lines bound is
+/// how much staging is alive at once, which is a property of the allocator and
+/// not of any picture — there is nothing to read back and no adapter-independent
+/// figure to assert. They are held by the argument at `write_layer_rect`
+/// instead, and by there being one place that writes a band.
+///
+/// The rectangle is deliberately awkward — off the origin, an odd width whose
+/// row is not a multiple of the copy alignment, and a height that leaves a
+/// short final band. A rectangle that divided evenly would leave the case that
+/// actually breaks untested.
+#[test]
+fn a_banded_layer_write_lands_exactly_where_an_unbanded_one_does() {
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+
+    let rect = PixelRect {
+        x: 5,
+        y: 7,
+        width: 53,
+        height: 41,
+    };
+    // Every pixel different, so a band landing one row out is a mismatch rather
+    // than a coincidence.
+    let pixels: Vec<u8> = (0..(rect.area() * 4) as usize)
+        .map(|i| (i * 31 + 7) as u8)
+        .collect();
+
+    // The truth: one `write_texture`, at the device's own limit.
+    h.canvas
+        .write_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect, &pixels);
+    let whole = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect);
+
+    let padded = (rect.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let rows = 9;
+    assert!(
+        rows < rect.height && !rect.height.is_multiple_of(rows),
+        "the fixture has to band, and to leave a short last band"
+    );
+    h.canvas.set_readback_limit((padded * rows) as u64);
+
+    h.canvas
+        .write_layer_rect(&h.gpu.device, &h.gpu.queue, 1, rect, &pixels);
+    // Read through the same banded path on both sides of the comparison would
+    // hide a read bug; that one is already pinned by the test above, so this
+    // reads slot 1 banded and re-reads slot 0 the same way. Slot 0's bytes were
+    // put down whole, so the two differing can only be the *write*.
+    let banded = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 1, rect);
+    let whole_reread = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect);
+
+    assert_eq!(whole_reread, whole, "the banded read moved the truth");
+    assert_eq!(
+        banded, whole,
+        "a banded layer write put different pixels down"
+    );
+}
+
 #[test]
 fn a_capture_of_a_large_document_never_costs_a_frame() {
     // The measurement the whole feature rests on. A save's blocking readback is
@@ -4500,7 +4572,8 @@ fn a_transform_lands_where_the_maths_says_and_undo_restores_both_ends() {
 
     // One patch, both ends. A patch covering only where the pixels went would
     // undo to a document that still had the hole in it.
-    h.canvas.write_layer_rect(&h.gpu.queue, 0, damage, &before);
+    h.canvas
+        .write_layer_rect(&h.gpu.device, &h.gpu.queue, 0, damage, &before);
     assert_eq!(h.pixel(12, 12), red, "undo did not restore the source");
     assert_eq!(h.pixel(32, 32), [0, 0, 0, 0], "undo left the copy behind");
 }
@@ -5226,8 +5299,33 @@ fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
             if i % 4 == 3 { 255 } else { (seed >> 24) as u8 }
         })
         .collect();
-    canvas.write_layer_rect(&gpu.queue, 0, whole_of(side), &pixels);
+    canvas.write_layer_rect(&gpu.device, &gpu.queue, 0, whole_of(side), &pixels);
     canvas
+}
+
+/// Read a layer thumbnail through the real two-pass, non-blocking path.
+///
+/// The loop is what the frame loop does: record whatever pass is due, submit,
+/// map, collect. Bounded because a job that never answers is a hang rather than
+/// a failure, which is the worst way for CI to break. A free function rather
+/// than only a `Harness` method because the wide-canvas test below drives a
+/// renderer of its own, and two copies of this loop is two things to keep in
+/// step about which pass is due when.
+fn thumbnail_of(gpu: &Gpu, canvas: &mut CanvasRenderer, slot: u32) -> Thumbnail {
+    assert!(canvas.begin_thumb(slot), "a thumbnail was in flight");
+    for _ in 0..64 {
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.drive_thumb(&gpu.device, &mut enc);
+        gpu.queue.submit(Some(enc.finish()));
+        canvas.submit_thumb();
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(thumb) = canvas.take_thumb(&gpu.device) {
+            return thumb;
+        }
+    }
+    panic!("the thumbnail never came home");
 }
 
 fn whole_of(side: u32) -> PixelRect {
@@ -5333,7 +5431,7 @@ fn an_undo_restores_every_pixel_a_tiled_stroke_changed() {
     assert_ne!(painted, before, "the stroke painted nothing");
 
     for (piece, bytes) in pieces.iter().zip(&patch) {
-        canvas.write_layer_rect(&gpu.queue, 0, *piece, bytes);
+        canvas.write_layer_rect(&gpu.device, &gpu.queue, 0, *piece, bytes);
     }
     let restored = canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, whole_of(SIDE));
 
@@ -5426,7 +5524,7 @@ fn a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly() {
     let second: Vec<u8> = (0..(SIDE as usize * SIDE as usize * 4))
         .map(|i| if i % 4 == 3 { 255 } else { (i * 7) as u8 })
         .collect();
-    canvas.write_layer_rect(&gpu.queue, 1, whole_of(SIDE), &second);
+    canvas.write_layer_rect(&gpu.device, &gpu.queue, 1, whole_of(SIDE), &second);
 
     let before: Vec<Vec<u8>> = (0..2)
         .map(|slot| canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE)))
@@ -5524,6 +5622,91 @@ fn a_thumbnail_shows_the_layers_content_and_not_the_whole_canvas() {
     // which is the form `Color32::from_rgba_unmultiplied` is handed.
     let mid = (side / 2 * side + side / 2) * 4;
     assert_eq!(&px[mid..mid + 3], &[255, 0, 0]);
+}
+
+/// **A one-pixel column on a very wide canvas is still found**, which is the
+/// behavioural half of `the_thumbnail_pass_never_steps_over_a_texel_on_any_
+/// canvas_umber_admits` in `canvas.rs`.
+///
+/// The bounds pass reduces by maximum precisely so that a sketch survives being
+/// shrunk into a 64-square, and `MAX_TAPS` used to undo that on a wide canvas:
+/// past a span of 256 source texels per destination texel the loop stepped, so
+/// it visited every other column and a thin vertical mark could fall between
+/// the taps entirely. `content_rect` then answered `None` and the row drew the
+/// same checker a blank layer draws, on a layer somebody had painted on. That
+/// is not cosmetic on its own terms and it is about to matter more: a scheme
+/// that takes a thumbnail before evicting a layer from VRAM would cache the
+/// wrong answer permanently, because the cache is keyed on a revision that has
+/// stopped moving.
+///
+/// **Two adjacent columns, because one alone proves nothing.** Within a
+/// destination texel a step of two visits `first`, `first + 2`, …, so of any two
+/// neighbouring columns exactly one is visited and exactly one is skipped —
+/// which parity depends on the canvas is not worth reimplementing here, and
+/// asking about both makes the case deterministic without doing so.
+///
+/// **What this does not cover.** It is only a real question on an adapter that
+/// will make a canvas past 16384, since at exactly 16384 the bounds pass's span
+/// is exactly 256 and nothing stepped. That is a Vulkan device with a large
+/// card — an RTX 3080 reports 32768 — and it is *not* WARP, lavapipe, or any
+/// D3D12 or Metal device, all of which cap at 16384. So on CI this passes
+/// without exercising the case, and says so rather than looking like cover it
+/// does not give. The picture pass's own worse bound is what a device capped at
+/// 16384 could reach, and it is pinned by arithmetic rather than by ink.
+#[test]
+fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
+    let h = harness_or_skip!();
+
+    let width = h
+        .gpu
+        .device
+        .limits()
+        .max_texture_dimension_2d
+        .min(umber_core::Document::MAX_EDGE);
+    // Short, so the slice is a few megabytes rather than a few gigabytes: what
+    // is under test is the span along one axis, and the width is that axis.
+    const HEIGHT: u32 = 64;
+
+    let mut canvas = h
+        .canvas
+        .for_document(&h.gpu.device, UVec2::new(width, HEIGHT));
+    let mut enc = h.encoder();
+    canvas.clear_all_layers(&mut enc);
+    canvas.clear_stroke(&mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    let column: Vec<u8> = [255u8, 0, 0, 255].repeat(HEIGHT as usize);
+    for x in [width / 2, width / 2 + 1] {
+        // A fresh slice each time, so the second reading cannot be the first
+        // one's ink still standing.
+        let mut enc = h.encoder();
+        canvas.clear_all_layers(&mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
+
+        canvas.write_layer_rect(
+            &h.gpu.device,
+            &h.gpu.queue,
+            0,
+            PixelRect {
+                x,
+                y: 0,
+                width: 1,
+                height: HEIGHT,
+            },
+            &column,
+        );
+
+        let thumb = thumbnail_of(h.gpu, &mut canvas, 0);
+        assert!(
+            !thumb.is_empty(),
+            "a one-pixel column at x = {x} on a {width}-wide canvas was reported \
+             as an empty layer",
+        );
+        assert!(
+            thumb.rgba.iter().skip(3).step_by(4).any(|a| *a > 0),
+            "the layer was found but its picture holds no ink",
+        );
+    }
 }
 
 /// A layer written to **between** a thumbnail's two passes must not wedge the
