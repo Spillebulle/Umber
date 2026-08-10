@@ -1300,6 +1300,34 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   - The luma weights are W3C's 0.3/0.59/0.11 applied to **linear** colour, which
     is a stated deviation rather than an oversight: every other mode here is
     already not Photoshop's, because the engine blends where it blends.
+- **Add (Glow) is not a blend function, and that is why it is in
+  `composite_over`.** Every other mode is a `B(Cb, Cs)` dropped into the W3C
+  formula; Clip Studio's Add (Glow) changes the *compositing* step — it is
+  Porter-Duff `plus`, a straight addition of premultiplied colour, which is
+  also exactly what `svg:plus` names. So it is the one mode with no SVG *name*
+  that still writes exactly, and it has no `blend_rgb` arm. **It agrees with
+  Add wherever the backdrop is opaque or empty**, derived rather than assumed:
+  at `ab = 1` the general form gives `Cb + as*Cs` and so does `plus`, and at
+  `ab = 0` both give `Sc`. The two can only differ at a soft edge, which is why
+  adding it changed no existing document.
+- **A bitmap bound belongs on *area*, not on a side, and `MAX_DIMENSION` is the
+  wrong ceiling for one.** A `.clip` layer's bitmap is its own rectangle and a
+  layer dragged about reaches past the page; the reader bounded it at twice the
+  longer canvas edge and refused five ordinary raster layers of one real
+  document as "could not read the shape of its bitmap", which reads as damage.
+  Area is what costs, because the work is `columns × rows` inflates — a tall
+  thin bitmap is cheap however far it hangs off. Measured over 5,438 bitmaps in
+  33 documents: worst side 3.75×, worst **area 15.93×**, and that worst is on
+  the *smallest* canvas, because the smaller the page the further a layer
+  reaches past it in relative terms. The per-side bound stays, to stop a bitmap
+  one pixel tall and a billion wide passing on area, but it is four times the
+  largest canvas rather than `MAX_DIMENSION` — one real file stores a layer
+  19712 px across.
+- **A floor can hide the bound you meant to test.** That fix's first guard used
+  the real document's own 845×1126 on 300², which is 10.57× by area and was
+  admitted by `BITMAP_AREA_FLOOR` whatever the slack — cutting the slack to a
+  quarter left it green. A guard has to be sized past *every* clause of the
+  rule it claims to drive, not just the one that motivated it.
 - **A widened enum silently breaks a fixed-width control.** `DropdownWidth::
   Exact` does not grow to fit its label, so the layer row's picker clipped
   "Colour Dodge" — its `BLEND_WIDTH` had been sized for "Multiply, the longest
