@@ -12,6 +12,61 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.2 — 2026-08-10
+
+Clip Studio documents that used to be refused now open, your files show their
+artwork in the file manager instead of a blank page icon, and Umber has every
+blend mode Photoshop and Clip Studio do.
+
+### New
+
+- **Thumbnails in the file manager**, on Windows and Linux. A folder of `.clip`,
+  `.kra`, `.psd` or `.ora` files shows the pictures rather than a row of
+  identical page icons. Umber reads the preview each file already carries, so it
+  is quick and it never has to open the document.
+- **Umber appears in "Open with"**, and double-clicking a document opens it.
+  Umber is added as a choice rather than taking the file type over, so whatever
+  opens your `.psd` files today still does.
+- **Every blend mode.** Twenty-four of them, including Soft Light, the four
+  colour modes and Clip Studio's Add (Glow). Soft Light in particular used to
+  arrive as Overlay, which looks quite different.
+- **A progress bar while a document loads.** Opening a large file used to freeze
+  the window for as long as it took. It now reads the file in the background and
+  tells you which layer it is on.
+- **Canvases up to 32768 pixels**, where your graphics card allows it. The New
+  document dialog offers what your machine can actually hold and says so when
+  that is less. Bear in mind one layer that size is over four gigabytes, so a
+  canvas that large holds very few of them.
+
+### Fixed
+
+- **Large Clip Studio documents opened.** A 15000 x 5000 file was refused with
+  "the canvas is larger than Umber can open" when the canvas was well inside the
+  limit. The real limit was on the whole stack, the message named the wrong
+  thing, and folders were counted as though they held pixels.
+- **Layers that hang off the page arrive.** Five layers of one document were
+  dropped as unreadable because Clip Studio had stored them larger than the
+  canvas, which is ordinary.
+- **The paper layer comes across.** Every Clip Studio document opened on
+  transparency where the artist had white paper behind their drawing.
+- **A canvas measured in centimetres opens at its real size.** An A4 page at 600
+  dpi arrived as a 21 x 29 pixel canvas and was then refused as empty.
+- **A vector layer says what it is.** It used to report that the file did not
+  hold its pixels, which reads like a damaged file. Clip Studio keeps vector
+  layers as strokes; rasterise one before saving and it comes across.
+- **The crash box** has the sad cat on it, and its padding is even.
+
+### Known limits
+
+- Vector layers and adjustment layers still arrive as a note rather than as
+  pixels. Both are named when the document opens.
+- A folder's own opacity is folded into its layers, which is exact unless the
+  layers inside it overlap.
+- A document needing more memory than your graphics card has will still stop
+  Umber rather than being refused politely.
+- macOS has neither thumbnails nor "Open with" yet. Both need Umber to ship as a
+  proper `.app` bundle first.
+
 ## 0.1.1 — 2026-08-09
 
 Clip Studio Paint documents open, there is an eyedropper that reaches the whole
