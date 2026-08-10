@@ -238,18 +238,7 @@ impl Harness {
     /// submit, map, collect. Bounded because a job that never answers is a hang
     /// rather than a failure, which is the worst way for CI to break.
     fn thumbnail(&mut self, slot: u32) -> Thumbnail {
-        assert!(self.canvas.begin_thumb(slot), "a thumbnail was in flight");
-        for _ in 0..64 {
-            let mut enc = self.encoder();
-            self.canvas.drive_thumb(&self.gpu.device, &mut enc);
-            self.gpu.queue.submit(Some(enc.finish()));
-            self.canvas.submit_thumb();
-            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
-            if let Some(thumb) = self.canvas.take_thumb(&self.gpu.device) {
-                return thumb;
-            }
-        }
-        panic!("the thumbnail never came home");
+        thumbnail_of(self.gpu, &mut self.canvas, slot)
     }
 
     /// Put an exact block of bytes into a layer.
@@ -5307,6 +5296,31 @@ fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
     canvas
 }
 
+/// Read a layer thumbnail through the real two-pass, non-blocking path.
+///
+/// The loop is what the frame loop does: record whatever pass is due, submit,
+/// map, collect. Bounded because a job that never answers is a hang rather than
+/// a failure, which is the worst way for CI to break. A free function rather
+/// than only a `Harness` method because the wide-canvas test below drives a
+/// renderer of its own, and two copies of this loop is two things to keep in
+/// step about which pass is due when.
+fn thumbnail_of(gpu: &Gpu, canvas: &mut CanvasRenderer, slot: u32) -> Thumbnail {
+    assert!(canvas.begin_thumb(slot), "a thumbnail was in flight");
+    for _ in 0..64 {
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.drive_thumb(&gpu.device, &mut enc);
+        gpu.queue.submit(Some(enc.finish()));
+        canvas.submit_thumb();
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(thumb) = canvas.take_thumb(&gpu.device) {
+            return thumb;
+        }
+    }
+    panic!("the thumbnail never came home");
+}
+
 fn whole_of(side: u32) -> PixelRect {
     PixelRect {
         x: 0,
@@ -5601,6 +5615,91 @@ fn a_thumbnail_shows_the_layers_content_and_not_the_whole_canvas() {
     // which is the form `Color32::from_rgba_unmultiplied` is handed.
     let mid = (side / 2 * side + side / 2) * 4;
     assert_eq!(&px[mid..mid + 3], &[255, 0, 0]);
+}
+
+/// **A one-pixel column on a very wide canvas is still found**, which is the
+/// behavioural half of `the_thumbnail_pass_never_steps_over_a_texel_on_any_
+/// canvas_umber_admits` in `canvas.rs`.
+///
+/// The bounds pass reduces by maximum precisely so that a sketch survives being
+/// shrunk into a 64-square, and `MAX_TAPS` used to undo that on a wide canvas:
+/// past a span of 256 source texels per destination texel the loop stepped, so
+/// it visited every other column and a thin vertical mark could fall between
+/// the taps entirely. `content_rect` then answered `None` and the row drew the
+/// same checker a blank layer draws, on a layer somebody had painted on. That
+/// is not cosmetic on its own terms and it is about to matter more: a scheme
+/// that takes a thumbnail before evicting a layer from VRAM would cache the
+/// wrong answer permanently, because the cache is keyed on a revision that has
+/// stopped moving.
+///
+/// **Two adjacent columns, because one alone proves nothing.** Within a
+/// destination texel a step of two visits `first`, `first + 2`, …, so of any two
+/// neighbouring columns exactly one is visited and exactly one is skipped —
+/// which parity depends on the canvas is not worth reimplementing here, and
+/// asking about both makes the case deterministic without doing so.
+///
+/// **What this does not cover.** It is only a real question on an adapter that
+/// will make a canvas past 16384, since at exactly 16384 the bounds pass's span
+/// is exactly 256 and nothing stepped. That is a Vulkan device with a large
+/// card — an RTX 3080 reports 32768 — and it is *not* WARP, lavapipe, or any
+/// D3D12 or Metal device, all of which cap at 16384. So on CI this passes
+/// without exercising the case, and says so rather than looking like cover it
+/// does not give. The picture pass's own worse bound is what a device capped at
+/// 16384 could reach, and it is pinned by arithmetic rather than by ink.
+#[test]
+fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
+    let Some(h) = Harness::new() else { return };
+
+    let width = h
+        .gpu
+        .device
+        .limits()
+        .max_texture_dimension_2d
+        .min(umber_core::Document::MAX_EDGE);
+    // Short, so the slice is a few megabytes rather than a few gigabytes: what
+    // is under test is the span along one axis, and the width is that axis.
+    const HEIGHT: u32 = 64;
+
+    let mut canvas = h
+        .canvas
+        .for_document(&h.gpu.device, UVec2::new(width, HEIGHT));
+    let mut enc = h.encoder();
+    canvas.clear_all_layers(&mut enc);
+    canvas.clear_stroke(&mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    let column: Vec<u8> = [255u8, 0, 0, 255].repeat(HEIGHT as usize);
+    for x in [width / 2, width / 2 + 1] {
+        // A fresh slice each time, so the second reading cannot be the first
+        // one's ink still standing.
+        let mut enc = h.encoder();
+        canvas.clear_all_layers(&mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
+
+        canvas.write_layer_rect(
+            &h.gpu.device,
+            &h.gpu.queue,
+            0,
+            PixelRect {
+                x,
+                y: 0,
+                width: 1,
+                height: HEIGHT,
+            },
+            &column,
+        );
+
+        let thumb = thumbnail_of(h.gpu, &mut canvas, 0);
+        assert!(
+            !thumb.is_empty(),
+            "a one-pixel column at x = {x} on a {width}-wide canvas was reported \
+             as an empty layer",
+        );
+        assert!(
+            thumb.rgba.iter().skip(3).step_by(4).any(|a| *a > 0),
+            "the layer was found but its picture holds no ink",
+        );
+    }
 }
 
 /// A layer written to **between** a thumbnail's two passes must not wedge the

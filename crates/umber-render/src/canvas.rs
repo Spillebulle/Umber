@@ -8209,6 +8209,88 @@ mod tests {
     /// one file the constant and the arrays are declared in.
     const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
     const EFFECT_WGSL: &str = include_str!("../shaders/effect.wgsl");
+    const THUMBNAIL_WGSL: &str = include_str!("../shaders/thumbnail.wgsl");
+
+    /// The `MAX_TAPS` the thumbnail shader compiles, as an integer.
+    ///
+    /// Parsed out of the WGSL for the reason [`shader_max_draws`] is: nothing in
+    /// Rust can name a constant that is a string until naga sees it. Strict
+    /// about the shape of the line, so a parse that quietly failed and answered
+    /// a default could not agree with whatever it was compared against.
+    fn shader_max_taps() -> u64 {
+        const NEEDLE: &str = "const MAX_TAPS: i32 = ";
+        let at = THUMBNAIL_WGSL
+            .find(NEEDLE)
+            .expect("thumbnail.wgsl no longer declares `const MAX_TAPS: i32 = ...`");
+        let rest = &THUMBNAIL_WGSL[at + NEEDLE.len()..];
+        let end = rest
+            .find(';')
+            .expect("`MAX_TAPS` is no longer a literal ending in `;`");
+        rest[..end]
+            .trim()
+            .parse()
+            .expect("`MAX_TAPS` is not a plain decimal literal")
+    }
+
+    /// **The thumbnail passes visit every texel on every canvas Umber admits**,
+    /// and this is what says so.
+    ///
+    /// `thumbnail.wgsl` clamps the taps per destination texel at `MAX_TAPS` and
+    /// steps over the rest. That is fine as a bound on a pathological loop and
+    /// ruinous as a filter: the bounds pass reduces by **maximum** so that a
+    /// one-pixel line survives being shrunk into a cell, and a step of two
+    /// visits every other column, so the line falls between the taps and a
+    /// painted layer comes back reported as empty.
+    ///
+    /// It was reachable. The comment at that constant argued the clamp could
+    /// never be hit because a canvas over 16384 wide is past
+    /// `max_texture_dimension_2d` — but [`Gpu::using_resolution`] raises exactly
+    /// that limit from the adapter, `Document::MAX_EDGE` is 32768, and an RTX
+    /// 3080 on Vulkan reports 32768. `using_resolution` has now caused three
+    /// bugs by looking as though it raises a limit it does not, or does not
+    /// raise one it does; see the note in `CLAUDE.md`.
+    ///
+    /// **The worst case is the picture pass, not the bounds pass**, which is why
+    /// the arithmetic is here rather than left as a sentence. The bounds pass
+    /// reduces the whole slice, so a texel spans `MAX_EDGE / SIZE`; the picture
+    /// pass reduces what [`umber_core::thumbnail::framed`] chose, which is the
+    /// content inflated by `1 / (1 - 2 * PADDING)` so the mark clears the edge of
+    /// the chip — and content can be the whole canvas. That one bites from a
+    /// content box of about 13710 px, inside 16384 and therefore reachable on
+    /// every device that caps there.
+    ///
+    /// What this does **not** cover: that the shader's own `span` is the
+    /// expression computed below. That is one file away and the only reading of
+    /// it available in Rust is the text. The behavioural half is
+    /// `a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found` in
+    /// `gpu_pipeline.rs`, which measures ink rather than arithmetic — and only
+    /// bites on an adapter that will make a canvas past 16384.
+    #[test]
+    fn the_thumbnail_pass_never_steps_over_a_texel_on_any_canvas_umber_admits() {
+        let edge = f64::from(umber_core::Document::MAX_EDGE);
+        let grid = f64::from(umber_core::thumbnail::SIZE);
+        let inflation = 1.0 / (1.0 - 2.0 * f64::from(umber_core::thumbnail::PADDING));
+
+        // `first` is a floor and `last` a ceil, so a span reaches one past the
+        // exact quotient on each side; taking one whole extra texel is the
+        // cheap bound and is never short of the real one.
+        let bounds_pass = (edge / grid).ceil() as u64 + 1;
+        let picture_pass = (edge * inflation / grid).ceil() as u64 + 1;
+        let worst = bounds_pass.max(picture_pass);
+
+        // The figures the comment at `MAX_TAPS` quotes, so a change to
+        // `MAX_EDGE`, `SIZE` or `PADDING` makes that prose red rather than
+        // merely stale.
+        assert_eq!(bounds_pass, 513, "the bounds pass's worst span moved");
+        assert_eq!(picture_pass, 611, "the picture pass's worst span moved");
+
+        assert!(
+            shader_max_taps() >= worst,
+            "thumbnail.wgsl steps over texels on a canvas Umber admits: \
+             MAX_TAPS is {}, and a destination texel spans up to {worst}",
+            shader_max_taps(),
+        );
+    }
 
     /// **Every shape the planner can ask for is a shape the shader names**, and
     /// with the same number.

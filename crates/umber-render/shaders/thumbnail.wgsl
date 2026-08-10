@@ -40,10 +40,41 @@ struct Thumb {
 //
 // A full box filter reads every texel of the slice exactly once across the whole
 // target, which is the same bandwidth the composite pass spends every frame — so
-// this is a bound on pathological loops rather than a budget. At 64 texels of
-// destination it is reached only by a canvas over 16384 wide, which is past
-// `max_texture_dimension_2d` on the limits Umber requests.
-const MAX_TAPS: i32 = 256;
+// this is a bound on pathological loops rather than a budget. **Stepping is not
+// a cheaper filter, it is a wrong answer**: the bounds pass reduces by maximum
+// precisely so a one-pixel line survives, and a step of two visits every other
+// column, so that line falls between the taps and the layer reports empty. A
+// painted layer drawing a blank thumbnail is what that looks like.
+//
+// So the constant has to be past the widest span any canvas Umber admits can
+// produce, and it is. **It was not, and the comment that stood here explained
+// why in a way that was false.** It said the clamp was reached only by a canvas
+// over 16384 wide, "which is past `max_texture_dimension_2d` on the limits Umber
+// requests" — but `Gpu::using_resolution` raises exactly that limit from the
+// adapter, and `Document::MAX_EDGE` is 32768. An RTX 3080 on Vulkan reports
+// 32768. A 20000-wide document is one somebody has, and its bounds pass stepped
+// by two.
+//
+// The derivation, at `dest` of `thumbnail::SIZE`:
+//
+//   * the **bounds** pass reduces the whole slice, so a destination texel spans
+//     `MAX_EDGE / SIZE` source texels, plus one for the floor and ceil either
+//     side — 513 at 32768;
+//   * the **picture** pass reduces the region `thumbnail::framed` chose, and
+//     that is the content inflated by `1 / (1 - 2 * PADDING)` so the mark does
+//     not touch the edge of the chip. Content can be the whole canvas, so the
+//     region reaches `MAX_EDGE / (1 - 2 * PADDING)` and the span reaches 611.
+//     **This is the larger of the two and it is the one nobody looked at**: it
+//     bites from a content box of about 13710 px, which is inside 16384 and
+//     therefore reachable on hardware that caps there — every D3D12 and Metal
+//     device, WARP and lavapipe included.
+//
+// 1024 is the next power of two above 611, so a change to `SIZE` or `PADDING`
+// does not silently re-arm the clamp. `the_thumbnail_pass_never_steps_over_a_
+// texel_on_any_canvas_umber_admits` in `canvas.rs` computes the real bound from
+// those constants and reads this line back out of the shader text, which is the
+// only way a WGSL constant can be checked against a Rust one.
+const MAX_TAPS: i32 = 1024;
 
 @group(0) @binding(0) var<uniform> u: Thumb;
 @group(0) @binding(1) var layers: texture_2d_array<f32>;
