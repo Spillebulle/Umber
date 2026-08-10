@@ -781,8 +781,18 @@ pub(crate) fn dialog_frame(p: &Palette) -> Frame {
         .fill(p.popover)
         .stroke(Stroke::new(1.0, p.popover_border))
         .corner_radius(8)
-        .inner_margin(Margin::same(18))
+        .inner_margin(Margin::same(DIALOG_MARGIN as i8))
 }
+
+/// The inset inside [`dialog_frame`].
+///
+/// Named because a caller that makes its content fill the frame has to know it:
+/// `set_min_height(available_height())` runs the content to the bottom of the
+/// space and squeezes this margin off the end, so the box gets its full inset
+/// at the sides and the top and almost none at the bottom. The crash box did
+/// exactly that. Subtracting it is the fix, and it has to be *this* number
+/// rather than a second 18.
+pub(crate) const DIALOG_MARGIN: f32 = 18.0;
 
 /// A dialog button. `strong` marks the one that carries out the action.
 ///

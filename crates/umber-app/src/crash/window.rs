@@ -64,7 +64,7 @@ const FOOTER: f32 = 36.0;
 /// opened.
 const MIN_BODY: f32 = 120.0;
 
-/// The drawing above the heading, as **coverage** rather than as a picture.
+/// The drawing beside the heading, as **coverage** rather than as a picture.
 ///
 /// It is the author's own sad cat, and it is stored as one channel of ink
 /// because a crash box is drawn in whichever of the six themes the artist uses.
@@ -74,7 +74,8 @@ const MIN_BODY: f32 = 120.0;
 /// darkness times the source alpha, which drops the card and the rounded
 /// surround both — and it is tinted with a palette token at draw time. In a
 /// light theme that is the drawing as it was made; in a dark one it is the same
-/// cat in chalk.
+/// cat in chalk. The token is `text_strong`, the heading's own ink, so the
+/// drawing and the words read as one thing.
 ///
 /// 256 px wide, from a 5000 px original, which is 11 KB against 3.2 MB and
 /// still twice [`CAT_WIDTH`] so it stays crisp on a 2× display.
@@ -82,6 +83,20 @@ const CAT: &[u8] = include_bytes!("../../../../assets/crash-cat.png");
 
 /// How wide the cat is drawn, in points. The height follows the picture.
 const CAT_WIDTH: f32 = 128.0;
+
+/// The warning mark's side, and the gap between it and the words.
+///
+/// Named because [`heading`] lays its row out by hand and has to measure the
+/// block before it can place it; two literals in that arithmetic would be two
+/// places for the mark's size to be stated.
+const MARK: f32 = 26.0;
+const MARK_GAP: f32 = 10.0;
+
+/// Space above the heading row.
+///
+/// The dialog frame's own inset puts the row hard under the top edge, which was
+/// tight enough with one line of text and is tighter with a picture beside it.
+const HEADING_TOP: f32 = 10.0;
 
 /// Show the report. Returns once the window has closed.
 pub fn show(report: &Report, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -216,9 +231,13 @@ fn body(
     inset.show(ui, |ui| {
         tabs::dialog_frame(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(ui.available_height());
+            // Less the frame's own bottom inset, which the frame applies after
+            // the content is measured — so filling the available height exactly
+            // leaves nothing for it and the box ends up with its full margin at
+            // the sides and the top and only the outer inset at the bottom.
+            ui.set_min_height(ui.available_height() - tabs::DIALOG_MARGIN);
 
-            heading(ui, p, report, cat_texture);
+            heading(ui, p, cat_texture);
             ui.add_space(12.0);
 
             // The settings dialog's shape, and for its reason: a header, **one**
@@ -275,66 +294,11 @@ fn body(
     });
 }
 
-/// The mark, the heading and the one line of fact under it.
-///
-/// The heading is the application's own voice and is exactly what it says. The
-/// line under it carries the version, because a crash box that does not say
-/// which build broke is a crash box nobody can act on.
-fn heading(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    report: &Report,
-    cat_texture: Option<&egui::TextureHandle>,
-) {
-    // The mark and the words on the left, the drawing on the right, on one
-    // row — so the box opens on what happened and what it is about at once,
-    // and the picture is beside the sentence rather than above it pushing the
-    // sentence down.
-    ui.horizontal(|ui| {
-        // The cat is placed first from the right, so the words take whatever is
-        // left rather than the picture being squeezed by them. `right_to_left`
-        // inside the row is how this file's own footer already does it.
-        let cat_width = cat_texture.map_or(0.0, |_| CAT_WIDTH);
-        let words = (ui.available_width() - cat_width - 12.0).max(80.0);
-
-        ui.vertical(|ui| {
-            ui.set_width(words);
-            ui.horizontal(|ui| {
-                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(26.0), Sense::hover());
-                icons::draw(ui.painter(), mark, Icon::Alert, p.warning);
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Oh no, oopsy")
-                            .size(text::HEADING)
-                            .color(p.text_strong)
-                            .strong(),
-                    );
-                    let version = if report.version.is_empty() {
-                        "Umber stopped unexpectedly".to_string()
-                    } else {
-                        format!("Umber {} stopped unexpectedly", report.version)
-                    };
-                    ui.label(
-                        egui::RichText::new(version)
-                            .size(text::SMALL)
-                            .color(p.text_muted),
-                    );
-                });
-            });
-        });
-
-        if let Some(texture) = cat_texture {
-            cat(ui, p, texture);
-        }
-    });
-}
-
 /// Decode the cat into an egui texture, once.
 ///
 /// The asset is one greyscale channel of coverage; egui wants RGBA, so the ink
 /// becomes the alpha of a white image and the *colour* comes from the tint at
-/// draw time. That is the whole reason it is stored this way — see [`CAT`].
+/// draw time. That is the whole reason it is stored that way — see [`CAT`].
 fn load_cat(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(CAT));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -358,22 +322,85 @@ fn load_cat(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(ctx.load_texture("crash-cat", image, egui::TextureOptions::LINEAR))
 }
 
-/// Draw the cat, centred, above the heading.
-fn cat(ui: &mut egui::Ui, p: &Palette, texture: &egui::TextureHandle) {
-    let size = texture.size_vec2();
-    let height = CAT_WIDTH * size.y / size.x.max(1.0);
-    // Centred by allocating the whole line and putting the picture in the
-    // middle of it, rather than by a layout — the box is one column and this is
-    // the only thing on its row.
-    let (rect, _) = ui.allocate_exact_size(
+/// The box's first row: the mark and the words, and the author's cat.
+///
+/// **Laid out by hand rather than as a row of widgets**, because what is wanted
+/// is a *placement*: the words centred a third in from the left and the picture
+/// a third in from the right, so the two read as one centred group with the gap
+/// between them rather than as two things pushed against opposite edges. An
+/// `ui.horizontal` can put things next to each other and cannot put them
+/// anywhere in particular, and the measuring it would take to do so is most of
+/// this function anyway.
+///
+/// Everything is measured before anything is drawn, which is also what lets the
+/// words sit centred *against the picture*: their height is known, so the block
+/// is placed against the taller of the two rather than hanging off its top.
+///
+/// **The version is deliberately not on this row**, and the box does not lose
+/// it: `Report::details` writes `Umber <version>` as its first line, so it is
+/// in the details block, in the report file and in whatever "Copy details"
+/// puts on the clipboard. This row is the emotional beat; the facts are below
+/// it and in the report.
+fn heading(ui: &mut egui::Ui, p: &Palette, cat_texture: Option<&egui::TextureHandle>) {
+    let title = ui.painter().layout_no_wrap(
+        "Oh no, oopsy".to_owned(),
+        egui::FontId::proportional(text::HEADING),
+        p.text_strong,
+    );
+    // The mark and one line, so the block is as tall as the taller of the two
+    // and both are centred on it.
+    let block = egui::Vec2::new(MARK + MARK_GAP + title.size().x, title.size().y.max(MARK));
+    let picture = cat_texture.map(|texture| {
+        let size = texture.size_vec2();
+        egui::Vec2::new(CAT_WIDTH, CAT_WIDTH * size.y / size.x.max(1.0))
+    });
+
+    // As tall as the taller of the two, so neither is clipped and both can be
+    // centred against it.
+    let height = picture.map_or(block.y, |cat| cat.y.max(block.y));
+    ui.add_space(HEADING_TOP);
+    let (row, _) = ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), height),
         Sense::hover(),
     );
-    let at = egui::Rect::from_center_size(rect.center(), egui::Vec2::new(CAT_WIDTH, height));
-    // `text` rather than `text_strong`: it is a decoration beside a heading,
-    // and the heading is what should be loudest. The tint is what makes the
-    // coverage a colour at all.
-    egui::Image::new(texture).tint(p.text).paint_at(ui, at);
+
+    // A third in from each end. With no picture there is nothing to balance
+    // against, so the words simply take the middle.
+    let (words_at, picture_at) = match picture {
+        Some(_) => (
+            row.left() + row.width() / 3.0,
+            row.right() - row.width() / 3.0,
+        ),
+        None => (row.center().x, row.center().x),
+    };
+
+    let block_rect = egui::Rect::from_center_size(egui::pos2(words_at, row.center().y), block);
+    // The mark is centred against the *words* rather than against the row, so a
+    // long version string moving the block does not leave it behind.
+    let mark = egui::Rect::from_min_size(
+        egui::pos2(block_rect.left(), block_rect.center().y - MARK / 2.0),
+        egui::Vec2::splat(MARK),
+    );
+    icons::draw(ui.painter(), mark, Icon::Alert, p.warning);
+
+    // Centred against the mark rather than sat on its top edge, which is what
+    // "centred with the triangle" means once there is only one line.
+    let left = block_rect.left() + MARK + MARK_GAP;
+    let top = block_rect.center().y - title.size().y / 2.0;
+    ui.painter()
+        .galley(egui::pos2(left, top), title, p.text_strong);
+
+    if let (Some(texture), Some(size)) = (cat_texture, picture) {
+        let at = egui::Rect::from_center_size(egui::pos2(picture_at, row.center().y), size);
+        // **The heading's own ink.** The coverage carries no colour of its
+        // own — that is the whole reason it is stored as ink — so this is what
+        // decides it, and matching `text_strong` makes the drawing and the
+        // words read as one thing rather than as a decoration beside a
+        // sentence.
+        egui::Image::new(texture)
+            .tint(p.text_strong)
+            .paint_at(ui, at);
+    }
 }
 
 /// What happened to the artist's work — the single most useful thing this box
