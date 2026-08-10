@@ -259,6 +259,10 @@ The installed packages offer Umber for all five, so you can open one from your
 file manager. Umber is added as a choice rather than taking the file type over,
 so whatever opens your `.psd` files today still does.
 
+On Windows and Linux the packages also draw thumbnails, so a folder of `.clip`
+or `.kra` files shows the artwork instead of a row of identical page icons.
+macOS does not have this yet.
+
 Several documents are open at once in tabs, each with its own layers, history
 and view. **A saved document carries its undo history**, so one reopened
 tomorrow can still be stepped back through.
@@ -343,6 +347,10 @@ a speed-derived approximation, and a mouse always paints at full pressure.
   nothing wraps. A line mixing left-to-right and right-to-left writing is shaped
   but not reordered. A character the chosen face has no glyph for is left blank
   rather than borrowed from another font.
+- **File thumbnails and "Open with" are Windows and Linux only.** On macOS
+  Umber does not appear in either, because both need Umber to ship as a proper
+  `.app` bundle and it does not yet.
+  [`docs/thumbnails.md`](docs/thumbnails.md) has what that would take.
 - **Two commands still throw the undo history away**: clearing a layer, and
   resizing the canvas. Both say so before you do them. Everything else is
   undoable, including deleting a layer.

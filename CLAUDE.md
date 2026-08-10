@@ -3875,6 +3875,42 @@ half-publish; `.github/workflows/release.yml` does the rest.
   takes `io.github.spillebulle.umber` explicitly, and it must run **before the
   first window exists**: the shell reads the identity when it creates the
   button, and setting it later does not move a button already on screen.
+- **A thumbnail never composites, and that is what makes it possible at all.**
+  `docs/thumbnails.md` is the design. Every format Umber reads already stores a
+  flattened preview — `mergedimage.png` in an `.ora` and a `.kra`, the composite
+  section of a `.psd`, the `CanvasPreview` table of a `.clip` — so
+  `docimport::preview` reads one entry and decodes one image, with no layer
+  walk, no canvas allocation and no GPU. The alternative is `import`, which
+  `survey-documents` measures at **12.3 GB** for one real document; on Windows
+  that would run inside Explorer's own process. The cost is stated at the
+  module: it is whatever the writing application last saved, so it can be stale
+  and a `.clip`'s is Clip Studio's rendering rather than Umber's. **Nothing that
+  decides pixels may read it.**
+- **Windows registers a COM handler on the *extension*, Linux names a command,
+  and neither claims `.png`.** Explorer has no command-line contract, so
+  `umber-shellext` is a DLL exposing `IThumbnailProvider`; it depends on
+  `umber-core` alone, so wgpu is not in its tree, and every entry point catches
+  panics because unwinding into COM is undefined behaviour. It hangs off the
+  extension key rather than `Umber.psd` for the reason the associations use
+  `OpenWithProgIds`: Explorer prefers the ProgID that *owns* the type, so
+  Photoshop keeps drawing `.psd` and Umber fills the gap for a `.clip`.
+  Registering on Umber's own ProgID would do nothing unless somebody had made
+  Umber the default. `.png` is refused on both platforms — every system has
+  drawn those for decades, so claiming one is a slower answer to a settled
+  question.
+  **The COM path is testable without the registry**, which is worth knowing
+  before anyone assumes otherwise: a memory stream through `Initialize` and
+  `GetThumbnail` gives a real GDI bitmap, and `DllGetClassObject` can be called
+  directly. Only "does Explorer choose to call it" needs an install.
+  **There is no `DllRegisterServer`** — the MSI writes the keys, because
+  self-registration is opaque to the installer's transaction and cannot be
+  rolled back, which is why `regsvr32` state outlives uninstalls.
+- **macOS has neither associations nor thumbnails, and both are blocked on one
+  thing: there is no `.app` bundle.** The release ships a bare `lipo`'d binary
+  in a tarball. A Quick Look extension is an `.appex` that can only live inside
+  a host bundle, and macOS refuses to load an unsigned one. So the order is
+  bundle, then signing identity, then the extension — and the bundle alone would
+  unblock `CFBundleDocumentTypes` too. `docs/thumbnails.md` has the shape.
 - **A file association is three things, and the registration is the least of
   them.** Umber is offered for the five formats `docimport` reads, on Windows
   and on Linux.
