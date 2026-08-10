@@ -3875,6 +3875,43 @@ half-publish; `.github/workflows/release.yml` does the rest.
   takes `io.github.spillebulle.umber` explicitly, and it must run **before the
   first window exists**: the shell reads the identity when it creates the
   button, and setting it later does not move a button already on screen.
+- **A file association is three things, and the registration is the least of
+  them.** Umber is offered for the five formats `docimport` reads, on Windows
+  and on Linux.
+  - **The command line has to open the document, or the association lies.**
+    `crash::parse_args` logged and ignored a bare argument, so registering for
+    `.psd` would have opened a *blank* canvas on a double-click. It now takes
+    the first bare argument as a document and `app.rs` spends it at the end of
+    `resumed` — not where it is read, because `open_path` asks the device
+    whether the canvas can exist and there is no device until then. A word
+    starting with `-` is still ignored rather than read as a filename; only the
+    first path is taken, since a glob can expand to fifty files; and the
+    extension is **not** checked, because `docimport` already has a sentence for
+    every way a file fails and a second copy of its list here would drift.
+  - **Windows registers through `OpenWithProgIds`, never `<ProgId>`.** WiX's
+    `<ProgId>`/`<Extension>` pair is the obvious spelling and writes the
+    extension's *default* — installing Umber would take `.psd` from Photoshop
+    and `.clip` from Clip Studio, silently, on the machine where those are what
+    the artist paints in. `OpenWithProgIds` is a union: Umber appears in "Open
+    with" and the existing default is untouched.
+    `windows_registration_offers_umber_without_taking_the_file_type` refuses the
+    tempting spelling, which is also the shorter one. Every command quotes
+    `%1` — painters' filenames have spaces in them.
+  - **`mimeinfo.cache` is what a Linux file manager actually reads**, and
+    neither the `.deb` nor the `.rpm` rebuilt it, so the four MIME types the
+    desktop entry had declared all along were **inert**. Both now run
+    `update-desktop-database` and `update-mime-database`, guarded on the command
+    existing; Arch and Flatpak do it themselves. **`.clip` also has no type in
+    the shared MIME database**, so `packaging/*.mime.xml` defines one, with the
+    `CSFCHUNK` magic `docimport::clipstudio::split` itself checks.
+  - **The guards read the packaging, not a copy of it**, and scan the WiX with
+    **comments stripped** — that file argues for itself at length, including by
+    quoting the spellings two guards refuse, so scanning raw text made both fail
+    on their own rationale.
+  - **macOS is not done and cannot be from here.** Associations live in an
+    `.app` bundle's `Info.plist` (`CFBundleDocumentTypes`) and the release ships
+    a bare binary in an archive, so there is no bundle to put them in. That is a
+    packaging change, not a registration one.
 - **On Linux the window icon is not used at all.** Wayland matches the window's
   **app id** against an installed `.desktop` file and takes the icon named
   there; X11 matches the entry's `StartupWMClass` against the window's class.

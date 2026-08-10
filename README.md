@@ -255,6 +255,10 @@ Anything lost on the way in is named in a notice when the document opens, rather
 than buried in a log: a flattened group, a dropped mask, a blend mode with no
 counterpart. Formats that would import subtly wrong are refused by name instead.
 
+The installed packages offer Umber for all five, so you can open one from your
+file manager. Umber is added as a choice rather than taking the file type over,
+so whatever opens your `.psd` files today still does.
+
 Several documents are open at once in tabs, each with its own layers, history
 and view. **A saved document carries its undo history**, so one reopened
 tomorrow can still be stepped back through.
