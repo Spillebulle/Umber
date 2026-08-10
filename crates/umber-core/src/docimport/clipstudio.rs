@@ -149,7 +149,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let mut warnings = Vec::new();
 
     let layers = Tables::read(&db)?;
-    let all = layers.tree(canvas.root, &mut warnings)?;
+    let all = layers.tree(canvas.root, LayerStack::MAX, &mut warnings)?;
 
     // **The Paper layer is the document's background, not a layer of it.** It
     // carries a flat colour and no bitmap, so it used to fall through the
@@ -453,6 +453,186 @@ pub(super) fn database_chunk(bytes: &[u8]) -> Result<&[u8], ImportError> {
     Ok(split(bytes)?.database)
 }
 
+// ---------------------------------------------------------------------------
+// Residency
+// ---------------------------------------------------------------------------
+
+/// How much of each layer this document actually holds, **without inflating a
+/// single block**. [`super::residency`] is the argument and the caller.
+///
+/// It lives here rather than beside those types because everything it needs is
+/// private to this module — the container, the four-table chain, the tree and
+/// its direction, and the bitmap bound. A second walk of any of that is exactly
+/// the drift `docformat`'s "there must never be a second ORA reader" refuses,
+/// and a survey walking its own chain would be measuring a stack Umber does not
+/// read.
+///
+/// Three deliberate departures from [`read`], each because the question is
+/// different:
+///
+/// - **No `check_bounds`.** The document that provoked the tiling design is one
+///   Umber refuses, and refusing to measure it would be answering a question
+///   nobody asked.
+/// - **[`super::residency::MAX_ENTRIES`] rather than [`LayerStack::MAX`]**, for
+///   the same reason, one level up in the walk.
+/// - **The Paper layer is left in the stack** and reported like any other. It
+///   becomes a `Background` on import and allocates no slice, so it is *not*
+///   counted in the occupancy the caller computes — but a survey that dropped
+///   it silently would be one that could not say so.
+pub(super) fn residency(bytes: &[u8]) -> Result<super::residency::DocumentResidency, ImportError> {
+    use super::residency::{DocumentResidency, MAX_ENTRIES, SliceResidency, tiles_touched};
+
+    let container = split(bytes)?;
+    let db = Database::open(container.database).map_err(|e| ImportError::Malformed {
+        format: FORMAT,
+        detail: e.to_string(),
+    })?;
+    let canvas = canvas(&db)?;
+    let tables = Tables::read(&db)?;
+    // Warnings are collected and thrown away: every one of them is about how a
+    // layer would *import*, and `skipped` below is this walk's own reporting.
+    let mut warnings = Vec::new();
+    let nodes = tables.tree(canvas.root, MAX_ENTRIES, &mut warnings)?;
+
+    let mut out = DocumentResidency {
+        size: canvas.size,
+        entries: nodes.len(),
+        folders: nodes.iter().filter(|n| n.folder).count(),
+        slices: Vec::new(),
+        skipped: Vec::new(),
+    };
+
+    for node in &nodes {
+        let Some(row) = tables.rows.get(&node.id) else {
+            continue;
+        };
+        if node.folder {
+            continue;
+        }
+        let name = clean_name(&row.name, false);
+        // A paper sheet and a correction layer both hold an `Offscreen` that is
+        // not a picture. Named rather than passed over, so the layer count in
+        // the report adds up.
+        if row.paper() {
+            out.skipped
+                .push((name, "the Paper layer, which becomes the background".into()));
+            continue;
+        }
+        if row.kind & LAYER_IS_CORRECTION != 0 {
+            out.skipped.push((name, "a correction layer".into()));
+            continue;
+        }
+
+        let slice = |mipmap: i64, origin: (i64, i64), mask: bool| {
+            if mipmap == 0 {
+                return None;
+            }
+            let Some((attribute, chunk)) = tables.offscreen(mipmap) else {
+                return Some(Err(row.no_pixels_reason().to_string()));
+            };
+            // `read_bitmap`'s own refusals are kept, packing included — the
+            // survey has to describe the slices Umber would actually store,
+            // not every rectangle the file happens to hold.
+            let (bitmap, _, data) = match read_bitmap(attribute, chunk, &container, canvas.size) {
+                Ok(read) => read,
+                // **A vector layer fails here rather than above**, exactly as
+                // it does in `build`: it has the whole mipmap chain and what is
+                // absent is the external chunk, because the strokes were never
+                // rasterised. Naming the cause at only one of the two sites is
+                // the bug that made every real vector layer report a damaged
+                // file, and a survey that miscounts them miscounts what it
+                // could not measure.
+                Err(reason) => {
+                    return Some(Err(if row.kind == VECTOR_KIND {
+                        row.no_pixels_reason().to_string()
+                    } else {
+                        reason
+                    }));
+                }
+            };
+            let Some(present) = csblocks::stored_blocks(data, bitmap.columns * bitmap.rows) else {
+                return Some(Err("its blocks could not be walked".to_string()));
+            };
+
+            let across = (canvas.size.x as usize).div_ceil(BLOCK);
+            let down = (canvas.size.y as usize).div_ceil(BLOCK);
+            let mut touched = vec![false; across * down];
+            let mut stored = 0usize;
+            for (index, held) in present.iter().enumerate() {
+                if !held {
+                    continue;
+                }
+                stored += 1;
+                let (xs, ys) = tiles_touched(
+                    (index % bitmap.columns, index / bitmap.columns),
+                    UVec2::new(bitmap.width, bitmap.height),
+                    origin,
+                    canvas.size,
+                );
+                for ty in ys {
+                    for tx in xs.clone() {
+                        touched[ty * across + tx] = true;
+                    }
+                }
+            }
+
+            Some(Ok(SliceResidency {
+                layer: clean_name(&row.name, false),
+                mask,
+                bitmap: UVec2::new(bitmap.width, bitmap.height),
+                grid: (bitmap.columns, bitmap.rows),
+                stored,
+                covered: touched.iter().filter(|hit| **hit).count(),
+                fill: match bitmap.fill {
+                    Fill::Empty => "empty",
+                    Fill::Stated(_) => "stated",
+                    Fill::Unknown => "unknown",
+                },
+            }))
+        };
+
+        // The same two origins `build` computes, from the same three column
+        // pairs — the placement is the one thing in this reader taken on
+        // somebody else's word, so a second statement of it would be a second
+        // thing to be wrong.
+        let render = slice(
+            row.render_mipmap,
+            (
+                row.offset.0 + row.render_offset.0,
+                row.offset.1 + row.render_offset.1,
+            ),
+            false,
+        );
+        let mask = slice(
+            row.mask_mipmap,
+            (
+                row.offset.0 + row.mask_offset.0 + row.mask_offscreen_offset.0,
+                row.offset.1 + row.mask_offset.1 + row.mask_offscreen_offset.1,
+            ),
+            true,
+        );
+        // **A layer naming no render mipmap is reported and a layer with no
+        // mask is not**, which is the one asymmetry here: most layers have no
+        // mask and saying so five hundred times would bury the list, while a
+        // layer with no *picture* is a slice missing from the sample and one
+        // real document in the folder is five of them.
+        match render {
+            Some(Ok(slice)) => out.slices.push(slice),
+            Some(Err(reason)) => out.skipped.push((name.clone(), reason)),
+            None => out
+                .skipped
+                .push((name.clone(), "it names no rendered bitmap".into())),
+        }
+        match mask {
+            Some(Ok(slice)) => out.slices.push(slice),
+            Some(Err(reason)) => out.skipped.push((format!("{name} (mask)"), reason)),
+            None => {}
+        }
+    }
+
+    Ok(out)
+}
+
 pub(super) fn table(db: &Database<'_>, name: &str) -> Result<Option<Table>, ImportError> {
     db.table(name).map_err(|e| ImportError::Malformed {
         format: FORMAT,
@@ -687,12 +867,24 @@ impl Tables {
     }
 
     /// The stack, bottom first, with each folder after its own contents.
-    fn tree(&self, root: i64, warnings: &mut Vec<ImportWarning>) -> Result<Vec<Node>, ImportError> {
+    ///
+    /// `limit` bounds both the entries and the nesting, and it is a parameter
+    /// rather than [`LayerStack::MAX`] for one caller: [`residency`] measures
+    /// documents Umber **refuses**, which is exactly the set of documents worth
+    /// a figure, so it would otherwise be blind to the one file the tiling
+    /// design was written about. Every other caller passes the stack's own cap
+    /// and behaves exactly as before.
+    fn tree(
+        &self,
+        root: i64,
+        limit: usize,
+        warnings: &mut Vec<ImportWarning>,
+    ) -> Result<Vec<Node>, ImportError> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         seen.insert(root);
         let start = self.rows.get(&root).map_or(0, |r| r.first_child);
-        self.chain(start, 0, &mut seen, &mut out, warnings)?;
+        self.chain(start, 0, limit, &mut seen, &mut out, warnings)?;
         Ok(out)
     }
 
@@ -717,14 +909,15 @@ impl Tables {
         &self,
         first: i64,
         depth: usize,
+        limit: usize,
         seen: &mut std::collections::HashSet<i64>,
         out: &mut Vec<Node>,
         warnings: &mut Vec<ImportWarning>,
     ) -> Result<(), ImportError> {
-        if depth >= LayerStack::MAX {
+        if depth >= limit {
             return Err(ImportError::TooManyLayers {
                 found: depth + 1,
-                max: LayerStack::MAX,
+                max: limit,
             });
         }
         let mut id = first;
@@ -735,10 +928,10 @@ impl Tables {
             let Some(row) = self.rows.get(&id) else {
                 break;
             };
-            if out.len() >= LayerStack::MAX {
+            if out.len() >= limit {
                 return Err(ImportError::TooManyLayers {
                     found: out.len() + 1,
-                    max: LayerStack::MAX,
+                    max: limit,
                 });
             }
             let folder = row.folder & FOLDER != 0;
@@ -757,7 +950,7 @@ impl Tables {
                 }
                 // Contents first, then the folder — which is where a
                 // `LayerStack` keeps one, above its own subtree.
-                self.chain(row.first_child, depth + 1, seen, out, warnings)?;
+                self.chain(row.first_child, depth + 1, limit, seen, out, warnings)?;
             }
             out.push(Node {
                 id,
@@ -2059,7 +2252,9 @@ mod tests {
             offscreens: HashMap::new(),
         };
         let mut warnings = Vec::new();
-        let nodes = tables.tree(1, &mut warnings).expect("a bounded walk");
+        let nodes = tables
+            .tree(1, LayerStack::MAX, &mut warnings)
+            .expect("a bounded walk");
         assert!(nodes.len() <= 2, "{} nodes", nodes.len());
     }
 
@@ -2092,7 +2287,7 @@ mod tests {
         };
         let mut warnings = Vec::new();
         assert!(matches!(
-            tables.tree(1, &mut warnings),
+            tables.tree(1, LayerStack::MAX, &mut warnings),
             Err(ImportError::TooManyLayers { .. })
         ));
     }
@@ -2180,7 +2375,7 @@ mod tests {
         };
         let mut warnings = Vec::new();
         assert!(matches!(
-            tables.tree(1, &mut warnings),
+            tables.tree(1, LayerStack::MAX, &mut warnings),
             Err(ImportError::TooManyLayers { .. })
         ));
     }
