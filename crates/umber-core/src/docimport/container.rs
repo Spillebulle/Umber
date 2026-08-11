@@ -459,4 +459,63 @@ mod tests {
         blit(&mut dst, size, &src, UVec2::new(8, 8), (-1, -1));
         assert!(dst.iter().all(|&b| b == 255));
     }
+
+    /// **A document's structure entry is refused at its own bound**, on both
+    /// formats, from a file of a few hundred bytes.
+    ///
+    /// Read at [`ImportedDocument::MAX_TOTAL_BYTES`] this was a `read_to_end`
+    /// growing a `Vec` to sixteen gigabytes before quick-xml saw a byte, which
+    /// aborts. The fixture is legal XML behind a comment, so the shape is not
+    /// what refuses it; the size is.
+    ///
+    /// **Driven one byte past the constant rather than at a figure of its
+    /// own**, so raising the bound moves the case with it. Both directions are
+    /// asserted: an entry a byte over is refused and one a byte under is read,
+    /// because a guard that only drove the first would pass with the bound at
+    /// zero.
+    #[test]
+    fn a_structure_entry_past_its_own_bound_is_refused_on_both_formats() {
+        use super::super::fixtures;
+
+        let over = MAX_STRUCTURE_BYTES as usize + 1;
+        for (bytes, format, name) in [
+            (
+                fixtures::ora_with_padded_stack(over),
+                SourceFormat::OpenRaster,
+                "stack.xml",
+            ),
+            (
+                fixtures::kra_with_padded_maindoc(over),
+                SourceFormat::Krita,
+                "maindoc.xml",
+            ),
+        ] {
+            assert!(
+                bytes.len() < 64 * 1024,
+                "the fixture is meant to be small and claim to be large: {} bytes",
+                bytes.len()
+            );
+            let mut zip = open(&bytes, format).expect("an archive");
+            let err = read_entry_bounded(&mut zip, name, format, MAX_STRUCTURE_BYTES)
+                .expect_err("an entry past the bound");
+            assert!(
+                format!("{err}").contains(name),
+                "the refusal does not name the entry that met the bound: {err}"
+            );
+        }
+
+        // A byte under is an ordinary read. Without this the bound could be any
+        // figure at all, including one that refuses every document.
+        let under = MAX_STRUCTURE_BYTES as usize - 1;
+        let bytes = fixtures::ora_with_padded_stack(under);
+        let mut zip = open(&bytes, SourceFormat::OpenRaster).expect("an archive");
+        let entry = read_entry_bounded(
+            &mut zip,
+            "stack.xml",
+            SourceFormat::OpenRaster,
+            MAX_STRUCTURE_BYTES,
+        )
+        .expect("an entry inside the bound");
+        assert!(entry.len() as u64 <= MAX_STRUCTURE_BYTES);
+    }
 }

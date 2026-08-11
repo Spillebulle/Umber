@@ -1798,4 +1798,65 @@ mod tests {
         assert!(is_srgb_profile("sRGB-elle-V2-srgbtrc.icc"));
         assert!(!is_srgb_profile("Rec2020-elle-V4-g10.icc"));
     }
+
+    /// `maindoc.xml` is `stack.xml`'s twin and takes the same bound at the call
+    /// site — see `openraster`'s guard for why the container's own is not
+    /// enough.
+    #[test]
+    fn a_maindoc_past_the_structure_bound_is_refused_by_the_reader() {
+        let bytes = fixtures::kra_with_padded_maindoc(container::MAX_STRUCTURE_BYTES as usize + 1);
+        let err = read(&bytes).expect_err("a maindoc.xml past the bound");
+        assert!(
+            matches!(err, ImportError::Malformed { ref detail, .. } if detail.contains("maindoc.xml")),
+            "{err:?}"
+        );
+    }
+
+    /// **A tile offset out of somebody else's file cannot overflow.**
+    ///
+    /// Both terms are read from the archive — `x`/`y` off the tile's own header
+    /// line and the offset off the layer element — so `i64::MAX` in both panics
+    /// a debug build and wraps in a release one. Saturating is what makes the
+    /// two agree, and `visible_rect` then refuses the saturated value exactly as
+    /// it refuses any other tile that misses the canvas.
+    ///
+    /// The extremes are the case, not decoration: nothing else in this module
+    /// drives them, and `container::crop` carries the same sweep for the same
+    /// reason. Demonstrated by mutation — put `x + offset.0` back and this
+    /// panics with "attempt to add with overflow" on the first pair.
+    ///
+    /// **What is asserted is containment rather than the sum.** `i64::MAX`
+    /// saturated against `i64::MIN` is `-1`, an ordinary tile hanging one pixel
+    /// off the corner and genuinely visible — so "nothing reaches the canvas"
+    /// would be false for that pair and true for every other, which is exactly
+    /// the shape of assertion that passes for the wrong reason. What has to hold
+    /// for every pair is that the position `visible_rect` is handed produces
+    /// either nothing or a rectangle inside the canvas.
+    #[test]
+    fn a_tile_offset_out_of_a_file_cannot_overflow() {
+        // Both terms extreme and in both directions, because the addition is of
+        // two numbers the file states and either can be the one that overflows.
+        const CANVAS: u32 = 64;
+        for tile_at in [(i64::MAX, i64::MAX), (i64::MIN, i64::MIN), (0, 0)] {
+            let tile = fixtures::kra_tile_file_at(4, &[0u8; 64 * 64 * 4], tile_at);
+            for offset in [
+                (i64::MAX, i64::MAX),
+                (i64::MIN, i64::MIN),
+                (i64::MAX, i64::MIN),
+                (i64::MIN, i64::MAX),
+            ] {
+                let mut placed = Vec::new();
+                assemble_tiles(&tile, offset, 4, |_, _, at| placed.push(at))
+                    .expect("the tile file itself is well formed");
+                assert_eq!(placed.len(), 1, "the fixture holds exactly one tile");
+                let canvas = UVec2::new(CANVAS, CANVAS);
+                if let Some(rect) = visible_rect(canvas, (64, 64), placed[0]) {
+                    assert!(
+                        rect.x + rect.width <= CANVAS && rect.y + rect.height <= CANVAS,
+                        "a tile at {tile_at:?} plus {offset:?} landed outside the canvas: {rect:?}"
+                    );
+                }
+            }
+        }
+    }
 }

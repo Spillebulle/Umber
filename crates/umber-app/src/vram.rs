@@ -208,9 +208,16 @@ pub fn flip_at_ceiling() -> Notice {
     Notice {
         title: "Could not flip the canvas".to_string(),
         lines: vec![
-            "Your picture is unchanged and nothing was mirrored. This document has more \
-             layers and masks than Umber can mirror in one step. Flattening or removing \
-             some layers, or removing a layer mask, will bring it within reach."
+            // **"This document has more layers than…" was the first draft**, and
+            // `no_refusal_states_what_the_card_holds` refused it on the word
+            // "has". That reads as pedantry and is not: the sweep cannot tell
+            // what the sentence has a figure *about*, so a wording that is
+            // clearly about the document today is one somebody edits into a
+            // wording about the card tomorrow. Saying what Umber could not do
+            // costs nothing and cannot drift into a capacity claim.
+            "Your picture is unchanged and nothing was mirrored. Umber could not make room \
+             to mirror this many layers and masks at once. Flattening or removing some \
+             layers, or removing a layer mask, will bring it within reach."
                 .to_string(),
         ],
     }

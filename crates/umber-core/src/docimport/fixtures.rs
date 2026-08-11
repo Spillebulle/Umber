@@ -46,6 +46,57 @@ pub fn png_grey(width: u32, height: u32, grey: &[u8]) -> Vec<u8> {
     encode_png(width, height, png::ColorType::Grayscale, grey)
 }
 
+/// A PNG that is a valid RGBA header with no pixels behind it.
+///
+/// **The whole point is that it is tiny and claims to be enormous**, which is
+/// the shape `check_image_size` exists for: a decoder hands back
+/// `width × height × 4` off these forty-odd bytes and a caller that believes it
+/// allocates that much. Built by hand rather than through `png::Encoder`, which
+/// will not write a header without data behind it.
+///
+/// **The empty `IDAT` is load-bearing.** `png` 0.18's `read_info` scans chunks
+/// until it finds one and refuses the file outright without it — "IDAT or fdAT
+/// chunk is missing" — so a fixture that really was a header alone never
+/// reaches the size check at all, and the guard would have been asserting about
+/// the wrong refusal. With an empty one the header parses, `output_buffer_size`
+/// answers what the header claims, and only `next_frame` fails: so an assertion
+/// that the *size* refusal came out is an assertion that nothing believed the
+/// figure.
+pub fn png_header_only(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        let mut named = kind.to_vec();
+        named.extend_from_slice(body);
+        out.extend_from_slice(&named);
+        out.extend_from_slice(&crc32(&named).to_be_bytes());
+    }
+
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    // Eight-bit RGBA, deflate, adaptive filtering, no interlace.
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &[]);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
 /// `width * height` copies of one pixel.
 fn solid(width: u32, height: u32, pixel: &[u8; 4]) -> Vec<u8> {
     pixel
@@ -88,6 +139,85 @@ impl Archive {
     fn finish(self) -> Vec<u8> {
         self.0.finish().unwrap().into_inner()
     }
+}
+
+/// `xml` behind a comment, **exactly** `bytes` long.
+///
+/// A comment before the root element is legal XML, so the result is a document
+/// that would parse — which is the point: what refuses it has to be the *size*
+/// and not the shape. Every filler byte the same, so it deflates to almost
+/// nothing and the archive stays small however large the entry claims to be.
+///
+/// Exact rather than "at least", because a bound is driven from both sides: a
+/// caller asking for one byte *under* the limit and getting thirty-seven over
+/// cannot tell a correct bound from one that refuses everything.
+fn padded_xml(xml: &str, bytes: usize) -> Vec<u8> {
+    let overhead = "<!--".len() + "-->".len() + xml.len();
+    assert!(
+        bytes >= overhead,
+        "asked for {bytes} bytes of a {overhead}-byte document"
+    );
+    let mut out = Vec::with_capacity(bytes);
+    out.extend_from_slice(b"<!--");
+    out.resize(bytes - "-->".len() - xml.len(), b'x');
+    out.extend_from_slice(b"-->");
+    out.extend_from_slice(xml.as_bytes());
+    debug_assert_eq!(out.len(), bytes);
+    out
+}
+
+/// An ORA whose `stack.xml` claims `bytes` uncompressed.
+///
+/// The archive itself is a few hundred bytes: that ratio is the whole hazard —
+/// see `container::MAX_STRUCTURE_BYTES`.
+pub fn ora_with_padded_stack(bytes: usize) -> Vec<u8> {
+    let mut a = Archive::new("image/openraster");
+    a.add(
+        "stack.xml",
+        &padded_xml("<image w=\"2\" h=\"2\"><stack/></image>", bytes),
+    );
+    a.finish()
+}
+
+/// The same for a `.kra`'s `maindoc.xml`.
+pub fn kra_with_padded_maindoc(bytes: usize) -> Vec<u8> {
+    let mut a = Archive::new("application/x-krita");
+    a.add(
+        "maindoc.xml",
+        &padded_xml(
+            "<DOC><IMAGE width=\"2\" height=\"2\" colorspacename=\"RGBA\"><layers/></IMAGE></DOC>",
+            bytes,
+        ),
+    );
+    a.finish()
+}
+
+/// A readable one-layer ORA that names a saved history of `bytes`.
+///
+/// The manifest is JSON-shaped and padded past its own bound, so what refuses it
+/// is `docimport::history::MAX_MANIFEST_BYTES` rather than anything about the
+/// document. The picture is ordinary and must still open — a history that will
+/// not read costs the history and nothing else.
+pub fn ora_with_padded_history(bytes: usize) -> Vec<u8> {
+    let mut a = Archive::new("image/openraster");
+    let png = png_rgba(2, 2, &solid(2, 2, &[10, 20, 30, 255]));
+    a.add("data/layer0.png", &png);
+    a.add(
+        crate::docformat::history::MANIFEST,
+        &padded_xml("{\"version\":3}", bytes),
+    );
+    a.add(
+        "stack.xml",
+        format!(
+            "<image w=\"2\" h=\"2\" {}=\"{}\"><stack>\
+             <layer name=\"Ink\" src=\"data/layer0.png\" x=\"0\" y=\"0\"/></stack></image>",
+            crate::docformat::HISTORY_ATTR,
+            crate::docformat::history::MANIFEST,
+        )
+        .as_bytes(),
+    );
+    a.add("mergedimage.png", &png);
+    a.finish()
 }
 
 /// A ZIP whose mimetype belongs to something else entirely.
@@ -538,11 +668,26 @@ pub fn kra_tile_file(pixel_size: u32, planes: &[u8]) -> Vec<u8> {
     tile_file(pixel_size, planes, false)
 }
 
+/// The same, with the tile at a stated position in its own header.
+pub fn kra_tile_file_at(pixel_size: u32, planes: &[u8], at: (i64, i64)) -> Vec<u8> {
+    tile_file_at(pixel_size, planes, false, at)
+}
+
 /// A Krita tile file: the five-line header, then one tile at the origin.
 ///
 /// `pixel_size` is what the header declares and what the reader is required to
 /// agree with — 4 for a layer's BGRA planes, 1 for a mask's selection.
 fn tile_file(pixel_size: u32, planes: &[u8], compress: bool) -> Vec<u8> {
+    tile_file_at(pixel_size, planes, compress, (0, 0))
+}
+
+/// The same, with the tile's own header position stated.
+///
+/// A parameter because the position is `i64` **read out of the file** and is
+/// then added to the layer's offset, which is also read out of the file — so the
+/// extremes are a case rather than a curiosity, and nothing else here can
+/// produce one.
+fn tile_file_at(pixel_size: u32, planes: &[u8], compress: bool, at: (i64, i64)) -> Vec<u8> {
     let body = if compress {
         lzf_compress(planes)
     } else {
@@ -554,7 +699,7 @@ fn tile_file(pixel_size: u32, planes: &[u8], compress: bool) -> Vec<u8> {
         format!("VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE {pixel_size}\nDATA 1\n")
             .into_bytes();
     // The declared size counts the flag byte as well as the payload.
-    out.extend_from_slice(format!("0,0,LZF,{}\n", body.len() + 1).as_bytes());
+    out.extend_from_slice(format!("{},{},LZF,{}\n", at.0, at.1, body.len() + 1).as_bytes());
     out.push(flag);
     out.extend_from_slice(&body);
     out
@@ -994,6 +1139,21 @@ pub fn psd(width: u32, height: u32, layers: &[PsdLayerSpec]) -> Vec<u8> {
     for component in [0usize, 1, 2, 3] {
         out.extend(std::iter::repeat_n(top[component], pixels));
     }
+    out
+}
+
+/// A flattened PSD whose *header* claims a size its pixels are nowhere near.
+///
+/// `psd` 0.3.5 reads the image data section by dividing what is actually there
+/// between the channels, so the declared size is never checked against it —
+/// which is why a twenty-six byte header out of a tiny file reaches
+/// `generate_rgba`'s `vec![0; (w * h * 4) as usize]`. The declared width and
+/// height sit at fixed offsets in the header (channels at 12, height at 14,
+/// width at 18), so this is the smallest real PSD with two fields rewritten.
+pub fn psd_claiming(width: u32, height: u32) -> Vec<u8> {
+    let mut out = psd_flattened(1, 1, &[7, 8, 9]);
+    out[14..18].copy_from_slice(&height.to_be_bytes());
+    out[18..22].copy_from_slice(&width.to_be_bytes());
     out
 }
 

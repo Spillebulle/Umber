@@ -183,4 +183,59 @@ mod tests {
         let err = read_png(b"not a png at all").unwrap_err();
         assert!(matches!(err, ImportError::Malformed { .. }), "{err:?}");
     }
+
+    /// **A PNG header alone cannot choose an allocation.**
+    ///
+    /// The fixture is a valid IHDR and an IEND, under a hundred bytes, claiming
+    /// one pixel past [`ImportedDocument::MAX_DIMENSION`] on a side — where
+    /// `output_buffer_size` answers `Some(4_295_098_372)` and `vec![0u8; …]`
+    /// **aborts** rather than failing, taking the panic hook, the crash report
+    /// and the autosave with it.
+    ///
+    /// **Refusing on the header rather than on the frame is what is being
+    /// asserted, and the fixture is what makes that legible.** There is no IDAT
+    /// at all, so a reader that allocated first and asked afterwards fails with
+    /// a *decode* error — a different variant, from `next_frame`, with the
+    /// allocation already spent. Only a check off `reader.info()` produces
+    /// `ImageTooLarge`. Demonstrated by mutation: move the call below
+    /// `output_buffer_size` and it is still `ImageTooLarge`; delete it and this
+    /// reads `Malformed`.
+    ///
+    /// The case is derived from the constant rather than written out, so raising
+    /// the ceiling moves the case with it instead of leaving one that no longer
+    /// exercises itself — `a_lock_that_saturates_stops_being_the_shape` is the
+    /// recorded reason.
+    #[test]
+    fn a_png_header_alone_cannot_ask_for_an_allocation() {
+        // `Image` holds a buffer and derives no `Debug`, so the refusal is read
+        // out rather than unwrapped — which also keeps a failure from printing
+        // a canvas.
+        let refusal = |w: u32, h: u32| match decode_png(
+            &fixtures::png_header_only(w, h),
+            SourceFormat::Png,
+        ) {
+            Ok(_) => panic!("a {w}×{h} header decoded, which needs the file to hold pixels"),
+            Err(e) => e,
+        };
+
+        let edge = ImportedDocument::MAX_DIMENSION + 1;
+        for (w, h) in [(edge, 1), (1, edge), (edge, edge)] {
+            let err = refusal(w, h);
+            assert!(
+                matches!(err, ImportError::ImageTooLarge { width, height } if width == w && height == h),
+                "a {w}×{h} header was not refused off the header: {err:?}"
+            );
+        }
+
+        // **And the bound is not off by one, which is the half that keeps the
+        // reader from being stricter than the writer.** A picture exactly at the
+        // ceiling gets past the size check and fails on the missing frame
+        // instead. One pixel tall, so the assertion costs 131 KB rather than
+        // four gigabytes.
+        let err = refusal(ImportedDocument::MAX_DIMENSION, 1);
+        assert!(
+            matches!(err, ImportError::Malformed { .. }),
+            "a picture at exactly the ceiling was refused for its size: {err:?}"
+        );
+    }
 }

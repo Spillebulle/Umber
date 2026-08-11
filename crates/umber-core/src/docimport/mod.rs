@@ -54,7 +54,12 @@
 
 mod blend;
 mod clipstudio;
-mod container;
+// `pub(crate)` for one reason: `container::MAX_STRUCTURE_BYTES` is a bound on
+// what the *reader* will take, and the guard that keeps it clear of what the
+// writer produces has to live beside the writer — see `docformat`'s
+// `a_full_stacks_own_structure_is_far_inside_the_bound`. A figure argued from
+// two ends needs both ends able to see it.
+pub(crate) mod container;
 /// The flattened picture a document already carries, for a file manager.
 pub mod preview;
 /// How much of each layer a real document actually holds, without decoding it.

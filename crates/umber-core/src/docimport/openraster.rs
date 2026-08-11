@@ -1437,4 +1437,44 @@ mod tests {
         let err = read(b"PK not really").unwrap_err();
         assert!(matches!(err, ImportError::Malformed { .. }), "{err:?}");
     }
+
+    /// **The reader passes the structure bound, and this is what says so.**
+    ///
+    /// `container`'s own guard drives `read_entry_bounded` with the figure and
+    /// cannot see what the caller hands it — the "a guard on a model is not a
+    /// guard on the call site" failure this project records four times over.
+    /// Demonstrated by mutation: put `ImportedDocument::MAX_TOTAL_BYTES` back at
+    /// the call site and this fails while every test in `container` stays green.
+    #[test]
+    fn a_stack_xml_past_the_structure_bound_is_refused_by_the_reader() {
+        let bytes = fixtures::ora_with_padded_stack(container::MAX_STRUCTURE_BYTES as usize + 1);
+        let err = read(&bytes).expect_err("a stack.xml past the bound");
+        assert!(
+            matches!(err, ImportError::Malformed { ref detail, .. } if detail.contains("stack.xml")),
+            "{err:?}"
+        );
+    }
+
+    /// **A history manifest is bounded too, and losing it costs the history and
+    /// nothing else.**
+    ///
+    /// The manifest is JSON whose entry count nothing in the format bounds, read
+    /// at the *document* ceiling and then handed whole to `serde_json`. What is
+    /// asserted is both halves: the picture still opens, and the drop is said
+    /// out loud as a warning rather than passed over — the rule `HistoryDropped`
+    /// already lives by.
+    #[test]
+    fn a_saved_history_past_its_own_bound_is_dropped_and_the_picture_opens() {
+        let bytes = fixtures::ora_with_padded_history(32 * 1024 * 1024 + 1);
+        let doc = read(&bytes).expect("the document opens regardless");
+        assert_eq!(doc.layers.len(), 1, "the picture is untouched");
+        assert!(doc.history.is_none(), "the history should not have loaded");
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| matches!(w, ImportWarning::HistoryDropped { .. })),
+            "a dropped history has to be said out loud: {:?}",
+            doc.warnings
+        );
+    }
 }

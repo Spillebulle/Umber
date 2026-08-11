@@ -98,12 +98,24 @@ impl Preview {
         // of our own would be a second resampler in a codebase that refuses
         // them everywhere else.
         let Some(source) = image::RgbaImage::from_raw(w, h, self.rgba) else {
-            // Unreachable: `new` already checked the length. Returning the
-            // original rather than panicking, because this runs inside
-            // Explorer.
+            // Not panicking, because this runs inside Explorer — but **the
+            // value has to satisfy [`Preview::new`]'s own invariant**, and it
+            // used to be `size: (w, h)` beside an empty buffer: a preview
+            // claiming a size its bytes do not have, which is the exact state
+            // that constructor exists to refuse, because it is an
+            // out-of-bounds read in whatever draws it. It happened not to be
+            // one — `umber-shellext`'s `to_bitmap` zips two `chunks_exact`, so
+            // an empty buffer gives a blank bitmap rather than a read past the
+            // end — and that is a property of one consumer rather than of the
+            // type. One transparent pixel is the smallest thing that is true.
+            //
+            // `from_raw` answers `None` only where the buffer is not
+            // `w × h × 4`, which `new` has already checked, so this is
+            // unreachable through the constructor. The fields are public,
+            // though, so a struct literal elsewhere could reach it.
             return Self {
-                size: UVec2::new(w, h),
-                rgba: Vec::new(),
+                size: UVec2::new(1, 1),
+                rgba: vec![0; 4],
             };
         };
         let scaled =
@@ -235,11 +247,22 @@ fn clip_preview(bytes: &[u8]) -> Result<Preview, ImportError> {
 /// `catch` rather than a second `catch_unwind` beside it, for the reason
 /// everything else in this module is shared.
 ///
-/// **The composite's size is checked before `rgba()` and that is not
-/// belt-and-braces**: `generate_rgba` is `vec![0; (w * h * 4) as usize]` read
-/// straight off the header, so a 26-byte header in a tiny file asks for
-/// gigabytes. See [`check_image_size`]. The check has to be *before*, because
-/// the allocation is inside the call.
+/// **The composite's size is checked before `rgba()`, and the check is inert
+/// today.** `generate_rgba` is `vec![0; (w * h * 4) as usize]` read straight off
+/// the header, so a twenty-six byte header in a tiny file asks for gigabytes —
+/// but `psd` 0.3.5 refuses a header past **30,000** on either edge, which is
+/// inside [`super::ImportedDocument::MAX_DIMENSION`]'s 32,768, so nothing gets
+/// past `from_bytes` for [`check_image_size`] to refuse. It is written anyway
+/// because the figure it states is Umber's: the tighter bound belongs to a
+/// dependency, and a `psd` bump either way must not be what decides this.
+///
+/// **The residual is 3.6 GB and is not closed.** At 30,000 square the crate's
+/// own allocation is inside every bound Umber states, and this path runs in
+/// Explorer's surrogate. Closing it means a *preview* ceiling — smaller than a
+/// canvas, because a thumbnail is decoded only to be shrunk — and that is a
+/// figure nobody has measured; `examples/survey-previews.rs` is the instrument,
+/// and whatever it says has to still admit a thumbnail of a 20000 × 5000
+/// document.
 fn psd_composite(bytes: &[u8]) -> Result<Preview, ImportError> {
     let psd = super::photoshop::catch(
         || psd::Psd::from_bytes(bytes),
@@ -399,6 +422,20 @@ mod tests {
         let wide = Preview::new(1920, 1080, vec![0; 1920 * 1080 * 4]).expect("a preview");
         assert_eq!(wide.fit_within(256).size, UVec2::new(256, 144));
 
+        // **And the same document stood on its end**, which nothing here drove
+        // until it was asked for. `fit_within` scales by `w.max(h)`, so every
+        // assertion in a landscape-only sweep passes with the `max` replaced by
+        // `w` — and an A4 page is the commonest shape a painting application
+        // opens. Demonstrated by mutation: `w.max(h)` → `w` gives 256 × 362 here
+        // and leaves every other case in this test green.
+        let tall = Preview::new(1080, 1920, vec![0; 1080 * 1920 * 4]).expect("a preview");
+        assert_eq!(tall.fit_within(256).size, UVec2::new(144, 256));
+
+        // A4 at 300 dpi, the real proportion rather than a round one: 2480×3508
+        // into 256 is 181×256.
+        let page = Preview::new(2480, 3508, vec![0; 2480 * 3508 * 4]).expect("a preview");
+        assert_eq!(page.fit_within(256).size, UVec2::new(181, 256));
+
         // A long thin canvas must not lose an axis entirely. 2500x625 is the
         // real proportion of one of the documents this was measured against.
         let thin = Preview::new(2500, 625, vec![0; 2500 * 625 * 4]).expect("a preview");
@@ -413,6 +450,98 @@ mod tests {
         // otherwise be zero.
         let panorama = Preview::new(10000, 5, vec![0; 10000 * 5 * 4]).expect("a preview");
         assert_eq!(panorama.fit_within(64).size, UVec2::new(64, 1));
+    }
+
+    /// **A header alone cannot choose an allocation on the thumbnail path
+    /// either**, and this one runs inside Explorer's surrogate process.
+    ///
+    /// Both arms of it, because they fail differently and only one of them is a
+    /// PNG. The `.png` fixture is a header and an IEND with no frame behind it,
+    /// so a reader that allocated first would come back with a *decode* error
+    /// rather than this one — see `flat`'s twin for the whole argument. The
+    /// `.psd` fixture is a real flattened document with two fields of its header
+    /// rewritten: `psd` 0.3.5 divides whatever image data is present between the
+    /// channels and never compares it with the declared size, so `rgba()` is
+    /// `vec![0; (w * h * 4)]` off twenty-six bytes.
+    ///
+    /// Demonstrated by mutation: delete either `check_image_size` call and the
+    /// PNG arm reads `Malformed` while the PSD arm — in a debug build, where the
+    /// crate's own `u32` multiply overflows first — reads `Malformed` out of the
+    /// new `catch`. Both fail.
+    /// **One pixel tall, deliberately.** A square at that edge is 4.3 GB, and a
+    /// guard whose *mutation* allocates four gigabytes on a CI runner is one
+    /// nobody will run twice. At `edge × 1` the buffer is 131 KB, so deleting
+    /// either check produces an ordinary wrong answer rather than an
+    /// out-of-memory — which is what makes this cheap to keep honest.
+    #[test]
+    fn a_thumbnail_header_alone_cannot_ask_for_an_allocation() {
+        let edge = super::super::ImportedDocument::MAX_DIMENSION + 1;
+
+        let err = from_bytes(&fixtures::png_header_only(edge, 1), SourceFormat::Png)
+            .expect_err("a header claiming past the ceiling");
+        assert!(
+            matches!(err, ImportError::ImageTooLarge { width, height } if width == edge && height == 1),
+            "a {edge}×1 PNG header was not refused off the header: {err:?}"
+        );
+
+        // **The Photoshop arm is refused, and by the crate rather than by
+        // Umber, which is worth saying out loud rather than asserting past.**
+        // `psd` 0.3.5 caps a header at 30,000 on each edge, *inside* Umber's own
+        // 32,768 — so `check_image_size` can never fire on this reader today and
+        // what refuses this fixture is `Psd::from_bytes`. The check stays
+        // because the bound it states is Umber's and this one is a dependency's:
+        // a `psd` bump that raised or dropped the cap would otherwise put the
+        // hole back with nothing here to notice.
+        //
+        // **What that leaves is a real residual and it is not closed**: at
+        // 30,000 square the crate's own `vec![0; (w * h * 4) as usize]` is
+        // 3.6 GB off a twenty-six byte header, and that is inside every bound
+        // Umber states. A tighter *preview* ceiling is the answer and it needs a
+        // figure nobody has measured — `examples/survey-previews.rs` is the
+        // instrument — because it must still admit a thumbnail of the artist's
+        // own 20000 × 5000 document.
+        let err = from_bytes(&fixtures::psd_claiming(edge, 1), SourceFormat::Photoshop)
+            .expect_err("a Photoshop header claiming past the ceiling");
+        assert!(
+            matches!(err, ImportError::Malformed { .. }),
+            "a {edge}×1 PSD header was not refused at all: {err:?}"
+        );
+    }
+
+    /// **The PSD arm refuses a file the crate panics on rather than dying with
+    /// it**, which is the property `umber-shellext` was providing for it and
+    /// `umber-app::thumbnail::run` was not.
+    ///
+    /// An RLE mask channel is the case `photoshop.rs`'s module docs name and
+    /// `an_rle_mask_channel_refuses_the_file_rather_than_taking_the_process_with_it`
+    /// already drives through the *import*. This is the same file through the
+    /// thumbnail, which had no `catch_unwind` at all until `psd_composite` was
+    /// given one.
+    ///
+    /// It asserts an ordinary refusal, and the assertion is the weaker half: the
+    /// property that matters is that the test process is still running to make
+    /// it. Under `panic = "abort"` — which is set nowhere and must not be — this
+    /// would take the test binary down rather than fail.
+    ///
+    /// The fixture's mask rectangle is deliberately **shorter than the layer**,
+    /// which is the whole of what makes the crate walk off the end: it skips the
+    /// per-scanline table using the layer's height for every channel. A mask the
+    /// same shape as its layer does not panic, so a fixture built that way would
+    /// pass whether or not anything caught.
+    #[test]
+    fn a_photoshop_file_the_crate_panics_on_has_no_thumbnail_and_no_panic() {
+        let bytes = fixtures::psd(
+            4,
+            8,
+            &[fixtures::PsdLayerSpec::new("Masked", [10, 20, 30, 255])
+                .mask(fixtures::PsdMask::new((0, 0, 2, 4), 200).compressed())],
+        );
+        let err = from_bytes(&bytes, SourceFormat::Photoshop)
+            .expect_err("a file the crate cannot read has no thumbnail");
+        assert!(
+            matches!(err, ImportError::Malformed { .. }),
+            "an unreadable Photoshop file should be refused, not guessed at: {err:?}"
+        );
     }
 
     /// A buffer that does not match the size it claims is refused rather than

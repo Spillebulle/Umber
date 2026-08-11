@@ -11671,31 +11671,89 @@ mod tests {
             text
         };
 
+        // **Both reservations and both of their helpers**, because there are two
+        // now: the layer array's, and the page-sized scratch a canvas flip
+        // mirrors into. The flip's was a bare `create_texture` — the entry
+        // `try_reserve`'s own list of what is still fatal did not name — and a
+        // second reservation is a second place for the ordering to be written
+        // the obvious wrong way round.
+        const FLIP_RESERVE: &str = concat!("fn ", "try_reserve_flip_scratch(");
+        const FLIP_HELPER: &str = concat!("fn ", "flip_scratch_texture(");
+
         // The helper must hold no view at all: it is the only thing that runs
         // between the push and the pop.
-        let helper = body(HELPER);
-        for construct in ["create_view", "LayerStore::", "from_texture"] {
-            assert!(
-                !helper.contains(construct),
-                "`layer_texture` reaches `{construct}`; it runs inside the error scope, so a view \
-                 of a failed texture would be built before anything has checked"
-            );
-        }
-
-        let code = body(RESERVE);
-        let pop = code
-            .find(".pop()")
-            .expect("`try_reserve` no longer pops an error scope");
-        for construct in ["create_view", "LayerStore::", "from_texture"] {
-            if let Some(at) = code.find(construct) {
+        for name in [HELPER, FLIP_HELPER] {
+            let helper = body(name);
+            for construct in ["create_view", "LayerStore::", "from_texture"] {
                 assert!(
-                    at > pop,
-                    "`try_reserve` reaches `{construct}` before it has popped its error scope; a \
-                     view of a failed texture is a Validation error the scope does not catch, and \
-                     it panics"
+                    !helper.contains(construct),
+                    "`{name}` reaches `{construct}`; it runs inside the error scope, so a view \
+                     of a failed texture would be built before anything has checked"
                 );
             }
         }
+
+        for name in [RESERVE, FLIP_RESERVE] {
+            let code = body(name);
+            let pop = code
+                .find(".pop()")
+                .unwrap_or_else(|| panic!("`{name}` no longer pops an error scope"));
+            for construct in ["create_view", "LayerStore::", "from_texture"] {
+                if let Some(at) = code.find(construct) {
+                    assert!(
+                        at > pop,
+                        "`{name}` reaches `{construct}` before it has popped its error scope; a \
+                         view of a failed texture is a Validation error the scope does not \
+                         catch, and it panics"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Nothing shipped grows the atlas through the infallible path.**
+    ///
+    /// This is the guard `try_reserve`'s stale enumeration wanted and did not
+    /// have. That list named `take_whole_page` as its worst entry after that
+    /// path had been made fallible, and said nothing about `flip_layers`, which
+    /// was the last infallible caller — so a reader consulting it would have
+    /// spent effort on a fixed problem and walked past the live one. A list of
+    /// what is unguarded goes stale in the reassuring direction every time
+    /// something is guarded; this cannot.
+    ///
+    /// [`CanvasRenderer::ensure_pages`] survives for the GPU tests, which want
+    /// an atlas grown without a refusal to unwrap. It is the *shipped* callers
+    /// that are the property, so the scan stops at this module — which is also
+    /// what keeps it from matching its own source, the failure
+    /// `a_reservation_builds_no_view_before_it_has_checked` records.
+    ///
+    /// Demonstrated by mutation: put `self.ensure_pages` back in `flip_layers`
+    /// and this fails.
+    #[test]
+    fn no_shipped_code_grows_the_atlas_infallibly() {
+        const SRC: &str = include_str!("canvas.rs");
+        const DEFINITION: &str = concat!("fn ", "ensure_pages(");
+        const CALL: &str = concat!(".", "ensure_pages(");
+
+        let shipped: String = SRC
+            .lines()
+            .take_while(|l| !l.starts_with("#[cfg(test)]"))
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shipped.contains(DEFINITION),
+            "`ensure_pages` was renamed or moved; this guard has to follow it"
+        );
+        // `try_ensure_pages` contains the shorter name, so the fallible calls
+        // have to be taken out before the infallible ones can be counted.
+        let infallible = shipped.replace(concat!(".try_", "ensure_pages("), "");
+        assert!(
+            !infallible.contains(CALL),
+            "something outside the tests calls the infallible `ensure_pages`; a growth that \
+             cannot be refused is an out-of-memory that reaches `crash::device_error`, and \
+             `try_ensure_pages` exists so that it does not"
+        );
     }
 
     /// The two figures a refusal may state are the two the device actually
