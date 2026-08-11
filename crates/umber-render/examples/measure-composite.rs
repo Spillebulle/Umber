@@ -142,6 +142,15 @@
 //! [`check_cameras`], which is also where the first of those mutations walked
 //! straight through the centred aim the check originally had.
 //!
+//! **And the dense store cannot catch a tile-resolution bug, which is the
+//! sharpest reason the check runs on all three.** Narrowing the fast-path test
+//! from `t_lo == t_up` to its x half — so a tap straddling a *horizontal* tile
+//! edge wrongly takes the fast path — comes back at **0 of 255 on the dense
+//! store** and at 24 and 15 on the blob and the scatter. The dense layout is the
+//! identity, so a tile's vertical neighbour really is the cell below it and
+//! reading across the boundary lands on the right texel anyway. Only a packed
+//! atlas can tell the two apart, and a packed atlas is the production layout.
+//!
 //! It is an example rather than a test because it asserts wall-clock time,
 //! which CLAUDE.md forbids on CI, and because it wants gigabytes of a real card.
 
