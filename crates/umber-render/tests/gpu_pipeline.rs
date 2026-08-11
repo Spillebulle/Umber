@@ -5043,6 +5043,72 @@ fn a_cancelled_capture_hands_its_buffers_back_rather_than_being_dropped() {
 }
 
 #[test]
+fn wiping_a_slice_a_capture_named_gives_the_capture_up_rather_than_re_reading_it() {
+    // A write to a slice a capture has already read is *marked*, and the step
+    // is read again before the document is handed over — which is right for
+    // paint and wrong for a wipe, because a wipe may be the slice **changing
+    // hands**. A capture's `Candidate` is snapshotted when it begins, so it
+    // believes slot 0 belongs to the layer that held it then; deleting a layer
+    // parks its slice, the undo budget can evict the parked entry, and the next
+    // layer added claims that slice and is handed it through `clear_layer`.
+    // Re-reading then files the new layer's pixels under the old layer's name,
+    // which is worse than the staleness the mark exists to repair.
+    //
+    // Driven rather than asserted about: what is measured is that the capture
+    // stops producing a document and settles, which is what the caller reacts
+    // to. Demonstrated by mutation — `clear_layer` calling `touch_slot` rather
+    // than `wipe_slot` leaves the capture live and it hands one over.
+    let mut h = harness_or_skip!();
+    let draws = vec![LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+        mask: None,
+        clipped: false,
+    }];
+    assert!(h.canvas.begin_capture(&[0], &draws));
+
+    // One step recorded and submitted, so the capture has really begun on the
+    // slice about to be wiped.
+    let mut enc = h.encoder();
+    h.canvas
+        .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.submit_capture();
+
+    // A slice changing hands looks exactly like this.
+    h.canvas.clear_layer(&h.gpu.queue, 0);
+
+    for _ in 0..2000 {
+        assert!(
+            h.canvas.take_capture(&h.gpu.device).is_none(),
+            "a capture whose slice was wiped handed over a document naming a \
+             layer that no longer owns it",
+        );
+        while h.canvas.take_capture_slice().is_some() {}
+        if !h.canvas.capture_in_flight() {
+            break;
+        }
+        let mut enc = h.encoder();
+        h.canvas
+            .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
+        h.canvas.submit_capture();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !h.canvas.capture_in_flight(),
+        "the capture never settled, so the next autosave of this document \
+         would be refused for ever",
+    );
+    assert!(
+        h.canvas.begin_capture(&[0], &draws),
+        "the staging buffer was never given back"
+    );
+}
+
+#[test]
 fn settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone() {
     // `cancel_capture` marks the job and does not free it, so *something* has
     // to keep asking — and the caller that cancels has usually stopped tracking

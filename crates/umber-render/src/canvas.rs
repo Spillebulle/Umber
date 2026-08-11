@@ -6517,7 +6517,7 @@ impl CanvasRenderer {
     pub fn clear_layer(&mut self, queue: &wgpu::Queue, slot: u32) {
         self.set_class(slot, SlotClass::Layer);
         self.release_slot(queue, slot);
-        self.touch_slot(slot);
+        self.wipe_slot(slot);
     }
 
     /// Make one slot a **mask**, revealing everything — what a new mask starts
@@ -6539,7 +6539,7 @@ impl CanvasRenderer {
     /// side, which is the same pair of claims with the arithmetic taken out of
     /// one of them.
     pub fn fill_layer_white(&mut self, queue: &wgpu::Queue, slot: u32) {
-        self.touch_slot(slot);
+        self.wipe_slot(slot);
         self.set_class(slot, SlotClass::Mask);
         self.release_slot(queue, slot);
     }
@@ -7996,6 +7996,38 @@ impl CanvasRenderer {
         if let Some(job) = self.capture.as_mut() {
             job.disturb(slot);
         }
+    }
+
+    /// Note that a slice's contents have been thrown away wholesale rather than
+    /// painted over.
+    ///
+    /// [`Self::touch_slot`] plus giving up on a capture that named the slice,
+    /// and the difference is **that a wipe may be a slice changing hands**. A
+    /// capture names slots and its `Candidate` was snapshotted when it began, so
+    /// it believes slot *S* belongs to the layer that held it then; deleting a
+    /// layer parks its slice, the undo budget can evict the parked entry, and
+    /// the next layer added claims that slice — and is handed it through
+    /// `clear_layer`, exactly here. Marking the step stale would then read it
+    /// again off whoever holds the slice *now* and file the new layer's pixels
+    /// under the old layer's name, which is worse than the staleness the mark
+    /// exists to repair. There is nothing to repair, so the capture goes.
+    ///
+    /// "Clear layer" and adding a mask reach this too and would have been safe
+    /// to re-read; they are rare, and one rule that cannot tell a recycle from a
+    /// wipe is better than two that have to.
+    ///
+    /// Only where the capture actually named the slice: a brand new layer's
+    /// fresh slice is not in `slots`, so the ordinary case of adding one costs
+    /// a capture nothing.
+    fn wipe_slot(&mut self, slot: u32) {
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(|job| job.slots.contains(&slot))
+        {
+            self.cancel_capture();
+        }
+        self.touch_slot(slot);
     }
 
     /// Note that every slice has changed — a flip, a resize, a fresh document.
