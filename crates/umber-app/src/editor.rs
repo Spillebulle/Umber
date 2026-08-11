@@ -320,15 +320,23 @@ pub enum BrushTab {
 /// *leave the entry where it is*. A caller that collapsed them would either
 /// refuse every flip or quiet the document for a refusal it is about to make.
 ///
-/// **Every reader of it matches exhaustively**, and that took a correction: the
-/// two menu rows read `gate == StepGate::FlipLocked`, which is `matches!`
-/// wearing an operator. A fourth answer would have been a compile error in
-/// `App::settle_step` and a silent `false` in both rows — the menu going on
-/// offering a command the model had just learned to decline, in a change whose
-/// whole purpose is stopping exactly that. They go through
+/// **Every reader today matches exhaustively, and a test is what keeps it that
+/// way.** The two menu rows read `gate == StepGate::FlipLocked`, which is
+/// `matches!` wearing an operator: a fourth answer would have been a compile
+/// error in `App::settle_step` and a silent `false` in both rows — the menu
+/// going on offering a command the model had just learned to decline, in a
+/// change whose whole purpose is stopping exactly that. They go through
 /// [`StepGate::refuses`] now. See CLAUDE.md's "Partial exhaustiveness is worse
 /// than none"; this is the shape it describes, found by a critic in the diff
 /// that cited that section.
+///
+/// The first phrasing of this paragraph claimed exhaustiveness outright, which
+/// is a claim about the whole program that nothing enforces — `PartialEq` is
+/// still derived (three tests want `assert_eq!`), so a fifth reader can write
+/// the equality test again, which is precisely how this arrived. What holds the
+/// line is `ui::tests::the_edit_menus_history_rows_go_dead_when_a_lock_refuses_
+/// the_flip`, a guard at the call site. Structure narrows the mistake; only a
+/// test at the call site catches it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepGate {
     /// Nothing in the way. Every entry that swaps pixels or stack shape, and
@@ -371,11 +379,14 @@ impl StepGate {
 /// pointed out that it had not had it.
 ///
 /// Written so it is true whether one layer is locked or twenty: `any_locked` is
-/// an `iter().any()`, so a sentence saying "the layer" is wrong for a stack with
-/// three locked in it, and a plural-agreement dance is not worth the alternative.
-/// No em-dash, like everything else the interface draws.
-pub const FLIP_LOCKED_REASON: &str = "A flip mirrors every layer at once, so it cannot skip a locked one. Unlock \
-     every locked layer in the Layers panel";
+/// an `iter().any()`, so the "Unlock **it** first" it replaces is wrong for a
+/// stack with three locked in it, and a plural-agreement dance is not worth the
+/// alternative. Only that half needed fixing — "cannot skip one" has *every
+/// layer* for its antecedent and was always right, and saying "a locked one"
+/// instead put a third "lock" into one tooltip for nothing. No em-dash, like
+/// everything else the interface draws.
+pub const FLIP_LOCKED_REASON: &str = "A flip mirrors every layer at once, so it cannot skip one. Unlock every \
+     locked layer in the Layers panel";
 
 impl Default for UiState {
     fn default() -> Self {
@@ -1398,6 +1409,19 @@ impl Editor {
     /// a fourth variant: the caller's `take_undo` already returns `None` a line
     /// later, and "there is nothing to step over" is not a refusal anybody has
     /// to be told about. `History::can_undo` is what a control asks about that.
+    ///
+    /// **This predicts on the `kind` where `App::reverse` decides on the
+    /// `body`, and the asymmetry is deliberate.** `reverse` mirrors only for an
+    /// `EditBody::Flip` whose kind also names an axis; this refuses for the kind
+    /// alone. The kind's predicate is therefore a strict *superset* of the
+    /// body's, so this can never answer `Clear` over a step that will go on to
+    /// mirror — it fails closed, which is the direction that matters. Reading
+    /// the body would be exact and is one line away, since `next_undo` hands
+    /// back the whole `&Edit`; it is not taken, because the exact reading buys
+    /// nothing over a safe over-approximation and would make the two functions
+    /// agree by construction *only* while both are read the same way. The guard
+    /// builds the disagreeing state on purpose — a `Flip` body under every kind
+    /// — which pins this reading rather than the other.
     fn gate_for(&self, next: Option<umber_core::EditKind>) -> StepGate {
         // Read off `flip_axis` rather than `matches!` on the two flip variants,
         // so a third axis would arrive here already handled. The axis itself is
@@ -2742,6 +2766,15 @@ mod tests {
             ed.history
                 .push_redo(umber_core::Edit::new(kind, umber_core::EditBody::Flip));
         }
+        // **The fixture is checked before it is used**, because its own
+        // ordering is load-bearing and silently so: `History::record` drains
+        // the redo stack, so putting the two loops the other way round leaves
+        // redo *empty*, and both assertions below then pass on `None => Clear`
+        // having tested nothing. A second critic asked for that mutation and it
+        // was green. Two entries applied and four held is the shape the four
+        // answers below mean anything over.
+        assert_eq!(ed.history.position(), 2, "the undo stack is not as loaded");
+        assert_eq!(ed.history.len(), 4, "the redo stack was drained");
         assert_eq!(
             ed.undo_gate(),
             StepGate::FlipLocked,

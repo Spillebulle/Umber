@@ -1016,6 +1016,55 @@ mod tests {
         assert_eq!(redone.patches()[0].pieces()[0].bytes()[0], 2);
     }
 
+    /// A peek names the entry the matching `take_*` will hand over, and does
+    /// not spend it.
+    ///
+    /// **The rule is this module's, so the guard is too.** It was guarded only
+    /// from `umber-app`, where the gate that reads it lives — and CLAUDE.md's
+    /// "enumerate the call sites of the rule, not the rule" cuts the other way
+    /// here, because which *end* of a stack these read is an engine fact rather
+    /// than a panel's. A second critic asked for it and was right.
+    ///
+    /// Both stacks carry **two** entries, which is the whole point: with one,
+    /// `first()` and `last()` are the same function. `first()` for either peek
+    /// reproduces the caller's original defect exactly — a gate reading the
+    /// bottom of the stack answers about an edit nobody is about to step over.
+    #[test]
+    fn a_peek_names_the_entry_the_take_would_hand_over() {
+        let fill = |edit: &Edit| edit.patches()[0].pieces()[0].bytes()[0];
+
+        let mut h = History::default();
+        h.record(edit(4, 4, 1));
+        h.record(edit(4, 4, 2));
+
+        let peeked = fill(h.next_undo().expect("two entries recorded"));
+        assert_eq!(peeked, 2, "the peek read the bottom of the undo stack");
+        assert_eq!(h.position(), 2, "the peek spent an entry");
+        let taken = h.take_undo().expect("two entries recorded");
+        assert_eq!(
+            fill(&taken),
+            peeked,
+            "the peek and the take disagree about which entry is next"
+        );
+
+        // The redo stack, whose own peek was covered by nothing at all. Its two
+        // entries carry different fills for the reason the undo pair does.
+        h.push_redo(taken);
+        h.push_redo(edit(4, 4, 3));
+        let peeked = fill(h.next_redo().expect("two entries pushed"));
+        assert_eq!(peeked, 3, "the peek read the bottom of the redo stack");
+        assert_eq!(
+            fill(&h.take_redo().expect("two entries pushed")),
+            peeked,
+            "the peek and the take disagree about which entry is next"
+        );
+
+        // And an empty stack peeks at nothing rather than panicking.
+        let empty = History::default();
+        assert!(empty.next_undo().is_none());
+        assert!(empty.next_redo().is_none());
+    }
+
     #[test]
     fn recording_clears_redo() {
         let mut h = History::default();

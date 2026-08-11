@@ -1694,6 +1694,16 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // one member. An equality test is what stood here first, and it is
     // `matches!` wearing an operator — a fourth variant would have been a
     // compile error in `App::settle_step` and a silent `false` here.
+    //
+    // **The gate is read before `App::undo` runs `finish_transform`**, so with
+    // a float standing this can disable a row a click would have made live: the
+    // float goes down as an `EditKind::Transform`, which is then the entry on
+    // top and is not a flip. The row is dead and its sentence names a flip that
+    // would no longer have been next. Left as it is deliberately — the error is
+    // always towards refusing, never towards offering what the model declines,
+    // which is the direction that costs a document nothing — and drawing the
+    // menu from a speculative `finish_transform` would mean predicting an edit
+    // in order to describe it.
     let undo_locked = ed.undo_gate().refuses();
     if menu_item(ui, Action::Undo, ed.history.can_undo() && !undo_locked)
         .on_disabled_hover_text(if undo_locked {

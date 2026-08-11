@@ -2187,6 +2187,18 @@ impl UmberApp {
         // the six strokes above it had already been stepped over — which they
         // have, correctly: a partial jump is exactly what pressing Ctrl+Z by
         // hand until it stopped working would have given.
+        //
+        // **The panel's rows are deliberately not disabled to match, where the
+        // Edit menu's are**, and the asymmetry is decided rather than
+        // overlooked. A menu row stands for *one* command with one outcome, so
+        // one that will raise a box instead of acting is a control that lies.
+        // A History row stands for a *position*, and every row above the flip
+        // is genuinely reachable; greying out the ones below it would grey out
+        // most of the list on the strength of one entry in the middle, and the
+        // row somebody clicks does not say which entry will stop the walk. So
+        // the click is honoured as far as it goes and the notice says where it
+        // stopped — which is why that notice may not claim nothing happened.
+        // See `flip_step_refusal`.
         match self.editor.history.steps_to(position) {
             Jump::Stay => {}
             Jump::Undo(steps) => {
