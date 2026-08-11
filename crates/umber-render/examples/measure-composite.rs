@@ -145,19 +145,120 @@ enum Variant {
     /// The page-table load alone, no atlas read. Timing only; see the module
     /// docs.
     Table,
+    /// `textureGather` inside the existing single-tile fast path: four gathers
+    /// where the shipped path does four `textureLoad`s, and the identical hand
+    /// lerp on the identical texel values. See [`GATHER_BODY`].
+    Gather,
 }
 
 impl Variant {
-    const ALL: [Variant; 3] = [Variant::Tiled, Variant::Sampled, Variant::Table];
+    const ALL: [Variant; 4] = [
+        Variant::Tiled,
+        Variant::Sampled,
+        Variant::Table,
+        Variant::Gather,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Variant::Tiled => "tiled",
             Variant::Sampled => "sampled",
             Variant::Table => "table",
+            Variant::Gather => "gather",
         }
     }
 }
+
+/// `tile_bilinear` with the fast path's four `textureLoad`s replaced by four
+/// `textureGather`s.
+///
+/// **The straddling path is byte for byte the shipped one.** A gather takes the
+/// four texels of one bilinear footprint out of one texture, and a straddling
+/// tap's four texels are in up to four different atlas cells, so there is
+/// nothing there for a gather to do. That is exactly why the fast path is the
+/// place to ask the question: `tiles.wgsl` records that a tap straddles a tile
+/// boundary only within half a texel of one, `1 - (255/256)^2`, about 0.78%.
+///
+/// Three things had to be got right, and each of them would have been a picture
+/// that moved:
+///
+/// **Where the gather is aimed.** The hardware picks its four texels as
+/// `floor(uv * dim - 0.5)` and that one plus one, in its own fixed point with
+/// a few bits of subtexel precision. Aiming at the true fractional position
+/// would put it a rounding error away from a texel boundary and let it step
+/// into the neighbouring tile — the seam this whole design exists to avoid. So
+/// it is aimed at `(a + 1) / dim`, which lands `p` at exactly `a + 0.5`: half a
+/// texel from either boundary, two orders of magnitude more slack than the
+/// hardware's precision. `dim` is derived from `doc_size` rather than asked of
+/// the texture, because a page *is* the canvas rounded up to whole tiles —
+/// `Grid::page_size` — so it is three integer operations and no query.
+///
+/// **The component order.** WGSL follows D3D and Vulkan: the returned vector is
+/// the four texels counter-clockwise from the lower left, which in a y-down
+/// texture is `.w` = (0,0), `.z` = (1,0), `.x` = (0,1), `.y` = (1,1). Getting
+/// this wrong is a picture shifted by a texel, which is why the check below
+/// demands *exact* equality against the shipped path rather than a tolerance.
+///
+/// **The clamp at the canvas edge.** The shipped path clamps both taps into the
+/// canvas, so within half a texel of the document's own border the two taps are
+/// one texel and it lerps a value against itself. A gather cannot be clamped
+/// that way — it fetches `a` and `a + 1` whatever they are, and `a + 1` there is
+/// either a real canvas texel (left edge) or the page's padding (right edge).
+/// Zeroing the weight on any axis where the two taps collapsed is what makes
+/// that exactly equal and not merely close: `mix(x, y, 0.0)` is `x * 1 + y * 0`,
+/// which is `x` for any finite `y`, and an 8-bit unorm texel is always finite.
+/// It is a `select` rather than a branch, so the common path pays two
+/// comparisons and no divergence.
+const GATHER_BODY: &str = r#"
+fn tile_bilinear(
+    atlas: texture_2d_array<f32>,
+    table: texture_2d_array<u32>,
+    slot: i32,
+    doc: vec2<f32>,
+    doc_size: vec2<i32>,
+    empty: vec4<f32>,
+) -> vec4<f32> {
+    let centred = doc - vec2<f32>(0.5);
+    let base = floor(centred);
+    let w = centred - base;
+    let hi = doc_size - vec2<i32>(1);
+    let lo = clamp(vec2<i32>(base), vec2<i32>(0), hi);
+    let up = clamp(vec2<i32>(base) + vec2<i32>(1), vec2<i32>(0), hi);
+
+    let t_lo = lo / TILE;
+    let t_up = up / TILE;
+    if (t_lo.x == t_up.x && t_lo.y == t_up.y) {
+        let entry = textureLoad(table, t_lo, slot, 0).r;
+        if (entry == TILE_UNBACKED) {
+            return empty;
+        }
+        let at = tile_atlas_texel(entry, lo, t_lo);
+        let page = i32(entry >> TILE_PAGE_SHIFT);
+        // The page is the canvas rounded up to whole tiles: Grid::page_size.
+        let dim = vec2<f32>(((doc_size + TILE - 1) / TILE) * TILE);
+        let uv = (vec2<f32>(at) + vec2<f32>(1.0)) / dim;
+        // Where a tap was clamped into the canvas the two taps are one texel,
+        // so this weight is zero and whatever the gather picked up beside it is
+        // multiplied by zero. Exactly what the four-load path computes.
+        let ww = select(w, vec2<f32>(0.0), lo == up);
+        let gr = textureGather(0, atlas, measure_samp, uv, page);
+        let gg = textureGather(1, atlas, measure_samp, uv, page);
+        let gb = textureGather(2, atlas, measure_samp, uv, page);
+        let ga = textureGather(3, atlas, measure_samp, uv, page);
+        let c00 = vec4<f32>(gr.w, gg.w, gb.w, ga.w);
+        let c10 = vec4<f32>(gr.z, gg.z, gb.z, ga.z);
+        let c01 = vec4<f32>(gr.x, gg.x, gb.x, ga.x);
+        let c11 = vec4<f32>(gr.y, gg.y, gb.y, ga.y);
+        return mix(mix(c00, c10, ww.x), mix(c01, c11, ww.x), ww.y);
+    }
+
+    let c00 = tile_load(atlas, table, slot, vec2<i32>(lo.x, lo.y), empty);
+    let c10 = tile_load(atlas, table, slot, vec2<i32>(up.x, lo.y), empty);
+    let c01 = tile_load(atlas, table, slot, vec2<i32>(lo.x, up.y), empty);
+    let c11 = tile_load(atlas, table, slot, vec2<i32>(up.x, up.y), empty);
+    return mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
+}
+"#;
 
 /// `tiles.wgsl` up to `fn tile_bilinear(`, having checked that nothing follows
 /// it.
@@ -220,6 +321,7 @@ fn shader_source(variant: Variant, page: UVec2) -> String {
              \x20   return vec4<f32>(f32(entry & 255u) * (0.25 / 255.0));\n\
              }\n"
         .to_string(),
+        Variant::Gather => GATHER_BODY.to_string(),
     };
     format!(
         "{}{}{}{}{}",
@@ -1194,44 +1296,82 @@ fn sweep_canvas(
             0,
             bytemuck::bytes_of(&view_uniforms(doc, &camera, pivot, 4.min(slots), false)),
         );
-        let a = read_back(
-            gpu,
-            find_pipeline(Variant::Tiled),
-            find_bg(Residency::Dense),
-            target,
-            target_view,
-            plan.output,
-        );
-        let b = read_back(
-            gpu,
-            find_pipeline(Variant::Sampled),
-            find_bg(Residency::Dense),
-            target,
-            target_view,
-            plan.output,
-        );
-        let worst = a
-            .iter()
-            .zip(&b)
-            .map(|(x, y)| (i32::from(*x) - i32::from(*y)).unsigned_abs())
-            .max()
-            .unwrap_or(0);
-        println!(
-            "  check: tiled against sampled on the dense store, 4 layers at 1:1 — \
-             largest channel deviation {worst} of 255{}",
-            if worst <= 2 {
-                ""
-            } else {
-                "  <-- LARGE. The two columns may not be one picture; treat the table as void."
+        // Every residency, not only the dense one. The dense store is the only
+        // one the *sampled* baseline can be compared against — it is the only
+        // identity layout — but `gather` has to answer for the packed atlas
+        // too, and for the unbacked branch, which the dense store never takes.
+        for &residency in &Residency::ALL {
+            let bg = find_bg(residency);
+            let a = read_back(
+                gpu,
+                find_pipeline(Variant::Tiled),
+                bg,
+                target,
+                target_view,
+                plan.output,
+            );
+            let g = read_back(
+                gpu,
+                find_pipeline(Variant::Gather),
+                bg,
+                target,
+                target_view,
+                plan.output,
+            );
+            let worst = worst_deviation(&a, &g);
+            // **Exact, not close.** `gather` is a pure optimisation of a path
+            // with a known-correct answer: it reads the same stored texels and
+            // runs the same f32 lerp, so anything other than zero means it is
+            // reading different texels — a shifted picture, a wrong component
+            // order, or the canvas-edge clamp not being reproduced.
+            println!(
+                "  check: gather against tiled on the {} store, 4 layers at 1:1 — \
+                 largest channel deviation {worst} of 255{}",
+                residency.label(),
+                if worst == 0 {
+                    "  (exact)"
+                } else {
+                    "  <-- NOT EXACT. gather is reading different texels; the column is void."
+                }
+            );
+
+            if residency != Residency::Dense {
+                continue;
             }
-        );
+            let b = read_back(
+                gpu,
+                find_pipeline(Variant::Sampled),
+                bg,
+                target,
+                target_view,
+                plan.output,
+            );
+            let worst = worst_deviation(&a, &b);
+            println!(
+                "  check: tiled against sampled on the dense store, 4 layers at 1:1 — \
+                 largest channel deviation {worst} of 255{}",
+                if worst <= 2 {
+                    ""
+                } else {
+                    "  <-- LARGE. The two columns may not be one picture; treat the table as void."
+                }
+            );
+        }
     }
 
     // ---- the sweep ------------------------------------------------------
     println!();
     println!(
-        "  {:<6} {:<5} {:<8} {:>11} {:>11} {:>11} {:>9}",
-        "zoom", "lyrs", "residency", "tiled ms", "sampled ms", "table ms", "tiled/s"
+        "  {:<6} {:<5} {:<8} {:>11} {:>11} {:>11} {:>11} {:>8} {:>8}",
+        "zoom",
+        "lyrs",
+        "residency",
+        "tiled ms",
+        "gather ms",
+        "sampled ms",
+        "table ms",
+        "tiled/s",
+        "gath/s"
     );
     for &zoom in &plan.zooms {
         for &layers in &plan.layers {
@@ -1274,18 +1414,29 @@ fn sweep_canvas(
                     target_view,
                     plan,
                 ));
+                let gather = summarise(time_cell(
+                    gpu,
+                    find_pipeline(Variant::Gather),
+                    bg,
+                    target_view,
+                    plan,
+                ));
                 println!(
-                    "  {:<6} {:<5} {:<8} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>8.2}x",
+                    "  {:<6} {:<5} {:<8} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} \
+                     {:>7.3} ±{:<3.0} {:>7.2}x {:>7.2}x",
                     zoom.label(),
                     layers,
                     residency.label(),
                     tiled.median,
                     spread_pct(&tiled),
+                    gather.median,
+                    spread_pct(&gather),
                     sampled.median,
                     spread_pct(&sampled),
                     table.median,
                     spread_pct(&table),
                     tiled.median / sampled.median,
+                    gather.median / sampled.median,
                 );
             }
         }
@@ -1296,6 +1447,15 @@ fn sweep_canvas(
 /// machine was quiet enough for the figure beside it to mean anything.
 fn spread_pct(s: &Summary) -> f64 {
     (s.high - s.low) / s.median * 100.0
+}
+
+/// The largest channel difference between two renderings of one frame.
+fn worst_deviation(a: &[u8], b: &[u8]) -> u32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (i32::from(*x) - i32::from(*y)).unsigned_abs())
+        .max()
+        .unwrap_or(0)
 }
 
 fn read_back(
