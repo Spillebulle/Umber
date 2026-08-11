@@ -8890,22 +8890,28 @@ mod tests {
     #[test]
     fn a_reservation_builds_no_view_before_it_has_checked() {
         const SRC: &str = include_str!("canvas.rs");
-        let at = SRC
-            .find("fn try_reserve(")
-            .expect("`try_reserve` was renamed; this guard has to follow it");
+        // Line by line rather than by byte offset, because `include_str!` hands
+        // back the file as it sits on disk and a checkout on Windows has CRLF
+        // where CI's has LF — a scan looking for "\n}\n" passes here and fails
+        // there, which is the shape of failure this project has been tagged
+        // broken by before.
+        let mut lines = SRC.lines().skip_while(|l| !l.contains("fn try_reserve("));
         // From the signature, so the function's own doc comment — which
-        // discusses views at length — is not what gets scanned. Ended at the
-        // first line that closes a top-level item.
-        let body = &SRC[at..];
-        let body = &body[..body.find("\n}\n").expect("`try_reserve` is not closed")];
-        // Comments stripped for the reason the WiX scans strip theirs: this
-        // function argues for itself inside its own body, naming the very
-        // construct the assertion refuses.
-        let code: String = body
-            .lines()
+        // discusses views at length — is not what gets scanned.
+        let code: String = lines
+            .by_ref()
+            // Stopped at the line that closes a top-level item.
+            .take_while(|l| *l != "}")
+            // Comments stripped for the reason the WiX scans strip theirs: this
+            // function argues for itself inside its own body, naming the very
+            // construct the assertion refuses.
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(
+            !code.is_empty(),
+            "`try_reserve` was renamed or reshaped; this guard has to follow it"
+        );
 
         let pop = code
             .find(".pop()")
