@@ -2434,8 +2434,9 @@ impl UmberApp {
             // is the plausible reason — the other refusals here are "this layer
             // already has a mask" and an index off the end, neither of which a
             // released slice would mend and both of which would otherwise cost
-            // the artist their oldest edits for nothing. Both are refused above,
-            // before the reservation, so a `None` here can only be the pool.
+            // the artist their oldest edits for nothing. The first is refused
+            // above, before the reservation; the second cannot arise, because
+            // `index` is `active_index`. So a `None` here can only be the pool.
             // The shape is not re-taken: a release never touches the stack.
             None if self.free_a_slot() => {
                 let Some(slot) = self.editor.layers.add_mask(index) else {
