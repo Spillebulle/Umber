@@ -8489,10 +8489,16 @@ fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
     // an over-approximation that grows towards dense under repeated flips and
     // is bounded by the grid. Nothing short of knowing where the paint is
     // *inside* a tile can do better, and that is a readback.
+    // `<= 3 * 2` was here first and said nothing: the fixture's grid *is* 3×2,
+    // so it could only fail on a corrupt table. What the coarsening actually has
+    // to be is **bounded away from dense** — two marks in two tiles must not
+    // have taken the whole layer — which is the claim a reader would want and
+    // the one a wider mirror would break.
     assert!(canvas.backed_tiles(0) >= backed);
     assert!(
-        canvas.backed_tiles(0) <= 3 * 2,
-        "residency ran past the whole grid"
+        canvas.backed_tiles(0) < 3 * 2,
+        "two flips of two marks took the whole grid: {} tiles",
+        canvas.backed_tiles(0)
     );
 }
 
@@ -8680,22 +8686,32 @@ fn a_growth_part_way_through_an_encoder_keeps_what_was_recorded_before_it() {
     // below fits and the second cannot. Six tiles a slot, so this walks slots
     // rather than restating the fixture arithmetic.
     let grid = [(0u32, 0u32), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)];
-    let mut spare = 2;
-    while canvas.free_tiles() > grid.len() {
+    // Derived rather than looped-until-satisfied: an unbounded `while` here
+    // walks `spare` past `MAX_SLOTS` the day the starting atlas gets bigger,
+    // `write_flat` logs and returns, `free_tiles` stops moving and the test
+    // **hangs** rather than failing. The count is what it is: whole slots first,
+    // then the remainder one tile at a time, leaving exactly one cell.
+    let cells = canvas.free_tiles();
+    assert_eq!(cells, canvas.page_count() as usize * grid.len());
+    let full_slots = (cells - 1) / grid.len();
+    let remainder = (cells - 1) % grid.len();
+    assert!(
+        3 + full_slots < 256,
+        "the fixture outgrew the slot ceiling: {full_slots} slots wanted"
+    );
+    for spare in 2..2 + full_slots as u32 {
         fill_tiled_slot(gpu, &mut canvas, spare, [0, 0, 255, 255]);
-        spare += 1;
     }
-    let resident = spare - 1;
-    let mut i = 0;
-    while canvas.free_tiles() > 1 {
+    let resident = 2 + full_slots as u32 - 1;
+    let spare = 2 + full_slots as u32;
+    for cell in grid.iter().take(remainder) {
         write_flat(
             gpu,
             &mut canvas,
             spare,
-            in_tile(grid[i].0, grid[i].1),
+            in_tile(cell.0, cell.1),
             [0, 0, 255, 255],
         );
-        i += 1;
     }
     assert_eq!(canvas.free_tiles(), 1, "exactly one cell left");
     assert_eq!(canvas.page_count(), pages_before, "nothing has grown yet");

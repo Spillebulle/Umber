@@ -4665,6 +4665,16 @@ impl UmberApp {
                 // covers is left as `install_canvas`'s clear — that is
                 // `docimport::PixelPiece`'s rule 3, and it is why there is no
                 // "this layer is finished" call here.
+                // **Which slices are masks has to be said, before they are
+                // written.** A rectangle of bytes does not say what it is for,
+                // and what a slot's *absent* tiles read as depends on it: a mask
+                // reveals where nothing is stored and a layer is transparent
+                // there. An imported mask arrives fully backed, so nothing shows
+                // today — until a grow-resize adds a region no copy fills. See
+                // `CanvasRenderer::mark_mask_slot`.
+                for slot in self.editor.layers.layers().iter().filter_map(|l| l.mask()) {
+                    canvas.mark_mask_slot(slot);
+                }
                 for upload in &uploads {
                     for piece in &upload.pieces {
                         canvas.write_layer_rect(

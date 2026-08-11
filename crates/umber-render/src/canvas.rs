@@ -798,7 +798,12 @@ impl Vram {
 /// * `resize` — rebuilds the whole array from the Canvas settings dialog.
 /// * A blank document — `Graphics::add_canvas`, reached by File → New, which
 ///   offers up to `max_texture_dimension_2d`; one slice at 32768² is 4.3 GB.
-/// * The effect cache's `ensure_slots(highest + 1)`, which is on the frame path.
+/// * **An effect slice's page, which is on the frame path.** `run_effect_steps`
+///   promotes every slice it targets, a promotion takes a whole page, and
+///   `take_whole_page` reaches the infallible `ensure_pages` where the pool has
+///   none. So a bake can ask the device for a canvas-sized texture on an
+///   ordinary frame and be refused fatally. It is the *worst* entry on this list
+///   because it is the only one the artist did not ask for by name.
 /// * The **page table and its first upload**, which `LayerStore::from_texture`
 ///   makes *after* this function has popped its scope. It is small — kilobytes
 ///   for an ordinary canvas, 16.8 MB for a full stack at 32768² — and it is
@@ -4132,13 +4137,27 @@ impl CanvasRenderer {
             .unwrap_or(SlotClass::Layer)
     }
 
-    /// Say what a slot's absent tiles read as.
+    /// Say that a slot holds a **mask**, so its absent tiles reveal rather than
+    /// hide.
     ///
-    /// Set by [`Self::fill_layer_white`] and reset by [`Self::clear_layer`], so
-    /// a slot recycled from a mask into a layer stops reading white. Both are
-    /// the *only* two places a slot changes what it is for, which is why this is
-    /// private: a third caller would be a slot whose class and whose pixels
-    /// disagreed.
+    /// Two callers and they are the two ways a mask comes into existence:
+    /// [`Self::fill_layer_white`], which is Add mask, and an *import*, which
+    /// arrives through `write_layer_rect` and has to be told separately —
+    /// nothing about a rectangle of bytes says what it is for.
+    /// [`Self::clear_layer`] is what puts a slot back to a layer, so a slice
+    /// recycled from a mask stops reading white.
+    ///
+    /// **A `.kra` transparency mask showed nothing today and was still
+    /// inconsistent**, which is why it is here rather than left: it arrives as
+    /// one fully-backed canvas piece, so there is no absent tile for the class
+    /// to answer for — until a grow-resize adds a region no copy fills, at which
+    /// point an in-app mask would reveal there and an imported one would hide.
+    /// Two masks in one document behaving differently for a reason no reader
+    /// could find.
+    pub fn mark_mask_slot(&mut self, slot: u32) {
+        self.set_class(slot, SlotClass::Mask);
+    }
+
     fn set_class(&mut self, slot: u32, class: SlotClass) {
         if let Some(c) = self.layers.class.get_mut(slot as usize) {
             *c = class;
@@ -10922,6 +10941,7 @@ mod tests {
     const EFFECT_WGSL: &str = include_str!("../shaders/effect.wgsl");
     const THUMBNAIL_WGSL: &str = include_str!("../shaders/thumbnail.wgsl");
     const TILES_WGSL: &str = include_str!("../shaders/tiles.wgsl");
+    const FLIP_WGSL: &str = include_str!("../shaders/flip.wgsl");
 
     /// A `const NAME: TYPE = LITERAL;` out of a shader, as text.
     ///
@@ -10989,13 +11009,17 @@ mod tests {
     /// of whatever page happens to sit at that slot index — a picture made of
     /// other layers.
     ///
-    /// **Three shaders take the page table and two more read layer texels
-    /// without it**, and that is the honest count rather than the tidy one:
-    /// `flip.wgsl` and `transform.wgsl` bind a *per-slice 2D view*, which a page
-    /// table cannot express at all, and both are correct only while residency is
-    /// the identity. `docs/perf/tiled-layer-storage.md` §7 already names them as
-    /// the sparse stage's work; they are excluded here by binding shape rather
-    /// than passed over, so this scan is about the three that took the array.
+    /// **Four shaders take the page table and one more reads layer texels
+    /// without it.** `flip.wgsl` used to be excluded here on the ground that it
+    /// binds a *per-slice 2D view*, which a page table cannot express — that
+    /// stopped being true when the sparse stage taught it `tile_load` against a
+    /// raw `D2Array` view, and a stale exclusion is a hole exactly where the
+    /// scan is meant to be. It is in the list now, under its own binding name.
+    ///
+    /// `transform.wgsl` is the one still outside, and it genuinely does bind a
+    /// per-slice 2D view: its `fs_mask` reads the layer the float was lifted
+    /// from, which `begin_float` has promoted to a whole identity-mapped page
+    /// for exactly that reason. See [`PageUse`].
     ///
     /// A text scan, for the reason the packaging scans here are. What it covers
     /// is that nobody put a direct read back into one of the three; what it
@@ -11011,6 +11035,7 @@ mod tests {
             ("composite.wgsl", COMPOSITE_WGSL),
             ("effect.wgsl", EFFECT_WGSL),
             ("thumbnail.wgsl", THUMBNAIL_WGSL),
+            ("flip.wgsl", FLIP_WGSL),
         ] {
             for line in src.lines() {
                 let code = line.split("//").next().unwrap_or("");
@@ -11021,7 +11046,7 @@ mod tests {
                 // is two of the four ways in.
                 let tight: String = code.chars().filter(|c| !c.is_whitespace()).collect();
                 for f in ["textureLoad(", "textureSampleLevel(", "textureSample("] {
-                    for binding in ["layers,", "layer_tex,"] {
+                    for binding in ["layers,", "layer_tex,", "atlas,"] {
                         let call = format!("{f}{binding}");
                         assert!(
                             !tight.contains(&call),
