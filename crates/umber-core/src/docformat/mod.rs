@@ -971,11 +971,19 @@ struct Watched<W> {
 }
 
 impl<W: Write + std::io::Seek> Watched<W> {
-    fn new(inner: W) -> Self {
+    fn new(mut inner: W) -> Self {
+        // Asked rather than assumed to be zero. It always is from `save_from`,
+        // which hands over a file it has just created — but the count only has
+        // to be right *relative* to the inner sink, and starting it at zero
+        // over a sink that was already somewhere would hand the ZIP writer
+        // offsets short by that much for as long as it went on writing
+        // successfully. A sink that cannot say where it is is one that cannot
+        // be written to either, so zero is as good an answer as any.
+        let at = inner.stream_position().unwrap_or(0);
         Self {
             inner,
             failed: None,
-            at: 0,
+            at,
         }
     }
 
