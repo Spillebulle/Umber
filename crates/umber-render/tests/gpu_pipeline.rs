@@ -2601,14 +2601,22 @@ fn a_banded_selection_upload_clips_exactly_where_an_unbanded_one_does() {
     // the real limit needs a canvas nobody should ask a CI runner for.
     let mut h = harness_or_skip!();
 
-    // Not centred, not square, and touching no edge: every row of this mask is
-    // the same, but *where* it sits is not, so a misplaced band moves the
-    // rectangle rather than leaving it looking plausible. The height is
-    // deliberately not a multiple of the band.
+    // **A triangle, and a rectangle will not do.** A rectangle selection's mask
+    // is the same byte in every row of its own bounding box, so a band that
+    // wrote the wrong rows would write bytes indistinguishable from the right
+    // ones — the fixture-shape failure CLAUDE.md records for the page table,
+    // and it was demonstrated here by mutation before this line was written:
+    // slicing every band from the head of the buffer left a rectangle fixture
+    // green. Every row of this one is a different width, so a misplaced band is
+    // a differently shaped mark. The height is deliberately not a multiple of
+    // the band either.
     let sel = || {
-        Selection::rectangle(
-            Vec2::new(9.0, 7.0),
-            Vec2::new(51.0, 43.0),
+        Selection::polygon(
+            &[
+                Vec2::new(10.0, 6.0),
+                Vec2::new(52.0, 6.0),
+                Vec2::new(10.0, 44.0),
+            ],
             UVec2::splat(DOC),
         )
         .expect("a selection")
@@ -2656,11 +2664,17 @@ fn a_banded_selection_upload_clips_exactly_where_an_unbanded_one_does() {
         "a banded selection upload clipped somewhere else than the whole one did"
     );
     // And that the fixture is not vacuous: a stroke that reached everywhere, or
-    // nowhere, would compare equal under any banding at all.
-    assert_eq!(whole[(32 * DOC + 32) as usize * 4 + 3], 255, "inside");
-    assert_eq!(whole[(32 * DOC + 2) as usize * 4 + 3], 0, "left of it");
-    assert_eq!(whole[(2 * DOC + 32) as usize * 4 + 3], 0, "above it");
-    assert_eq!(whole[(60 * DOC + 32) as usize * 4 + 3], 0, "below it");
+    // nowhere, would compare equal under any banding at all. The third of these
+    // is the one that matters — inside the mask's own rectangle and outside the
+    // shape, which is where a row written from the wrong band lands.
+    let alpha = |x: u32, y: u32| whole[(y * DOC + x) as usize * 4 + 3];
+    assert!(alpha(15, 10) > 0, "inside the triangle");
+    assert_eq!(alpha(2, 32), 0, "left of the mask's own rectangle");
+    assert_eq!(
+        alpha(48, 40),
+        0,
+        "inside the rectangle, past the hypotenuse"
+    );
 }
 
 // ---------------------------------------------------------------------------
