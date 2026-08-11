@@ -543,17 +543,144 @@ pub trait Canvases {
     /// asked about.
     fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError>;
 
+    /// Entry `index`'s pixels, **already encoded**, where the source has them
+    /// that way and no longer holds the canvas they came from.
+    ///
+    /// `None` — the default, and every caller but the autosave — means "ask me
+    /// for the bytes", so nothing that does not need this changes at all.
+    ///
+    /// **This is what lets a source release a buffer before the archive is
+    /// written.** A `Canvases` is asked top of the stack first and the autosave's
+    /// capture comes home bottom first, so a source that could only hand over raw
+    /// pixels has to hold every one of them until the writer reaches it — which
+    /// is `docs/perf/formats-and-host-memory.md` §10.1's ten gigabytes. Encoding
+    /// each slice as it arrives and keeping the PNG turns the order into a
+    /// non-question.
+    ///
+    /// Asked **before** [`Self::layer`] and instead of it, never as well.
+    fn layer_image(&mut self, index: usize) -> Option<&LayerImage> {
+        let _ = index;
+        None
+    }
+
     /// Entry `index`'s mask slice, canvas-sized and in the same form.
     ///
     /// Asked only where [`SaveLayer::mask`] is `Some`, so a document with no
     /// masks never reaches this.
     fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError>;
 
+    /// Entry `index`'s mask, already encoded. [`Self::layer_image`]'s twin.
+    fn mask_image(&mut self, index: usize) -> Option<&MaskImage> {
+        let _ = index;
+        None
+    }
+
     /// The flattened composite, straight-alpha sRGB, canvas-sized.
     ///
     /// Asked once, last, and held across both entries it feeds —
     /// `mergedimage.png` and the thumbnail scaled down from the same bytes.
     fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError>;
+}
+
+/// One layer's image, trimmed and PNG-encoded, with everything the archive
+/// still needs from the canvas-sized buffer it came from.
+///
+/// **Made by the same two functions the writer would have used**, in the same
+/// order, so an archive built from these is the archive built from the pixels
+/// byte for byte — structurally, rather than because two encoders were kept in
+/// step. `write_png` takes a sink, so the only difference between here and the
+/// streaming path is which sink; `finish_png`'s own docs already record that the
+/// bytes are identical either way.
+///
+/// What is carried besides the PNG is what `write_archive` reads off a
+/// [`Placed`] later: where the trimmed rectangle sits (`stack.xml`'s `x` and
+/// `y`) and its [`crate::textobj::Fingerprint`], which a text layer's record is
+/// stamped with. The fingerprint is taken here whether or not the layer carries
+/// text, because the buffer it is taken over is about to be dropped — one FNV
+/// pass over the trimmed image against a PNG encode of the same bytes, which is
+/// not a cost worth a second shape of this type for.
+pub struct LayerImage {
+    png: Vec<u8>,
+    print: crate::textobj::Fingerprint,
+}
+
+impl LayerImage {
+    /// Trim and encode one canvas-sized layer buffer.
+    ///
+    /// `pixels` is layer-texture form — sRGB with alpha premultiplied in linear
+    /// space — exactly as [`SaveLayer::pixels`] is.
+    pub fn of(pixels: &[u8], canvas: UVec2) -> Result<Self, SaveError> {
+        let expected = canvas.x as usize * canvas.y as usize * 4;
+        if pixels.len() != expected {
+            return Err(SaveError::WrongSize {
+                what: "a layer image".to_string(),
+                found: pixels.len(),
+                expected,
+            });
+        }
+        let placed = trim(pixels, canvas);
+        let print = crate::textobj::Fingerprint::of(
+            PixelRect {
+                x: placed.at.0,
+                y: placed.at.1,
+                width: placed.size.x,
+                height: placed.size.y,
+            },
+            &placed.pixels,
+        );
+        let mut png = Vec::new();
+        write_png(&mut png, placed.size, &placed.pixels)?;
+        Ok(Self { png, print })
+    }
+
+    /// How many bytes this is holding, so a caller can say what it costs.
+    pub fn len(&self) -> usize {
+        self.png.len()
+    }
+
+    /// True where the encode produced nothing, which it never does — a PNG has
+    /// a signature. Present because clippy asks for it beside [`Self::len`].
+    pub fn is_empty(&self) -> bool {
+        self.png.is_empty()
+    }
+}
+
+/// One mask, reduced to coverage and PNG-encoded. [`LayerImage`]'s twin.
+///
+/// Never trimmed, for the reason the streaming path does not trim one: a mask is
+/// canvas-sized by definition and its transparent region is a region that
+/// *hides*, so a bounding box of the non-zero pixels would come back as a mask
+/// revealing everything outside it.
+pub struct MaskImage {
+    png: Vec<u8>,
+}
+
+impl MaskImage {
+    /// Reduce one canvas-sized mask slice to its red channel and encode it.
+    pub fn of(pixels: &[u8], canvas: UVec2) -> Result<Self, SaveError> {
+        let expected = canvas.x as usize * canvas.y as usize * 4;
+        if pixels.len() != expected {
+            return Err(SaveError::WrongSize {
+                what: "a mask image".to_string(),
+                found: pixels.len(),
+                expected,
+            });
+        }
+        let grey: Vec<u8> = pixels.chunks_exact(4).map(|px| px[0]).collect();
+        let mut png = Vec::new();
+        write_png_grey(&mut png, canvas, &grey)?;
+        Ok(Self { png })
+    }
+
+    /// How many bytes this is holding.
+    pub fn len(&self) -> usize {
+        self.png.len()
+    }
+
+    /// See [`LayerImage::is_empty`].
+    pub fn is_empty(&self) -> bool {
+        self.png.is_empty()
+    }
 }
 
 /// The source [`encode`] and [`save`] use: there isn't one.
@@ -1392,22 +1519,46 @@ fn write_archive<W: Write + std::io::Seek>(
             continue;
         }
         let src = format!("data/layer{i:03}.png");
-        // Scoped so the canvas-sized buffer is gone before the PNG is written:
-        // `trim` owns what it produces, so past this brace the only thing alive
-        // is the layer's own content rectangle. For a fetched buffer that is
-        // the difference between one canvas resident and one per layer.
-        let placed = {
-            let pixels = resolve(
-                canvases,
-                layer.pixels,
-                Wanted::Layer(at),
-                expected,
-                doc.layers,
-            )?;
-            trim(&pixels, doc.size)
+        // **Encoded already, where the source could not hold the canvas.** The
+        // archive is written top of the stack first and the autosave's capture
+        // arrives bottom first, so a source able only to hand over pixels has to
+        // keep every one of them until the writer reaches it. A source that
+        // encodes as each slice comes home hands over the PNG instead — see
+        // [`Canvases::layer_image`] — and the bytes are the same bytes, because
+        // [`LayerImage::of`] is this branch's `trim` and `write_png` with a
+        // different sink.
+        //
+        // The fingerprint and the placement are copied out here rather than read
+        // later, because holding the borrow would keep `canvases` locked past
+        // the mask below it.
+        let placed = match canvases.layer_image(at) {
+            Some(image) => {
+                let print = image.print;
+                zip.start_file(&src, stored())?;
+                zip.write_all(&image.png)?;
+                Encoded::Already(print)
+            }
+            None => {
+                // Scoped so the canvas-sized buffer is gone before the PNG is
+                // written: `trim` owns what it produces, so past this brace the
+                // only thing alive is the layer's own content rectangle. For a
+                // fetched buffer that is the difference between one canvas
+                // resident and one per layer.
+                let placed = {
+                    let pixels = resolve(
+                        canvases,
+                        layer.pixels,
+                        Wanted::Layer(at),
+                        expected,
+                        doc.layers,
+                    )?;
+                    trim(&pixels, doc.size)
+                };
+                zip.start_file(&src, stored())?;
+                write_png(zip, placed.size, &placed.pixels)?;
+                Encoded::Here(placed)
+            }
         };
-        zip.start_file(&src, stored())?;
-        write_png(zip, placed.size, &placed.pixels)?;
 
         // The mask, as a greyscale PNG of the slice's red channel, under
         // `umber/` where no other reader will look. Never trimmed: a mask is
@@ -1422,15 +1573,26 @@ fn write_archive<W: Write + std::io::Seek>(
         let mask_src = match layer.mask {
             Some(mask) => {
                 let src = mask_src(i);
-                // Scoped like the layer's own, and for the same reason: the
-                // canvas-sized slice is gone by the closing brace and only the
-                // one-byte-a-pixel coverage survives into the encoder.
-                let grey: Vec<u8> = {
-                    let mask = resolve(canvases, mask, Wanted::Mask(at), expected, doc.layers)?;
-                    mask.chunks_exact(4).map(|px| px[0]).collect()
-                };
-                zip.start_file(&src, stored())?;
-                write_png_grey(zip, doc.size, &grey)?;
+                match canvases.mask_image(at) {
+                    // Already encoded, for the reason the layer's own is.
+                    Some(image) => {
+                        zip.start_file(&src, stored())?;
+                        zip.write_all(&image.png)?;
+                    }
+                    None => {
+                        // Scoped like the layer's own, and for the same reason:
+                        // the canvas-sized slice is gone by the closing brace
+                        // and only the one-byte-a-pixel coverage survives into
+                        // the encoder.
+                        let grey: Vec<u8> = {
+                            let mask =
+                                resolve(canvases, mask, Wanted::Mask(at), expected, doc.layers)?;
+                            mask.chunks_exact(4).map(|px| px[0]).collect()
+                        };
+                        zip.start_file(&src, stored())?;
+                        write_png_grey(zip, doc.size, &grey)?;
+                    }
+                }
                 Some(src)
             }
             None => None,
@@ -1447,15 +1609,7 @@ fn write_archive<W: Write + std::io::Seek>(
         // whole either way — the pixels are the layer's ordinary PNG.
         let text_entry = match layer.text {
             Some(text) => {
-                let print = crate::textobj::Fingerprint::of(
-                    PixelRect {
-                        x: placed.at.0,
-                        y: placed.at.1,
-                        width: placed.size.x,
-                        height: placed.size.y,
-                    },
-                    &placed.pixels,
-                );
+                let print = placed.fingerprint();
                 match text.to_json(&print) {
                     Ok(json) => {
                         let src = text_src(i);
@@ -1517,7 +1671,7 @@ fn write_archive<W: Write + std::io::Seek>(
             xml: layer_xml(
                 layer,
                 &src,
-                placed.at,
+                placed.at(),
                 op,
                 exact,
                 selected,
@@ -1968,6 +2122,48 @@ pub(crate) fn clean_name(raw: &str) -> String {
 }
 
 // --- the pixels ------------------------------------------------------------
+
+/// What `write_archive` still needs about a layer image once its PNG is in the
+/// archive, whichever side encoded it.
+///
+/// Two arms rather than making the streaming path build a [`LayerImage`] too:
+/// that would take the fingerprint over every layer of every save, where today
+/// it is taken only for a layer that carries text. A source that hands over a
+/// `LayerImage` has already paid for it, because the buffer it was taken over is
+/// gone.
+enum Encoded {
+    /// The caller encoded it and kept the fingerprint.
+    Already(crate::textobj::Fingerprint),
+    /// This function encoded it and still holds the trimmed pixels.
+    Here(Placed),
+}
+
+impl Encoded {
+    /// Where the trimmed rectangle sits on the canvas, which is `stack.xml`'s
+    /// `x` and `y`.
+    fn at(&self) -> (u32, u32) {
+        match self {
+            Self::Already(print) => (print.rect.x, print.rect.y),
+            Self::Here(placed) => placed.at,
+        }
+    }
+
+    /// The fingerprint a text record is stamped with.
+    fn fingerprint(&self) -> crate::textobj::Fingerprint {
+        match self {
+            Self::Already(print) => *print,
+            Self::Here(placed) => crate::textobj::Fingerprint::of(
+                PixelRect {
+                    x: placed.at.0,
+                    y: placed.at.1,
+                    width: placed.size.x,
+                    height: placed.size.y,
+                },
+                &placed.pixels,
+            ),
+        }
+    }
+}
 
 /// A layer's pixels reduced to the rectangle that actually holds anything.
 struct Placed {
@@ -4457,6 +4653,49 @@ mod tests {
         }
     }
 
+    /// A source that holds no canvas at all: every layer and every mask was
+    /// encoded when it arrived and only the PNG survives.
+    ///
+    /// [`Self::layer`] and [`Self::mask`] **refuse**, which is what makes this
+    /// more than a second spelling of [`OneAtATime`]: if `write_archive` ever
+    /// fell back to asking for pixels, this would fail loudly rather than
+    /// quietly taking the path the whole change exists to avoid.
+    struct AlreadyEncoded {
+        layers: Vec<Option<LayerImage>>,
+        masks: Vec<Option<MaskImage>>,
+        merged: Vec<u8>,
+        asked: Vec<String>,
+    }
+
+    impl Canvases for AlreadyEncoded {
+        fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+            Err(SaveError::NotSupplied {
+                what: format!("raw pixels of layer {index}, which this source does not hold"),
+            })
+        }
+
+        fn layer_image(&mut self, index: usize) -> Option<&LayerImage> {
+            self.asked.push(format!("layer {index}"));
+            self.layers.get(index)?.as_ref()
+        }
+
+        fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+            Err(SaveError::NotSupplied {
+                what: format!("raw mask of layer {index}, which this source does not hold"),
+            })
+        }
+
+        fn mask_image(&mut self, index: usize) -> Option<&MaskImage> {
+            self.asked.push(format!("mask {index}"));
+            self.masks.get(index)?.as_ref()
+        }
+
+        fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError> {
+            self.asked.push("merged".to_string());
+            Ok(Cow::Borrowed(&self.merged))
+        }
+    }
+
     /// A directory of this test's own, emptied first.
     ///
     /// The pid is not enough on its own now that these tests *sweep* the
@@ -4520,6 +4759,71 @@ mod tests {
         assert_eq!(
             source.asked,
             ["layer 3", "layer 2", "layer 0", "mask 0", "merged",],
+            "the writer asked in the wrong order, or asked twice"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An archive built from images the caller encoded is the archive built
+    /// from the pixels, byte for byte.
+    ///
+    /// **The only thing that can settle it.** `LayerImage::of` is `trim` and
+    /// `write_png` with a different sink, so the claim is structural — and a
+    /// claim about bytes that is argued rather than compared is exactly what
+    /// this project does not accept anywhere else. It is measured against the
+    /// *same* `expected` the streamed save is measured against, so all three
+    /// routes into `write_archive` are pinned to one file.
+    ///
+    /// The source refuses to hand over pixels at all, which is what says the
+    /// writer really took the encoded path rather than falling back to the one
+    /// this exists to avoid.
+    #[test]
+    fn an_archive_built_from_encoded_images_is_the_one_built_from_pixels() {
+        let fixture = BothWays::new();
+
+        let held = fixture.layers(false);
+        let (expected, held_warnings) =
+            encode(&fixture.document(&held, false)).expect("encode held");
+
+        // Encoded in the order the *capture* produces them — bottom of the
+        // stack upwards — which is the order the archive does not ask in. That
+        // mismatch is the whole reason this path exists.
+        let mut source = AlreadyEncoded {
+            layers: fixture
+                .pixels
+                .iter()
+                .map(|px| match px.is_empty() {
+                    // The folder, which holds no slice and is never asked about.
+                    true => None,
+                    false => Some(LayerImage::of(px, fixture.size).expect("encode a layer")),
+                })
+                .collect(),
+            masks: vec![Some(
+                MaskImage::of(&fixture.mask, fixture.size).expect("encode a mask"),
+            )],
+            merged: fixture.merged.clone(),
+            asked: Vec::new(),
+        };
+
+        let deferred = fixture.layers(true);
+        let dir = temp_dir("encoded");
+        let path = dir.join("encoded.ora");
+        let warnings =
+            save_from(&path, &fixture.document(&deferred, true), &mut source).expect("save");
+        let written = std::fs::read(&path).expect("read back");
+
+        assert_eq!(
+            written,
+            expected,
+            "an archive built from encoded images is not the encoded one ({} bytes against {})",
+            written.len(),
+            expected.len()
+        );
+        assert_eq!(warnings, held_warnings);
+        assert_eq!(
+            source.asked,
+            ["layer 3", "layer 2", "layer 0", "mask 0", "merged"],
             "the writer asked in the wrong order, or asked twice"
         );
 
