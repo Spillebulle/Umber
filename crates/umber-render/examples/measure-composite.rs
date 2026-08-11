@@ -47,6 +47,11 @@
 //! - **gather** — `textureGather` inside the existing single-tile fast path.
 //!   §11.3 named this as the unmeasured middle between the shipped four loads
 //!   and an apron; [`GATHER_BODY`] is what it is and why it is exact.
+//! - **hw-fast** — the *hardware* bilinear tap inside that same fast path, which
+//!   needs no apron for the same reason gather does not. It is **not exact** and
+//!   is therefore not a candidate; it is here to price the ceiling, because
+//!   without it a refusal of gather reads as "nothing can be done" when what the
+//!   run actually says is "not this way". [`HW_FAST_BODY`].
 //!
 //! # Residency is the axis that can reverse the sign
 //!
@@ -170,14 +175,19 @@ enum Variant {
     /// where the shipped path does four `textureLoad`s, and the identical hand
     /// lerp on the identical texel values. See [`GATHER_BODY`].
     Gather,
+    /// The **hardware** bilinear tap inside that same fast path. Not exact, and
+    /// therefore not a candidate on its own terms — it is here to price the
+    /// ceiling the other two are measured against. See [`HW_FAST_BODY`].
+    HwFast,
 }
 
 impl Variant {
-    const ALL: [Variant; 4] = [
+    const ALL: [Variant; 5] = [
         Variant::Tiled,
         Variant::Sampled,
         Variant::Table,
         Variant::Gather,
+        Variant::HwFast,
     ];
 
     fn label(self) -> &'static str {
@@ -186,6 +196,7 @@ impl Variant {
             Variant::Sampled => "sampled",
             Variant::Table => "table",
             Variant::Gather => "gather",
+            Variant::HwFast => "hw-fast",
         }
     }
 }
@@ -285,6 +296,79 @@ fn tile_bilinear(
 }
 "#;
 
+/// `tile_bilinear` with the fast path's four loads replaced by **one hardware
+/// bilinear tap** — and the reason it is here even though it is not a
+/// candidate.
+///
+/// The fast path's whole condition is that the four texels of the footprint sit
+/// in one atlas cell. Where that holds, the hardware sampler pointed at the
+/// right place inside the cell fetches exactly those four texels and filters
+/// them, with no apron anywhere: an apron exists for the straddling 0.78%, and
+/// this variant does not touch the straddling branch. That is the observation
+/// that makes it worth a column.
+///
+/// **It is not exact, and both reasons are real rather than theoretical.**
+///
+/// The first is arithmetic. The hardware's weights are a few bits of fixed
+/// point where the shipped path's are f32, so this is the same class of
+/// difference as `sampled` against `tiled` — the check below prints it.
+///
+/// The second is worse and is why this is priced rather than proposed. The
+/// hardware picks its own base texel from the coordinate it is handed, in its
+/// own rounding, where the fast path picked one in f32 and *checked* that the
+/// pair was inside a tile. Within a rounding error of a texel boundary the two
+/// can disagree by one, and the hardware then reads across the cell edge into
+/// an unrelated tile. That is a one-texel seam at a tile boundary, appearing on
+/// some layers at some zooms — which is exactly the failure `tiles.wgsl` refuses
+/// an apron over, arriving by another door. It also drops the canvas-edge clamp,
+/// so the outermost half-texel blends the page's padding in.
+///
+/// Neither is settled by the deviation this example prints, because both are
+/// about *where* the rounding falls and a single frame on a single adapter is
+/// one sample of that. Read the column as a ceiling on what any fast-path
+/// change could buy, and nothing more.
+const HW_FAST_BODY: &str = r#"
+fn tile_bilinear(
+    atlas: texture_2d_array<f32>,
+    table: texture_2d_array<u32>,
+    slot: i32,
+    doc: vec2<f32>,
+    doc_size: vec2<i32>,
+    empty: vec4<f32>,
+) -> vec4<f32> {
+    let centred = doc - vec2<f32>(0.5);
+    let base = floor(centred);
+    let w = centred - base;
+    let hi = doc_size - vec2<i32>(1);
+    let lo = clamp(vec2<i32>(base), vec2<i32>(0), hi);
+    let up = clamp(vec2<i32>(base) + vec2<i32>(1), vec2<i32>(0), hi);
+
+    let t_lo = lo / TILE;
+    let t_up = up / TILE;
+    if (t_lo.x == t_up.x && t_lo.y == t_up.y) {
+        let entry = textureLoad(table, t_lo, slot, 0).r;
+        if (entry == TILE_UNBACKED) {
+            return empty;
+        }
+        let cell = vec2<f32>(
+            f32((entry >> TILE_X_SHIFT) & 255u),
+            f32((entry >> TILE_Y_SHIFT) & 255u),
+        );
+        let at = cell * f32(TILE) + (doc - vec2<f32>(t_lo * TILE));
+        let dim = vec2<f32>(((doc_size + TILE - 1) / TILE) * TILE);
+        return textureSampleLevel(
+            atlas, measure_samp, at / dim, i32(entry >> TILE_PAGE_SHIFT), 0.0
+        );
+    }
+
+    let c00 = tile_load(atlas, table, slot, vec2<i32>(lo.x, lo.y), empty);
+    let c10 = tile_load(atlas, table, slot, vec2<i32>(up.x, lo.y), empty);
+    let c01 = tile_load(atlas, table, slot, vec2<i32>(lo.x, up.y), empty);
+    let c11 = tile_load(atlas, table, slot, vec2<i32>(up.x, up.y), empty);
+    return mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
+}
+"#;
+
 /// `tiles.wgsl` up to `fn tile_bilinear(`, having checked that nothing follows
 /// it.
 ///
@@ -347,6 +431,7 @@ fn shader_source(variant: Variant, page: UVec2) -> String {
              }\n"
         .to_string(),
         Variant::Gather => GATHER_BODY.to_string(),
+        Variant::HwFast => HW_FAST_BODY.to_string(),
     };
     format!(
         "{}{}{}{}{}",
@@ -1360,6 +1445,25 @@ fn sweep_canvas(
                 }
             );
 
+            // `hw-fast` is a *rendering* of the same picture rather than a
+            // recomputation of it — hardware weights against f32 ones — so this
+            // is reported and never asserted. See `HW_FAST_BODY` for why even a
+            // small figure here settles nothing about the seam it risks.
+            let h = read_back(
+                gpu,
+                find_pipeline(Variant::HwFast),
+                bg,
+                target,
+                target_view,
+                plan.output,
+            );
+            println!(
+                "  check: hw-fast against tiled on the {} store, 4 layers at 1:1 — \
+                 largest channel deviation {} of 255  (not exact by construction)",
+                residency.label(),
+                worst_deviation(&a, &h),
+            );
+
             if residency != Residency::Dense {
                 continue;
             }
@@ -1387,16 +1491,18 @@ fn sweep_canvas(
     // ---- the sweep ------------------------------------------------------
     println!();
     println!(
-        "  {:<6} {:<5} {:<8} {:>11} {:>11} {:>11} {:>11} {:>8} {:>8}",
+        "  {:<6} {:<5} {:<8} {:>11} {:>11} {:>11} {:>11} {:>11} {:>8} {:>8} {:>8}",
         "zoom",
         "lyrs",
         "residency",
         "tiled ms",
         "gather ms",
+        "hw-fast ms",
         "sampled ms",
         "table ms",
         "tiled/s",
-        "gath/s"
+        "gath/s",
+        "hwf/s"
     );
     for &zoom in &plan.zooms {
         for &layers in &plan.layers {
@@ -1446,9 +1552,16 @@ fn sweep_canvas(
                     target_view,
                     plan,
                 ));
+                let hw_fast = summarise(time_cell(
+                    gpu,
+                    find_pipeline(Variant::HwFast),
+                    bg,
+                    target_view,
+                    plan,
+                ));
                 println!(
                     "  {:<6} {:<5} {:<8} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} \
-                     {:>7.3} ±{:<3.0} {:>7.2}x {:>7.2}x",
+                     {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>7.2}x {:>7.2}x {:>7.2}x",
                     zoom.label(),
                     layers,
                     residency.label(),
@@ -1456,12 +1569,15 @@ fn sweep_canvas(
                     spread_pct(&tiled),
                     gather.median,
                     spread_pct(&gather),
+                    hw_fast.median,
+                    spread_pct(&hw_fast),
                     sampled.median,
                     spread_pct(&sampled),
                     table.median,
                     spread_pct(&table),
                     tiled.median / sampled.median,
                     gather.median / sampled.median,
+                    hw_fast.median / sampled.median,
                 );
             }
         }
