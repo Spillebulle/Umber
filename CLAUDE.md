@@ -850,11 +850,15 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   *slightly more likely to fire*, because it is charged on buffers too. That is a
   trade, not a free win. Wired at `install_import`, `add_layer` and `add_mask`;
   `begin_float`, `resize`, File → New and the effect cache are still fatal and
-  `try_reserve`'s docs enumerate them. **The atlas added one more to the fatal
-  side and it is the worst entry on the list: an effect bake.** A bake promotes
-  every slice it targets and a promotion reaches the infallible `ensure_pages`,
-  so a canvas-sized allocation can now be asked for on an ordinary frame — the
-  only entry there the artist did not ask for by name.
+  `try_reserve`'s docs enumerate them. **The bake is not, any more.** A bake
+  promotes every slice it targets and runs on an ordinary frame, so it was the
+  one entry on that list the artist did not ask for by name; `promote` answers a
+  `PageRefusal` now, and a device refusal reaches `vram::effect_refused` once per
+  episode, saying the picture is unchanged and the layers are drawn without their
+  effects. **The two ways to be refused a page are not one thing**: the device
+  declining an allocation has a figure and a remedy, where `MAX_SLOTS` has
+  neither, and collapsing them told an artist to close other applications about a
+  ceiling Umber sets.
 - **A refusal names what the document needs and never what the card has**,
   because wgpu exposes no total-memory query — `generate_allocator_report`
   reports Umber's own allocations, and the only route to the card's capacity is
@@ -1939,8 +1943,12 @@ when nobody asked for it.
   large canvas) already block. **Any loop of `write_layer_rect` still
   accumulates**: `install_import` held 8.4 GB of staging for a twenty-one-layer
   hundred-megapixel document, and `swap_patch` is the same shape bounded by the
-  undo budget instead. `upload_coverage` is the second unbanded canvas-sized
-  write and is **not** fixed — Select All is 1.07 GB of staging at 32768².
+  undo budget instead. `upload_coverage` bands too, and it is the one whose
+  caller is `App::start_stroke`. What makes the per-band wait payable on the
+  pen-down path is that it only bands when the mask outruns what the device
+  guarantees for one buffer — a selection past 16384 square on
+  `downlevel_defaults`, which D3D12 and Metal cannot make at all — and only when
+  the selection actually changed.
 - **A cancelled capture is marked, not dropped**, for the reason `reset_probes`
   gives. Both halves have to be told — the renderer gives its buffer back, the
   scheduler stops waiting — which is what `app.rs`'s `stop_autosave_of` is for.
@@ -1965,11 +1973,22 @@ when nobody asked for it.
   that must sit *below* the expiry sweep. They answer different questions, and
   the case where neither destination lands is overwhelmingly the full disk —
   exactly where clearing what has expired might let the next attempt through.
-- **What is left of the ten gigabytes is the capture itself, and it is
-  `canvas.rs`'s.** `DocumentCapture` arrives whole from
-  `CanvasRenderer::take_capture`, so every canvas is resident before the writer
-  thread starts. Releasing finished slices one at a time is the remaining half;
-  `docs/perf/formats-and-host-memory.md` §10.1 has it.
+- **The capture never holds the document.** `take_capture_slice` hands each layer
+  slice over as its last band leaves the staging buffer and the writer thread
+  encodes it into a `docformat::LayerImage` and drops the canvas, so what stands
+  is the PNG the archive was going to hold anyway. `take_capture` returns the
+  size and the flattened preview alone — the preview has to stay pixels, because
+  the archive's thumbnail is averaged down from it, and it is one canvas rather
+  than N. **Asking one at a time was not enough on its own**: the archive is
+  written top of the stack first and the capture comes home bottom first, so a
+  source that could only produce *pixels* would hold every one of them until the
+  writer reached it whatever the protocol. `Canvases::layer_image` is the other
+  half, and `LayerImage::of` is `write_archive`'s own `trim` and `write_png` with
+  a different sink, so the archive is byte for byte the one built from pixels.
+  **A capture ends two ways and both clear the writer**: `finish` consumes its
+  images, `abandon` throws them away, and `begin` clears again — one capture's
+  images standing while the next fills in around them is a document written out
+  of two instants.
 - **Expiry can only reach inside one directory, structurally.** `Reaper` is the
   only thing in Umber that deletes a document, and "the callers only pass
   internal paths" is not good enough — a later change makes that false in
@@ -4090,6 +4109,14 @@ method rather than as an anecdote:
   half reads **0 of 255 on the dense store** and 24 and 15 on the packed ones.
   Same shape as the squareness trap above — and the packed layout is the
   production one.
+- **A fixture carrying only what a real file produces is a test of the fixture.**
+  The same shape recurred twice in one branch and both times the fixture was
+  doing no work: a save fixture whose every layer covers its canvas trims to
+  `(0, 0)`, so `x` and `y` are the same number and an origin read transposed
+  writes a byte-identical archive; and a mask fixture carrying `[v, v, v, 255]`
+  — which is exactly what a real mask slice holds — cannot tell apart two
+  functions that both read the red channel. Ask what the values have in common
+  before believing the assertion.
 - **A parent that mutates its own tree while a critic is building from it will
   have the mutation reported back as a defect in the change.** A critic returned
   "gather is not exact and it is non-deterministic across processes", with real
