@@ -7874,6 +7874,18 @@ impl CanvasRenderer {
     /// type. A thumbnail of that slice in flight is disowned in the same
     /// breath: it is a picture of the layer as it was a moment ago, and drawing
     /// it would show the stroke that has just landed as missing.
+    ///
+    /// **"Every method" is a claim about a set somebody has to have counted**,
+    /// and it has been wrong twice. The first time was `render_float`, which
+    /// wrote the float's preview slice every frame of a drag and bumped
+    /// nothing; the second was a guard that said it drove every route and drove
+    /// three of nine, so `flip_layers`, `fill_layer_white`, `commit_float` and
+    /// both of `commit_stroke`'s early-return arms could each have their
+    /// increment deleted with all 170 GPU tests still green. The set is now
+    /// enumerated in `writing_a_slice_moves_its_revision_and_leaves_the_others_
+    /// alone`, which names the two it does not drive and why. Adding a method
+    /// that writes a slice means adding a case there — a rule enforced inside N
+    /// methods still needs somebody to check that N is all of them.
     fn touch_slot(&mut self, slot: u32) {
         if let Some(rev) = self.slot_revisions.get_mut(slot as usize) {
             *rev += 1;

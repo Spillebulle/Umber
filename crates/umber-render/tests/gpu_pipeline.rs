@@ -6409,6 +6409,29 @@ fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
 /// The invalidation rule, at the level that owns it. Every route that writes a
 /// slice moves that slice's counter and no other — which is what lets the layer
 /// list cache a picture and know exactly when it has stopped being true.
+///
+/// **The list of routes is the point, and this test used to drive three of
+/// them.** `CanvasRenderer` calls `touch_slot` from nine places that a document
+/// can reach, and the guard covered `commit_stroke`'s ordinary arm,
+/// `clear_layer` and `write_layer_rect` — while its own first sentence, and
+/// `thumbs.rs`'s module docs, both said "every". Deleting the increment in
+/// `flip_layers`, in `fill_layer_white`, in `commit_float`, and in each of
+/// `commit_stroke`'s two early-return arms left all 170 tests in this file
+/// green. A canvas flip costs every layer in the picture its thumbnail's
+/// correctness, and it is the one of the five that is a whole-document
+/// operation.
+///
+/// So the routes are enumerated here rather than described. The two that are
+/// *not* driven are named with the reason:
+///
+/// * `draw_float`, which writes the float's **preview** slice every frame of a
+///   drag. It is covered, by `a_dragged_float_carries_the_effect_derived_from_
+///   it` — deleting that one increment is the only one of the six that this
+///   file already caught, which is worth knowing before assuming the coverage
+///   here was uniform.
+/// * `write_entry`, which is reachable only from `unback_tile_for_test` and
+///   `borrow_tile_for_test`. No document reaches it, so a thumbnail cannot go
+///   stale through it.
 #[test]
 fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
     let Some(mut h) = Harness::new() else { return };
@@ -6429,9 +6452,49 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
         "and wrote nothing else"
     );
 
-    // The other two routes into a layer's pixels, each of which the layer list
-    // depends on being counted.
+    // `commit_stroke`'s *blended* arm, which returns before the ordinary path
+    // and carries an increment of its own. A brush with a blend mode takes a
+    // different route through the same function, so it is a different line.
     let after_commit = h.canvas.slot_revision(0);
+    h.stamp(&[dab(32.0, 32.0, 8.0, 1.0)]);
+    h.commit_blended_to(0, Color::BLACK, 1.0, BrushMode::Paint, BlendMode::Multiply);
+    assert!(
+        h.canvas.slot_revision(0) > after_commit,
+        "a blended commit returns early and must still count"
+    );
+
+    // And its "nothing to do" arm: a commit whose damage reaches no tile still
+    // clears the scratch, and a caller that has been told the slice moved will
+    // simply re-read a picture that has not. Counting it is the safe direction.
+    let after_blended = h.canvas.slot_revision(0);
+    let mut enc = h.encoder();
+    h.canvas.commit_stroke(
+        &h.gpu.device,
+        &h.gpu.queue,
+        &mut enc,
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        &[],
+        StrokeStyle {
+            color: Color::BLACK,
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            ..Default::default()
+        },
+    );
+    h.gpu.queue.submit(Some(enc.finish()));
+    assert!(
+        h.canvas.slot_revision(0) > after_blended,
+        "a commit with no damaged pieces returns early and must still count"
+    );
+
+    // The route an undo takes.
+    let after_empty = h.canvas.slot_revision(0);
     h.write_block(
         0,
         PixelRect {
@@ -6443,7 +6506,7 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
         [1, 2, 3, 4],
     );
     assert!(
-        h.canvas.slot_revision(0) > after_commit,
+        h.canvas.slot_revision(0) > after_empty,
         "an undo writes its patch back through `write_layer_rect`"
     );
 
@@ -6451,7 +6514,76 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
     let enc = h.encoder();
     h.canvas.clear_layer(&h.gpu.queue, 0);
     h.gpu.queue.submit(Some(enc.finish()));
-    assert!(h.canvas.slot_revision(0) > after_write);
+    assert!(h.canvas.slot_revision(0) > after_write, "a clear");
+
+    // Adding a mask. It writes the page table rather than pixels, which is
+    // exactly why it is easy to forget: the slice's *contents* change from
+    // "nothing" to "reveal everything" without a texel being written.
+    let after_clear = h.canvas.slot_revision(1);
+    h.canvas.fill_layer_white(&h.gpu.queue, 1);
+    assert!(
+        h.canvas.slot_revision(1) > after_clear,
+        "a new mask reveals everything, which is a different picture from what \
+         the slice held a moment ago"
+    );
+
+    // Putting a floating transform down. `draw_float` writes the preview slice
+    // and is covered elsewhere; this is the commit into the layer's own.
+    let mask = PixelRect {
+        x: 8,
+        y: 8,
+        width: 12,
+        height: 10,
+    };
+    h.write_block(0, mask, [200, 30, 40, 255]);
+    let before_float = h.canvas.slot_revision(0);
+    let mut xf = Transform::identity(mask);
+    h.canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: mask,
+                pixels: None,
+                mask: None,
+            },
+        )
+        .expect("no room for a preview");
+    xf.offset = Vec2::splat(16.0);
+    let params = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let damage = xf.damage(UVec2::splat(DOC), true).expect("something to do");
+    let mut enc = h.encoder();
+    h.canvas
+        .commit_float(&h.gpu.queue, &mut enc, damage, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.end_float(&h.gpu.queue);
+    assert!(
+        h.canvas.slot_revision(0) > before_float,
+        "a transform put down wrote the layer and the list was not told"
+    );
+
+    // A canvas flip, which is the whole document at once — and the only route
+    // here that has to move *several* counters. Driving it against a single
+    // slot would leave the loop's body covered and the loop itself not.
+    let flipped = [h.canvas.slot_revision(0), h.canvas.slot_revision(1)];
+    let untouched = h.canvas.slot_revision(2);
+    h.canvas
+        .flip_layers(&h.gpu.device, &h.gpu.queue, &[0, 1], FlipAxis::Horizontal);
+    assert!(
+        h.canvas.slot_revision(0) > flipped[0] && h.canvas.slot_revision(1) > flipped[1],
+        "a canvas flip mirrors every layer, so every thumbnail of one is a \
+         picture of the document as it no longer is"
+    );
+    assert_eq!(
+        h.canvas.slot_revision(2),
+        untouched,
+        "a flip of two slots moved a third"
+    );
 }
 
 /// The mirror of a tightly packed square of RGBA8, done on the CPU.

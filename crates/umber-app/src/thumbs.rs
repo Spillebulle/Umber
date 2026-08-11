@@ -9,6 +9,15 @@
 //! down, an undo, a clear, a new mask, a flip and a resize all pass through one
 //! of those methods by construction.
 //!
+//! **That "every" is a claim about a set somebody has to have counted, and it
+//! was not a guarantee.** The sentence above is true of the code and was
+//! untested for five of the renderer's nine routes: deleting the increment in
+//! `flip_layers`, in `fill_layer_white`, in `commit_float` or in either of
+//! `commit_stroke`'s early-return arms left every GPU test green, and the flip
+//! is the one that costs *every* layer in the picture its thumbnail. The set is
+//! enumerated now, in `writing_a_slice_moves_its_revision_and_leaves_the_others_
+//! alone`; a method added there that writes a slice needs a case beside it.
+//!
 //! What this module decides, and what makes it worth being a module:
 //!
 //! * **which** slot is read next, when several are stale. One thumbnail is read
