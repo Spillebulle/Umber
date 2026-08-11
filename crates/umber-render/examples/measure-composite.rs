@@ -424,11 +424,23 @@ const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 ///
 /// Alpha is held at 64 so that the colour stays a legal premultiplied value and
 /// so a stack of 54 accumulates rather than saturating at the second layer.
-fn page_bytes(page: UVec2) -> Vec<u8> {
+///
+/// **The padding outside the canvas replicates the edge texel, and the check is
+/// what found that it had to.** A page is the canvas rounded up to whole tiles,
+/// so 1920x1080 is stored in 2048x1280 — and the sampled baseline's
+/// `ClampToEdge` clamps at the *page's* edge, 2047, where `tile_bilinear`
+/// clamps at the canvas's, 1919. With independent content in the padding the
+/// two disagreed by **9 of 255** along the last half-texel band, which is not a
+/// bug in either path: it is the baseline being unfaithful to the
+/// canvas-*sized* slice the atlas replaced, whose clamp had nothing beyond the
+/// canvas to reach. Replicating the edge makes the page's clamp and the
+/// canvas's agree by construction.
+fn page_bytes(page: UVec2, doc: UVec2) -> Vec<u8> {
     let mut out = vec![0u8; (page.x as usize) * (page.y as usize) * 4];
     for (i, px) in out.chunks_exact_mut(4).enumerate() {
         let x = (i % page.x as usize) as u32;
         let y = (i / page.x as usize) as u32;
+        let (x, y) = (x.min(doc.x - 1), y.min(doc.y - 1));
         let h = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(2_246_822_519);
         let a = 64u8;
         px.copy_from_slice(
@@ -501,7 +513,7 @@ fn build_store(gpu: &Gpu, grid: &Grid, slots: u32, residency: Residency, label: 
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let fill = page_bytes(page);
+    let fill = page_bytes(page, grid.doc_size);
     for slice in 0..pages {
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
