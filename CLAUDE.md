@@ -1012,6 +1012,21 @@ dense 83,740. Re-run both before quoting any of it.
   wrong for a stroke. `end_float` hands the preview's page back; the layer's own
   page stays, because demoting would need to know which tiles are empty and that
   is a readback.
+- **A mask is read and written through the array's *raw* view.**
+  `LAYER_FORMAT_LINEAR` — `flip.wgsl`'s view, for `flip.wgsl`'s reason. **Which
+  of the two a commit takes is `SlotClass`, never `StrokeStyle::on_mask`**: the
+  class is what `back_tiles`' clear, the readback's empty value and the flip's
+  `tile_load` already answer to, and a wrong class breaks a mask there first. The
+  blended commit asks *both* and fails closed.
+- **`umber-version` is 4, and it is the one revision about what an older build
+  would *show* rather than drop** — every mask a full gamma curve out, silently.
+  A version-3 document is converted on load, for the layer's mask entry and for
+  mask patches in its saved history, and **that conversion is not lossless**: the
+  multiplier survives to within 0.499 of a level, the byte cannot.
+  `history::VERSION` did **not** move, because a mask patch can only exist in a
+  document that already declares 4. Group compositing therefore needs **5**;
+  `docs/group-compositing.md` §4.3, `docs/layer-effects.md` and
+  `docs/layer-rename.md` all still claim 4.
 - **`fill_layer_white` is a table write and a new mask therefore costs nothing.**
   Full reveal *is* a mask slot's empty value. `SlotClass` is what carries the two
   empty values into the three places that need them in Rust and cannot ask a
@@ -2327,13 +2342,19 @@ reporter's own window.
   test pins that. Do not "fix" the inversion.
 
 - **A mask arrives from a `.kra`'s transparency masks and from nowhere else but
-  Umber's own ORA.** A mask slice holds **sRGB-encoded coverage**, because
-  `composite.wgsl` reads its red channel through the layer array's
-  `Rgba8UnormSrgb` view — while every source format states a mask as a *linear*
-  multiplier on alpha. So 128 there is 188 here, and
-  `docimport::srgb::encode_coverage` is the one place the two meet; copying the
-  byte across is wrong by a full gamma curve and hides four fifths of a layer
-  somebody hid by half. Krita's other four mask kinds — filter, transform,
+  Umber's own ORA.** A mask slice holds coverage as a **linear** multiplier on
+  alpha, which is what every source format already states, so the byte is copied
+  across and `docimport::srgb::mask_buffer` only widens it. **This bullet used to
+  say the opposite** — 128 there was 188 here — and that was inherited rather
+  than chosen: a mask borrows a slice of the layer array and was read through
+  that array's sRGB view. The encode was **not injective**, so 73 of 256 states
+  collided, all at the reveal end. **It is a trade, not a free win**: a mask
+  scales premultiplied RGBA, and the counts mirror exactly — linear storage
+  reaches 256 alphas and 183 colours, sRGB 183 and 256. Alpha decides it, because
+  alpha is the channel a mask multiplies and what a transparent-background
+  document exports; the cost is banding at the hide end over an opaque backdrop,
+  where the first non-zero level now moves the output 13 sRGB levels rather than
+  1. Krita's other four mask kinds — filter, transform,
   selection, colorize — are named, not approximated, and a transparency mask
   built from a vector selection arrives unmasked with a warning rather than a
   vector renderer being put inside an importer. The pixels are **not** beside
@@ -3929,6 +3950,18 @@ method rather than as an anecdote:
   measured off a headless pass instead — `inks_drawn` tessellates and keeps the
   opaque vertex colours, which is one field where a shape is a dozen types with
   three shapes of stroke among them.
+- **A guard on one module is not a guard on the twin call site in another.** The
+  mask migration is one function called from two places — `openraster::load_mask`
+  and `docimport::history` — and only the first was driven, while a doc comment
+  claimed the second was covered by it. Turning the second off left all 1,122
+  tests green, and the cost would have been a document damaged by an undo.
+  **Enumerate the call sites of the rule, not the rule**, across module
+  boundaries as well as within one.
+- **A figure invented to justify a guard is worse than no comment**, because it
+  is what the next change gets argued against. A GPU sweep chose its range on
+  "the old storage could express 22 of the 56 there"; measured, it expressed all
+  56, and the range where the two readings actually differ was somewhere else
+  entirely.
 - **A guard on a model is not a guard on the panel, and the panel is where the
   gate usually is.** `a_read_only_palette_cannot_be_changed_by_any_gesture`
   drives `panel`; the palette's adding mark is in `header_controls`, which
