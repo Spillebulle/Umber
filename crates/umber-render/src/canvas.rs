@@ -3005,20 +3005,20 @@ pub struct CanvasRenderer {
     /// The largest buffer this device will create, in bytes.
     ///
     /// Taken from the device rather than assumed, and honoured by every
-    /// readback here — see [`band_rows`] — and by
-    /// [`CanvasRenderer::write_layer_rect`]. For a readback it is the *real*
-    /// bound: those go through the validated `create_buffer`. For a write it is
-    /// a **self-imposed proxy**, because a `write_texture` staging buffer is not
-    /// validated against it at all; see `write_layer_rect`.
+    /// readback here — see [`band_rows`] — by
+    /// [`CanvasRenderer::write_layer_rect`], and by [`upload_coverage`]. For a
+    /// readback it is the *real* bound: those go through the validated
+    /// `create_buffer`. For a write it is a **self-imposed proxy**, because a
+    /// `write_texture` staging buffer is not validated against it at all; see
+    /// `write_layer_rect`.
     ///
-    /// **It is not the only canvas-sized write in this file, and a comment here
-    /// used to say it was.** `upload_coverage`, reached from `set_selection`,
-    /// puts one byte per document pixel into a coverage texture in a single
-    /// unbanded `write_texture` — 256 MiB of staging for Select All on a 16384²
-    /// canvas and 1.07 GB at 32768², on the same fatal allocation path. It is
-    /// left alone here deliberately: it is a different function with a different
-    /// caller, and one change should not quietly become two. Anybody bounding it
-    /// wants this field and `band_rows` and nothing else new.
+    /// **`upload_coverage` is the second write it bounds, and it was named here
+    /// as unfixed before it was fixed.** A selection's coverage is one byte per
+    /// document pixel, so Select All asked for 256 MiB of staging at 16384² and
+    /// 1.07 GB at 32768² in one `write_texture`, on the same fatal allocation
+    /// path. It bands now, and — unlike `write_layer_rect`, whose callers are an
+    /// import and an undo — the caller is `App::start_stroke`. What makes the
+    /// per-band wait payable there is stated at `upload_coverage`.
     ///
     /// Held as a field so a test can lower it and drive the banded path on a
     /// document small enough to check by hand; on a real device it would take a
@@ -5180,7 +5180,7 @@ impl CanvasRenderer {
                 let (sx, sy) = mask.aspect();
                 self.dab_state.tip_scale = [sx, sy];
                 self.dab_state.use_tip = 1;
-                (upload_mask(device, queue, mask), true)
+                (upload_mask(device, queue, mask, self.readback_limit), true)
             }
             None => {
                 self.dab_state.tip_scale = [1.0, 1.0];
@@ -5267,7 +5267,7 @@ impl CanvasRenderer {
 
         if !same_tile {
             let texture = match &tile {
-                Some(mask) => upload_mask(device, queue, mask),
+                Some(mask) => upload_mask(device, queue, mask, self.readback_limit),
                 None => make_tip_texture(device, 1, 1),
             };
             self.grain_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -5322,6 +5322,7 @@ impl CanvasRenderer {
                     rect.height,
                     sel.coverage(),
                     "umber-selection-mask",
+                    self.readback_limit,
                 )
             }
             None => {
@@ -6704,6 +6705,7 @@ impl CanvasRenderer {
                         r.height,
                         sel.coverage(),
                         "umber-float-mask",
+                        self.readback_limit,
                     ),
                     [r.x as f32, r.y as f32],
                     [r.width as f32, r.height as f32],
@@ -9430,6 +9432,17 @@ impl CanvasRenderer {
         self.readback_limit = bytes;
     }
 
+    /// What [`Self::set_readback_limit`] would be putting back.
+    ///
+    /// Exists so a test that lowers the limit to drive one banded path can
+    /// restore the device's own figure before measuring something else — a
+    /// comparison taken while the limit is still low is a comparison of two
+    /// banded paths, which is a different claim from the one such a test makes.
+    #[doc(hidden)]
+    pub fn readback_limit_for_test(&self) -> u64 {
+        self.readback_limit
+    }
+
     /// Pretend a slice of this canvas costs more than it does, so the paths that
     /// stop holding an allocation "in case" can be driven on a document small
     /// enough to check by hand.
@@ -10012,7 +10025,20 @@ fn clear_view(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, labe
 }
 
 /// Upload an 8-bit mask — a tip or a paper tile — into a fresh texture.
-fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wgpu::Texture {
+///
+/// `limit` is [`CanvasRenderer::readback_limit`], passed because
+/// [`upload_coverage`] bands against it. Nothing here ever reaches it: a tip
+/// document is 256 square and the largest grain tile anybody has imported is
+/// 500 square, so `band_rows` hands back the whole mask and the upload is the
+/// single `write_texture` it always was. It is threaded anyway rather than
+/// giving the tip path its own unbanded copy of the function, which is the
+/// second statement of a rule this file refuses everywhere else.
+fn upload_mask(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mask: &TipMask,
+    limit: u64,
+) -> wgpu::Texture {
     upload_coverage(
         device,
         queue,
@@ -10020,10 +10046,38 @@ fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wg
         mask.height(),
         mask.coverage(),
         "umber-brush-tip",
+        limit,
     )
 }
 
 /// Put `bytes` — one per texel, row-major — into a new coverage texture.
+///
+/// **Banded against `limit`, for the reason [`CanvasRenderer::write_layer_rect`]
+/// is.** `Queue::write_texture` allocates a staging buffer the size of the
+/// upload, and a selection's coverage is one byte per *document* pixel: Select
+/// All is 256 MiB at 16384² and 1.07 GB at 32768². `StagingBuffer::new` reports
+/// a failed allocation through the fatal `handle_hal_error`, which calls `lose`,
+/// so no error scope catches it and the device is gone — which is why the
+/// figure is worth bounding even though nothing validates it. `band_rows`
+/// returns the whole image whenever it fits, so a tip, a paper tile and every
+/// selection on an ordinary canvas take exactly the one `write_texture` they
+/// always did.
+///
+/// **Where it does band it waits**, because a submit hands staging to that
+/// submission's fence rather than releasing it — so banding without waiting
+/// bounds the size of one allocation and not how many are alive, which is the
+/// half `write_layer_rect`'s docs say is not a bound at all.
+///
+/// **That wait is on the pen-down path and the case is what makes it
+/// payable.** `set_selection` is called from `App::start_stroke`, so this runs
+/// as the nib touches the glass — but only when the selection has actually
+/// changed (compared by `Arc` identity), and it only *bands* when the mask
+/// outruns what the device guarantees for one buffer. On a device reporting
+/// `downlevel_defaults`' 256 MiB that is a selection past 16384 square, which is
+/// a canvas D3D12 and Metal cannot make at all and a Vulkan one where a single
+/// layer slice is 4.3 GB. The first stroke after a Select All there pays a poll
+/// per band; every canvas below it pays nothing, and no stroke pays anything on
+/// the second and later strokes.
 fn upload_coverage(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -10031,29 +10085,52 @@ fn upload_coverage(
     height: u32,
     bytes: &[u8],
     label: &str,
+    limit: u64,
 ) -> wgpu::Texture {
     let texture = make_coverage_texture(device, width, height, label);
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            // One byte per texel: R8Unorm is all a coverage mask needs, matching
-            // the stroke scratch it feeds.
-            bytes_per_row: Some(width),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+    // One byte per texel: R8Unorm is all a coverage mask needs, matching the
+    // stroke scratch it feeds. `Queue::write_texture` takes tightly packed rows
+    // — the 256-byte alignment is `copy_buffer_to_texture`'s — so the row stride
+    // is the width and a band is a contiguous slice of `bytes`.
+    let band = band_rows(limit, width.max(1), height);
+    let row = width as usize;
+    let mut first = 0;
+    while first < height {
+        let rows = band.min(height - first);
+        let from = row * first as usize;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: first,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes[from..from + row * rows as usize],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        first += rows;
+        if band < height {
+            // Flush this band's staging into a submission of its own and wait
+            // for the fence, so the staging alive at any instant is one band.
+            // Only where the upload was banded at all: an ordinary mask must
+            // not gain a submit, let alone a stall.
+            queue.submit([]);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+    }
     texture
 }
 

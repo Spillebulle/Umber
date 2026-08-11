@@ -2585,6 +2585,84 @@ fn nothing_outside_a_selections_own_rectangle_is_paintable() {
     }
 }
 
+#[test]
+fn a_banded_selection_upload_clips_exactly_where_an_unbanded_one_does() {
+    // A selection's coverage is one byte per pixel of its own rectangle, so
+    // Select All on a large canvas is a canvas-sized `write_texture` — 256 MiB
+    // of staging at 16384² and 1.07 GB at 32768², on the allocation path whose
+    // failure loses the device. `upload_coverage` bands it, and what a band can
+    // get wrong is *which rows it wrote*: an offset that is band-relative where
+    // it should be absolute, or a slice taken from the head of the buffer every
+    // time, puts the whole mask back at the top of the texture.
+    //
+    // So this compares the mark, not the mechanism. The same selection is
+    // uploaded twice — once whole, once in eight bands — and the two strokes
+    // must leave byte-identical layers. Driven by `set_readback_limit`, because
+    // the real limit needs a canvas nobody should ask a CI runner for.
+    let mut h = harness_or_skip!();
+
+    // Not centred, not square, and touching no edge: every row of this mask is
+    // the same, but *where* it sits is not, so a misplaced band moves the
+    // rectangle rather than leaving it looking plausible. The height is
+    // deliberately not a multiple of the band.
+    let sel = || {
+        Selection::rectangle(
+            Vec2::new(9.0, 7.0),
+            Vec2::new(51.0, 43.0),
+            UVec2::splat(DOC),
+        )
+        .expect("a selection")
+    };
+    let mask = sel().bounds();
+    let wide = h.canvas.readback_limit_for_test();
+
+    h.set_selection(Some(sel()));
+    h.stamp(&[dab(32.0, 32.0, 60.0, 1.0)]);
+    h.commit_to(0, Color::WHITE, 1.0, BrushMode::Paint);
+
+    // The scratch has to go, or the second stroke's `max` would be taken
+    // against coverage the *first* one already put there — and a banded upload
+    // that clipped nothing at all would pass.
+    let mut enc = h.encoder();
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // Eight bands of five rows and a last of one, so the short final band and
+    // the reused staging are both exercised.
+    h.canvas.set_readback_limit((mask.width * 5) as u64);
+    // A fresh `Arc`, which is what makes the renderer upload again rather than
+    // recognising the selection it already holds.
+    h.set_selection(Some(sel()));
+    h.stamp(&[dab(32.0, 32.0, 60.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    // Put the limit back before reading, so the comparison is not itself banded
+    // — that is a different guard's claim and not this one's.
+    h.canvas.set_readback_limit(wide);
+    let full = PixelRect {
+        x: 0,
+        y: 0,
+        width: DOC,
+        height: DOC,
+    };
+    let whole = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, full);
+    let banded = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 1, full);
+    assert_eq!(
+        banded, whole,
+        "a banded selection upload clipped somewhere else than the whole one did"
+    );
+    // And that the fixture is not vacuous: a stroke that reached everywhere, or
+    // nowhere, would compare equal under any banding at all.
+    assert_eq!(whole[(32 * DOC + 32) as usize * 4 + 3], 255, "inside");
+    assert_eq!(whole[(32 * DOC + 2) as usize * 4 + 3], 0, "left of it");
+    assert_eq!(whole[(2 * DOC + 32) as usize * 4 + 3], 0, "above it");
+    assert_eq!(whole[(60 * DOC + 32) as usize * 4 + 3], 0, "below it");
+}
+
 // ---------------------------------------------------------------------------
 // Undo storage
 // ---------------------------------------------------------------------------
