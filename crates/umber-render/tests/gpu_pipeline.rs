@@ -9009,6 +9009,17 @@ fn a_capture_of_a_partly_painted_mask_reveals_what_the_save_does() {
         captured.layers[1], expected[1],
         "an autosaved mask hides what a saved one reveals"
     );
+
+    // **And the flattened preview, which is the step after the last layer.**
+    // `gaps` and `empty` describe the *step*, so a merged image that inherited
+    // the previous one's would come back with holes shaped like wherever that
+    // layer happened not to be stored — `mergedimage.png` punched out, in a
+    // file nothing else in the suite reads.
+    let expected_merged = canvas.export_rgba(&gpu.device, &gpu.queue, &draws);
+    assert_eq!(
+        captured.merged, expected_merged,
+        "the flattened preview came back with holes"
+    );
 }
 
 /// An effect that has been switched off hands its **page** back.

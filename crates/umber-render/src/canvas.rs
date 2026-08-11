@@ -8971,13 +8971,20 @@ impl CanvasRenderer {
             // [`Capture::gaps`] for why that is there rather than a
             // `clear_buffer` here. Recorded per step, because it is the step's
             // slot whose residency it describes.
+            //
+            // **Recomputed on every band, not once per step.** Guarding it on
+            // `row == 0` is the tempting saving and is a staleness waiting to
+            // happen: what it would be guarding is the *step*, which is not what
+            // that field describes. It is one pass over the slot's table slice
+            // — 1,580 comparisons at the largest canvas Umber makes, once a
+            // band, on a five-minute timer.
             job.empty = self.class_of(slot).empty_bytes();
-            if job.state == StepState::Waiting && job.row == 0 {
-                job.gaps = (0..self.layers.grid.tiles.y)
+            job.gaps.clear();
+            job.gaps.extend(
+                (0..self.layers.grid.tiles.y)
                     .flat_map(|ty| (0..self.layers.grid.tiles.x).map(move |tx| (tx, ty)))
-                    .filter(|t| !self.layers.entry(slot, *t).is_backed())
-                    .collect();
-            }
+                    .filter(|t| !self.layers.entry(slot, *t).is_backed()),
+            );
             let band = PixelRect {
                 x: 0,
                 y: band_first as u32,
@@ -9028,6 +9035,12 @@ impl CanvasRenderer {
             self.capture = Some(job);
             return;
         }
+        // **The flattened preview has no gaps**, and saying so is not tidiness:
+        // `gaps` and `empty` are the *step's*, and the step before this one was
+        // a layer. Left alone they would punch that layer's unbacked tiles out
+        // of the merged image — holes in `mergedimage.png` shaped like wherever
+        // the topmost layer happened not to be stored.
+        job.gaps.clear();
         let source = {
             // The flattened preview, from the *same* composite pass the screen
             // uses — the reason `export_rgba` and `pick_colour` reuse it too.
