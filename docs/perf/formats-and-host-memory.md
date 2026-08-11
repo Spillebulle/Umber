@@ -276,6 +276,25 @@ range.** The suite already knows the shape of this — the guard is
 it simply has never been asked to count. The exact figure is a three-line check
 over `coverage_table()` and should be run before anybody acts on the estimate.
 
+**Run, and the estimate was close: 183 survive and 73 are unreachable, with the
+slope falling through 1 at input 75 rather than 62.** The same 73 falls out from
+the far end, which is the reading that matters and was not in the estimate at
+all: sweeping every stored byte through `srgb_to_linear` and quantising to the
+8-bit alpha a mask multiplies gives **183** distinct multipliers the composite
+can show, against 256 stored linearly. The count is now a test rather than a
+note — `a_mask_multiplier_reaches_every_level_the_composite_can_show` in
+`docimport::srgb`, and `every_level_a_mask_can_hold_moves_the_picture` in
+`gpu_pipeline.rs` for the same claim on the GPU.
+
+**And this section's recommendation was built, with one change: there is no
+dedicated array.** The mask stayed in the layer array and took a second *view*
+of it, `LAYER_FORMAT_LINEAR` — the raw view `flip.wgsl` already used, and for
+the same reason. That reaches every word of the quality argument above at the
+cost of one binding and one pipeline pair, and costs nothing threaded through
+the atlas, the page table, the flip, `resize` or the capture. See
+`docs/perf/roadmap.md` §2.3 for the three places the built change diverged from
+what was planned, including why `history::VERSION` did not move.
+
 So the honest position, which is the opposite of the first draft's:
 
 > A dedicated `R8Unorm` mask array holding **linear** coverage is not a quality

@@ -220,6 +220,12 @@ pub const EXTENSION: &str = "ora";
 /// case this attribute exists for. An older build now refuses the document
 /// instead, and says which version it would need.
 ///
+/// **A mask no longer declares 2, and this paragraph is history rather than the
+/// rule.** Its coverage became linear at 4 and [`required_version`] answers 4
+/// for one; what still declares 2 is clipping alone. Left standing because 2 is
+/// what the *bar* was set by and the reasoning is still the reasoning — a file
+/// somebody wrote at 2 is still out there and still read.
+///
 /// A lock and a link did **not** earn it and ride along on the same revision.
 /// An older build that drops them shows the identical picture; what it loses is
 /// a promise about what the artist can do to it next, which is recoverable by
