@@ -7786,14 +7786,6 @@ impl CanvasRenderer {
         }
     }
 
-    /// The canvas's tile grid.
-    ///
-    /// Observation only, and what a test needs to name a tile at all.
-    #[doc(hidden)]
-    pub fn tile_grid(&self) -> Grid {
-        self.layers.grid
-    }
-
     /// Take one tile of one slot out of the page table, so it reads as the
     /// slot's empty value — transparent for a layer, white for a mask.
     ///
