@@ -23,10 +23,11 @@ use crate::thumbs;
 use crate::ui;
 use crate::update;
 use glam::{UVec2, Vec2};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::docformat::{self, Canvas, SaveDocument, SaveLayer};
 use umber_core::export;
 use umber_core::history::PatchPiece;
 use umber_core::{
@@ -3054,48 +3055,41 @@ impl UmberApp {
             };
             let stack = self.editor.layers.layers();
 
-            // Every layer comes off the GPU whole, and all of them are held at
-            // once — 16 MB each at 2048², so a full stack is a few hundred
-            // megabytes for as long as the save takes. That is the price of a
-            // format that keeps layers, and `read_layer_rect` blocks, which is
-            // why this is only ever reached from an explicit Save and never
-            // from the drawing loop.
-            // A folder holds no slice, so it reads back as nothing at all and
-            // `SaveLayer::folder` writes it as a nested `<stack>` with no
-            // `src`. Kept in step with the stack positionally rather than
-            // filtered out, because `doc.active` and the history's positions
-            // both count every entry.
-            let pixels: Vec<Vec<u8>> = stack
-                .iter()
-                .map(|layer| match layer.slot() {
-                    Some(slot) => {
-                        canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect)
-                    }
-                    None => Vec::new(),
-                })
-                .collect();
-            // The masks, read the same way and only where there is one. A
-            // document with no masks pays for nothing here.
-            let masks: Vec<Option<Vec<u8>>> = stack
-                .iter()
-                .map(|layer| {
-                    layer.mask().map(|slot| {
-                        canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect)
-                    })
-                })
-                .collect();
-            // The flattened preview the format requires comes from the same
-            // composite pass the screen uses, so it cannot disagree with it — and
-            // from the same *draw list*, effects included, which is the other half
-            // of that and is not free: see `App::baked_draws`.
-            let merged = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &merged_draws);
-
+            // **Nothing canvas-sized is read here.** Every layer, every mask and
+            // the flattened preview are `Canvas::Deferred`, and `SaveSource`
+            // below reads exactly one of them at a time as the archive reaches
+            // it. Holding them all was 16 MB each at 2048² and 400 MB each at
+            // the canvas `docs/perf/formats-and-host-memory.md` §10.2 argues
+            // from, where a twenty-four-slice document came to ten gigabytes for
+            // as long as the save took.
+            //
+            // `read_layer_rect` still blocks and is still called once per slice,
+            // which is why this is only ever reached from an explicit Save and
+            // never from the drawing loop. What changed is when, not how often.
+            //
+            // A folder holds no slice and is never asked about — `SaveLayer::
+            // folder` writes it as a nested `<stack>` with no `src`. Kept in
+            // step with the stack positionally rather than filtered out, because
+            // `doc.active`, the history's positions and `SaveSource`'s own
+            // indices all count every entry.
             let layers: Vec<SaveLayer<'_>> = stack
                 .iter()
-                .zip(&pixels)
-                .zip(&masks)
-                .map(|((layer, px), mask)| save_layer(layer, px, mask.as_deref()))
+                .map(|layer| {
+                    save_layer(
+                        layer,
+                        Canvas::Deferred,
+                        layer.mask().map(|_| Canvas::Deferred),
+                    )
+                })
                 .collect();
+            let mut source = SaveSource {
+                canvas,
+                gpu: &gfx.gpu,
+                rect,
+                slots: stack.iter().map(umber_core::Layer::slot).collect(),
+                masks: stack.iter().map(umber_core::Layer::mask).collect(),
+                merged_draws,
+            };
 
             // The undo history, resolved against the stack it belongs to. No
             // GPU work: the patches have been in memory since they were
@@ -3113,7 +3107,7 @@ impl UmberApp {
                 .then(|| docformat::SaveHistory::new(&self.editor.history, &self.editor.layers))
                 .flatten();
 
-            docformat::save(
+            docformat::save_from(
                 &path,
                 &SaveDocument {
                     size,
@@ -3121,9 +3115,10 @@ impl UmberApp {
                     active: self.editor.layers.active_index(),
                     background: self.editor.doc.background,
                     dpi: self.editor.doc.dpi,
-                    merged: &merged,
+                    merged: Canvas::Deferred,
                     history,
                 },
+                &mut source,
             )
         };
 
@@ -5628,8 +5623,8 @@ fn file_name_of(path: &Path) -> String {
 /// share a guard unless somebody arranges it.
 fn save_layer<'a>(
     layer: &'a umber_core::Layer,
-    px: &'a [u8],
-    mask: Option<&'a [u8]>,
+    px: Canvas<'a>,
+    mask: Option<Canvas<'a>>,
 ) -> SaveLayer<'a> {
     SaveLayer {
         visible: layer.visible,
@@ -5652,6 +5647,89 @@ fn save_layer<'a>(
         depth: layer.depth,
         folder: layer.is_folder(),
         ..SaveLayer::new(&layer.name, layer.blend, px)
+    }
+}
+
+/// Where an explicit Save reads its canvas-sized buffers from.
+///
+/// One at a time, off the GPU, in the order the archive wants them. That is the
+/// whole of why a save no longer holds the stack: at
+/// `docs/perf/formats-and-host-memory.md`'s reference canvas a layer is 400 MB,
+/// so twenty-four of them held at once was ten gigabytes and one at a time is
+/// four hundred megabytes.
+///
+/// **It changes nothing about the readback itself.** `read_layer_rect` still
+/// blocks and is still called once per slice — that is the price of a format
+/// that keeps layers, and it is why a save is the only thing that may call it.
+/// What moved is when each call happens: as the writer reaches that layer,
+/// rather than all of them up front.
+///
+/// It carries slots rather than `&Layer`s so nothing here can be tempted into
+/// re-deriving what `save_layer` already wrote into the document — the two are
+/// built from the same `stack.iter()` in the same order, and a slot is what a
+/// readback actually needs.
+struct SaveSource<'a> {
+    canvas: &'a CanvasRenderer,
+    gpu: &'a Gpu,
+    rect: PixelRect,
+    /// Layer slice per stack entry; `None` for a folder, which holds none.
+    slots: Vec<Option<u32>>,
+    /// Mask slice per stack entry, where there is one.
+    masks: Vec<Option<u32>>,
+    /// The draw list the flattened preview is composited from — the *baked* one,
+    /// so `mergedimage.png` shows the effects the screen shows. See
+    /// `App::baked_draws`.
+    merged_draws: Vec<LayerDraw>,
+}
+
+impl SaveSource<'_> {
+    fn read(&self, slot: Option<u32>, what: &str) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        // A slot the stack does not hold cannot be reached from the save — the
+        // document was built from the same iteration this was — and it is
+        // refused rather than read as an empty layer, because a document
+        // silently saved with a blank layer is worse than one not saved at all.
+        let Some(slot) = slot else {
+            return Err(docformat::SaveError::NotSupplied {
+                what: what.to_string(),
+            });
+        };
+        Ok(Cow::Owned(self.canvas.read_layer_rect(
+            &self.gpu.device,
+            &self.gpu.queue,
+            slot,
+            self.rect,
+        )))
+    }
+}
+
+impl docformat::Canvases for SaveSource<'_> {
+    fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.read(
+            self.slots.get(index).copied().flatten(),
+            &format!("pixels of layer {index}"),
+        )
+    }
+
+    fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.read(
+            self.masks.get(index).copied().flatten(),
+            &format!("mask of layer {index}"),
+        )
+    }
+
+    fn merged(&mut self) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        // The flattened preview the format requires comes from the same
+        // composite pass the screen uses, so it cannot disagree with it — and
+        // from the same *draw list*, effects included, which is the other half
+        // of that and is not free: see `App::baked_draws`.
+        //
+        // Asked last, after every layer's PNG is already on disk, so it is never
+        // resident beside one.
+        Ok(Cow::Owned(self.canvas.export_rgba(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.merged_draws,
+        )))
     }
 }
 
@@ -5913,7 +5991,7 @@ mod tests {
         let layer = &stack.layers()[0];
         assert_eq!(layer.effects().len(), 1, "precondition: the layer holds it");
 
-        let written = save_layer(layer, &[], None);
+        let written = save_layer(layer, Canvas::Held(&[]), None);
         assert_eq!(
             written.effects,
             layer.effects(),
@@ -5967,7 +6045,7 @@ mod tests {
         let layer = &stack.layers()[0];
         assert!(layer.is_text(), "precondition: the layer holds it");
 
-        let written = save_layer(layer, &[], None);
+        let written = save_layer(layer, Canvas::Held(&[]), None);
         assert_eq!(
             written.text,
             Some(&record),

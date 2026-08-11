@@ -512,8 +512,8 @@ pub fn kind_from_id(id: &str) -> Option<EditKind> {
 ///
 /// Nothing here reaches the GPU: the patches are already in memory, having been
 /// captured at commit time. A save's blocking readbacks are unchanged.
-pub(crate) fn write(
-    zip: &mut ZipWriter<std::io::Cursor<Vec<u8>>>,
+pub(crate) fn write<W: Write + std::io::Seek>(
+    zip: &mut ZipWriter<W>,
     canvas: UVec2,
     layers: &[String],
     history: &SaveHistory<'_>,
@@ -649,7 +649,7 @@ pub(crate) fn patch_src(index: usize, piece: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docformat::{SaveDocument, SaveLayer, encode};
+    use crate::docformat::{Canvas, SaveDocument, SaveLayer, encode};
     use crate::docimport::{self, ImportWarning};
     use crate::document::{Background, Document};
     use crate::geom::PixelRect;
@@ -704,7 +704,7 @@ mod tests {
                 // A mask goes into the file wherever the stack has one, so a
                 // patch recorded against a mask has something to be placed
                 // against when the document comes back.
-                mask: l.mask().map(|_| &pixels[..]),
+                mask: l.mask().map(|_| Canvas::Held(&pixels)),
                 ..SaveLayer::new(&l.name, BlendMode::Normal, &pixels)
             })
             .collect();
@@ -714,7 +714,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: SaveHistory::new(history, stack),
         })
         .expect("encode");
@@ -868,7 +868,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap();
@@ -997,7 +997,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: SaveHistory::new(&history, &stack),
         })
         .unwrap();

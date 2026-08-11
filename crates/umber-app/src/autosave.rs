@@ -82,6 +82,7 @@
 //! number first, and rebuilt only when that number moves. That is what lets a
 //! document closed or saved after its copy was written stop being offered.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,7 +91,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
-use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::docformat::{self, Canvas, SaveDocument, SaveLayer};
 use umber_core::textobj::TextObject;
 use umber_core::{Background, BlendMode, Effect};
 use umber_render::{CanvasRenderer, DocumentCapture, Gpu};
@@ -1968,17 +1969,14 @@ fn run_task(task: Task) -> Vec<Report> {
     // Zipped by `pixel_index` rather than positionally: a folder is an entry
     // with no slice, so the capture is shorter than the stack and a positional
     // zip would pair every layer above a folder with the pixels of the one
-    // below it — and then truncate the top of the stack away entirely.
-    let empty: Vec<u8> = Vec::new();
+    // below it — and then truncate the top of the stack away entirely. That
+    // mapping is `CaptureSource`'s now, stated once, so the layers below carry
+    // no bytes at all.
     let layers: Vec<SaveLayer<'_>> = doc
         .layers
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let px = doc
-                .pixel_index(i)
-                .and_then(|k| pixels.layers.get(k))
-                .map_or(&empty[..], Vec::as_slice);
             SaveLayer {
                 visible: l.visible,
                 opacity: l.opacity,
@@ -1986,10 +1984,11 @@ fn run_task(task: Task) -> Vec<Report> {
                 // `Candidate::slots`. A mask the capture did not bring back is
                 // written as no mask at all rather than as a blank one: an autosave
                 // that invented an empty mask would hide the layer it belonged to.
+                // `mask_index` answers that without the bytes.
                 mask: doc
                     .mask_index(i)
-                    .and_then(|k| pixels.layers.get(k))
-                    .map(Vec::as_slice),
+                    .filter(|k| pixels.layers.get(*k).is_some())
+                    .map(|_| Canvas::Deferred),
                 // The snapshot's, not the live stack's: this runs on the
                 // writer thread, minutes after the document was described.
                 effects: &l.effects,
@@ -2003,7 +2002,7 @@ fn run_task(task: Task) -> Vec<Report> {
                 link: l.link,
                 depth: l.depth,
                 folder: l.folder,
-                ..SaveLayer::new(&l.name, l.blend, px)
+                ..SaveLayer::new(&l.name, l.blend, Canvas::Deferred)
             }
         })
         .collect();
@@ -2016,22 +2015,12 @@ fn run_task(task: Task) -> Vec<Report> {
         active: doc.active_layer,
         background: doc.background,
         dpi: doc.dpi,
-        merged: &pixels.merged,
+        merged: Canvas::Deferred,
         history: None,
     };
-
-    let encoded = match docformat::encode(&document) {
-        // Warnings are dropped rather than shown. They say the same thing on
-        // every autosave of the same document, and an explicit Save already
-        // reports them — a notice raised by a timer would be a dialog appearing
-        // over somebody's canvas every five minutes.
-        Ok((bytes, _)) => bytes,
-        Err(e) => {
-            return vec![Report::Failed {
-                title: doc.title,
-                message: e.to_string(),
-            }];
-        }
+    let mut source = CaptureSource {
+        doc: &doc,
+        pixels: &pixels,
     };
 
     let mut reports = Vec::new();
@@ -2040,13 +2029,28 @@ fn run_task(task: Task) -> Vec<Report> {
     // The internal copy first. It is the one that exists for every document,
     // saved or not, and writing it before the painter's own file means a
     // failure to replace theirs still leaves a recoverable copy somewhere.
-    if let Some(path) = &internal
-        && let Err(message) = write_internal(path, &encoded)
-    {
-        reports.push(Report::Failed {
-            title: doc.title.clone(),
-            message,
-        });
+    //
+    // It is also the one the archive is *encoded into*. The archive is streamed
+    // into the file as it is built rather than assembled in a `Vec<u8>` first —
+    // the reference document's every layer PNG at once, plus the doubling a
+    // growing `Vec` costs — so there is no longer one buffer for two
+    // destinations to share. What they share instead is the finished file, and
+    // a copy of it is *closer* to one archive in two places than two encodings
+    // would have been.
+    //
+    // Warnings are dropped rather than shown. They say the same thing on every
+    // autosave of the same document, and an explicit Save already reports them —
+    // a notice raised by a timer would be a dialog appearing over somebody's
+    // canvas every five minutes.
+    let mut encoded_at: Option<&Path> = None;
+    if let Some(path) = &internal {
+        match write_internal(path, &document, &mut source) {
+            Ok(()) => encoded_at = Some(path),
+            Err(message) => reports.push(Report::Failed {
+                title: doc.title.clone(),
+                message,
+            }),
+        }
     }
 
     // Then the document's own file, which this **overwrites without asking**.
@@ -2056,10 +2060,21 @@ fn run_task(task: Task) -> Vec<Report> {
     // path nobody has saved to. Overwriting *without asking* is right where the
     // painter put the document at that path themselves and is not where Umber
     // did. See `Candidate::write_own_file`.
+    //
+    // Copied from the internal archive where there is one and encoded afresh
+    // where there is not — which also covers the internal write having *failed*,
+    // so a full autosave directory still leaves the painter's own file written.
+    // That was true when both came off one `Vec<u8>` and it has to stay true;
+    // it is only possible because the source reads a capture that is still in
+    // hand rather than consuming it.
     if let Some(path) = &doc.path
         && doc.write_own_file
     {
-        match docformat::write_encoded(path, &encoded) {
+        let written = match encoded_at {
+            Some(from) => copy_archive(from, path),
+            None => docformat::save_from(path, &document, &mut source).map(|_| ()),
+        };
+        match written {
             Ok(()) => {
                 wrote_user_file = true;
                 log::debug!("autosaved {}", path.display());
@@ -2089,15 +2104,93 @@ fn run_task(task: Task) -> Vec<Report> {
     reports
 }
 
-fn write_internal(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_internal(
+    path: &Path,
+    document: &SaveDocument<'_>,
+    source: &mut dyn docformat::Canvases,
+) -> Result<(), String> {
     if let Some(dir) = path.parent()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
         return Err(format!("{} could not be created: {e}", dir.display()));
     }
-    docformat::write_encoded(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    docformat::save_from(path, document, source).map_err(|e| format!("{}: {e}", path.display()))?;
     log::debug!("autosave copy at {}", path.display());
     Ok(())
+}
+
+/// Put the archive at `from` at `to` as well, whole or not at all.
+///
+/// Through `docformat::write_with`, so this is the *one* temp-and-rename and
+/// not a second one — which matters more here than anywhere: what it is
+/// replacing is the artist's own document.
+///
+/// `std::io::copy` rather than reading the archive into a `Vec<u8>` first,
+/// because a `Vec` of it is exactly what streaming the encode got rid of.
+fn copy_archive(from: &Path, to: &Path) -> Result<(), docformat::SaveError> {
+    docformat::write_with(to, |file| {
+        let mut source = std::fs::File::open(from)?;
+        std::io::copy(&mut source, file)?;
+        Ok(())
+    })
+}
+
+/// Where an autosave's canvas-sized buffers come from: the capture that has
+/// already come home.
+///
+/// It **borrows** rather than taking, which is deliberate and is what lets the
+/// painter's own file be encoded afresh when the internal copy could not be
+/// written. Taking would drop each buffer a little earlier and buy nothing: the
+/// capture's peak is reached the moment the last slice arrives, before the
+/// writer thread starts, and the archive is streamed so nothing accumulates
+/// beside it.
+///
+/// **The N canvases the capture holds are what is left of
+/// `docs/perf/formats-and-host-memory.md` §10.1, and they are not this
+/// module's to release.** `DocumentCapture` arrives whole from
+/// `CanvasRenderer::take_capture`; encoding each slice *as it comes home* needs
+/// the renderer to hand finished slices over one at a time, which is a change to
+/// `canvas.rs`.
+struct CaptureSource<'a> {
+    doc: &'a Candidate,
+    pixels: &'a DocumentCapture,
+}
+
+impl CaptureSource<'_> {
+    /// The capture's buffer at `index`, or a refusal naming what was missing.
+    ///
+    /// A slice the capture did not bring back is refused rather than written
+    /// blank: an autosave that quietly replaced somebody's layer with nothing is
+    /// the worst thing on this path, and the timer's next attempt is minutes
+    /// away rather than never.
+    fn at(&self, index: Option<usize>, what: &str) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        index
+            .and_then(|k| self.pixels.layers.get(k))
+            .map(|bytes| Cow::Borrowed(bytes.as_slice()))
+            .ok_or_else(|| docformat::SaveError::NotSupplied {
+                what: what.to_string(),
+            })
+    }
+}
+
+impl docformat::Canvases for CaptureSource<'_> {
+    fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.at(
+            self.doc.pixel_index(index),
+            &format!("pixels of layer {index}"),
+        )
+    }
+
+    fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.at(
+            self.doc.mask_index(index),
+            &format!("mask of layer {index}"),
+        )
+    }
+
+    fn merged(&mut self) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        Ok(Cow::Borrowed(&self.pixels.merged))
+    }
 }
 
 /// One expiry sweep of `dir`. Returns how many were deleted.

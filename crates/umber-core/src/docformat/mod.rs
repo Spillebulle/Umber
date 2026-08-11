@@ -4,14 +4,14 @@
 //! # use std::path::Path;
 //! # use glam::UVec2;
 //! # let layers: Vec<umber_core::docformat::SaveLayer> = vec![];
-//! # let merged = vec![];
+//! # let merged: Vec<u8> = vec![];
 //! let doc = umber_core::docformat::SaveDocument {
 //!     size: UVec2::new(2048, 2048),
 //!     layers: &layers,
 //!     active: 0,
 //!     background: umber_core::Background::WHITE,
 //!     dpi: 72.0,
-//!     merged: &merged,
+//!     merged: umber_core::docformat::Canvas::Held(&merged),
 //!     history: None,
 //! };
 //! let warnings = umber_core::docformat::save(Path::new("sketch.ora"), &doc)?;
@@ -144,9 +144,31 @@
 //! # What is still not saved
 //!
 //! The camera. A reopened document is framed to fit, like any other.
+//!
+//! # What a save costs the host, and the two rules that bound it
+//!
+//! A layer is four bytes a pixel, so the reference document
+//! `docs/perf/formats-and-host-memory.md` argues from — 20000 × 5000, twenty
+//! layers and four masks — is 400 MB a slice and 10 GB for the stack. Two rules
+//! keep this module from being the thing that holds all of it at once:
+//!
+//! * **The archive is written as it is built, never assembled in memory.**
+//!   [`save`] and [`save_from`] hand [`ZipWriter`] the temporary file itself, so
+//!   a layer's PNG reaches the disk before the next layer is looked at and no
+//!   entry is ever held after it has gone in. [`encode`] is the one function
+//!   that still builds a `Vec<u8>`, and it exists for the round-trip tests and
+//!   for callers that genuinely want the bytes.
+//! * **A canvas-sized buffer may be *fetched* rather than held.** See
+//!   [`Canvas`] and [`Canvases`]. A caller that can produce one layer at a time
+//!   — reading it off the GPU, or taking it out of a capture — hands over a
+//!   source instead of twenty borrows, and the writer asks for exactly one at a
+//!   time. That the trait's methods take `&mut self` and hand back a
+//!   `Cow<'_, [u8]>` is what makes "one at a time" a property the borrow checker
+//!   enforces rather than one this module promises.
 
 pub mod history;
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::Path;
 
@@ -416,6 +438,107 @@ const ORA_VERSION: &str = "0.0.3";
 /// Longest edge of the thumbnail the specification asks every writer to include.
 const THUMBNAIL_MAX: u32 = 256;
 
+/// Where a canvas-sized buffer is, on its way into the archive.
+///
+/// A layer is `width * height * 4` bytes — 400 MB on the reference canvas of
+/// `docs/perf/formats-and-host-memory.md` — so whether the writer *borrows*
+/// twenty of them or *asks for* one at a time is the difference between ten
+/// gigabytes of host memory and four hundred megabytes. It is a decision the
+/// caller makes and this is where it is said.
+///
+/// [`Self::Held`] is what every caller did before there was a choice, and it is
+/// still right wherever the bytes exist anyway: the round-trip tests, and a
+/// caller whose buffers came from somewhere that cannot be asked again.
+///
+/// [`Self::Deferred`] is refused by [`encode`] and [`save`], which have no
+/// source to ask — with a named error rather than an empty layer, because a
+/// document silently saved with blank pixels is the worst failure this module
+/// could have.
+#[derive(Clone, Copy, Debug)]
+pub enum Canvas<'a> {
+    /// The caller holds these bytes for the whole save.
+    Held(&'a [u8]),
+    /// The writer asks [`Canvases`] for these when it reaches them, and drops
+    /// them before it asks for the next.
+    Deferred,
+}
+
+impl<'a> From<&'a [u8]> for Canvas<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        Self::Held(bytes)
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for Canvas<'a> {
+    fn from(bytes: &'a Vec<u8>) -> Self {
+        Self::Held(bytes)
+    }
+}
+
+/// What a save asks for the canvas-sized buffers it was not handed.
+///
+/// **One at a time, and that is structural rather than promised.** Every method
+/// takes `&mut self` and hands back a `Cow<'_, [u8]>` borrowed from it, so a
+/// caller may serve every request out of one reused buffer and the writer
+/// *cannot* be holding a second when it asks for the next — the borrow checker
+/// refuses it. That is the whole mechanism by which a save of the reference
+/// document costs one canvas rather than one per layer.
+///
+/// The order the writer asks in is the order the archive holds things, which is
+/// **top of the stack first**, then the flattened image last. A caller that can
+/// only produce buffers in some other order has to hold them, and should say
+/// [`Canvas::Held`].
+///
+/// Indices are into [`SaveDocument::layers`], which is bottom-first — the same
+/// numbering the caller built the stack with, so nothing has to be reversed on
+/// the way out.
+pub trait Canvases {
+    /// Entry `index`'s pixels, canvas-sized and in layer-texture form.
+    ///
+    /// Asked once per non-folder entry. A folder holds no slice and is never
+    /// asked about.
+    fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError>;
+
+    /// Entry `index`'s mask slice, canvas-sized and in the same form.
+    ///
+    /// Asked only where [`SaveLayer::mask`] is `Some`, so a document with no
+    /// masks never reaches this.
+    fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError>;
+
+    /// The flattened composite, straight-alpha sRGB, canvas-sized.
+    ///
+    /// Asked once, last, and held across both entries it feeds —
+    /// `mergedimage.png` and the thumbnail scaled down from the same bytes.
+    fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError>;
+}
+
+/// The source [`encode`] and [`save`] use: there isn't one.
+///
+/// Every method refuses, naming what was asked for. A [`Canvas::Deferred`]
+/// reaching one of those two is a caller bug — they were handed no way to fetch
+/// anything — and the alternative to refusing is a layer written blank.
+struct NoCanvases;
+
+impl Canvases for NoCanvases {
+    fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+        Err(SaveError::NotSupplied {
+            what: format!("pixels of layer {index}"),
+        })
+    }
+
+    fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+        Err(SaveError::NotSupplied {
+            what: format!("mask of layer {index}"),
+        })
+    }
+
+    fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError> {
+        Err(SaveError::NotSupplied {
+            what: "flattened image".to_string(),
+        })
+    }
+}
+
 /// One layer on its way to disk.
 pub struct SaveLayer<'a> {
     pub name: &'a str,
@@ -425,13 +548,20 @@ pub struct SaveLayer<'a> {
     pub blend: BlendMode,
     /// `width * height * 4` bytes in layer-texture form — sRGB-encoded with
     /// alpha premultiplied in linear space. See the module docs.
-    pub pixels: &'a [u8],
+    ///
+    /// [`Canvas::Deferred`] where the caller would rather be asked; see that
+    /// type for why a large document wants to be.
+    pub pixels: Canvas<'a>,
     /// The layer's mask slice, canvas-sized and in the same form as `pixels`.
     ///
     /// Only the **red** channel is written — a mask is coverage, and the slice
     /// carries the same value in all three colour channels. See
     /// [`MASK_ATTR`].
-    pub mask: Option<&'a [u8]>,
+    ///
+    /// `Some` is what says there *is* a mask, whether or not its bytes are in
+    /// hand: a deferred one is `Some(Canvas::Deferred)`, and `None` is the only
+    /// way to say a layer has none.
+    pub mask: Option<Canvas<'a>>,
     /// The layer's effects, in composite order — exactly what
     /// `Layer::effects` hands back. See [`EFFECTS_ATTR`].
     ///
@@ -471,13 +601,13 @@ impl<'a> SaveLayer<'a> {
     /// take have no sensible default and a half-built layer is not a thing to
     /// hand round. Its purpose is that adding a flag here does not mean
     /// touching every test that builds one.
-    pub fn new(name: &'a str, blend: BlendMode, pixels: &'a [u8]) -> Self {
+    pub fn new(name: &'a str, blend: BlendMode, pixels: impl Into<Canvas<'a>>) -> Self {
         Self {
             name,
             visible: true,
             opacity: 1.0,
             blend,
-            pixels,
+            pixels: pixels.into(),
             mask: None,
             effects: &[],
             clipped: false,
@@ -501,7 +631,7 @@ impl<'a> SaveLayer<'a> {
             visible,
             depth,
             folder: true,
-            ..Self::new(name, BlendMode::Normal, &[])
+            ..Self::new(name, BlendMode::Normal, &[][..])
         }
     }
 }
@@ -529,7 +659,11 @@ pub struct SaveDocument<'a> {
     /// of it in this module would be a second implementation to keep in step,
     /// and a saved file whose preview disagreed with the screen is exactly the
     /// bug that arrangement produces.
-    pub merged: &'a [u8],
+    ///
+    /// [`Canvas::Deferred`] is asked for **last**, after every layer has gone
+    /// in, which is what lets a caller that composites on demand pay for one
+    /// canvas rather than carrying it beside the whole stack.
+    pub merged: Canvas<'a>,
     /// The undo history, resolved against the stack by
     /// [`SaveHistory::new`] — `None` writes the file exactly as it was written
     /// before histories were saved at all.
@@ -654,6 +788,16 @@ pub enum SaveError {
         found: usize,
         expected: usize,
     },
+    /// A buffer the document said would be fetched, with nothing to fetch it.
+    ///
+    /// A caller bug, and named rather than passed over for the reason
+    /// [`Self::WrongSize`] is: the alternative to refusing is a layer written
+    /// blank, which is a document silently damaged by its own save. Only
+    /// [`encode`] and [`save`] can produce it — they are handed no
+    /// [`Canvases`] — and only from a [`Canvas::Deferred`] they were given.
+    NotSupplied {
+        what: String,
+    },
 }
 
 impl From<std::io::Error> for SaveError {
@@ -692,6 +836,11 @@ impl std::fmt::Display for SaveError {
                 "The {what} came back as {found} bytes where {expected} were expected, so \
                  the document was not saved."
             ),
+            Self::NotSupplied { what } => write!(
+                f,
+                "The {what} were to be fetched and there was nothing to fetch them, so the \
+                 document was not saved."
+            ),
         }
     }
 }
@@ -710,13 +859,50 @@ impl std::error::Error for SaveError {
 /// Returns whatever the format could not carry exactly; an empty list means the
 /// file holds everything the document did.
 ///
-/// The file is written whole to a temporary neighbour and renamed into place.
-/// A save that fails halfway — a full disk, a pulled USB stick — would
-/// otherwise leave a truncated archive where the artist's last good version
-/// used to be, which is the one failure a save must not have.
+/// The file is written to a temporary neighbour and renamed into place. A save
+/// that fails halfway — a full disk, a pulled USB stick — would otherwise leave
+/// a truncated archive where the artist's last good version used to be, which
+/// is the one failure a save must not have. The archive is **streamed** into
+/// that temporary rather than assembled in memory first: see the module docs,
+/// and note that it makes no difference to the guarantee, because what is
+/// renamed is still only ever a file that was written to the end.
+///
+/// Every buffer has to be [`Canvas::Held`]; [`save_from`] is the one that can
+/// fetch.
 pub fn save(path: &Path, doc: &SaveDocument<'_>) -> Result<Vec<SaveWarning>, SaveError> {
-    let (bytes, warnings) = encode(doc)?;
-    write_encoded(path, &bytes)?;
+    save_from(path, doc, &mut NoCanvases)
+}
+
+/// [`save`], asking `canvases` for every [`Canvas::Deferred`] buffer as the
+/// archive reaches it.
+///
+/// This is what a document too large to hold in host memory is written by: the
+/// writer asks for one canvas-sized buffer at a time, in archive order, and the
+/// source may serve every one of them out of a single reused allocation. See
+/// [`Canvases`].
+///
+/// The same one temporary and the same one rename. A source that fails partway
+/// through — a readback that could not map — leaves the temporary discarded and
+/// the artist's file exactly as it was, which is the same guarantee a full disk
+/// already had.
+pub fn save_from(
+    path: &Path,
+    doc: &SaveDocument<'_>,
+    canvases: &mut dyn Canvases,
+) -> Result<Vec<SaveWarning>, SaveError> {
+    let mut warnings = Vec::new();
+    write_with(path, |file| {
+        // Buffered, because the writer now makes many small writes where it
+        // used to make one large one: a `File` has no buffer of its own, so a
+        // PNG streamed straight at it is a syscall per chunk.
+        let mut zip = ZipWriter::new(std::io::BufWriter::with_capacity(64 * 1024, file));
+        warnings = write_archive(&mut zip, doc, canvases)?;
+        // Both flushes are load-bearing and neither is the other. `finish`
+        // writes the central directory; the `BufWriter` may still be holding
+        // the tail of it, and its own `Drop` would swallow the error.
+        zip.finish()?.flush()?;
+        Ok(())
+    })?;
     Ok(warnings)
 }
 
@@ -738,10 +924,46 @@ pub fn save(path: &Path, doc: &SaveDocument<'_>) -> Result<Vec<SaveWarning>, Sav
 /// and for an exported `sketch.png` it is `sketch.png.saving` rather than a
 /// name that would collide with the save of a document beside it.
 pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
+    write_with(path, |file| {
+        file.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+/// Put whatever `fill` writes at `path`, whole or not at all.
+///
+/// **The one temp-and-rename in Umber**, and the reason this is the function
+/// rather than [`write_encoded`]: a streamed archive has no `&[u8]` to hand
+/// over, and a second copy of "write beside it, then rename" would be a second
+/// thing to get right. [`write_encoded`] is now one line of this;
+/// [`save_from`] is the other caller, and [`crate::export`] and the autosave
+/// reach it through the first.
+///
+/// If `fill` fails, or the rename does, the temporary is removed and the file
+/// at `path` is untouched — which is the whole point, and is why `fill` writing
+/// half an archive before it fails is a failure and not a corruption.
+pub fn write_with(
+    path: &Path,
+    fill: impl FnOnce(&mut std::fs::File) -> Result<(), SaveError>,
+) -> Result<(), SaveError> {
     let mut temporary = path.to_path_buf().into_os_string();
     temporary.push(".saving");
     let temporary = std::path::PathBuf::from(temporary);
-    std::fs::write(&temporary, bytes)?;
+
+    let written = (|| -> Result<(), SaveError> {
+        let mut file = std::fs::File::create(&temporary)?;
+        fill(&mut file)?;
+        // A `std::fs::File` buffers nothing, so this is cheap; it is here so
+        // that "everything `fill` wrote reached the operating system" is stated
+        // rather than inferred from that fact.
+        file.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(e);
+    }
+
     if let Err(e) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(SaveError::Io(e));
@@ -752,8 +974,83 @@ pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 /// Build the archive in memory.
 ///
 /// Separate from [`save`] so the round-trip tests can write and read without
-/// touching a disk.
+/// touching a disk. **Not what a large document is saved by** — the whole
+/// archive lands in one `Vec<u8>`, which for the reference canvas is every
+/// layer's PNG at once and a doubling transient on top. [`save`] streams
+/// instead and this is written in terms of the same body, so the two cannot
+/// produce different bytes.
+///
+/// Every buffer has to be [`Canvas::Held`], for the reason [`save`]'s do.
 pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), SaveError> {
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let warnings = write_archive(&mut zip, doc, &mut NoCanvases)?;
+    Ok((zip.finish()?.into_inner(), warnings))
+}
+
+/// Which buffer a [`Canvas::Deferred`] stands for, so one resolver serves all
+/// three.
+#[derive(Clone, Copy)]
+enum Wanted {
+    Layer(usize),
+    Mask(usize),
+    Merged,
+}
+
+impl Wanted {
+    /// What the buffer is called in a [`SaveError::WrongSize`], which has to
+    /// read the same whether the bytes were held or fetched.
+    fn describe(self, layers: &[SaveLayer<'_>]) -> String {
+        match self {
+            Self::Layer(i) => format!("pixels of layer “{}”", layers[i].name),
+            Self::Mask(i) => format!("mask of layer “{}”", layers[i].name),
+            Self::Merged => "flattened image".to_string(),
+        }
+    }
+}
+
+/// The bytes behind one [`Canvas`], borrowed where they were held and fetched
+/// where they were not.
+///
+/// Checked against the canvas size **here**, at the point of use, so a fetched
+/// buffer is held to exactly the bound a held one is — the alternative is a
+/// source that hands back a short read and a file whose layers are silently
+/// sheared.
+fn resolve<'c>(
+    canvases: &'c mut dyn Canvases,
+    canvas: Canvas<'c>,
+    wanted: Wanted,
+    expected: usize,
+    layers: &[SaveLayer<'_>],
+) -> Result<Cow<'c, [u8]>, SaveError> {
+    let bytes = match canvas {
+        Canvas::Held(bytes) => Cow::Borrowed(bytes),
+        Canvas::Deferred => match wanted {
+            Wanted::Layer(i) => canvases.layer(i)?,
+            Wanted::Mask(i) => canvases.mask(i)?,
+            Wanted::Merged => canvases.merged()?,
+        },
+    };
+    if bytes.len() != expected {
+        return Err(SaveError::WrongSize {
+            what: wanted.describe(layers),
+            found: bytes.len(),
+            expected,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Write the whole archive into `zip`, asking `canvases` for anything the
+/// document deferred.
+///
+/// The one body [`encode`], [`save`] and [`save_from`] share, which is what
+/// makes "the streamed file is byte for byte the encoded one" structural rather
+/// than a thing to keep true.
+fn write_archive<W: Write + std::io::Seek>(
+    zip: &mut ZipWriter<W>,
+    doc: &SaveDocument<'_>,
+    canvases: &mut dyn Canvases,
+) -> Result<Vec<SaveWarning>, SaveError> {
     if doc.layers.is_empty() {
         return Err(SaveError::Empty);
     }
@@ -767,15 +1064,24 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
         return Err(SaveError::Empty);
     }
     let expected = doc.size.x as usize * doc.size.y as usize * 4;
+
+    // Every buffer the caller is *holding*, measured before a byte is written.
+    // A deferred one cannot be measured here without fetching it, which would
+    // be the whole stack in memory again — so it is measured in `resolve`, at
+    // the point of use, and the refusal reads identically either way. What this
+    // loop keeps is that a caller who handed over the bytes still learns their
+    // shape is wrong before anything has been written at all.
     for layer in doc.layers.iter().filter(|l| !l.folder) {
-        if layer.pixels.len() != expected {
+        if let Canvas::Held(pixels) = layer.pixels
+            && pixels.len() != expected
+        {
             return Err(SaveError::WrongSize {
                 what: format!("pixels of layer “{}”", layer.name),
-                found: layer.pixels.len(),
+                found: pixels.len(),
                 expected,
             });
         }
-        if let Some(mask) = layer.mask
+        if let Some(Canvas::Held(mask)) = layer.mask
             && mask.len() != expected
         {
             return Err(SaveError::WrongSize {
@@ -785,15 +1091,15 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
             });
         }
     }
-    if doc.merged.len() != expected {
+    if let Canvas::Held(merged) = doc.merged
+        && merged.len() != expected
+    {
         return Err(SaveError::WrongSize {
             what: "flattened image".to_string(),
-            found: doc.merged.len(),
+            found: merged.len(),
             expected,
         });
     }
-
-    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
 
     // The specification requires `mimetype` first and uncompressed, and real
     // readers — Umber's own included — check it.
@@ -816,7 +1122,11 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
     // belongs to, which is the one thing the numbering is for.
     for (i, layer) in doc.layers.iter().rev().enumerate() {
         // `doc.active` indexes the bottom-first stack; this loop runs top first.
-        let selected = doc.layers.len() - 1 - i == doc.active;
+        // `at` is that same bottom-first index, which is what a `Canvases` is
+        // asked in — the caller numbered the stack, so nothing is reversed on
+        // the way out.
+        let at = doc.layers.len() - 1 - i;
+        let selected = at == doc.active;
         if layer.folder {
             entries.push(Entry {
                 depth: layer.depth,
@@ -826,10 +1136,22 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
             continue;
         }
         let src = format!("data/layer{i:03}.png");
-        let placed = trim(layer.pixels, doc.size);
-        let png = encode_png(placed.size, &placed.pixels)?;
+        // Scoped so the canvas-sized buffer is gone before the PNG is written:
+        // `trim` owns what it produces, so past this brace the only thing alive
+        // is the layer's own content rectangle. For a fetched buffer that is
+        // the difference between one canvas resident and one per layer.
+        let placed = {
+            let pixels = resolve(
+                canvases,
+                layer.pixels,
+                Wanted::Layer(at),
+                expected,
+                doc.layers,
+            )?;
+            trim(&pixels, doc.size)
+        };
         zip.start_file(&src, stored())?;
-        zip.write_all(&png)?;
+        write_png(zip, placed.size, &placed.pixels)?;
 
         // The mask, as a greyscale PNG of the slice's red channel, under
         // `umber/` where no other reader will look. Never trimmed: a mask is
@@ -844,9 +1166,15 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
         let mask_src = match layer.mask {
             Some(mask) => {
                 let src = mask_src(i);
-                let grey: Vec<u8> = mask.chunks_exact(4).map(|px| px[0]).collect();
+                // Scoped like the layer's own, and for the same reason: the
+                // canvas-sized slice is gone by the closing brace and only the
+                // one-byte-a-pixel coverage survives into the encoder.
+                let grey: Vec<u8> = {
+                    let mask = resolve(canvases, mask, Wanted::Mask(at), expected, doc.layers)?;
+                    mask.chunks_exact(4).map(|px| px[0]).collect()
+                };
                 zip.start_file(&src, stored())?;
-                zip.write_all(&encode_png_grey(doc.size, &grey)?)?;
+                write_png_grey(zip, doc.size, &grey)?;
                 Some(src)
             }
             None => None,
@@ -955,7 +1283,7 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
     // would otherwise open the document on transparency. See the module docs.
     if let Some(colour) = doc.background.colour() {
         zip.start_file(BACKGROUND_SRC, stored())?;
-        zip.write_all(&encode_png(doc.size, &solid(doc.size, colour))?)?;
+        write_png(zip, doc.size, &solid(doc.size, colour))?;
         entries.push(Entry {
             // At the top level whatever the stack above it does: the background
             // is under everything, so it can be inside nothing.
@@ -973,7 +1301,7 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
     // the manifest fingerprints the stack the reader will rebuild.
     let names: Vec<String> = doc.layers.iter().map(|l| clean_name(l.name)).collect();
     let saved_history = match &doc.history {
-        Some(h) if !h.is_empty() => history::write(&mut zip, doc.size, &names, h)?,
+        Some(h) if !h.is_empty() => history::write(zip, doc.size, &names, h)?,
         _ => false,
     };
 
@@ -990,15 +1318,19 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
     )?;
 
     // Both are required of a conforming writer, and both are what gives a file
-    // manager something to show.
+    // manager something to show — and both come off the *same* flattened image,
+    // which is why it is fetched once here and held across the pair rather than
+    // asked for twice.
+    let merged = resolve(canvases, doc.merged, Wanted::Merged, expected, doc.layers)?;
     zip.start_file("mergedimage.png", stored())?;
-    zip.write_all(&encode_png(doc.size, doc.merged)?)?;
+    write_png(zip, doc.size, &merged)?;
 
-    let (thumb_size, thumb) = thumbnail(doc.merged, doc.size);
+    let (thumb_size, thumb) = thumbnail(&merged, doc.size);
+    drop(merged);
     zip.start_file("Thumbnails/thumbnail.png", stored())?;
-    zip.write_all(&encode_png(thumb_size, &thumb)?)?;
+    write_png(zip, thumb_size, &thumb)?;
 
-    Ok((zip.finish()?.into_inner(), warnings))
+    Ok(warnings)
 }
 
 /// Umber's mode as an OpenRaster `composite-op`, and whether it is exact.
@@ -1502,22 +1834,36 @@ fn thumbnail(merged: &[u8], canvas: UVec2) -> (UVec2, Vec<u8>) {
 /// widens it back to `(g, g, g, 255)` on the way in, which is exactly the form
 /// a mask slice holds — so the round trip is byte for byte and needs no
 /// conversion at either end.
-fn encode_png_grey(size: UVec2, grey: &[u8]) -> Result<Vec<u8>, SaveError> {
+/// A PNG in memory.
+///
+/// The one caller left is [`history::write`], and it is not an oversight: the
+/// file's own byte budget is stated over *encoded* patches, so it has to know
+/// how large one came out before it can decide whether to keep it — and it
+/// walks the timeline newest-first to make that decision while writing the
+/// entries oldest-first. What it accumulates is bounded by
+/// [`history::BUDGET_BYTES`], where a layer's PNG is bounded only by the canvas.
+fn encode_png(size: UVec2, rgba: &[u8]) -> Result<Vec<u8>, SaveError> {
     let mut out = Vec::new();
-    let mut encoder = png::Encoder::new(&mut out, size.x, size.y);
-    encoder.set_color(png::ColorType::Grayscale);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(png::Compression::Fast);
-    encoder
-        .write_header()
-        .and_then(|mut w| w.write_image_data(grey))
-        .map_err(|e| SaveError::Io(std::io::Error::other(e)))?;
+    write_png(&mut out, size, rgba)?;
     Ok(out)
 }
 
-fn encode_png(size: UVec2, rgba: &[u8]) -> Result<Vec<u8>, SaveError> {
-    let mut out = Vec::new();
-    let mut encoder = png::Encoder::new(&mut out, size.x, size.y);
+/// A greyscale PNG, written straight into `sink`.
+///
+/// `sink` rather than a returned `Vec<u8>` so a mask's PNG never exists beside
+/// the archive it is going into. The bytes are identical either way — the
+/// encoder makes the same calls in the same order — which is what lets
+/// `a_streamed_save_is_byte_for_byte_the_archive_encode_builds` hold.
+fn write_png_grey(sink: &mut impl Write, size: UVec2, grey: &[u8]) -> Result<(), SaveError> {
+    let mut encoder = png::Encoder::new(sink, size.x, size.y);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    finish_png(encoder, grey)
+}
+
+fn write_png(sink: &mut impl Write, size: UVec2, rgba: &[u8]) -> Result<(), SaveError> {
+    let mut encoder = png::Encoder::new(sink, size.x, size.y);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     // ORA specifies sRGB, and so does Umber's engine at its edges.
@@ -1528,11 +1874,21 @@ fn encode_png(size: UVec2, rgba: &[u8]) -> Result<Vec<u8>, SaveError> {
     // that will be written again in a minute — is the wrong trade. Exports are
     // a different question, and are a different function.
     encoder.set_compression(png::Compression::Fast);
+    finish_png(encoder, rgba)
+}
+
+/// Write the header, the image and the trailer, and **report the trailer's own
+/// failure**.
+///
+/// `png::Writer` writes `IEND` from its `Drop` and throws away whatever that
+/// says, which cost nothing while the sink was a `Vec<u8>` that could not fail.
+/// Streaming into a file it is the difference between a refused save and an
+/// archive missing the end of its last entry, so `finish` is called explicitly.
+fn finish_png<W: Write>(encoder: png::Encoder<'_, W>, data: &[u8]) -> Result<(), SaveError> {
     encoder
         .write_header()
-        .and_then(|mut w| w.write_image_data(rgba))
-        .map_err(|e| SaveError::Io(std::io::Error::other(e)))?;
-    Ok(out)
+        .and_then(|mut w| w.write_image_data(data).and(w.finish()))
+        .map_err(|e| SaveError::Io(std::io::Error::other(e)))
 }
 
 // --- the container ---------------------------------------------------------
@@ -1614,7 +1970,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: px,
+            merged: Canvas::Held(px),
             history: None,
         })
         .expect("encode");
@@ -1713,7 +2069,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
-                merged: &px,
+                merged: Canvas::Held(&px),
                 history: None,
             })
             .expect("encode");
@@ -1842,7 +2198,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &px,
+            merged: Canvas::Held(&px),
             history: None,
         })
         .expect("encode");
@@ -1900,7 +2256,7 @@ mod tests {
             active: 1,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &px,
+            merged: Canvas::Held(&px),
             history: None,
         });
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
@@ -1953,7 +2309,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &px,
+            merged: Canvas::Held(&px),
             history: None,
         })
         .unwrap();
@@ -2025,7 +2381,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &px,
+            merged: Canvas::Held(&px),
             history: None,
         })
         .unwrap();
@@ -2096,7 +2452,7 @@ mod tests {
             active: 2,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &px,
+            merged: Canvas::Held(&px),
             history: Some(saved),
         });
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
@@ -2144,7 +2500,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &merged,
+            merged: Canvas::Held(&merged),
             history: None,
         });
 
@@ -2193,7 +2549,7 @@ mod tests {
                 ..SaveLayer::new("Paper", BlendMode::Normal, &pixels)
             },
             SaveLayer {
-                mask: Some(&mask),
+                mask: Some(Canvas::Held(&mask)),
                 clipped: true,
                 link: Some(3),
                 ..SaveLayer::new("Ink", BlendMode::Normal, &pixels)
@@ -2205,7 +2561,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .expect("encode");
@@ -2317,7 +2673,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .expect("encode");
@@ -2405,7 +2761,7 @@ mod tests {
 
         let plain = || layer("Ink", &pixels);
         let masked = || SaveLayer {
-            mask: Some(&mask),
+            mask: Some(Canvas::Held(&mask)),
             ..plain()
         };
         let clipped = || SaveLayer {
@@ -2419,7 +2775,7 @@ mod tests {
         // An effect *and* a mask: the highest of the two, not the sum and not
         // whichever was tested last.
         let both = || SaveLayer {
-            mask: Some(&mask),
+            mask: Some(Canvas::Held(&mask)),
             ..effected()
         };
 
@@ -2464,7 +2820,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .expect("encode");
@@ -2599,7 +2955,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
-                merged: &px,
+                merged: Canvas::Held(&px),
                 history: None,
             })
             .expect("encode")
@@ -2704,7 +3060,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .expect("encode");
@@ -2757,7 +3113,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .expect("encode");
@@ -2813,7 +3169,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: 72.0,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .expect("encode");
@@ -2896,7 +3252,7 @@ mod tests {
             active: 0,
             background: Background::opaque(paper),
             dpi: 300.0,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         });
 
@@ -2933,7 +3289,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap();
@@ -2965,7 +3321,7 @@ mod tests {
             active: 0,
             background: Background::opaque(Color::from_srgb_u8(20, 120, 200, 255)),
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap();
@@ -3002,7 +3358,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: 150.0,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap();
@@ -3031,7 +3387,7 @@ mod tests {
             active: 0,
             background: Background::WHITE,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         });
         assert_eq!(doc.layers.len(), LayerStack::MAX);
@@ -3076,7 +3432,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &merged,
+            merged: Canvas::Held(&merged),
             history: None,
         });
         assert_eq!(doc.layers[0].pixels, pixels);
@@ -3099,7 +3455,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &merged,
+            merged: Canvas::Held(&merged),
             history: None,
         });
         assert_eq!(doc.layers[0].pixels, pixels);
@@ -3117,7 +3473,7 @@ mod tests {
             active: 1,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &painted,
+            merged: Canvas::Held(&painted),
             history: None,
         });
 
@@ -3144,7 +3500,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         };
 
@@ -3178,7 +3534,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         });
         assert_eq!(doc.layers[0].name, "<ink> & \"paper\"");
@@ -3195,7 +3551,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap();
@@ -3236,7 +3592,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap();
@@ -3288,7 +3644,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap_err();
@@ -3307,7 +3663,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &full,
+            merged: Canvas::Held(&full),
             history: None,
         })
         .unwrap_err();
@@ -3468,7 +3824,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
-                merged: &pixels,
+                merged: Canvas::Held(&pixels),
                 history: None,
             },
         )
