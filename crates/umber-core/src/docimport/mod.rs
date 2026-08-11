@@ -1910,11 +1910,33 @@ mod tests {
     /// the stack rather than the canvas and carries the figure to act on.
     #[test]
     fn a_stack_refusal_names_the_stack_and_not_the_canvas() {
-        let err = check_resident(16384, 16384, 64, 68_719_476_736, 16 << 30).unwrap_err();
+        // **The case is derived from the constants that define it**, which is
+        // the rule a raised ceiling has already caught this codebase on once:
+        // the largest canvas Umber opens, at the full stack, holding what such
+        // a stack would hold if it were solid paint.
+        let edge = ImportedDocument::MAX_DIMENSION;
+        let held = u64::from(edge) * u64::from(edge) * 4 * LayerStack::MAX as u64;
+        let err = check_resident(
+            edge,
+            edge,
+            LayerStack::MAX,
+            held,
+            ImportedDocument::MAX_TOTAL_BYTES,
+        )
+        .unwrap_err();
         let said = err.to_string();
-        assert!(said.contains("64 layers"), "{said}");
-        assert!(said.contains("16384×16384"), "{said}");
-        assert!(said.contains("68.7 GB"), "{said}");
+        assert!(
+            said.contains(&format!("{} layers", LayerStack::MAX)),
+            "{said}"
+        );
+        assert!(said.contains(&format!("{edge}×{edge}")), "{said}");
+        assert!(said.contains(&gigabytes(held)), "{said}");
+        // **The bound is pinned as a literal and the document's figure is
+        // not**, and the asymmetry is deliberate. The document's figure is this
+        // test's own input, so deriving it says only that the sentence carries
+        // what it was handed; the bound is a constant somebody may change, and
+        // a literal is what makes that change fail here loudly rather than
+        // agree with itself.
         assert!(
             said.contains("17.2 GB"),
             "the sentence must say what the bound is: {said}"
