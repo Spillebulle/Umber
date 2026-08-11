@@ -4214,6 +4214,19 @@ impl CanvasRenderer {
     /// [`Self::clear_layer`] is what puts a slot back to a layer, so a slice
     /// recycled from a mask stops reading white.
     ///
+    /// **There is a third caller that ought to exist and does not**, and naming
+    /// it is the point of saying "two" out loud. `app.rs`'s `resumed` rebuilds
+    /// storage for every open document, and `install_canvas`'s
+    /// [`Self::clear_all_layers`] puts every slot back to `Layer` — with no
+    /// marking loop after it, unlike `install_import`, which runs one before it
+    /// writes. That is harmless only because Android is the only path that
+    /// reaches it and a resume keeps no pixels anyway, both of which are stated
+    /// under "Platform support" and neither of which is a property of *this*
+    /// function. **The class now decides more than it did**: which view of the
+    /// page a commit renders a mask through, so a mask whose class was lost
+    /// would take the sRGB pipeline and write the encoding the composite stopped
+    /// reading. Whoever builds the Android path owes this a call.
+    ///
     /// **A `.kra` transparency mask showed nothing today and was still
     /// inconsistent**, which is why it is here rather than left: it arrives as
     /// one fully-backed canvas piece, so there is no absent tile for the class
