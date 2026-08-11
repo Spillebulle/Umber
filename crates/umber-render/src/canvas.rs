@@ -4702,11 +4702,7 @@ impl CanvasRenderer {
             plan.to.x as i64 - plan.from.x as i64,
             plan.to.y as i64 - plan.from.y as i64,
         );
-        let mut owned: Vec<u32> = Vec::new();
         for slot in 0..MAX_SLOTS as u32 {
-            if self.layers.owned_page(slot).is_some() {
-                owned.push(slot);
-            }
             for (tile, from) in self.layers.backed(slot) {
                 // What of this tile survives, where it lands, and which
                 // destination tiles that reaches.
@@ -4826,20 +4822,18 @@ impl CanvasRenderer {
         queue.submit(Some(enc.finish()));
         self.layers = resized;
 
-        // A page-backed slot stays one. `apply_canvas` has already put the float
-        // down, so the only ones left are effect slices — and their cache is
-        // emptied above, which means nothing is promoted here in practice and
-        // this exists so that "an owned page survives a resize" is a property of
-        // the method rather than of who happens to call it.
-        if !owned.is_empty() {
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("resize-promote"),
-            });
-            for slot in owned {
-                self.promote(device, queue, &mut enc, slot);
-            }
-            queue.submit(Some(enc.finish()));
-        }
+        // **Nothing comes out of a resize page-backed, and that is deliberate
+        // rather than an omission.** Every slot in the new store is tiled, with
+        // the tiles the copies above actually filled; a formerly owned page is
+        // not carried. Two things owned one and neither survives this method:
+        // `end_float` ran above, and `EffectCache::forget_all` ran above that,
+        // so an effect slice's pixels are stale and will be rebaked — where
+        // `promote` runs and takes a page again. Re-promoting here would hold a
+        // whole canvas for an effect the cache has already forgotten.
+        //
+        // The same reasoning `live` rests on, one level down: this is the one
+        // moment in the program when nothing is holding storage above the
+        // stack, which is why it is the one shrink with no transient.
 
         // Everything above this line answers to the canvas being left behind —
         // `CanvasCopy::plan` and the copy extent. Everything below it is being
