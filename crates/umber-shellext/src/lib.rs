@@ -442,26 +442,6 @@ mod tests {
         );
     }
 
-    /// A preview becomes a bitmap of the same shape, premultiplied, top-down.
-    ///
-    /// The premultiply is what stops a soft edge arriving with a dark fringe,
-    /// and an opaque pixel has to survive it exactly — rounding down would make
-    /// every thumbnail imperceptibly dark and nothing would ever say so.
-    #[test]
-    fn an_opaque_pixel_survives_the_premultiply_exactly() {
-        // Done on the arithmetic rather than through GDI so it runs on CI,
-        // which has no desktop: `CreateDIBSection` is the one line this cannot
-        // reach, and it is the line that does no arithmetic.
-        let pre = |c: u8, a: u8| ((u32::from(c) * u32::from(a) + 127) / 255) as u8;
-        for c in [0u8, 1, 127, 128, 254, 255] {
-            assert_eq!(pre(c, 255), c, "opaque {c} must be itself");
-            assert_eq!(pre(c, 0), 0, "transparent must be zero");
-        }
-        // Half alpha halves the colour, to the nearest level.
-        assert_eq!(pre(255, 128), 128);
-        assert_eq!(pre(200, 128), 100);
-    }
-
     /// Every format the previewer reads is tried, so one registration serves
     /// all four extensions — Explorer supplies bytes and never says which.
     #[test]
@@ -503,24 +483,276 @@ mod com_tests {
     //! installing is whether Explorer chooses to call us, and nothing else.
 
     use super::*;
-    use windows::Win32::Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW};
+    use windows::Win32::Graphics::Gdi::{BITMAP, DIBSECTION, DeleteObject, GetObjectW};
     use windows::Win32::UI::Shell::SHCreateMemStream;
 
-    /// An ORA of `size` square, built through the public encoder.
-    fn document(size: u32) -> Vec<u8> {
-        // A bare PNG is a document `preview` reads, and it is the one format
-        // this crate can produce without reaching into `umber-core`'s
-        // test-only fixtures. What is under test here is the COM path.
+    /// A PNG of `width` × `height` holding exactly `rgba`, straight-alpha sRGB.
+    ///
+    /// A bare PNG is a document `preview` reads, and it is the one format this
+    /// crate can produce without reaching into `umber-core`'s test-only
+    /// fixtures. What is under test is the COM path and what comes out the far
+    /// end of it, so the bytes have to survive the encode unchanged — which
+    /// `a_document_round_trips_its_pixels_through_the_encoder` is what checks,
+    /// because every pixel assertion below rests on it.
+    fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         umber_core::export::encode(
-            &[10u8, 200, 60, 255].repeat((size * size) as usize),
-            size,
-            size,
+            rgba,
+            width,
+            height,
             &umber_core::export::ExportOptions {
                 format: umber_core::export::ExportFormat::Png,
                 ..Default::default()
             },
         )
         .expect("a document")
+    }
+
+    /// A square, single-colour, fully opaque document — for the tests that are
+    /// about the COM plumbing rather than about the picture.
+    fn document(size: u32) -> Vec<u8> {
+        png(
+            size,
+            size,
+            &[10u8, 200, 60, 255].repeat((size * size) as usize),
+        )
+    }
+
+    // ----------------------------------------------------------- the picture
+
+    /// **Three wide and two tall, six pixels no two of which agree.**
+    ///
+    /// Every property `to_bitmap` has is a property of *where a number ends
+    /// up*, so a fixture that is square, or one colour, or wholly opaque
+    /// cannot see any of them. This one is none of the three, and each choice
+    /// buys a specific mutation:
+    ///
+    /// * **Non-square** — transposing `biWidth` and `biHeight` is caught.
+    /// * **Distinct per channel** — dropping the BGRA swap is caught. Every
+    ///   pixel has a different value in each of red, green and blue, so a
+    ///   channel that arrived from the wrong place is a wrong number rather
+    ///   than a coincidence.
+    /// * **One pixel at alpha 200** — the premultiply's rounding is caught.
+    ///   `200 × 200 = 40000`, which is `156.86` of 255: rounded is 157 and
+    ///   truncated is 156, so dropping the `+ 127` moves that byte. Its green
+    ///   and blue deliberately do *not* move, which is why the red is the one
+    ///   the assertion turns on.
+    /// * **One pixel fully transparent, and it is not black** — a premultiply
+    ///   that was skipped leaves `(10, 20, 30)` standing where zero belongs.
+    /// * **Two fully opaque pixels** — the property the deleted arithmetic test
+    ///   used to claim: an opaque pixel is exactly itself, and `+ 127` rounding
+    ///   is what makes that true rather than one level dark.
+    ///
+    /// Row-major, top row first, straight-alpha sRGB — the form a `Preview`
+    /// holds.
+    const SHAPE: (u32, u32) = (3, 2);
+    #[rustfmt::skip]
+    const PIXELS: [u8; 24] = [
+        200,   0,   0, 255,   0, 210,   0, 255,   0,   0, 220, 255,
+        200, 100,  50, 200,  10,  20,  30,   0, 255, 254, 253, 255,
+    ];
+
+    /// What [`to_bitmap`] must write, in the order a DIB holds it: **BGRA,
+    /// premultiplied**, one row after another from the top.
+    ///
+    /// Worked out by hand rather than by calling the code under test, which is
+    /// the whole point — `(c × a + 127) / 255` per channel, alpha carried
+    /// through untouched.
+    #[rustfmt::skip]
+    const BGRA: [u8; 24] = [
+        // Opaque: the colour itself, with blue and red exchanged.
+          0,   0, 200, 255,    0, 210,   0, 255,  220,   0,   0, 255,
+        // 50→39, 100→78, 200→157 at alpha 200; then zeroes; then near-white.
+         39,  78, 157, 200,    0,   0,   0,   0,  253, 254, 255, 255,
+    ];
+
+    /// What came back out of GDI: the shape, the buffer, and whether GDI
+    /// believes the buffer runs top row first.
+    struct ReadBack {
+        width: u32,
+        height: u32,
+        /// The bitmap's own storage, in the order [`to_bitmap`] wrote it.
+        pixels: Vec<u8>,
+        /// Whether this is a **top-down** DIB.
+        ///
+        /// **Not read off `dsBmih.biHeight`**, and that was measured rather
+        /// than assumed: GDI hands that field back as `+2` for the bitmap this
+        /// crate creates with `-2`, so the sign is normalised away and an
+        /// assertion on it fails against correct code. Nor can the buffer
+        /// settle it — the rows sit in memory in the same order either way,
+        /// and the orientation is only ever a statement about how to *read*
+        /// them.
+        ///
+        /// What does settle it is asking GDI to convert. `GetDIBits` into a
+        /// **bottom-up** destination (a positive `biHeight`) returns the rows
+        /// in the order that destination wants, flipping them where the source
+        /// disagrees. So a source GDI holds as top-down comes back reversed
+        /// against its own buffer, and a bottom-up one comes back identical:
+        /// the flip is GDI's own answer to the question, rather than ours.
+        top_down: bool,
+    }
+
+    /// Read a bitmap back the way the shell would have to.
+    fn read_back(bitmap: HBITMAP) -> ReadBack {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC, GetDIBits};
+
+        let mut ds = DIBSECTION::default();
+        let wrote = unsafe {
+            GetObjectW(
+                bitmap.into(),
+                std::mem::size_of::<DIBSECTION>() as i32,
+                Some((&raw mut ds).cast()),
+            )
+        };
+        assert_eq!(
+            wrote as usize,
+            std::mem::size_of::<DIBSECTION>(),
+            "GDI did not describe this as a DIB section"
+        );
+        assert!(!ds.dsBm.bmBits.is_null(), "a DIB section with no pixels");
+        assert_eq!(ds.dsBm.bmBitsPixel, 32, "the shell was promised 32-bit");
+
+        let (width, height) = (ds.dsBm.bmWidth, ds.dsBm.bmHeight);
+        let count = width as usize * height as usize * 4;
+        // SAFETY: `bmBits` is the buffer `CreateDIBSection` allocated for a
+        // 32-bit bitmap of the shape GDI has just reported, and the bitmap
+        // outlives the copy.
+        let pixels =
+            unsafe { std::slice::from_raw_parts(ds.dsBm.bmBits.cast::<u8>(), count) }.to_vec();
+
+        // Ask for the same pixels bottom-up and see whether GDI turns them
+        // over. A memory device context, because none of this touches a screen.
+        let dc = unsafe { CreateCompatibleDC(None) };
+        assert!(!dc.is_invalid(), "no GDI device context on this machine");
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                // Positive: "give me these bottom-up".
+                biHeight: height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bottom_up = vec![0u8; count];
+        // SAFETY: `bottom_up` holds exactly the bytes `info` describes, and
+        // both it and `info` outlive the call.
+        let lines = unsafe {
+            GetDIBits(
+                dc,
+                bitmap,
+                0,
+                height as u32,
+                Some(bottom_up.as_mut_ptr().cast()),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        };
+        let _ = unsafe { DeleteDC(dc) };
+        assert_eq!(lines, height, "GetDIBits did not return every row");
+
+        let stride = width as usize * 4;
+        let flipped: Vec<u8> = pixels
+            .chunks_exact(stride)
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
+        // Without this the reading is a coin toss: a picture that is its own
+        // mirror answers both ways at once, and the caller's fixture is the
+        // only thing stopping it. The same trap as a square fixture one line
+        // up, so it is refused here rather than remembered there.
+        assert_ne!(
+            flipped, pixels,
+            "this picture is its own vertical mirror, so nothing about it can \
+             say which way up it is"
+        );
+        assert!(
+            bottom_up == flipped || bottom_up == pixels,
+            "GetDIBits returned neither the buffer nor its mirror, so this \
+             reading says nothing about the orientation"
+        );
+        ReadBack {
+            width: width as u32,
+            height: height as u32,
+            top_down: bottom_up == flipped,
+            pixels,
+        }
+    }
+
+    /// Every pixel assertion below rests on the encoder handing its bytes back,
+    /// so that is checked rather than assumed. A PNG that quantised, matted or
+    /// premultiplied would make [`BGRA`] wrong for a reason that has nothing to
+    /// do with the code this file is guarding.
+    #[test]
+    fn a_document_round_trips_its_pixels_through_the_encoder() {
+        let bytes = png(SHAPE.0, SHAPE.1, &PIXELS);
+        let preview = read_any(&bytes).expect("a preview");
+        assert_eq!((preview.size.x, preview.size.y), SHAPE);
+        assert_eq!(
+            preview.rgba, PIXELS,
+            "the encoder did not preserve the fixture"
+        );
+    }
+
+    /// **What Explorer is actually handed.** The whole route — a stream in, a
+    /// GDI bitmap out — measured pixel by pixel against [`BGRA`].
+    ///
+    /// This is the only guard over `to_bitmap`, and it is deliberately one
+    /// test rather than four: the four properties (the channel order, the
+    /// axes, which way up, the rounding) are all statements about the same one
+    /// buffer, and splitting them would mean four documents, four COM
+    /// sequences and four chances to build a fixture too tame to see anything.
+    ///
+    /// Demonstrated by mutation, all four of them:
+    ///
+    /// * `dst[0] = pre(src[0]) … dst[2] = pre(src[2])` — the swap dropped.
+    /// * `biHeight: height as i32` — bottom-up, an upside-down thumbnail.
+    /// * `biWidth: height`, `biHeight: -(width)` — the axes transposed.
+    /// * `(c * a) / 255` — the rounding dropped.
+    ///
+    /// Every one of them passed all eleven tests in this crate before this
+    /// existed.
+    #[test]
+    fn the_bitmap_explorer_is_handed_is_the_picture_the_document_holds() {
+        let bytes = png(SHAPE.0, SHAPE.1, &PIXELS);
+        let provider: IInitializeWithStream = ThumbnailProvider::new().into();
+        // SAFETY: the slice outlives the call; `SHCreateMemStream` copies it.
+        let stream = unsafe { SHCreateMemStream(Some(&bytes)) }.expect("a stream");
+        unsafe { provider.Initialize(&stream, 0) }.expect("initialise");
+
+        let thumbs: IThumbnailProvider = provider.cast().expect("both interfaces");
+        let mut bitmap = HBITMAP::default();
+        let mut alpha = WTS_ALPHATYPE(0);
+        // A box larger than either edge, so `fit_within` is the identity and
+        // the pixels that come back are the pixels that went in. Scaling is
+        // `Preview`'s own rule and has its own tests; what is under test here
+        // is everything after it.
+        // SAFETY: both out-parameters are live for the call.
+        unsafe { thumbs.GetThumbnail(8, &mut bitmap, &mut alpha) }.expect("a thumbnail");
+        assert!(!bitmap.is_invalid(), "no bitmap came back");
+
+        let back = read_back(bitmap);
+        assert_eq!(
+            (back.width, back.height),
+            SHAPE,
+            "the bitmap is not the shape of the picture — the axes are transposed"
+        );
+        assert!(
+            back.top_down,
+            "GDI holds this as a bottom-up DIB, so Explorer draws the thumbnail \
+             upside down"
+        );
+        assert_eq!(
+            back.pixels, BGRA,
+            "the bytes Explorer composites are not the picture: expected BGRA, \
+             premultiplied with rounding"
+        );
+
+        // Explorer owns the bitmap in the real flow; here the test does.
+        let _ = unsafe { DeleteObject(bitmap.into()) };
     }
 
     /// The whole provider, through its own interfaces: initialise from a stream
