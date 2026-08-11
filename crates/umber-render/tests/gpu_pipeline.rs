@@ -6093,6 +6093,110 @@ fn an_effect_with_no_reach_produces_no_draw_at_all() {
     );
 }
 
+/// An effect on a layer the composite discards is not baked, not given a slice
+/// and not drawn — and taking it out moves no pixel.
+///
+/// `composite.wgsl`'s loop reads a hidden layer's texels and then `continue`s
+/// past `acc`, so an effect derived from one is a canvas-sized slice and up to
+/// several full-screen passes a frame for a picture nobody sees. The predicate
+/// here is that shader's own, `!visible || opacity <= 0.0`.
+///
+/// **Four outputs, and the pixel is the one that matters.** The bake count and
+/// the draw list say the work did not happen; the composite says the elision was
+/// safe. The clipped layer above the hidden one is there deliberately: an
+/// unclipped invisible draw is the one shape `layer-residency.md` §2.2 warns
+/// against removing, because it writes `clip_alpha` for whatever is clipped to
+/// it — an effect draw cannot be that draw, because its own layer's draw follows
+/// immediately and writes the same zero, and this is what says so out loud.
+///
+/// And showing the layer again brings the effect back, so this is an elision
+/// rather than a loss.
+#[test]
+fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
+    let mut h = harness_or_skip!();
+    h.write_block(2, WHOLE, [128, 128, 128, 255]);
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    h.write_block(1, WHOLE, [255, 0, 0, 255]);
+
+    let floor = layer(2, 1.0, BlendMode::Normal);
+    let hidden = LayerDraw {
+        visible: false,
+        ..layer(0, 1.0, BlendMode::Normal)
+    };
+    // Clipped to the layer below it, which is the hidden one. Its own draw is
+    // what has to keep bounding this to nothing once the effect draws are gone.
+    let clipped = LayerDraw {
+        clipped: true,
+        ..layer(1, 1.0, BlendMode::Normal)
+    };
+
+    // Angle 180 puts the offset at +x, clear of the square, exactly as
+    // `a_drop_shadow_at_multiply_multiplies_against_the_backdrop` does.
+    let cast = [shadow(Color::BLACK, 180.0, 12.0)];
+    let plain = [floor, hidden, clipped];
+    let stack = [
+        effected(floor, &[]),
+        effected(hidden, &cast),
+        effected(clipped, &[]),
+    ];
+
+    let before_bakes = h.canvas.effect_bakes();
+    let before_slots = h.canvas.slot_capacity();
+    let baked = h.bake(&stack, 3);
+
+    assert_eq!(
+        baked.draws.len(),
+        3,
+        "a hidden layer's effect still produced a draw: {:?}",
+        baked.draws
+    );
+    assert_eq!(
+        h.canvas.effect_bakes(),
+        before_bakes,
+        "a hidden layer's effect was baked into a slice nothing reads"
+    );
+    assert_eq!(
+        h.canvas.slot_capacity(),
+        before_slots,
+        "a hidden layer's effect took a canvas-sized slice"
+    );
+    assert_eq!(baked.dropped, 0);
+
+    // (45, 32) is inside where the shadow would have fallen and clear of the
+    // square, so it is the pixel that would move if any of this were unsound.
+    for (x, y) in [(45, 32), (32, 32), (24, 24), (0, 0)] {
+        assert_eq!(
+            h.composite_pixel(&baked.draws, x, y),
+            h.composite_pixel(&plain, x, y),
+            "the picture moved at ({x}, {y}) when the effect was elided"
+        );
+    }
+
+    // Show it again and the effect comes back: this is an elision, not a loss.
+    let shown = layer(0, 1.0, BlendMode::Normal);
+    let lit = [
+        effected(floor, &[]),
+        effected(shown, &cast),
+        effected(
+            LayerDraw {
+                clipped: true,
+                ..layer(1, 1.0, BlendMode::Normal)
+            },
+            &[],
+        ),
+    ];
+    let baked = h.bake(&lit, 3);
+    assert_eq!(
+        baked.draws.len(),
+        4,
+        "showing the layer again did not bring its effect back"
+    );
+    assert!(
+        h.canvas.effect_bakes() > before_bakes,
+        "showing the layer again drew a shadow nothing had baked"
+    );
+}
+
 /// **The second gate.** A drop shadow at Multiply multiplies against *the
 /// backdrop* — what is under the layer — and not against its own layer.
 ///

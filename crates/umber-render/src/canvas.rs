@@ -6069,28 +6069,71 @@ impl CanvasRenderer {
             );
         }
 
+        // What is left once the effects of layers the composite discards are
+        // taken out — a slice not allocated, a bake not run and a draw not made.
+        //
+        // **The predicate is `composite.wgsl`'s own**, `!visible || opacity <=
+        // 0.0`, read off the layer rather than off the effect draw: an effect
+        // draw takes its `visible` from its layer and its opacity is the
+        // effect's times the layer's, so the two agree by construction. Walk
+        // that shader's loop with either false and every write is dead — a
+        // clipped draw multiplies a local and `continue`s, an unclipped one
+        // writes `select(0.0, lay.a, false)`, which is `0.0` whatever the slice
+        // holds, and `continue`s. So the pixels of an effect on a hidden layer
+        // are never read, and baking them is a canvas-sized slice and up to
+        // several full-screen passes a frame for a picture nobody sees. A layer
+        // inside a hidden **folder** is covered without a second rule:
+        // `LayerStack::effective_visible` has already ANDed its ancestors in, so
+        // it arrives here with `visible: false`.
+        //
+        // **Dropping the draws is safe, and it is not the unconditional
+        // elision `layer-residency.md` §2.2 warns about.** That warning is about
+        // removing an invisible *layer* draw, which can be the one that writes
+        // `clip_alpha` for a clipped run above it. An effect draw cannot be:
+        // an inner one is always `clipped`, so it never writes `clip_alpha` at
+        // all, and an outer one sits immediately before its own layer's draw
+        // with the same `clipped` flag and nothing between them but its
+        // siblings — so the layer's draw, which is *not* dropped, writes the
+        // same `0.0` a moment later.
+        //
+        // **After the budget arithmetic, deliberately.** `dropped` is what the
+        // panel reports and `kept` is which effects an over-budget document
+        // draws; filtering before either would change both, so an over-budget
+        // document would silently start drawing a different set of effects.
+        // Nothing here may move a pixel.
+        let drawn: Vec<(usize, Effect)> = kept
+            .iter()
+            .copied()
+            .filter(|(i, _)| {
+                let draw = stack[*i].draw;
+                draw.visible && draw.opacity > 0.0
+            })
+            .collect();
+
         if self.effects.base != base {
             self.effects.forget_entries();
             self.effects.base = base;
         }
 
-        // Which cache entry each kept effect is, allocating for the ones that are
-        // new and releasing the ones nothing wants any more. A key is the *slot
-        // the draw carries* and not the layer — §5.2 — so a float's preview slice
-        // falls out of the cache rather than needing a rule.
-        let keys: Vec<(u32, Option<u32>, EffectKind)> = kept
+        // Which cache entry each drawn effect is, allocating for the ones that
+        // are new and releasing the ones nothing wants any more. A key is the
+        // *slot the draw carries* and not the layer — §5.2 — so a float's
+        // preview slice falls out of the cache rather than needing a rule. A
+        // layer that has just been hidden loses its effects' slices here, and
+        // gets them back when it is shown again.
+        let keys: Vec<(u32, Option<u32>, EffectKind)> = drawn
             .iter()
             .map(|(i, e)| (stack[*i].draw.slot, stack[*i].draw.mask, e.kind))
             .collect();
         self.effects.retain_only(&keys);
-        let mut slots = Vec::with_capacity(kept.len());
+        let mut slots = Vec::with_capacity(drawn.len());
         for key in &keys {
             match self.effects.slot_for(*key, capacity) {
                 Some(slot) => slots.push(slot),
                 None => {
-                    // Unreachable: `capacity` bounds `kept` above. Named rather
-                    // than unwrapped because the failure is a draw pointing at a
-                    // slice nobody wrote.
+                    // Unreachable: `capacity` bounds `kept` above, and `drawn`
+                    // is a subset of it. Named rather than unwrapped because the
+                    // failure is a draw pointing at a slice nobody wrote.
                     log::error!("no effect slice for {key:?}");
                     self.effects.forget_all();
                     self.effects.dropped = wanted.len();
@@ -6132,7 +6175,7 @@ impl CanvasRenderer {
         // there until pointer-up moved the slice's revision. Silent, and only
         // reachable once the gate stopped being one value for the whole bake.
         let mut previous_source: Option<(u32, bool)> = None;
-        for ((position, effect), slot) in kept.iter().zip(&slots) {
+        for ((position, effect), slot) in drawn.iter().zip(&slots) {
             let entry = &stack[*position];
             // **One binding, read by the stamp, the grouping key and the extract.**
             // Not three spellings of one expression: the property that has to hold
@@ -6170,7 +6213,7 @@ impl CanvasRenderer {
             self.effects.record(stamp);
         }
         if steps.is_empty() {
-            return self.baked(stack, kept, &slots, frame);
+            return self.baked(stack, &drawn, &slots, frame);
         }
 
         if let Err(what) = self.run_effect_steps(device, queue, encoder, &steps) {
@@ -6186,7 +6229,7 @@ impl CanvasRenderer {
             self.effects.dropped = wanted.len();
             return plain(wanted.len());
         }
-        self.baked(stack, kept, &slots, frame)
+        self.baked(stack, &drawn, &slots, frame)
     }
 
     /// The draw list, with each kept effect spliced in beside its layer.
@@ -6194,6 +6237,12 @@ impl CanvasRenderer {
     /// `docs/layer-effects.md` §4's order, and it falls out of two facts rather
     /// than being restated here: `Layer::effects` is held in composite order, and
     /// `Effect::is_outer` says which side of the layer each falls on.
+    ///
+    /// `kept` is what actually got a slice — which is not every effect the
+    /// document holds, nor even every one inside the budget: an effect on a
+    /// layer the composite discards is neither baked nor drawn. So `active_index`
+    /// is counted off what this pushes rather than off the caller's list, which
+    /// it already was.
     fn baked(
         &self,
         stack: &[LayerEffects<'_>],
