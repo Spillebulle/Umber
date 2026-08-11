@@ -35,6 +35,16 @@ use umber_core::layer::BlendMode;
 /// `saturating_sub` because the counter is reset partway through a run, so
 /// allocations made before a reset are freed after it; the peak is what is
 /// being read and an underflowing live count would only make it *lower*.
+///
+/// **These are process-globals and nothing locks them, which is safe only
+/// because this binary holds exactly one `#[test]`.** Add a second and the
+/// harness runs them on parallel threads, every reading becomes the sum of two
+/// tests' allocations, and — because the assertion below is an *upper bound on
+/// a difference* — the likely outcome is that it passes while measuring
+/// nothing. That is CLAUDE.md's "a test that writes a process-global must take
+/// a lock, and the harness will not tell you it does not", and the cheapest
+/// answer here is the one-test rule rather than a mutex, because a second test
+/// would also have to run alone to mean anything.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
@@ -176,13 +186,20 @@ fn a_deferred_save_costs_the_same_whatever_the_stack_is() {
     let few = deferred_peak(&path, 2);
     let many = deferred_peak(&path, 24);
 
-    // Twenty-two more layers, for less than two slices in total. The path this
-    // replaced cost twenty-two of them, so the bound is forty-fold clear of
-    // both readings and is nowhere near either — it is a bound on the *shape*,
-    // and a per-layer cost that had crept up to a tenth of a canvas would still
-    // trip it.
+    // Twenty-two more layers, for less than two slices in total, where the path
+    // this replaced cost twenty-two. The honest margin is about 2.2x — the
+    // measured growth is a little over half a slice — and it is a bound on the
+    // *shape* rather than a tight one: a per-layer cost that had crept up to a
+    // tenth of a canvas would still trip it. No figure is quoted here on
+    // purpose; the `println!` below prints the ones somebody would want, which
+    // is the only way a comment cannot go stale against the code beside it.
     assert!(
-        many.saturating_sub(few) < 2 * slice,
+        many >= few,
+        "the peak fell as layers were added, which means the reading is noise \
+         rather than a measurement: {few} for 2 layers, {many} for 24"
+    );
+    assert!(
+        many - few < 2 * slice,
         "22 more layers cost {} bytes, which is a slice ({slice}) or more each: \
          {few} for 2 layers, {many} for 24",
         many - few,

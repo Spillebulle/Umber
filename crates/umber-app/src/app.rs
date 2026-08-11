@@ -5683,15 +5683,23 @@ struct SaveSource<'a> {
 }
 
 impl SaveSource<'_> {
-    fn read(&self, slot: Option<u32>, what: &str) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+    /// One slice off the GPU, or a refusal.
+    ///
+    /// The sentence the artist sees is not this one — `docformat::resolve`
+    /// replaces it with the layer's *name*, which this side does not have, and
+    /// a source asked in indices would otherwise refuse a document by a number
+    /// nobody has seen. What is written here is what a direct caller gets.
+    fn read(
+        &self,
+        slot: Option<u32>,
+        what: impl FnOnce() -> String,
+    ) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
         // A slot the stack does not hold cannot be reached from the save — the
         // document was built from the same iteration this was — and it is
         // refused rather than read as an empty layer, because a document
         // silently saved with a blank layer is worse than one not saved at all.
         let Some(slot) = slot else {
-            return Err(docformat::SaveError::NotSupplied {
-                what: what.to_string(),
-            });
+            return Err(docformat::SaveError::NotSupplied { what: what() });
         };
         Ok(Cow::Owned(self.canvas.read_layer_rect(
             &self.gpu.device,
@@ -5704,17 +5712,15 @@ impl SaveSource<'_> {
 
 impl docformat::Canvases for SaveSource<'_> {
     fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        self.read(
-            self.slots.get(index).copied().flatten(),
-            &format!("pixels of layer {index}"),
-        )
+        self.read(self.slots.get(index).copied().flatten(), || {
+            format!("pixels of stack entry {index}, which holds no slice")
+        })
     }
 
     fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        self.read(
-            self.masks.get(index).copied().flatten(),
-            &format!("mask of layer {index}"),
-        )
+        self.read(self.masks.get(index).copied().flatten(), || {
+            format!("mask of stack entry {index}, which holds no slice")
+        })
     }
 
     fn merged(&mut self) -> Result<Cow<'_, [u8]>, docformat::SaveError> {

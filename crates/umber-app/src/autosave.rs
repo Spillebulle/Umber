@@ -360,14 +360,23 @@ impl Reaper {
 }
 
 /// True for the two names an autosave writes: the archive, and the temporary
-/// neighbour `docformat::write_encoded` renames into place.
+/// neighbour `docformat::write_with` renames into place.
+///
+/// **The temporary is `<name>.ora.saving-<pid>-<n>` and not `<name>.ora.saving`**,
+/// so this matches on the prefix of the tail rather than on the whole of it.
+/// `write_with` made the name unique because two writers of one document
+/// sharing it truncate each other's work; the price is that a temporary a hard
+/// kill leaves behind is no longer overwritten by the next save, which makes
+/// *this* the thing that clears it up. Matching only the old exact spelling
+/// would have left every such file in the autosave directory for ever.
 fn is_autosave_name(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
     let ext = format!(".{}", docformat::EXTENSION);
-    lower.ends_with(&ext) || lower.ends_with(&format!("{ext}.saving"))
+    let temporary = format!("{ext}.saving");
+    lower.ends_with(&ext) || lower.contains(&temporary)
 }
 
 // ---------------------------------------------------------------------------
@@ -2098,6 +2107,27 @@ fn run_task(task: Task) -> Vec<Report> {
         }
     }
 
+    // **`Report::Written` is a claim that a file exists, so nothing reaching
+    // the disk means nothing to report.**
+    //
+    // It used to be free: an encode that failed returned before any of this,
+    // so a `Written` could only follow bytes that had been built. Streaming
+    // moved the encode *inside* the two destinations, and with the early
+    // return gone every encode-class failure — a short capture, a canvas that
+    // changed size, a stack too deep — fell through to an unconditional
+    // `Written`. That is not merely a wrong log line: `app.rs` hands it to
+    // `crash::note_autosave`, which would then name an internal copy that was
+    // never written, at a revision it never held, for a crash box to offer
+    // back. Same rule as `Report::rescued`'s — claiming work is safe when it
+    // is not is worse than claiming nothing.
+    //
+    // The gate is "either destination landed" rather than the old "the encode
+    // succeeded", which also closes the half that predates this: both writes
+    // failing used to report `Written` too.
+    if !(encoded_at.is_some() || wrote_user_file) {
+        return reports;
+    }
+
     // Swept against the directory the internal copy was *just written to*,
     // rather than against a directory named separately. It is a small thing and
     // it is the same principle as `Reaper` itself: the only place expiry can
@@ -2175,29 +2205,34 @@ impl CaptureSource<'_> {
     /// blank: an autosave that quietly replaced somebody's layer with nothing is
     /// the worst thing on this path, and the timer's next attempt is minutes
     /// away rather than never.
-    fn at(&self, index: Option<usize>, what: &str) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+    ///
+    /// The sentence the artist sees is not this one — `docformat::resolve`
+    /// replaces it with the layer's *name*, which this side does not have. What
+    /// is written here is what a reader of a log or a direct caller gets, so it
+    /// says which slice of the capture was missing.
+    fn at(
+        &self,
+        index: Option<usize>,
+        what: impl FnOnce() -> String,
+    ) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
         index
             .and_then(|k| self.pixels.layers.get(k))
             .map(|bytes| Cow::Borrowed(bytes.as_slice()))
-            .ok_or_else(|| docformat::SaveError::NotSupplied {
-                what: what.to_string(),
-            })
+            .ok_or_else(|| docformat::SaveError::NotSupplied { what: what() })
     }
 }
 
 impl docformat::Canvases for CaptureSource<'_> {
     fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        self.at(
-            self.doc.pixel_index(index),
-            &format!("pixels of layer {index}"),
-        )
+        self.at(self.doc.pixel_index(index), || {
+            format!("pixels the capture did not bring back for stack entry {index}")
+        })
     }
 
     fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        self.at(
-            self.doc.mask_index(index),
-            &format!("mask of layer {index}"),
-        )
+        self.at(self.doc.mask_index(index), || {
+            format!("mask the capture did not bring back for stack entry {index}")
+        })
     }
 
     fn merged(&mut self) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
@@ -2691,9 +2726,22 @@ mod tests {
         // file that means anything.
         assert!(umber_core::docimport::import(&theirs).is_ok());
         assert!(umber_core::docimport::import(&ours).is_ok());
-        // And the temporary neighbour the atomic write goes through is gone.
-        assert!(!theirs.with_extension("ora.saving").exists());
-        assert!(!ours.with_extension("ora.saving").exists());
+        // And the temporary neighbour the atomic write goes through is gone,
+        // in both directories. A substring sweep rather than an exact name:
+        // `docformat::write_with`'s temporary carries a process id and a
+        // counter now, so naming `"hands.ora.saving"` would pass whatever was
+        // left behind — and it is `is_autosave_name`'s job to recognise the
+        // same shape, which `an_autosave_name_is_the_archive_or_its_temporary`
+        // pins.
+        for dir in [&documents, &internal] {
+            let left: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".saving"))
+                .collect();
+            assert!(left.is_empty(), "a temporary was left in {dir:?}: {left:?}");
+        }
 
         let _ = std::fs::remove_dir_all(&internal);
         let _ = std::fs::remove_dir_all(&documents);
@@ -2737,6 +2785,84 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&internal);
         let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// **An autosave that wrote nothing reports nothing written.**
+    ///
+    /// `Report::Written` is a claim that a file exists, and `app.rs` spends it:
+    /// it hands the internal copy's *chosen* path to `crash::note_autosave`, so
+    /// a `Written` after a total failure puts a file in the next crash box that
+    /// was never written, at a revision it never held.
+    ///
+    /// It used to be free. An encode that failed returned before either
+    /// destination was reached, so a `Written` could only follow bytes that had
+    /// been built — and streaming moved the encode *inside* the two writes, at
+    /// which point every encode-class failure fell through to an unconditional
+    /// one. Nothing else in this module could see that: every other test here
+    /// has at least one destination succeed.
+    ///
+    /// Driven through a capture that came home a slice short, because that is
+    /// the failure the artist can actually meet — the readback giving up is a
+    /// runtime event, where a canvas of the wrong size or a stack too deep are
+    /// not reachable from a running editor.
+    #[test]
+    fn an_autosave_that_wrote_nothing_claims_nothing() {
+        let blocked = scratch("nothing-internal");
+        let wall = blocked.join("wall");
+        std::fs::write(&wall, b"not a directory").expect("write");
+        let ours = wall.join("copies").join("nothing-1111111111111111.ora");
+
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        // No path, so the painter's own file is not a destination either: the
+        // internal copy is the only one, and it cannot be created.
+        doc.path = None;
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "the failure was not reported at all: {reports:?}"
+        );
+        assert!(
+            !reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "nothing reached the disk and the autosave said it had: {reports:?}"
+        );
+
+        // And the same when the *encode* is what fails, which is the case
+        // streaming moved inside the write. A capture one slice short of the
+        // stack is what a readback that gave up leaves behind.
+        let internal = scratch("nothing-short");
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        doc.path = None;
+        let short = DocumentCapture {
+            size: UVec2::ONE,
+            layers: Vec::new(),
+            merged: vec![200, 40, 40, 255],
+        };
+        let reports = run_task(Task {
+            doc,
+            internal: Some(internal.join("short-2222222222222222.ora")),
+            pixels: short,
+            expiry: None,
+        });
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "a capture missing a slice was written as a blank layer: {reports:?}"
+        );
+        assert!(
+            !reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "an encode that failed still reported a file: {reports:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocked);
+        let _ = std::fs::remove_dir_all(&internal);
     }
 
     /// A failed internal copy still leaves the painter's own file written.
@@ -3992,6 +4118,39 @@ mod tests {
         assert!(is_autosave_name(Path::new("hands-0.ora")));
         assert!(is_autosave_name(Path::new("hands-0.ORA")));
         assert!(is_autosave_name(Path::new("hands-0.ora.saving")));
+        // The shape `docformat::write_with` actually writes, which is the one
+        // this has to recognise: the process and a counter follow `.saving`,
+        // so the old exact match would leave every abandoned temporary in the
+        // directory for ever — and it is now the only thing that clears one,
+        // because a unique name means the next save no longer overwrites it.
+        // Built from the real writer rather than typed out, so the two cannot
+        // drift: whatever `write_with` names a temporary, this is asked about.
+        let dir = scratch("temporary-shape");
+        let target = dir.join("hands-0.ora");
+        let seen = std::sync::Mutex::new(Vec::new());
+        umber_core::docformat::write_with(&target, |_| {
+            seen.lock().unwrap().extend(
+                std::fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned()),
+            );
+            Ok(())
+        })
+        .expect("write");
+        let live = seen.into_inner().unwrap();
+        assert_eq!(live.len(), 1, "expected one temporary, saw {live:?}");
+        assert_ne!(
+            live[0], "hands-0.ora.saving",
+            "the name stopped being unique"
+        );
+        assert!(
+            is_autosave_name(Path::new(&live[0])),
+            "`{}` is a temporary the reaper would refuse to clear up",
+            live[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
         assert!(!is_autosave_name(Path::new("hands.png")));
         assert!(!is_autosave_name(Path::new("hands")));
         assert!(!is_autosave_name(Path::new("orafile")));

@@ -788,13 +788,25 @@ pub enum SaveError {
         found: usize,
         expected: usize,
     },
-    /// A buffer the document said would be fetched, with nothing to fetch it.
+    /// A buffer the document said would be fetched that could not be.
     ///
-    /// A caller bug, and named rather than passed over for the reason
-    /// [`Self::WrongSize`] is: the alternative to refusing is a layer written
-    /// blank, which is a document silently damaged by its own save. Only
-    /// [`encode`] and [`save`] can produce it — they are handed no
-    /// [`Canvases`] — and only from a [`Canvas::Deferred`] they were given.
+    /// Named rather than passed over for the reason [`Self::WrongSize`] is: the
+    /// alternative to refusing is a layer written blank, which is a document
+    /// silently damaged by its own save.
+    ///
+    /// **Two unlike failures share it, and both belong here.** One is a caller
+    /// bug — a [`Canvas::Deferred`] reaching [`encode`] or [`save`], which are
+    /// handed no [`Canvases`] at all. The other is a source that genuinely
+    /// could not produce a buffer it was asked for: the autosave's capture
+    /// coming home short of a slice, which is a runtime failure of the
+    /// readback and not a bug anywhere. What makes one variant right for both
+    /// is that the *consequence* is identical and is the only thing the artist
+    /// can act on — this document was not written, and none of it was.
+    ///
+    /// `what` is filled in by [`resolve`] rather than by the source, so it
+    /// names the **layer** and not the index the source was asked in: a source
+    /// knows which slice it failed to read and does not know what the artist
+    /// called it.
     NotSupplied {
         what: String,
     },
@@ -836,10 +848,13 @@ impl std::fmt::Display for SaveError {
                 "The {what} came back as {found} bytes where {expected} were expected, so \
                  the document was not saved."
             ),
+            // One sentence for all three of `Wanted`'s spellings, which is why
+            // it is built round "could not read the …" rather than round a
+            // plural: "the mask of layer “Ink”" and "the flattened image" are
+            // both singular and "the pixels of layer “Ink”" is not.
             Self::NotSupplied { what } => write!(
                 f,
-                "The {what} were to be fetched and there was nothing to fetch them, so the \
-                 document was not saved."
+                "Umber could not read the {what}, so the document was not saved."
             ),
         }
     }
@@ -895,15 +910,134 @@ pub fn save_from(
         // Buffered, because the writer now makes many small writes where it
         // used to make one large one: a `File` has no buffer of its own, so a
         // PNG streamed straight at it is a syscall per chunk.
-        let mut zip = ZipWriter::new(std::io::BufWriter::with_capacity(64 * 1024, file));
-        warnings = write_archive(&mut zip, doc, canvases)?;
-        // Both flushes are load-bearing and neither is the other. `finish`
-        // writes the central directory; the `BufWriter` may still be holding
-        // the tail of it, and its own `Drop` would swallow the error.
-        zip.finish()?.flush()?;
+        let sink = std::io::BufWriter::with_capacity(64 * 1024, file);
+        warnings = stream_archive(sink, doc, canvases)?.1;
         Ok(())
     })?;
     Ok(warnings)
+}
+
+/// Build the archive into `sink`, and hand `sink` back with it.
+///
+/// The composition [`save_from`] uses, factored out so a test can drive it over
+/// a sink that fails — which is the failure streaming introduces and is not
+/// reachable through a path.
+fn stream_archive<W: Write + std::io::Seek>(
+    sink: W,
+    doc: &SaveDocument<'_>,
+    canvases: &mut dyn Canvases,
+) -> Result<(W, Vec<SaveWarning>), SaveError> {
+    let mut watched = Watched::new(sink);
+    let mut zip = ZipWriter::new(&mut watched);
+    let warnings = write_archive(&mut zip, doc, canvases)?;
+    // `finish` writes the central directory; the sink may still be holding the
+    // tail of it, and a `BufWriter`'s own `Drop` would swallow that error.
+    // Neither can fail here — `Watched` absorbs — so the reading that matters
+    // is the one after them.
+    zip.finish()?.flush()?;
+    match watched.give_up() {
+        (_, Some(e)) => Err(SaveError::Io(e)),
+        (sink, None) => Ok((sink, warnings)),
+    }
+}
+
+/// A sink that stops writing at its first failure, remembers it, and goes on
+/// *reporting* success.
+///
+/// **`ZipWriter` may not be shown an I/O error, and that is a real defect
+/// rather than a preference.** Handed one part-way through an entry, zip 8.6.0
+/// unwinds into `ZipWriter::drop`, which tries to finalise the entry it was in
+/// the middle of; `finish_file` then reads a stream position behind where the
+/// entry started and trips `debug_assert!(file_end >= self.stats.start)`. So a
+/// full disk during a save is a **panic** in any build with debug assertions
+/// on, and in a release build the same subtraction merely wraps into a
+/// nonsense entry size. Neither is reachable from the shape this replaced,
+/// where the archive was built in a `Vec<u8>` that could not fail.
+///
+/// Absorbing is what keeps that away without a `mem::forget` on the error path
+/// — a leak on every failed save — or a second archive writer. Nothing is lost
+/// by it: the bytes after a failure are going into a temporary that is about
+/// to be deleted, and the error itself is kept and returned. Positions are
+/// tracked here rather than asked of the inner sink, because zip seeks back to
+/// patch each local header and those seeks have to keep answering after the
+/// writes have stopped landing.
+struct Watched<W> {
+    inner: W,
+    /// The first failure, which is the one worth reporting: everything after
+    /// it is a consequence.
+    failed: Option<std::io::Error>,
+    /// Where the stream would be if every write had landed.
+    at: u64,
+}
+
+impl<W: Write + std::io::Seek> Watched<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            failed: None,
+            at: 0,
+        }
+    }
+
+    fn give_up(self) -> (W, Option<std::io::Error>) {
+        (self.inner, self.failed)
+    }
+
+    fn note(&mut self, e: std::io::Error) {
+        if self.failed.is_none() {
+            self.failed = Some(e);
+        }
+    }
+}
+
+impl<W: Write + std::io::Seek> Write for Watched<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.failed.is_none() {
+            match self.inner.write(buf) {
+                Ok(n) => {
+                    self.at += n as u64;
+                    return Ok(n);
+                }
+                Err(e) => self.note(e),
+            }
+        }
+        self.at += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.failed.is_none()
+            && let Err(e) = self.inner.flush()
+        {
+            self.note(e);
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write + std::io::Seek> std::io::Seek for Watched<W> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        if self.failed.is_none() {
+            match self.inner.seek(to) {
+                Ok(at) => {
+                    self.at = at;
+                    return Ok(at);
+                }
+                Err(e) => self.note(e),
+            }
+        }
+        // Answered from the count this kept, so the writer's own bookkeeping
+        // stays consistent after the bytes have stopped landing. `End` is the
+        // one it cannot answer for — the inner sink's length is exactly what is
+        // no longer known — so it stands still, which is as good as any other
+        // number for a file that is about to be deleted.
+        self.at = match to {
+            std::io::SeekFrom::Start(n) => n,
+            std::io::SeekFrom::Current(d) => self.at.saturating_add_signed(d),
+            std::io::SeekFrom::End(_) => self.at,
+        };
+        Ok(self.at)
+    }
 }
 
 /// Put bytes somebody already has at `path`, whole or not at all.
@@ -942,12 +1076,38 @@ pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 /// If `fill` fails, or the rename does, the temporary is removed and the file
 /// at `path` is untouched — which is the whole point, and is why `fill` writing
 /// half an archive before it fails is a failure and not a corruption.
+///
+/// # The temporary's name has to be unique, and it did not used to
+///
+/// It was `<path>.saving`, one name for every writer of that file, and that
+/// was safe for as long as the window between creating it and renaming it was
+/// a single `std::fs::write`. It is not any more: `save_from` opens the
+/// temporary and then performs every readback and every PNG encode inside it,
+/// which on a large document is seconds to a minute rather than milliseconds.
+///
+/// Two writers of one document is not hypothetical. An explicit Save and an
+/// autosave of the same document can overlap — `App::stop_autosave_of` can
+/// only cancel a capture, and a `Task` already dispatched to the writer thread
+/// is past that — and with one name the second `File::create` **truncates the
+/// first's live temporary**, after which one rename moves a half-written
+/// archive into place as the artist's document and the other fails. Silent
+/// damage to the file the temp-and-rename exists to protect.
+///
+/// So the name carries the process and a counter. The cost is that a temporary
+/// left behind by a hard kill is no longer overwritten by the next save and
+/// simply sits there — a stray file beside somebody's document, which is
+/// visible, harmless and recoverable, against a corruption that is none of
+/// those. `.saving` stays *in* the name so anything matching on it still does.
 pub fn write_with(
     path: &Path,
     fill: impl FnOnce(&mut std::fs::File) -> Result<(), SaveError>,
 ) -> Result<(), SaveError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+
     let mut temporary = path.to_path_buf().into_os_string();
-    temporary.push(".saving");
+    temporary.push(format!(".saving-{}-{token}", std::process::id()));
     let temporary = std::path::PathBuf::from(temporary);
 
     let written = (|| -> Result<(), SaveError> {
@@ -1015,6 +1175,13 @@ impl Wanted {
 /// buffer is held to exactly the bound a held one is — the alternative is a
 /// source that hands back a short read and a file whose layers are silently
 /// sheared.
+///
+/// A [`SaveError::NotSupplied`] coming *out* of a source is renamed on the way
+/// through, because only this side knows what the layer is called: a source is
+/// asked in indices and would otherwise refuse a document by a number the
+/// artist has never seen. It is the same `what` a [`SaveError::WrongSize`] from
+/// the line below carries, so the two adjacent failures cannot report the same
+/// layer two different ways.
 fn resolve<'c>(
     canvases: &'c mut dyn Canvases,
     canvas: Canvas<'c>,
@@ -1025,10 +1192,16 @@ fn resolve<'c>(
     let bytes = match canvas {
         Canvas::Held(bytes) => Cow::Borrowed(bytes),
         Canvas::Deferred => match wanted {
-            Wanted::Layer(i) => canvases.layer(i)?,
-            Wanted::Mask(i) => canvases.mask(i)?,
-            Wanted::Merged => canvases.merged()?,
-        },
+            Wanted::Layer(i) => canvases.layer(i),
+            Wanted::Mask(i) => canvases.mask(i),
+            Wanted::Merged => canvases.merged(),
+        }
+        .map_err(|e| match e {
+            SaveError::NotSupplied { .. } => SaveError::NotSupplied {
+                what: wanted.describe(layers),
+            },
+            other => other,
+        })?,
     };
     if bytes.len() != expected {
         return Err(SaveError::WrongSize {
@@ -1877,13 +2050,22 @@ fn write_png(sink: &mut impl Write, size: UVec2, rgba: &[u8]) -> Result<(), Save
     finish_png(encoder, rgba)
 }
 
-/// Write the header, the image and the trailer, and **report the trailer's own
-/// failure**.
+/// Write the header, the image and the trailer.
 ///
 /// `png::Writer` writes `IEND` from its `Drop` and throws away whatever that
-/// says, which cost nothing while the sink was a `Vec<u8>` that could not fail.
-/// Streaming into a file it is the difference between a refused save and an
-/// archive missing the end of its last entry, so `finish` is called explicitly.
+/// says; this calls `finish` so the trailer's own failure is a value rather
+/// than a silence.
+///
+/// **It is not what stands between a full disk and a truncated archive, and an
+/// earlier version of this comment said it was.** Two things make that claim
+/// false. A sink that refuses the trailer refuses the next entry's local
+/// header too, and the last PNG is followed by the ZIP's own central
+/// directory — so the save is refused either way. And [`Watched`] now absorbs
+/// the failure before any of this sees it, so on the streaming path
+/// `write_image_data` and `finish` cannot fail at all. The call is kept for
+/// what it costs — nothing — and for the day something upstream of it can
+/// fail again; it is not load-bearing today and no test can make it look as
+/// though it is.
 fn finish_png<W: Write>(encoder: png::Encoder<'_, W>, data: &[u8]) -> Result<(), SaveError> {
     encoder
         .write_header()
@@ -3832,10 +4014,30 @@ mod tests {
 
         assert!(docimport::import(&path).is_ok());
         assert!(
-            !path.with_extension("ora.saving").exists(),
-            "the temporary file was left behind"
+            leftovers(&dir).is_empty(),
+            "the temporary file was left behind: {:?}",
+            leftovers(&dir)
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Names left in `dir` that say they are one of [`write_with`]'s
+    /// temporaries.
+    ///
+    /// A **substring** test, deliberately. The temporary carries a process id
+    /// and a counter now — see [`write_with`] for why it has to — so an
+    /// assertion naming `"<stem>.saving"` exactly would pass whatever was left
+    /// behind, which is a guard that stops guarding without ever failing.
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.contains(".saving"))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // --- streaming and deferred buffers ------------------------------------
@@ -3849,7 +4051,13 @@ mod tests {
     /// two documents.
     struct BothWays {
         size: UVec2,
-        pixels: Vec<u8>,
+        /// One canvas per stack entry, and **no two alike**. Sharing one buffer
+        /// across the layers is the shape this fixture started with and it left
+        /// a hole: with identical bytes on every layer, a resolver asked for the
+        /// wrong *index* writes a byte-identical archive, so the comparison
+        /// could not see a layer mix-up at all. Index 1 is the folder's and is
+        /// never read.
+        pixels: Vec<Vec<u8>>,
         mask: Vec<u8>,
         merged: Vec<u8>,
         effects: Vec<Effect>,
@@ -3859,17 +4067,25 @@ mod tests {
     impl BothWays {
         fn new() -> Self {
             let size = UVec2::new(6, 5);
+            // Not flat: `trim` crops to the non-transparent box and a PNG
+            // filters each row against the one above, so a document of one
+            // colour would compare equal under almost any bug in either.
+            let canvas = |step: u32, hole: bool| -> Vec<u8> {
+                (0..size.x * size.y)
+                    .flat_map(|i| {
+                        let v = (i * step % 251) as u8;
+                        [v, v / 2, 255 - v, if hole && i == 0 { 0 } else { 255 }]
+                    })
+                    .collect()
+            };
             Self {
                 size,
-                // Not flat: `trim` crops to the non-transparent box and a PNG
-                // filters each row against the one above, so a document of one
-                // colour would compare equal under almost any bug in either.
-                pixels: (0..size.x * size.y)
-                    .flat_map(|i| {
-                        let v = (i * 37 % 251) as u8;
-                        [v, v / 2, 255 - v, if i == 0 { 0 } else { 255 }]
-                    })
-                    .collect(),
+                pixels: vec![
+                    canvas(37, true),
+                    Vec::new(),
+                    canvas(53, false),
+                    canvas(71, true),
+                ],
                 mask: (0..size.x * size.y)
                     .flat_map(|i| {
                         let v = (i * 11 % 253) as u8;
@@ -3890,9 +4106,9 @@ mod tests {
         /// Folder, masked layer, text layer, effected layer, background, a
         /// blend mode that warns — everything with a branch in `write_archive`.
         fn layers(&self, deferred: bool) -> Vec<SaveLayer<'_>> {
-            let px = || match deferred {
+            let px = |at: usize| match deferred {
                 true => Canvas::Deferred,
-                false => Canvas::Held(&self.pixels),
+                false => Canvas::Held(&self.pixels[at]),
             };
             let mask = || match deferred {
                 true => Canvas::Deferred,
@@ -3902,7 +4118,7 @@ mod tests {
                 SaveLayer {
                     mask: Some(mask()),
                     locked: true,
-                    ..SaveLayer::new("Wash", BlendMode::Add, px())
+                    ..SaveLayer::new("Wash", BlendMode::Add, px(0))
                 },
                 SaveLayer::folder("Group", 0, true),
                 SaveLayer {
@@ -3910,12 +4126,12 @@ mod tests {
                     clipped: true,
                     link: Some(2),
                     effects: &self.effects,
-                    ..SaveLayer::new("Shadowed", BlendMode::Multiply, px())
+                    ..SaveLayer::new("Shadowed", BlendMode::Multiply, px(2))
                 },
                 SaveLayer {
                     depth: 1,
                     text: Some(&self.text),
-                    ..SaveLayer::new("Caption", BlendMode::Normal, px())
+                    ..SaveLayer::new("Caption", BlendMode::Normal, px(3))
                 },
             ]
         }
@@ -3936,45 +4152,63 @@ mod tests {
         }
     }
 
-    /// A source that serves **every** buffer out of one reused allocation.
+    /// A source that serves every buffer out of one reused allocation, and
+    /// records what it was asked for.
     ///
-    /// This is the guard for "one canvas at a time" and it is a compile-time
-    /// one: `Canvases` hands back a `Cow<'_, [u8]>` borrowed from `&mut self`,
-    /// so a writer holding one of these while asking for the next would be
-    /// rejected by the borrow checker. Serving them all out of one buffer is
-    /// what makes that *observable* — every earlier buffer is overwritten, so
-    /// an archive that still comes out byte for byte identical is one that had
-    /// finished with each before it asked for the next.
+    /// **"One canvas at a time" is the borrow checker's guarantee and not this
+    /// type's**, and saying otherwise was an overclaim worth retracting:
+    /// `Canvases` hands back a `Cow<'_, [u8]>` borrowed from `&mut self`, so a
+    /// writer holding one while asking for the next does not compile. Reusing
+    /// the scratch demonstrates that a caller *may* work that way — it is what
+    /// a source reading into a fixed buffer would do — and demonstrates nothing
+    /// about the writer.
+    ///
+    /// What this does carry is `asked`, which pins the *order*, and that is not
+    /// decoration: fetching a buffer early and holding it across the archive
+    /// produces byte-identical output, so the sequence is the only reading that
+    /// can tell "one at a time, in archive order" from "all of them up front".
     struct OneAtATime<'a> {
         fixture: &'a BothWays,
         scratch: Vec<u8>,
-        /// What was asked for, in order, so the sequence can be pinned too.
+        /// What was asked for, in order.
         asked: Vec<String>,
     }
 
     impl OneAtATime<'_> {
-        fn serve(&mut self, from: &[u8], what: String) -> Result<Cow<'_, [u8]>, SaveError> {
+        fn serve(&mut self, from: Which, what: String) -> Result<Cow<'_, [u8]>, SaveError> {
             self.asked.push(what);
+            // The fixture is behind a shared reference, so copying the handle
+            // out ends the borrow conflict with `&mut self` — no clone of a
+            // canvas, which would have made the "one buffer" above false in
+            // the fixture itself.
+            let fixture = self.fixture;
             self.scratch.clear();
-            self.scratch.extend_from_slice(from);
+            self.scratch.extend_from_slice(match from {
+                Which::Pixels(at) => &fixture.pixels[at],
+                Which::Mask => &fixture.mask,
+                Which::Merged => &fixture.merged,
+            });
             Ok(Cow::Borrowed(&self.scratch))
         }
     }
 
+    enum Which {
+        Pixels(usize),
+        Mask,
+        Merged,
+    }
+
     impl Canvases for OneAtATime<'_> {
         fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
-            let pixels = self.fixture.pixels.clone();
-            self.serve(&pixels, format!("layer {index}"))
+            self.serve(Which::Pixels(index), format!("layer {index}"))
         }
 
         fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
-            let mask = self.fixture.mask.clone();
-            self.serve(&mask, format!("mask {index}"))
+            self.serve(Which::Mask, format!("mask {index}"))
         }
 
         fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError> {
-            let merged = self.fixture.merged.clone();
-            self.serve(&merged, "merged".to_string())
+            self.serve(Which::Merged, "merged".to_string())
         }
     }
 
@@ -4135,8 +4369,7 @@ mod tests {
                 if self.served > 1 {
                     return Err(SaveError::Io(std::io::Error::other("the device went away")));
                 }
-                let _ = index;
-                Ok(Cow::Borrowed(&self.fixture.pixels))
+                Ok(Cow::Borrowed(&self.fixture.pixels[index]))
             }
             fn mask(&mut self, _: usize) -> Result<Cow<'_, [u8]>, SaveError> {
                 Ok(Cow::Borrowed(&self.fixture.mask))
@@ -4164,9 +4397,110 @@ mod tests {
             "a failed save replaced the file it was meant to protect"
         );
         assert!(
-            !dir.join("precious.ora.saving").exists(),
-            "the temporary was left behind"
+            leftovers(&dir).is_empty(),
+            "the temporary was left behind: {:?}",
+            leftovers(&dir)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A sink that gives out while the archive is being built is a refusal,
+    /// wherever in the archive it gives out.**
+    ///
+    /// This is the failure streaming introduces: the disk used to fill up after
+    /// the archive existed, and now it fills up *during* it, with a PNG encoder
+    /// and a ZIP writer both part-way through. The budget is swept across the
+    /// whole archive so the refusal lands inside a layer's PNG, between
+    /// entries, inside `stack.xml` and inside the central directory — one
+    /// chosen figure would drive whichever of those it happened to hit.
+    ///
+    /// **It found a panic, which is why it is written this way.** Handed an
+    /// I/O error part-way through an entry, zip 8.6.0 unwinds into
+    /// `ZipWriter::drop`, which finalises the entry it was in the middle of and
+    /// trips `debug_assert!(file_end >= self.stats.start)` — so a full disk
+    /// during a save was a panic in any build with debug assertions on.
+    /// [`Watched`] is what keeps the error away from it, and this sweep is what
+    /// says so: without it, some budget in this loop aborts the test.
+    ///
+    /// **What it deliberately does not claim is that it covers `finish_png`'s
+    /// explicit `finish`.** Nothing can, and now less than ever: `Watched`
+    /// absorbs, so the PNG encoder never sees a failure at all. See that
+    /// function.
+    #[test]
+    fn a_sink_that_gives_out_is_a_refusal_wherever_it_gives_out() {
+        /// Accepts `budget` bytes and then refuses, over a real cursor so the
+        /// `Seek` the ZIP writer needs still works.
+        struct Fills {
+            inner: std::io::Cursor<Vec<u8>>,
+            budget: usize,
+        }
+        impl Write for Fills {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.budget == 0 {
+                    return Err(std::io::Error::other("no space left on device"));
+                }
+                let take = buf.len().min(self.budget);
+                self.budget -= take;
+                self.inner.write(&buf[..take])
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+        impl std::io::Seek for Fills {
+            fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(to)
+            }
+        }
+
+        let fixture = BothWays::new();
+        let held = fixture.layers(false);
+        let (whole, _) = encode(&fixture.document(&held, false)).expect("encode");
+
+        let mut drove = 0;
+        for budget in (0..whole.len()).step_by(whole.len() / 24 + 1) {
+            let sink = Fills {
+                inner: std::io::Cursor::new(Vec::new()),
+                budget,
+            };
+            // Through `stream_archive`, which is exactly what `save_from`
+            // composes — built *into* the failing sink, so the refusal happens
+            // inside whichever encoder was mid-entry. Writing a *finished*
+            // archive at a failing sink, which is what this drove at first,
+            // tests `write_all` and nothing here.
+            let out = stream_archive(sink, &fixture.document(&held, false), &mut NoCanvases);
+            assert!(
+                out.is_err(),
+                "a sink that stopped after {budget} of {} bytes reported success",
+                whole.len()
+            );
+            drove += 1;
+        }
+        assert!(drove >= 24, "the sweep drove only {drove} budgets");
+
+        // And end to end, through the real writer into a real path: an
+        // encoder that cannot read must leave the file that was there.
+        struct Breaks;
+        impl Canvases for Breaks {
+            fn layer(&mut self, _: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+                Err(SaveError::Io(std::io::Error::other(
+                    "no space left on device",
+                )))
+            }
+            fn mask(&mut self, _: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+                unreachable!()
+            }
+            fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError> {
+                unreachable!()
+            }
+        }
+        let dir = temp_dir("sink");
+        let path = dir.join("kept.ora");
+        std::fs::write(&path, b"still theirs").unwrap();
+        let deferred = fixture.layers(true);
+        assert!(save_from(&path, &fixture.document(&deferred, true), &mut Breaks).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"still theirs");
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
         let _ = std::fs::remove_file(&path);
     }
 
