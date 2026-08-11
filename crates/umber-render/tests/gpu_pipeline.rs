@@ -8999,8 +8999,20 @@ fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
 /// has no card to put under memory pressure — the same instrument
 /// `a_bake_refused_its_page_draws_the_layer_and_reports_once` uses.
 ///
-/// Demonstrated by mutation: put the `log::error!`/`continue` back in place of
-/// the abandonment and this fails on the pixels, not on the `Err`.
+/// **What this covers is the *device* arm and not the ceiling one**, and the
+/// difference was found by mutation rather than reasoned about: restoring the
+/// tile-drop `continue` leaves this green, because the refusal here comes out of
+/// `try_ensure_pages` before the loop is reached at all. Driving the loop's own
+/// shortfall needs the atlas at `MAX_SLOTS` — 256 pages, hundreds of megabytes
+/// at this canvas, and not a test hook — so that path and the `free.len() <
+/// wanted` check above it are reasoned about and unexercised. Both are refusals
+/// *before* anything is written, so a mistake in either is a flip that does not
+/// happen rather than one that half does; `flip_layers`' own docs say the same
+/// where somebody changing it will read it.
+///
+/// The `Err` is matched on the arm that is actually reachable here, not on
+/// "either" — a guard that accepted both would stop saying which one it drove
+/// the moment the other became reachable.
 #[test]
 fn a_flip_the_atlas_cannot_hold_leaves_every_pixel_where_it_was() {
     let h = harness_or_skip!();
@@ -9053,8 +9065,9 @@ fn a_flip_the_atlas_cannot_hold_leaves_every_pixel_where_it_was() {
         .flip_layers(&gpu.device, &gpu.queue, &[0, 1], FlipAxis::Horizontal)
         .expect_err("the atlas cannot supply the cells a mirror needs");
     assert!(
-        matches!(refused, PageRefusal::Device(_) | PageRefusal::Ceiling),
-        "{refused:?}"
+        matches!(refused, PageRefusal::Device(_)),
+        "the ceiling hook stands in for a card that would not allocate, so this is \
+         the device arm: {refused:?}"
     );
 
     // **Nothing moved.** Not the layer that would have been mirrored first, not

@@ -6634,6 +6634,20 @@ impl CanvasRenderer {
     ///    unwind and nothing reaches the GPU. That is what lets 1 and 2 be a
     ///    guard rather than a claim about reachability.
     ///
+    /// **Only the first is driven by a test, and saying which is the point.**
+    /// `a_flip_the_atlas_cannot_hold_leaves_every_pixel_where_it_was` provokes a
+    /// device refusal with `set_page_ceiling_for_test` and measures both layers
+    /// byte for byte either side of it. The other two need the atlas at
+    /// [`MAX_SLOTS`] — 256 pages, which at any canvas worth testing is hundreds
+    /// of megabytes, and unlike the page ceiling it is not a test hook. So 2 and
+    /// 3 are reasoned about and unexercised, exactly as [`PageRefusal::Ceiling`]
+    /// is for the effect bake. What that costs is bounded by their shape: both
+    /// refuse *before* anything is written, so a mistake in either is a flip
+    /// that does not happen rather than one that half does. Demonstrated by
+    /// mutation — restoring the tile-drop `continue` leaves that test green,
+    /// which is why this paragraph is here rather than a claim that the guard
+    /// covers it.
+    ///
     /// **Three things done before the loop do survive an abandonment there**, and
     /// naming them is the honest form of "changes nothing": the probes are reset,
     /// a capture in flight is cancelled, and every slot's revision is bumped. None

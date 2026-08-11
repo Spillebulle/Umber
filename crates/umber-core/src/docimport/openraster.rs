@@ -1482,7 +1482,10 @@ mod tests {
             .iter()
             .find(|w| matches!(w, ImportWarning::HistoryDropped { .. }))
         else {
-            panic!("a dropped history has to be said out loud: {:?}", doc.warnings);
+            panic!(
+                "a dropped history has to be said out loud: {:?}",
+                doc.warnings
+            );
         };
         assert!(
             reason.contains("claims to be"),
