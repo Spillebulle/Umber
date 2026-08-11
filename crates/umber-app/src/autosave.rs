@@ -4124,6 +4124,201 @@ mod tests {
         assert!(umber_core::docimport::import(&loops.theirs).is_ok());
     }
 
+    /// Paint the whole of one slice a flat opaque colour, the way an undo does.
+    ///
+    /// Opaque so the file can be compared byte for byte: at an alpha of 255 the
+    /// premultiplied bytes a layer texture holds and the straight-alpha bytes an
+    /// ORA holds are the same four numbers, so nothing here rests on a promise
+    /// about rounding. See CLAUDE.md, Testing.
+    fn paint_slice(gpu: &Gpu, loops: &mut FrameLoop, slot: u32, colour: [u8; 4]) {
+        let size = loops.editor.doc.size;
+        let bytes: Vec<u8> = colour
+            .iter()
+            .copied()
+            .cycle()
+            .take(size.x as usize * size.y as usize * 4)
+            .collect();
+        let rect = umber_core::PixelRect {
+            x: 0,
+            y: 0,
+            width: size.x,
+            height: size.y,
+        };
+        loops
+            .canvases
+            .get_mut(&loops.id)
+            .expect("a renderer")
+            .write_layer_rect(&gpu.device, &gpu.queue, slot, rect, &bytes);
+    }
+
+    /// The one colour the whole of a written archive's layer holds, and the one
+    /// its flattened preview holds.
+    ///
+    /// Read out of the **file** rather than asserted about a flag, because what
+    /// the bug produced was a perfectly valid archive holding two instants of
+    /// one document. Both halves come from the same capture and must therefore
+    /// agree; the layer is trimmed on the way out, so a flat opaque fill covers
+    /// the canvas and the piece is the whole of it.
+    fn colours_written(path: &Path) -> ([u8; 4], [u8; 4]) {
+        let doc = umber_core::docimport::import(path).expect("the archive reads back");
+        let layer = doc.layers.last().expect("a layer");
+        let piece = layer.pixels.first().expect("the layer holds pixels");
+        let first: [u8; 4] = piece.bytes[..4].try_into().expect("four bytes");
+        assert!(
+            piece.bytes.chunks_exact(4).all(|p| p == first),
+            "the fill was not flat, so this comparison says nothing",
+        );
+        let preview = umber_core::docimport::preview::from_path(path).expect("a preview");
+        let merged: [u8; 4] = preview.rgba[..4].try_into().expect("four bytes");
+        (first, merged)
+    }
+
+    /// An edit landing between two steps of a capture must not be written as a
+    /// document that never existed.
+    ///
+    /// A capture reads the document a slice at a time over many frames — about
+    /// ninety seconds on the reference 20000×5000 document — and every write
+    /// goes through `touch_slot`, which used to tell the *thumbnail* of that
+    /// slice and tell the capture nothing. So an undo, a "Clear layer", a mask
+    /// fill, a text placement or an ordinary stroke commit landing inside a
+    /// capture left the archive holding that layer as it was and the flattened
+    /// preview as it now is. Neither half is damaged; together they are a
+    /// document no instant of the session ever held, written silently, five
+    /// minutes at a time.
+    ///
+    /// **The file is what is read**, not a flag: asserting that the capture
+    /// noticed would only restate the rule the fix is written in. And the moment
+    /// of the edit is taken from `capture_step_for_test` rather than from a
+    /// count of frames, or the guard would go quiet the day a step takes one
+    /// frame more and the edit started landing before the layer was read — where
+    /// there is nothing to repair and the assertion passes for the wrong reason.
+    ///
+    /// Demonstrated by mutation: with `Capture::disturb` no longer called from
+    /// `touch_slot` the layer comes back as the colour before the edit while the
+    /// preview comes back as the colour after it.
+    #[test]
+    fn an_edit_during_a_capture_is_never_written_as_two_instants() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "two-instants");
+        let slot = loops.editor.layers.layers()[0]
+            .slot()
+            .expect("the one layer holds a slice");
+
+        const BEFORE: [u8; 4] = [200, 40, 40, 255];
+        const AFTER: [u8; 4] = [40, 160, 60, 255];
+        paint_slice(gpu, &mut loops, slot, BEFORE);
+
+        // Spend frames until the layer has been read and the preview has not.
+        // One layer means two steps, so a linear cursor of 1 is exactly the gap
+        // an edit has to land in for the two halves to disagree.
+        let mut between = false;
+        for _ in 0..64 {
+            loops.frame(gpu, true);
+            if loops
+                .canvases
+                .get(&loops.id)
+                .and_then(CanvasRenderer::capture_step_for_test)
+                == Some(1)
+            {
+                between = true;
+                break;
+            }
+        }
+        assert!(
+            between,
+            "the capture never sat between its layer and its preview, so this \
+             guard exercised nothing",
+        );
+
+        paint_slice(gpu, &mut loops, slot, AFTER);
+        loops.run_until_written(gpu);
+        assert!(loops.theirs.exists(), "the document was never written");
+
+        let (layer, merged) = colours_written(&loops.theirs);
+        assert_eq!(
+            layer, merged,
+            "the archive holds a layer and a flattened preview from two \
+             different instants of the document",
+        );
+        assert_eq!(
+            layer, AFTER,
+            "the file was written from before the edit rather than after it",
+        );
+    }
+
+    /// A capture disturbed over and over must still end in a written file once
+    /// the painting stops.
+    ///
+    /// Re-reading what an edit made stale is a fixed point, and somebody
+    /// painting without pause on a layer the capture has already walked past can
+    /// hold it away from that point for ever. Only one capture runs at a time,
+    /// so an unbounded one would starve **every other open document's** autosave
+    /// as well as its own — which is worse than the mixed file the re-read
+    /// exists to prevent, and just as silent. `Capture::rereads` bounds it: the
+    /// capture gives up, the scheduler waits rather than starting another into
+    /// the same painting, and the next attempt writes the document.
+    ///
+    /// The interval is zero here, so the `defer` on giving up costs nothing and
+    /// the run continues immediately — which is deliberate. What this measures
+    /// is that giving up is **recoverable**, not how long the wait is; asserting
+    /// a duration would be asserting wall-clock time, which nothing here may do.
+    ///
+    /// Demonstrated by mutation: with `rereads` never decremented the capture
+    /// never gives up, `captures_given_up` stays at zero and the first assertion
+    /// fails.
+    #[test]
+    fn a_capture_disturbed_over_and_over_still_writes_the_document_in_the_end() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "storm");
+        let slot = loops.editor.layers.layers()[0]
+            .slot()
+            .expect("the one layer holds a slice");
+
+        const AFTER: [u8; 4] = [40, 160, 60, 255];
+        paint_slice(gpu, &mut loops, slot, [200, 40, 40, 255]);
+
+        // Somebody painting on the bottom layer without ever pausing. Every
+        // frame, so nothing the capture reads is ever still what the document
+        // holds by the time the next step is recorded.
+        for _ in 0..400 {
+            loops.frame(gpu, true);
+            paint_slice(gpu, &mut loops, slot, AFTER);
+        }
+        assert!(
+            !loops.theirs.exists(),
+            "the document was written while it was being edited every frame, so \
+             the rest of this guard would say nothing",
+        );
+        assert!(
+            loops
+                .canvases
+                .get(&loops.id)
+                .map(CanvasRenderer::captures_given_up)
+                .unwrap_or(0)
+                > 0,
+            "no capture ever gave up, so the budget that bounds the re-read was \
+             never reached and this guard exercised nothing",
+        );
+
+        // The painting stops. Nothing further disturbs the capture, so the fixed
+        // point settles and the file lands.
+        loops.run_until_written(gpu);
+        assert!(
+            loops.theirs.exists() && loops.ours.exists(),
+            "a document disturbed until its capture gave up was never autosaved \
+             again",
+        );
+        let (layer, merged) = colours_written(&loops.theirs);
+        assert_eq!(layer, merged, "two instants in one archive");
+        assert_eq!(layer, AFTER);
+    }
+
     #[test]
     fn a_title_that_is_not_a_file_name_still_becomes_one() {
         assert_eq!(stem_of("hands"), "hands");
