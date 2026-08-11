@@ -3252,7 +3252,12 @@ impl CanvasRenderer {
     /// beside it is the same renderer with one allocation asked for rather than
     /// assumed, instead of a second copy of a hundred and fifty lines that would
     /// drift the first time a texture is added to one of them.
-    fn assemble(device: &wgpu::Device, doc_size: UVec2, shared: Shared, layers: LayerStore) -> Self {
+    fn assemble(
+        device: &wgpu::Device,
+        doc_size: UVec2,
+        shared: Shared,
+        layers: LayerStore,
+    ) -> Self {
         let stroke = make_stroke_texture(device, doc_size);
         let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -8853,6 +8858,105 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The scope must be popped before a single view is built**, and this is
+    /// the one property of [`try_reserve`] that decides whether the whole
+    /// refusal path works or ends in the crash box it exists to replace.
+    ///
+    /// A view of a failed texture is `CreateTextureViewError::InvalidResource`,
+    /// which classifies as *Validation* — a filter an `OutOfMemory` scope does
+    /// not catch — so it reaches `on_uncaptured_error`, which is
+    /// `crash::device_error`, which panics on purpose. `LayerStore::new` builds
+    /// `1 + 2 × capacity` views immediately, so a `try_reserve` written the
+    /// obvious way, around "the same body `ensure_slots` has", would panic one
+    /// line after the check.
+    ///
+    /// **This reads the source rather than the behaviour, and that is a
+    /// limitation worth stating plainly.** The behavioural test would have to
+    /// provoke a real refusal on a runner with no graphics card, and every way
+    /// of doing that reliably is worse than the gap: a canvas past the device's
+    /// dimension limit fails as *Validation* rather than out-of-memory and so
+    /// exercises the wrong arm; a genuinely enormous request risks a driver
+    /// answering `DeviceError::Unexpected`, which wgpu maps through the **fatal**
+    /// path and would lose the device for every other test in this binary; and
+    /// on a software adapter it is a several-hundred-gigabyte allocation against
+    /// system memory. So the guard is the text, in the shape the packaging scans
+    /// already take here, and it says which half it covers. What it cannot see:
+    /// whether the scope's *filter* is right, and whether wgpu still classifies
+    /// a view of an error texture the way it did in 29.0.4.
+    ///
+    /// Demonstrated by mutation: replace `layer_texture` with `LayerStore::new`
+    /// inside `try_reserve` and this fails.
+    #[test]
+    fn a_reservation_builds_no_view_before_it_has_checked() {
+        const SRC: &str = include_str!("canvas.rs");
+        let at = SRC
+            .find("fn try_reserve(")
+            .expect("`try_reserve` was renamed; this guard has to follow it");
+        // From the signature, so the function's own doc comment — which
+        // discusses views at length — is not what gets scanned. Ended at the
+        // first line that closes a top-level item.
+        let body = &SRC[at..];
+        let body = &body[..body.find("\n}\n").expect("`try_reserve` is not closed")];
+        // Comments stripped for the reason the WiX scans strip theirs: this
+        // function argues for itself inside its own body, naming the very
+        // construct the assertion refuses.
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let pop = code
+            .find(".pop()")
+            .expect("`try_reserve` no longer pops an error scope");
+        for construct in ["create_view", "LayerStore::", "from_texture"] {
+            if let Some(at) = code.find(construct) {
+                assert!(
+                    at > pop,
+                    "`try_reserve` reaches `{construct}` before it has popped its error scope; a \
+                     view of a failed texture is a Validation error the scope does not catch, and \
+                     it panics"
+                );
+            }
+        }
+    }
+
+    /// The two figures a refusal may state are the two the device actually
+    /// declined, and they are different numbers for the two call sites.
+    ///
+    /// A document that failed to *open* had nothing resident beside its array,
+    /// so `bytes` and `peak_bytes` agree. A *growth* holds the array it is
+    /// replacing as well — the copy is recorded against both textures — so
+    /// `peak_bytes` is `c + n` and is the figure the device saw. Reading `bytes`
+    /// there understates by the whole of the picture already on the card.
+    #[test]
+    fn a_refused_reservation_states_both_the_array_and_the_transient() {
+        let doc_size = UVec2::new(20000, 5000);
+        let slice = slice_bytes(doc_size);
+        assert_eq!(slice, 400_000_000, "a slice of this canvas is 400 MB");
+
+        let fresh = Vram {
+            slices: 21,
+            held: 0,
+            slice_bytes: slice,
+            doc_size,
+        };
+        assert_eq!(fresh.bytes(), 8_400_000_000);
+        assert_eq!(
+            fresh.peak_bytes(),
+            fresh.bytes(),
+            "nothing is held beside a document's first array"
+        );
+
+        let grown = Vram { held: 21, ..fresh };
+        assert_eq!(grown.bytes(), 8_400_000_000, "the new array alone");
+        assert_eq!(
+            grown.peak_bytes(),
+            16_800_000_000,
+            "a growth holds the array it replaces at the same instant"
+        );
+    }
 
     /// The `MAX_DRAWS` the shader compiles, as an integer.
     ///

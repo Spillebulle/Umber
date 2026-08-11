@@ -22,6 +22,7 @@ use crate::theme;
 use crate::thumbs;
 use crate::ui;
 use crate::update;
+use crate::vram;
 use glam::{UVec2, Vec2};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ use umber_core::{
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, EffectFrame, FloatParams, FloatSource, Gpu,
-    LayerDraw, ProbeParams,
+    LayerDraw, ProbeParams, Vram,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -185,11 +186,36 @@ impl Graphics {
             Some(existing) => existing.for_document(&self.gpu.device, size, slots),
             None => CanvasRenderer::new(&self.gpu.device, size, self.config.format, slots),
         };
-        // The background belongs to this document, not to whichever one the
-        // pipelines were cloned out of.
         canvas.set_background(doc.background);
+        self.install_canvas(id, canvas);
+    }
 
-        // Fresh textures hold whatever the allocation contained.
+    /// [`Graphics::add_canvas`]'s allocation, asked for rather than assumed, and
+    /// **without a document to hang it on**.
+    ///
+    /// The split is what lets a caller refuse before anything has happened. A
+    /// `DocId` only exists once the document is open, so an `add_canvas` that
+    /// could fail would fail with the tab already on the strip and the stack
+    /// already in the editor — and there is no way back from that but unwinding
+    /// an open, which is a second implementation of closing a document. Building
+    /// the storage first and installing it afterwards means a refusal leaves the
+    /// session exactly as it was, which is the rule every other gate here keeps.
+    ///
+    /// The background is the caller's to set, because this does not take a
+    /// `Document`: [`Graphics::add_canvas`] is what pairs the two, and a
+    /// renderer cloned from another document's does not inherit it.
+    fn make_canvas(&self, size: UVec2, slots: u32) -> Result<CanvasRenderer, Vram> {
+        match self.canvases.values().next() {
+            Some(existing) => existing.try_for_document(&self.gpu.device, size, slots),
+            None => CanvasRenderer::try_new(&self.gpu.device, size, self.config.format, slots),
+        }
+    }
+
+    /// Clear a document's storage and file it under its id.
+    ///
+    /// Shared by [`Graphics::add_canvas`] and the fallible route, so the clear
+    /// is stated once: fresh textures hold whatever the allocation contained.
+    fn install_canvas(&mut self, id: DocId, mut canvas: CanvasRenderer) {
         let mut enc = self
             .gpu
             .device
@@ -2147,6 +2173,15 @@ impl UmberApp {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
         self.finish_transform();
+        // **Before the add**, for the reason `install_import` reserves before it
+        // opens: a stack holding a slice the texture array does not have is one
+        // the composite indexes off the end of, and nothing here could put that
+        // back. `try_ensure_slots` changes nothing at all on a refusal, so this
+        // is a question and not a step.
+        if let Err(refused) = self.reserve_a_slice() {
+            self.editor.notice = Some(vram::slice_refused("a layer", &refused));
+            return;
+        }
         // Before the add, so a refusal records nothing. Every entry is `Kept`;
         // what makes this an undoable *add* is that the new layer is not among
         // them, so restoring this shape takes it back out — and the entry that
@@ -2203,6 +2238,36 @@ impl UmberApp {
             });
         canvas.clear_layer(&mut enc, slot);
         gfx.gpu.queue.submit(Some(enc.finish()));
+    }
+
+    /// Ask the device for the storage one more slice would need, changing
+    /// nothing.
+    ///
+    /// One gate for [`Self::add_layer`] and [`Self::add_mask`], because they are
+    /// the same question — both claim exactly one slice off the same pool — and
+    /// guarding one and not the other is the asymmetry that gets forgotten. Both
+    /// call it **before** their model change: a refusal here means the add did
+    /// not happen, where a refusal after it would leave the stack naming a slice
+    /// the array does not have.
+    ///
+    /// `slot_capacity_after_one_claim` rather than `slot_capacity_needed() + 1`,
+    /// because a claim that fills a parked slice's gap needs no storage at all
+    /// and reserving for it would grow the array by 400 MB at 10000² for a slice
+    /// nobody takes. See that method.
+    ///
+    /// With no graphics yet — the Android path before `resumed` — there is
+    /// nothing to ask and nothing to refuse; the caller's own `self.gfx` check
+    /// below is what stops the edit reaching a renderer that does not exist.
+    fn reserve_a_slice(&mut self) -> Result<(), Vram> {
+        let needed = self.editor.layers.slot_capacity_after_one_claim();
+        let id = self.editor.session.active_id();
+        let Some(gfx) = self.gfx.as_mut() else {
+            return Ok(());
+        };
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return Ok(());
+        };
+        canvas.try_ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed)
     }
 
     fn delete_layer(&mut self, index: usize) {
@@ -2323,6 +2388,13 @@ impl UmberApp {
         self.finish_transform();
         let index = self.editor.layers.active_index();
         if self.editor.layers.locked_at(index) {
+            return;
+        }
+        // Before the model change, exactly as `add_layer` does and through the
+        // same gate. A mask is an ordinary slice of the same array, so it is the
+        // same question and must not be the forgotten half of it.
+        if let Err(refused) = self.reserve_a_slice() {
+            self.editor.notice = Some(vram::slice_refused("a mask", &refused));
             return;
         }
         // The mask this layer has *now* — none — so restoring this shape takes
@@ -4450,6 +4522,36 @@ impl UmberApp {
         let size = doc.size;
         let slots = layers.slot_capacity_needed();
 
+        // **The layer array is asked for before the document is opened**, which
+        // is the whole of how a card that cannot hold it produces a sentence
+        // rather than the crash box. `create_texture` failing is an uncaptured
+        // device error and `crash::device_error` panics on purpose, so until
+        // this existed a document merely too large for the machine was reported
+        // as a crash — with the tab already on the strip and the stack already
+        // in the editor. Here nothing has happened yet, so a refusal leaves the
+        // session exactly as it was, exactly as the device-limit check above
+        // does.
+        //
+        // **It does not cover the uploads below.** Those go through
+        // `Queue::write_texture`, whose staging buffer is allocated by wgpu's
+        // *fatal* error path — an out-of-memory there loses the device before
+        // any error scope sees it. `CanvasRenderer::write_layer_rect`'s banding
+        // and the submit in the loop bound how much staging can stand at once;
+        // they do not make it reportable. See `vram`'s module docs.
+        let reserved = match self.gfx.as_ref() {
+            Some(gfx) => match gfx.make_canvas(UVec2::new(size.x, size.y), slots) {
+                Ok(canvas) => Some(canvas),
+                Err(refused) => {
+                    // The artist's own count, not the slice count: a masked
+                    // layer is two slices and the layers panel would show one.
+                    let count = layers.layers().iter().filter(|l| !l.is_folder()).count();
+                    self.editor.notice = Some(vram::open_refused(&name, count, &refused));
+                    return false;
+                }
+            },
+            None => None,
+        };
+
         let id = self.editor.open_document(
             DocumentState {
                 camera: umber_core::Camera::fit(doc.size_vec2(), self.editor.canvas_size),
@@ -4469,8 +4571,12 @@ impl UmberApp {
             notes.clone(),
         );
 
-        if let Some(gfx) = self.gfx.as_mut() {
-            gfx.add_canvas(id, &doc, slots);
+        if let (Some(gfx), Some(mut canvas)) = (self.gfx.as_mut(), reserved) {
+            // The background belongs to this document rather than to whichever
+            // one the pipelines were cloned out of — `make_canvas` does not take
+            // a `Document`, so this is where the two are paired.
+            canvas.set_background(doc.background);
+            gfx.install_canvas(id, canvas);
             if let Some(canvas) = gfx.canvases.get_mut(&id) {
                 // Each of these submits, and waits per band where the slice is
                 // larger than one staging buffer. Nothing in or after this loop

@@ -1316,6 +1316,35 @@ impl LayerStack {
         SlotPool::locked(&self.pool).next
     }
 
+    /// What [`LayerStack::slot_capacity_needed`] would answer after one more
+    /// slice is claimed, **without claiming one**.
+    ///
+    /// This exists so a caller can ask the device for the storage *before* the
+    /// layer or the mask exists. The renderer's refusal changes nothing at all,
+    /// which is only worth anything if the model has not already moved: a stack
+    /// holding a slice the texture array does not have is a stack the composite
+    /// indexes off the end of, and there is no putting that back from the app.
+    ///
+    /// **It is not `slot_capacity_needed() + 1`**, and that is the point. A
+    /// delete parks its slice in an undo entry and an eviction gives the number
+    /// back, so the pool routinely holds a gap; a claim that fills one moves
+    /// nothing and needs no storage. Asking for one more than the high-water
+    /// mark would grow the array by a slice nobody will use — at 10000² that is
+    /// 400 MB, on exactly the canvas where growth is a single slice and the
+    /// waste is not lost in a doubling.
+    ///
+    /// Where nothing can be claimed at all — an empty free list against the
+    /// ceiling — the answer is the mark itself, because the add is about to be
+    /// refused by [`LayerStack::add`] and no storage will be asked for.
+    pub fn slot_capacity_after_one_claim(&self) -> u32 {
+        let pool = SlotPool::locked(&self.pool);
+        if pool.free.is_empty() && pool.has_headroom() {
+            pool.next + 1
+        } else {
+            pool.next
+        }
+    }
+
     /// One past the highest slice the **live stack** claims, ignoring anything
     /// parked in an undo entry.
     ///
@@ -3070,6 +3099,55 @@ mod tests {
             "the freed mask slice must be reused before the array grows"
         );
         assert_eq!(s.slot_capacity_needed(), 2);
+    }
+
+    /// The prediction a caller reserves storage from has to be what actually
+    /// happens, in **both** directions: a claim off the free list must ask for
+    /// nothing, and a claim off the top must ask for exactly one more.
+    ///
+    /// This measures the answer against the observation rather than restating
+    /// the rule — the prediction is taken, the claim is then made, and the two
+    /// are compared. Written the tempting way, `slot_capacity_needed() + 1`,
+    /// the second half fails: a stack with a parked slice on its free list
+    /// would grow the texture array by a slice nobody would ever use, which at
+    /// 10000² is 400 MB.
+    #[test]
+    fn the_reservation_for_one_more_slice_is_what_a_claim_actually_needs() {
+        let mut s = LayerStack::new();
+
+        // Nothing free, so the next claim is off the top and needs one more.
+        let predicted = s.slot_capacity_after_one_claim();
+        s.add().expect("a second layer");
+        assert_eq!(
+            s.slot_capacity_needed(),
+            predicted,
+            "a claim off the top needs one slice more than the array holds"
+        );
+        assert_eq!(predicted, 2, "slots 0 and 1 are claimed");
+
+        // A third, then park the **middle** slice. Parking the highest would be
+        // compacted away by `give_back` and leave the free list empty again,
+        // which is the case above rather than this one.
+        s.add().expect("a third layer");
+        let middle = (0..s.len())
+            .find(|i| s.get(*i).and_then(Layer::slot) == Some(1))
+            .expect("some layer holds slot 1");
+        assert_eq!(removed(&mut s, middle), Some(1));
+        let mark = s.slot_capacity_needed();
+        assert_eq!(mark, 3, "the mark does not fall for a gap below the top");
+
+        // A claim now fills that gap, so nothing more may be reserved for it.
+        let predicted = s.slot_capacity_after_one_claim();
+        assert_eq!(
+            predicted, mark,
+            "reserving mark + 1 here would grow the array for a slice nobody claims"
+        );
+        assert_eq!(s.add(), Some(1), "the parked slice is what the claim takes");
+        assert_eq!(
+            s.slot_capacity_needed(),
+            predicted,
+            "a claim off the free list needs no more storage than the array already has"
+        );
     }
 
     /// Deleting a masked layer has to give **both** slices back. Leaking the

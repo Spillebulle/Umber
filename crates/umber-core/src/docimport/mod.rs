@@ -1107,7 +1107,12 @@ impl StackSize {
 /// their picture is and not how a buffer was sized. One decimal place: the
 /// difference between 6.0 and 6.4 GB is worth showing when the bound is 17.2,
 /// and a second place is noise on a figure nobody can hit exactly.
-fn gigabytes(bytes: u64) -> String {
+///
+/// Public because `umber-app`'s graphics-memory refusal is the same sentence
+/// about the same picture in a different unit's worth of memory, and two
+/// spellings of "how big is your document" would eventually disagree about the
+/// unit or the decimal place while both looking right on their own.
+pub fn gigabytes(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
 }
 
