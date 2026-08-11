@@ -83,7 +83,7 @@ pub struct Loading {
     outcome: std::sync::mpsc::Receiver<Result<ImportedDocument, ImportError>>,
 }
 
-/// Wakes the event loop when the worker's stack unwinds, however it unwinds.
+/// The worker's end of the channel, and the wake that must follow it.
 ///
 /// **The wake has to be a destructor, because a panic is not a return.** Under
 /// `ControlFlow::Wait` a value appearing in a channel is not an event, so the
@@ -95,13 +95,51 @@ pub struct Loading {
 /// it, until an unrelated window event happened to produce a frame. Unwinding
 /// runs destructors, so this fires on both paths and is the only statement of
 /// the wake.
-struct WakeAtTheEnd(EventLoopProxy<Wake>);
+///
+/// **It owns the sender, and that is the whole reason this is a struct rather
+/// than a guard beside one.** What the woken frame has to see on the panic path
+/// is the channel *disconnected*, which needs the sender already dropped — and
+/// the first draft got that backwards while asserting the opposite in a
+/// comment. A body local declared first does **not** drop last: a captured
+/// upvar is a field of the closure's environment, and the environment is
+/// dropped after every local in the body, so the guard went first and the wake
+/// raced the disconnect. Measured rather than reasoned about, on both the
+/// ordinary and the unwinding path. Holding the sender here and dropping it
+/// *inside* `drop` makes the order a property of this type instead of of where
+/// a `let` happens to sit.
+///
+/// The wake is a closure rather than an [`EventLoopProxy`] for the reason
+/// `Autosave::waker` is one: it is what lets a test watch this fire without a
+/// window, which a destructor otherwise has nothing checking at all.
+struct Finish {
+    /// `Option` only so `drop` can let it go before the wake.
+    answer: Option<std::sync::mpsc::Sender<Result<ImportedDocument, ImportError>>>,
+    wake: Box<dyn Fn() + Send>,
+}
 
-impl Drop for WakeAtTheEnd {
+impl Finish {
+    /// Hand the answer over. Failing means the application dropped the handle,
+    /// which is a document nobody is waiting for any more.
+    fn answer(&self, result: Result<ImportedDocument, ImportError>) {
+        if let Some(answer) = self.answer.as_ref() {
+            let _ = answer.send(result);
+        }
+    }
+}
+
+impl Drop for Finish {
     fn drop(&mut self) {
-        // A failure here is the loop having gone, which is the application
-        // closing: there is nobody left to tell.
-        let _ = self.0.send_event(Wake);
+        // **The sender goes first and the order is the point.** On the panic
+        // path nothing was sent, so what the woken frame has to find is a
+        // channel with no senders left; waking before this drop would let it
+        // read `Empty`, answer "still reading", and go back to sleep with no
+        // second wake ever coming — the very bug this exists to close.
+        drop(self.answer.take());
+        // Failing means the loop has gone, which is the application closing:
+        // there is nobody left to tell. Nothing in here may panic, because a
+        // panic in a destructor while unwinding aborts the process — which is
+        // why this is a `let _` over a `Result` and not an `expect`.
+        (self.wake)();
     }
 }
 
@@ -248,19 +286,20 @@ impl Loading {
         // would look at it — until some unrelated window event produced a frame.
         // Unwinding runs destructors, so this fires on the panic path and the
         // ordinary one alike, and there is now one statement of the wake instead
-        // of two.
-        let finished = WakeAtTheEnd(proxy.clone());
+        // of two. See [`Finish`] for why it owns the sender.
+        let wake_proxy = proxy.clone();
+        let finish = Finish {
+            answer: Some(sender),
+            wake: Box::new(move || {
+                let _ = wake_proxy.send_event(Wake);
+            }),
+        };
         // Named, so the line `crash::report_panic` writes for a worker says
         // which worker. It is the only trace a panic in a reader leaves, since
         // no report is written for a thread that is not `main`.
         let started = std::thread::Builder::new()
             .name("umber-open".to_owned())
             .spawn(move || {
-                // Declared first so it drops **last**, after `sender`: the
-                // frame the wake produces must find the answer already in the
-                // channel, or on the ordinary path it would read `Empty` and
-                // wait for another event that never comes.
-                let _wake = finished;
                 // `Progress` is an `Fn`, so the last reading cannot be a captured
                 // `mut` — it lives in a cell of its own. An atomic rather than a
                 // `Cell` because the callback has to be `Sync` too, which is what
@@ -279,17 +318,16 @@ impl Loading {
                     }
                 };
                 let result = umber_core::docimport::import_reporting(&worker_path, &report);
-                // The send can fail only if the application has dropped the handle,
-                // which is a document nobody is waiting for any more.
-                let _ = sender.send(result);
+                finish.answer(result);
             });
         if let Err(e) = started {
             // Nothing else to do, and deliberately so: the closure went with
-            // the failure, taking `sender` with it, so the channel is already
-            // disconnected and `take` answers `WorkerVanished`. No wake is
-            // needed either — `begin_open` asks for a frame straight after this
-            // returns, and `collect_loading` runs early in `render`, so a
-            // refusal is settled before the modal is drawn even once.
+            // the failure, taking `Finish` with it, so the sender is already
+            // dropped and `take` answers `WorkerVanished` — and the wake fired
+            // on the way, which costs one frame nobody needed and is the same
+            // route a panic takes. `begin_open` asks for a frame straight after
+            // this returns anyway, and `collect_loading` runs early in
+            // `render`, so a refusal is settled before the modal is drawn once.
             log::error!("could not start the document reader: {e}");
         }
 
@@ -599,6 +637,69 @@ mod tests {
             "a document that opened raised a notice"
         );
         assert!(ed.loading.is_none(), "the dialog was left up");
+    }
+
+    /// A reader that panics asks for the frame that will notice it, and asks
+    /// **after** the channel has gone quiet.
+    ///
+    /// Two claims and the second is the one a comment got wrong. Noticing is
+    /// useless without a frame to notice in — the loop is `ControlFlow::Wait`
+    /// and a panic reaches neither of the worker's own wakes — and the wake has
+    /// to land *after* the sender is dropped, or the woken frame reads `Empty`,
+    /// answers "still reading", and goes back to sleep with nothing left to
+    /// wake it. The first draft declared the guard as a body local and asserted
+    /// it dropped last; a captured upvar is a field of the closure environment,
+    /// which is dropped after every body local, so it dropped **first**.
+    ///
+    /// Both halves are measured rather than restated: the wake counts itself,
+    /// and it reads the receiver at the moment it fires, which is the only
+    /// instant the ordering is observable.
+    #[test]
+    fn a_reader_that_panics_asks_for_a_frame_once_its_channel_is_quiet() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (sender, outcome) = std::sync::mpsc::channel();
+        let outcome = Arc::new(std::sync::Mutex::new(outcome));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        // What the receiver answered on the frame this wake asked for.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+
+        let watcher = Arc::clone(&outcome);
+        let counter = Arc::clone(&wakes);
+        let record = Arc::clone(&seen);
+        let finish = Finish {
+            answer: Some(sender),
+            wake: Box::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let reading = match watcher.lock().expect("the receiver").try_recv() {
+                    Ok(_) => "answered",
+                    Err(TryRecvError::Empty) => "empty",
+                    Err(TryRecvError::Disconnected) => "disconnected",
+                };
+                *record.lock().expect("the record") = Some(reading);
+            }),
+        };
+
+        let worker = std::thread::Builder::new()
+            .name("umber-open-test".to_owned())
+            .spawn(move || {
+                let _finish = finish;
+                panic!("a reader panicked part way through a document");
+            })
+            .expect("a worker thread");
+        assert!(worker.join().is_err(), "the worker was supposed to panic");
+
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "a reader that died asked for no frame, so nothing would look at it",
+        );
+        assert_eq!(
+            *seen.lock().expect("the record"),
+            Some("disconnected"),
+            "the wake landed before the channel went quiet, so the frame it \
+             asked for would read the decode as still running",
+        );
     }
 
     /// And a reader that is merely slow is left alone.

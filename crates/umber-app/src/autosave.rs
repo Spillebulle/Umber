@@ -1241,6 +1241,17 @@ struct InFlight {
     /// Where this document's internal copy goes, resolved when the capture
     /// began. `None` on a system with no data directory.
     internal: Option<PathBuf>,
+    /// The writer this capture's slices were going to died part way through it,
+    /// so it can no longer produce a whole document. See
+    /// [`Autosave::lose_writer`].
+    ///
+    /// **Marked rather than abandoned**, and the difference is the renderer's:
+    /// `flight` is what `capturing_id` answers with, and `collect` reaches the
+    /// canvas holding the readback only through that — so emptying it here
+    /// would strand the job for the life of the renderer, which is the
+    /// disowned-job bug `settle_capture` exists to undo. The capture is
+    /// therefore collected exactly as usual and thrown away at the end.
+    doomed: bool,
 }
 
 /// One document, ready to be written, once every slice has been encoded.
@@ -1397,6 +1408,19 @@ enum Latch {
     Writer,
 }
 
+/// What has already been said this run, one flag per [`Latch`].
+///
+/// **Named fields rather than an array indexed by `latch as usize`**, which is
+/// the numeric-forcing hazard `Effect::rank` records: an index compiles for a
+/// variant that has no slot, so a third `Latch` would be an out-of-bounds panic
+/// on `poll` — which runs every frame. [`Autosave::latch`] is an exhaustive
+/// match instead, so a third one is a compile error asking where its flag goes.
+#[derive(Default)]
+struct Complained {
+    document: bool,
+    writer: bool,
+}
+
 /// The autosave's whole state: the schedule, what is in flight, and the thread
 /// that writes.
 pub struct Autosave {
@@ -1413,7 +1437,7 @@ pub struct Autosave {
     seq: u64,
     /// Which kinds of failure have already been shown. See
     /// [`Report::complaint`] for why there are two of them.
-    complained: [bool; 2],
+    complained: Complained,
     /// There is no writer and the artist has not been told.
     ///
     /// A flag rather than a report pushed where it is discovered, because both
@@ -1478,7 +1502,7 @@ impl Default for Autosave {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
             seq: 0,
-            complained: [false; 2],
+            complained: Complained::default(),
             lost: false,
             swept: false,
             marks_dir: sessions_dir(),
@@ -1565,7 +1589,11 @@ impl Autosave {
     pub fn begin(&mut self, doc: Candidate) {
         let internal = self.internal_path_for(&doc);
         self.send(Job::Abandon);
-        self.flight = Some(InFlight { doc, internal });
+        self.flight = Some(InFlight {
+            doc,
+            internal,
+            doomed: false,
+        });
     }
 
     /// Hand one finished slice to the writer, which encodes it and drops the
@@ -1581,6 +1609,13 @@ impl Autosave {
         let Some(flight) = self.flight.as_ref() else {
             return;
         };
+        // The writer that had this capture's earlier slices is gone, so no
+        // whole document can come out of it however many more arrive. The
+        // buffer is dropped here rather than encoded into a fresh writer that
+        // will only be told to throw it away.
+        if flight.doomed {
+            return;
+        }
         let layers = flight
             .doc
             .layers
@@ -1663,6 +1698,25 @@ impl Autosave {
         let Some(flight) = self.flight.take() else {
             return;
         };
+        // **A capture whose writer died is dropped rather than written**, and
+        // that is what stops one incident producing two dialogs. Sent on, it
+        // would reach a fresh writer holding none of the slices the dead one
+        // ate, be refused by `CaptureSource` as `NotSupplied`, and come back as
+        // a `Report::Failed` naming *the document* — a second interruption,
+        // blaming a painting for a thread's death, and burning the other latch
+        // so a genuinely unrelated failure later in the run could never be
+        // shown. The clock is still moved on, so the next attempt is a whole
+        // five minutes away rather than immediate.
+        if flight.doomed {
+            log::warn!(
+                "the autosave of “{}” is being dropped: its writer died part way through it",
+                flight.doc.title,
+            );
+            if let Some(record) = self.docs.get_mut(&flight.doc.id) {
+                record.last = now;
+            }
+            return;
+        }
         if let Some(record) = self.docs.get_mut(&flight.doc.id) {
             record.last = now;
         }
@@ -1891,13 +1945,17 @@ impl Autosave {
                 }
             }
         }
-        // **After the channel, deliberately.** A writer that died holding a
-        // finished document has its `Report::Written` sitting in the queue
-        // ahead of the disconnect, and that document really was written — so
-        // it is applied first, and the sentence saying autosave has gone comes
-        // after it rather than instead of it. Drained here rather than at the
-        // top because that is also where a *failed spawn* lands, which is the
-        // one way in with no channel to have read.
+        // **After the loop, and the reason is not the one that first went
+        // here.** That comment said a `Report::Written` ahead of the disconnect
+        // had to be applied before the notice, which sounds right and is not a
+        // mechanism: `Written`'s `notice()` is `None`, so it can never displace
+        // anything, and `collect` applies its side effects wherever it sits in
+        // the batch. What actually requires this position is that `lose_writer`
+        // sets the flag from *inside* the loop — drain first and a death
+        // discovered this frame is not reported until the next one, which the
+        // frame-loop guard's single `frame()` call would fail on. It is also
+        // where a **failed spawn** lands, the one way in with no channel to
+        // have read at all.
         if std::mem::take(&mut self.lost) {
             self.note(Report::NoWriter, &mut out);
         }
@@ -1907,18 +1965,40 @@ impl Autosave {
         out
     }
 
-    /// Log a report, and pass it on unless its own kind of failure has already
-    /// interrupted the artist this run.
+    /// Log a report, and pass it on unless the artist has heard enough.
+    ///
+    /// Two rules and each was a bug. Its own **kind** of failure says itself
+    /// once a run, which is [`Report::complaint`]'s split. And **at most one
+    /// failure leaves any one drain**, because `collect` shows the last notice
+    /// it is handed and drops the rest: without this a `Report::Failed` arriving
+    /// in the same batch as the writer's death would burn its latch without
+    /// ever being seen, and could then never be shown again. The one that got
+    /// there first is kept, and the second is logged and waits — its latch
+    /// untouched, so it can still interrupt somebody on a later frame if it
+    /// happens again.
     fn note(&mut self, report: Report, out: &mut Vec<Report>) {
         if let Some((latch, line)) = report.complaint() {
             log::warn!("{line}");
-            let shown = &mut self.complained[latch as usize];
+            if out.iter().any(|r| r.complaint().is_some()) {
+                return;
+            }
+            let shown = self.latch(latch);
             if *shown {
                 return;
             }
             *shown = true;
         }
         out.push(report);
+    }
+
+    /// This run's flag for one kind of failure.
+    ///
+    /// An exhaustive match rather than an index, for [`Complained`]'s reason.
+    fn latch(&mut self, which: Latch) -> &mut bool {
+        match which {
+            Latch::Document => &mut self.complained.document,
+            Latch::Writer => &mut self.complained.writer,
+        }
     }
 
     /// There is no writer: one ended without being asked to, or one could not
@@ -1942,28 +2022,35 @@ impl Autosave {
     /// taken it — so that this is true of the function rather than of its one
     /// call site.
     ///
-    /// The capture in flight is deliberately **left alone**, and what makes that
-    /// safe is an ordering rather than a check. It finishes into a fresh writer
-    /// holding none of the slices the dead one ate; `CaptureSource::layer_image`
-    /// answers `None` for one it was not given, `docformat` turns that into
-    /// `SaveError::NotSupplied`, and the whole write is refused and reported.
-    /// **A missing *mask* is not refused** — `run_task` writes it as no mask at
-    /// all, because inventing an empty one would hide the layer it belongs to —
-    /// and that is safe only because `Candidate::slots` puts every layer slice
-    /// before every mask slice and `take_capture_slice` hands them over in
-    /// ascending order. What a dead writer loses is therefore always a prefix,
-    /// and any non-empty prefix contains a layer, which is what refuses. **If a
-    /// capture ever delivers a mask before every layer, this is the sentence
-    /// that stops being true.**
+    /// The capture in flight is **marked and not cleared**. Clearing `flight`
+    /// would empty `capturing_id`, which is the only route `collect` has to the
+    /// renderer's own job, and strand it for the life of the renderer: exactly
+    /// the disowned-job bug `settle_capture` exists to undo. So the readback is
+    /// collected exactly as usual and [`Self::finish`] throws it away.
     ///
-    /// Clearing `flight` here instead would empty `capturing_id`, which is the
-    /// only route `collect` has to the renderer's own job, and strand it for the
-    /// life of the renderer: exactly the disowned-job bug `settle_capture`
-    /// exists to undo.
+    /// **Throwing it away is what stops one incident producing two dialogs.**
+    /// Sent on, it would reach a fresh writer holding none of the slices the
+    /// dead one ate and come back as a `Report::Failed` naming the *document* —
+    /// blaming a painting for a thread's death, and burning the second latch so
+    /// an unrelated failure later in the run could never be shown.
+    ///
+    /// That also retires a load-bearing argument rather than resting on it: a
+    /// partial capture *would* have been refused, because
+    /// `CaptureSource::layer_image` answers `None` for a slice it was not given
+    /// and `docformat` turns that into `SaveError::NotSupplied` — but only
+    /// because a missing **mask** is silently written as no mask at all, and the
+    /// loss is always a *prefix* (`Candidate::slots` puts every layer before
+    /// every mask, `take_capture_slice` delivers in ascending order), and a
+    /// non-empty prefix contains a layer whenever the stack holds one. Three
+    /// premises, one of them about a stack shape nobody has checked is
+    /// impossible. Not reaching the writer needs none of them.
     fn lose_writer(&mut self) {
         self.tx = None;
         self.rx = None;
         self.lost = true;
+        if let Some(flight) = self.flight.as_mut() {
+            flight.doomed = true;
+        }
     }
 
     /// Where this document's internal copy has been put, if one has been.
@@ -3404,7 +3491,7 @@ mod tests {
         // two failures answer to different latches, so a dead writer does not
         // spend the run's one "disk full".
         assert!(
-            !autosave.complained[Latch::Document as usize],
+            !*autosave.latch(Latch::Document),
             "a dead writer burned the latch a document failure needs",
         );
 
@@ -3442,6 +3529,201 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&internal);
         let _ = std::fs::remove_dir_all(&sessions);
+    }
+
+    /// A capture whose writer died is dropped, not blamed on its document.
+    ///
+    /// **One incident, one dialog.** The capture in flight when a writer dies
+    /// cannot be abandoned — `flight` is what `capturing_id` answers with, and
+    /// `collect` reaches the renderer's readback only through that, so emptying
+    /// it strands the job for the life of the renderer. So it is *marked*, and
+    /// `finish` throws it away. Sent on instead, it would reach a fresh writer
+    /// holding none of the slices the dead one ate, be refused as
+    /// `NotSupplied`, and come back as a `Report::Failed` naming the document —
+    /// a second interruption, blaming a painting for a thread's death, and
+    /// spending the other latch so an unrelated failure later in the run could
+    /// never be shown.
+    ///
+    /// Driven as the real sequence: a capture part way home, its writer dying
+    /// under it, and the rest of the slices arriving afterwards.
+    #[test]
+    fn a_capture_whose_writer_died_is_dropped_rather_than_blamed_on_its_document() {
+        let internal = scratch("doomed-internal");
+        let sessions = scratch("doomed-sessions");
+        let session = session_of(1);
+        let id = session.active_id();
+
+        let mut autosave = Autosave {
+            interval: Duration::ZERO,
+            expiry: None,
+            marks_dir: Some(sessions.clone()),
+            ..Autosave::default()
+        };
+        autosave.next_due(Instant::now(), true, &session);
+        let ours = internal.join("Untitled 1-5555555555555555.ora");
+        autosave.docs.get_mut(&id).expect("a record").internal = Some(ours.clone());
+
+        let mut doc = candidate(id, "Untitled 1");
+        doc.size = UVec2::ONE;
+        autosave.begin(doc);
+
+        // The writer this capture's slices were going to, dead under it.
+        let (task_tx, task_rx) = mpsc::channel::<Job>();
+        let (report_tx, report_rx) = mpsc::channel::<Report>();
+        let dead = std::thread::Builder::new()
+            .name("umber-autosave-test".to_owned())
+            .spawn(move || {
+                let _ends = (task_rx, report_tx);
+                panic!("the autosave writer panicked part way through a document");
+            })
+            .expect("a writer thread");
+        assert!(dead.join().is_err(), "the writer was supposed to panic");
+        autosave.tx = Some(task_tx);
+        autosave.rx = Some(report_rx);
+        autosave.lost = false;
+
+        let told = autosave.poll();
+        assert_eq!(
+            told.iter().filter_map(Report::notice).count(),
+            1,
+            "the writer's death was not reported: {told:?}",
+        );
+
+        // The rest of the capture comes home as it always would, and is
+        // finished as it always would be.
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 0,
+            size: UVec2::ONE,
+            pixels: vec![200, 40, 40, 255],
+        });
+        autosave.finish(
+            DocumentCapture {
+                size: UVec2::ONE,
+                merged: vec![200, 40, 40, 255],
+            },
+            Instant::now(),
+        );
+
+        // Nothing more is said, and nothing half-written is left behind.
+        let mut later = Vec::new();
+        for _ in 0..200 {
+            later.extend(autosave.poll());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !later.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "a document was blamed for its writer dying: {later:?}",
+        );
+        assert!(
+            !*autosave.latch(Latch::Document),
+            "one incident spent both latches, so a later disk failure is silent",
+        );
+        assert!(
+            !ours.exists(),
+            "a capture missing its earlier slices was written out anyway",
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
+        let _ = std::fs::remove_dir_all(&sessions);
+    }
+
+    /// Each kind of failure says itself once, and neither spends the other's
+    /// turn.
+    ///
+    /// **Three rules, and every one of them was a bug on the way here.** One
+    /// latch for both meant a writer's death burned the run's single
+    /// interruption so a later "disk full" was never shown, and an earlier
+    /// document failure swallowed the news that autosave had stopped
+    /// altogether. Latching without being shown is the same harm one step in:
+    /// `collect` keeps the last notice it is handed and drops the rest, so two
+    /// failures in one drain spent two latches to show one dialog. And a
+    /// `Report::Written` must touch neither, or a document that saved perfectly
+    /// would quietly use up the run's warning.
+    ///
+    /// Driven through `note`, which is where all three live, and reading what
+    /// comes *out* — a report the artist is shown — rather than the flags.
+    #[test]
+    fn each_kind_of_failure_says_itself_once_and_neither_spends_the_others_turn() {
+        let failed = || Report::Failed {
+            title: "Sketch".to_owned(),
+            message: "the disk is full".to_owned(),
+        };
+        let written = || Report::Written {
+            id: Session::default().active_id(),
+            revision: 0,
+            wrote_user_file: true,
+            expired: 0,
+        };
+
+        let mut autosave = Autosave {
+            marks_dir: Some(scratch("latches-sessions")),
+            ..Autosave::default()
+        };
+
+        // A document failure is shown, and then not again.
+        let mut out = Vec::new();
+        autosave.note(failed(), &mut out);
+        assert_eq!(out.len(), 1, "a document failure was never shown");
+        let mut twice = Vec::new();
+        autosave.note(failed(), &mut twice);
+        assert!(
+            twice.is_empty(),
+            "the artist was interrupted twice for one kind of failure",
+        );
+
+        // The writer's turn is untouched by any of that.
+        let mut writer = Vec::new();
+        autosave.note(Report::NoWriter, &mut writer);
+        assert_eq!(
+            writer.len(),
+            1,
+            "a document failure spent the interruption a dead writer needs",
+        );
+
+        // A written document costs nothing.
+        let mut fresh = Autosave {
+            marks_dir: Some(scratch("latches-sessions-2")),
+            ..Autosave::default()
+        };
+        let mut good = Vec::new();
+        fresh.note(written(), &mut good);
+        assert_eq!(good.len(), 1, "a written document was swallowed");
+        let mut after = Vec::new();
+        fresh.note(failed(), &mut after);
+        assert_eq!(
+            after.len(),
+            1,
+            "a document that saved perfectly spent the run's warning",
+        );
+
+        // And two failures in one drain leave one dialog and one spent latch,
+        // so the one that waited can still be shown later.
+        let mut both = Autosave {
+            marks_dir: Some(scratch("latches-sessions-3")),
+            ..Autosave::default()
+        };
+        let mut drained = Vec::new();
+        both.note(failed(), &mut drained);
+        both.note(Report::NoWriter, &mut drained);
+        assert_eq!(
+            drained.len(),
+            1,
+            "two dialogs came out of one drain, and `collect` shows one: {drained:?}",
+        );
+        assert!(
+            !*both.latch(Latch::Writer),
+            "the report `collect` would have dropped burned its latch anyway",
+        );
+
+        for dir in [
+            "latches-sessions",
+            "latches-sessions-2",
+            "latches-sessions-3",
+        ] {
+            let _ = std::fs::remove_dir_all(
+                std::env::temp_dir().join(format!("umber-autosave-{dir}-{}", std::process::id())),
+            );
+        }
     }
 
     /// A machine that will not give Umber a thread is told about too.
@@ -3490,11 +3772,19 @@ mod tests {
             "the notice overstates what is known: {:?}",
             said[0],
         );
-        // Once per run, like every other failure here.
+        // Once per run, like every other failure here — and asked by raising it
+        // *again*, because a second `poll` over a cleared flag would answer
+        // empty whatever the latch did.
+        autosave.lost = true;
         assert!(
             autosave.poll().is_empty(),
             "the artist would be interrupted again with nothing new to say",
         );
+
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
+            "umber-autosave-nowriter-sessions-{}",
+            std::process::id()
+        )));
     }
 
     /// **One archive still reaches two places, and this is what now says so.**
@@ -3860,6 +4150,30 @@ mod tests {
         assert!(
             reports.iter().any(|r| matches!(r, Report::Failed { .. })),
             "the internal copy failed silently: {reports:?}"
+        );
+        // **And it reaches the artist as a sentence**, not only as a variant.
+        // The wording lives in `Report::notice` now, and nothing read the
+        // `Failed` arm of it in either direction — so `Failed { .. } => None`
+        // compiled, passed, and put every per-document autosave failure back to
+        // being silent, which is the shipped defect this whole change is about.
+        // Delivery of that sentence is `collect`'s, covered by
+        // `a_writer_that_dies_reaches_the_artist_through_the_frame_loop`; these
+        // two together are the rule.
+        let said: Vec<Notice> = reports.iter().filter_map(Report::notice).collect();
+        assert_eq!(
+            said.len(),
+            1,
+            "a failure the artist never hears: {reports:?}"
+        );
+        assert!(
+            said[0].title.contains("rescued.ora"),
+            "the notice does not name the document that failed: {:?}",
+            said[0],
+        );
+        assert!(
+            said[0].lines.iter().any(|l| l.contains("File, Save")),
+            "the notice leaves the artist nothing to do: {:?}",
+            said[0],
         );
         assert!(
             matches!(
