@@ -6,7 +6,8 @@
 use glam::UVec2;
 
 use super::{
-    ImportError, ImportedDocument, ImportedLayer, SourceFormat, StackSize, check_bounds, srgb,
+    ImportError, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat, StackSize,
+    check_bounds, srgb,
 };
 use crate::document::Background;
 use crate::layer::BlendMode;
@@ -90,7 +91,7 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let format = SourceFormat::Png;
     let image = decode_png(bytes, format)?;
     // A flat picture is one layer and no folders.
-    check_bounds(
+    let mut budget = check_bounds(
         format,
         image.size.x,
         image.size.y,
@@ -100,10 +101,20 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let mut pixels = image.rgba;
     srgb::encode_buffer(&mut pixels);
 
+    // **One piece covering the canvas, because a flat picture *is* the
+    // canvas.** There is nothing sparse to find: the PNG decoded to exactly
+    // this rectangle and every pixel of it came out of the file.
+    let layer = ImportedLayer::new(
+        "Image",
+        BlendMode::Normal,
+        vec![PixelPiece::whole(image.size, pixels)],
+    );
+    budget.charge(&layer)?;
+
     Ok(ImportedDocument {
         format,
         size: image.size,
-        layers: vec![ImportedLayer::new("Image", BlendMode::Normal, pixels)],
+        layers: vec![layer],
         active: None,
         background: Background::Transparent,
         dpi: None,

@@ -4619,19 +4619,23 @@ impl UmberApp {
                 // catches up. What is gone is the unbounded case. See
                 // `CanvasRenderer::write_layer_rect`, which says the same thing
                 // about any loop of it and not only about this one.
+                //
+                // **A piece at a time, and the rectangle is the reader's.** It
+                // used to be one canvas-sized write per layer, which is what
+                // made every reader densify what it had read. Whatever no piece
+                // covers is left as `install_canvas`'s clear — that is
+                // `docimport::PixelPiece`'s rule 3, and it is why there is no
+                // "this layer is finished" call here.
                 for upload in &uploads {
-                    canvas.write_layer_rect(
-                        &gfx.gpu.device,
-                        &gfx.gpu.queue,
-                        upload.slot,
-                        umber_core::PixelRect {
-                            x: 0,
-                            y: 0,
-                            width: size.x,
-                            height: size.y,
-                        },
-                        &upload.pixels,
-                    );
+                    for piece in &upload.pieces {
+                        canvas.write_layer_rect(
+                            &gfx.gpu.device,
+                            &gfx.gpu.queue,
+                            upload.slot,
+                            piece.rect,
+                            &piece.bytes,
+                        );
+                    }
                 }
             }
         }

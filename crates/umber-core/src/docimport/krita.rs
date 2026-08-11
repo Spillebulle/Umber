@@ -65,10 +65,11 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
-    check_bounds, flat, lzf, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat,
+    StackSize, check_bounds, flat, lzf, srgb,
 };
 use crate::document::Background;
+use crate::geom::PixelRect;
 use crate::layer::{BlendMode, LayerStack};
 
 const FORMAT: SourceFormat = SourceFormat::Krita;
@@ -117,7 +118,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let maindoc = container::read_entry(&mut zip, "maindoc.xml", FORMAT)?;
     let mut warnings = Vec::new();
     let doc = parse_maindoc(&maindoc, &mut warnings)?;
-    check_bounds(
+    let mut budget = check_bounds(
         FORMAT,
         doc.size.x,
         doc.size.y,
@@ -160,7 +161,12 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
             continue;
         }
         match load_layer(&mut zip, &doc.name, spec, doc.size, &mut warnings) {
-            Ok(layer) => layers.push(layer),
+            Ok(layer) => {
+                // Charged as it lands, so what bounds the accumulation is the
+                // pixels the file actually held. See `PieceBudget`.
+                budget.charge(&layer)?;
+                layers.push(layer);
+            }
             Err(reason) => warnings.push(ImportWarning::LayerSkipped {
                 layer: spec.name.clone(),
                 reason,
@@ -589,16 +595,35 @@ fn load_layer(
             .and_then(|b| (b.len() >= 4).then(|| [b[2], b[1], b[0], b[3]]))
             .unwrap_or([0, 0, 0, 0]);
 
-    let mut pixels = default_pixel
-        .iter()
-        .copied()
-        .cycle()
-        .take(canvas.x as usize * canvas.y as usize * 4)
-        .collect::<Vec<u8>>();
-    assemble_tiles(&data, (spec.x, spec.y), 4, |tile, size, at| {
-        blit_tile(&mut pixels, canvas, tile, size, at);
-    })?;
-    srgb::encode_buffer(&mut pixels);
+    // **One piece per stored tile — but only where the pixels outside the
+    // tiles are transparent.** A Krita layer states what it holds where it
+    // stored nothing, and almost always that is transparent: then a tile the
+    // file kept is a rectangle the file holds, and the canvas between them is
+    // the empty value the upload's clear already leaves. A layer with a
+    // *coloured* default pixel says the opposite — every pixel of the canvas
+    // carries that colour — so there is nothing sparse about it and it takes
+    // the dense path it always had. See `PixelPiece`'s rule 3.
+    let pixels = if default_pixel == [0, 0, 0, 0] {
+        let mut pieces = Vec::new();
+        assemble_tiles(&data, (spec.x, spec.y), 4, |tile, size, at| {
+            if let Some(piece) = tile_piece(canvas, tile, size, at) {
+                pieces.push(piece);
+            }
+        })?;
+        pieces
+    } else {
+        let mut dense = default_pixel
+            .iter()
+            .copied()
+            .cycle()
+            .take(canvas.x as usize * canvas.y as usize * 4)
+            .collect::<Vec<u8>>();
+        assemble_tiles(&data, (spec.x, spec.y), 4, |tile, size, at| {
+            blit_tile(&mut dense, canvas, tile, size, at);
+        })?;
+        srgb::encode_buffer(&mut dense);
+        vec![PixelPiece::whole(canvas, dense)]
+    };
 
     let (mode, fidelity) = blend::nearest(&spec.composite_op);
     match fidelity {
@@ -659,7 +684,12 @@ fn load_layer(
 ///   zero on faith would hide a layer completely on the strength of a file
 ///   that said nothing, which is the silent damage this module refuses in the
 ///   other direction.
-fn load_mask(zip: &mut Zip<'_>, document: &str, spec: &MaskSpec, canvas: UVec2) -> Option<Vec<u8>> {
+fn load_mask(
+    zip: &mut Zip<'_>,
+    document: &str,
+    spec: &MaskSpec,
+    canvas: UVec2,
+) -> Option<Vec<PixelPiece>> {
     if spec.filename.is_empty() {
         return None;
     }
@@ -683,7 +713,13 @@ fn load_mask(zip: &mut Zip<'_>, document: &str, spec: &MaskSpec, canvas: UVec2) 
         blit_coverage_tile(&mut coverage, canvas, tile, size, at);
     })
     .ok()?;
-    Some(srgb::encode_coverage_buffer(&coverage))
+    // One canvas piece. A mask's empty value is white and the upload's clear
+    // leaves transparent black, so a mask may not go sparse yet whatever its
+    // default pixel is — `PixelPiece`'s rule 3.
+    Some(vec![PixelPiece::whole(
+        canvas,
+        srgb::encode_coverage_buffer(&coverage),
+    )])
 }
 
 /// Krita's mask kinds, named the way its own interface names them.
@@ -776,37 +812,88 @@ fn assemble_tiles(
     Ok(())
 }
 
-/// Walk the part of a tile that lands inside the canvas, handing each
-/// `(index in the tile, index of the destination pixel)` pair to `f`.
+/// The part of a tile at `at` that lands inside the canvas, in canvas
+/// coordinates, or `None` for one that misses it entirely.
 ///
 /// Krita keeps whole tiles even where only a corner of one is inside the
 /// canvas, and layers may sit at negative coordinates, so most of a real file's
-/// tiles need clipping on at least one side. Written once and shared by both
-/// blits below: the clipping is the subtle half and two copies of it is two
-/// chances to get an edge wrong.
+/// tiles need clipping on at least one side. **This is the one statement of
+/// that clipping** — [`for_each_visible`] and [`tile_piece`] both derive their
+/// loops from it, because the clipping is the subtle half and three copies of
+/// it would be three chances to get an edge wrong.
+fn visible_rect(canvas: UVec2, tile_size: (usize, usize), at: (i64, i64)) -> Option<PixelRect> {
+    let (tw, th) = tile_size;
+    let x_from = at.0.saturating_neg().clamp(0, tw as i64);
+    let x_to = (canvas.x as i64).saturating_sub(at.0).clamp(0, tw as i64);
+    let y_from = at.1.saturating_neg().clamp(0, th as i64);
+    let y_to = (canvas.y as i64).saturating_sub(at.1).clamp(0, th as i64);
+    if x_to <= x_from || y_to <= y_from {
+        return None;
+    }
+    Some(PixelRect {
+        x: (at.0 + x_from) as u32,
+        y: (at.1 + y_from) as u32,
+        width: (x_to - x_from) as u32,
+        height: (y_to - y_from) as u32,
+    })
+}
+
+/// Walk the part of a tile that lands inside the canvas, handing each
+/// `(index in the tile, index of the destination pixel)` pair to `f`.
 fn for_each_visible(
     canvas: UVec2,
     tile_size: (usize, usize),
     at: (i64, i64),
     mut f: impl FnMut(usize, usize),
 ) {
-    let (tw, th) = tile_size;
-    for row in 0..th {
-        let dy = at.1 + row as i64;
-        if dy < 0 || dy >= canvas.y as i64 {
-            continue;
-        }
-        for col in 0..tw {
-            let dx = at.0 + col as i64;
-            if dx < 0 || dx >= canvas.x as i64 {
-                continue;
-            }
+    let Some(rect) = visible_rect(canvas, tile_size, at) else {
+        return;
+    };
+    let tw = tile_size.0;
+    for dy in rect.y..rect.y + rect.height {
+        let row = (i64::from(dy) - at.1) as usize;
+        for dx in rect.x..rect.x + rect.width {
+            let col = (i64::from(dx) - at.0) as usize;
             f(
                 row * tw + col,
                 dy as usize * canvas.x as usize + dx as usize,
             );
         }
     }
+}
+
+/// One planar BGRA tile as a [`PixelPiece`], already sRGB-encoded.
+///
+/// The sparse half of what [`blit_tile`] does densely, and it is the same
+/// bytes: `srgb::encode_pixel` of a fully transparent pixel is four zeroes —
+/// `TABLE`'s alpha-0 row is all zeroes — so the canvas the dense path filled
+/// with the default transparent pixel and then encoded is exactly the canvas
+/// this leaves untouched.
+fn tile_piece(
+    canvas: UVec2,
+    tile: &[u8],
+    tile_size: (usize, usize),
+    at: (i64, i64),
+) -> Option<PixelPiece> {
+    let rect = visible_rect(canvas, tile_size, at)?;
+    let (tw, th) = tile_size;
+    let plane = tw * th;
+    let mut bytes = Vec::with_capacity(rect.area() as usize * 4);
+    for dy in rect.y..rect.y + rect.height {
+        let row = (i64::from(dy) - at.1) as usize;
+        for dx in rect.x..rect.x + rect.width {
+            let col = (i64::from(dx) - at.0) as usize;
+            let s = row * tw + col;
+            // Planar, and blue first — see `blit_tile`.
+            bytes.extend_from_slice(&srgb::encode_pixel([
+                tile[2 * plane + s],
+                tile[plane + s],
+                tile[s],
+                tile[3 * plane + s],
+            ]));
+        }
+    }
+    Some(PixelPiece::new(rect, bytes))
 }
 
 /// Copy one planar BGRA tile into the RGBA canvas.
@@ -857,6 +944,7 @@ fn flattened_fallback(
     let mut pixels = vec![0u8; canvas.x as usize * canvas.y as usize * 4];
     container::blit(&mut pixels, canvas, &image.rgba, image.size, (0, 0));
     srgb::encode_buffer(&mut pixels);
+    let pixels = vec![PixelPiece::whole(canvas, pixels)];
 
     warnings.push(ImportWarning::DocumentFlattened { reason });
     Ok(ImportedDocument {

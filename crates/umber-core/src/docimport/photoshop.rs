@@ -99,8 +99,8 @@ use psd::{ColorMode, PsdChannelKind, PsdDepth};
 
 use super::blend::{self, Fidelity};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
-    check_bounds, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat,
+    StackSize, check_bounds, srgb,
 };
 use crate::document::Background;
 use crate::layer::BlendMode;
@@ -134,7 +134,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     // This reader makes no folders: a PSD group arrives as nothing at all, so
     // every entry it will produce holds pixels. If groups are ever read, this
     // is one of the two places that has to learn about them.
-    check_bounds(
+    let mut budget = check_bounds(
         FORMAT,
         size.x,
         size.y,
@@ -230,10 +230,19 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         }
         srgb::encode_buffer(&mut pixels);
 
-        let mut imported = ImportedLayer::new(name, mode, pixels);
+        // **One canvas-sized piece, because the crate gives nothing better.**
+        // A `.psd` does store per-layer rectangles, and `psd` 0.3.5's
+        // `Layer::rgba()` resolves them into a canvas-sized buffer before this
+        // reader ever sees one — the layer's own rectangle is behind a private
+        // accessor, the same limit that keeps its masks unreadable. Cropping
+        // this buffer back down would be scanning for content, which is not the
+        // same claim as "the file holds this rectangle" and would cost a full
+        // pass to learn something the file already knows.
+        let mut imported = ImportedLayer::new(name, mode, vec![PixelPiece::whole(size, pixels)]);
         imported.visible = visible;
         imported.opacity = opacity;
         imported.clipped = clipped;
+        budget.charge(&imported)?;
         layers.push(imported);
     }
 
@@ -262,7 +271,11 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
     ImportedDocument {
         format: FORMAT,
         size,
-        layers: vec![ImportedLayer::new("Background", BlendMode::Normal, pixels)],
+        layers: vec![ImportedLayer::new(
+            "Background",
+            BlendMode::Normal,
+            vec![PixelPiece::whole(size, pixels)],
+        )],
         active: None,
         background: Background::Transparent,
         dpi: None,

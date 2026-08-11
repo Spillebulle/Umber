@@ -7,6 +7,7 @@ use glam::UVec2;
 use zip::ZipArchive;
 
 use super::{ImportError, ImportedDocument, SourceFormat};
+use crate::geom::PixelRect;
 
 pub type Zip<'a> = ZipArchive<Cursor<&'a [u8]>>;
 
@@ -179,13 +180,65 @@ impl Attrs {
     }
 }
 
-/// Copy a layer's own rectangle into a canvas-sized buffer.
+/// The part of a layer's own rectangle that lands on the canvas, as its own
+/// tightly packed rectangle.
 ///
 /// Source layers are stored at their bounding box with an offset, which may be
 /// negative and may run past the canvas — Photoshop and Krita both keep pixels
 /// outside the visible area, and a document that has been cropped is full of
 /// them. Everything outside the canvas is dropped here rather than trusted to
 /// arithmetic later.
+///
+/// `None` where nothing lands, which is a layer dragged entirely off the page.
+/// That is not an error: the old dense reader produced a canvas of zeroes for
+/// it, and no piece at all is the same picture — see [`PixelPiece`]'s rule 3.
+///
+/// **The clipping is [`blit`]'s, arithmetic for arithmetic.** They are the same
+/// two intersections and a divergence between them is a layer landing a pixel
+/// out; `cropping_agrees_with_the_dense_blit_it_replaced` drives both over the
+/// same offsets and compares the assembled result.
+///
+/// [`PixelPiece`]: super::PixelPiece
+pub fn crop(
+    src: &[u8],
+    src_size: UVec2,
+    at: (i64, i64),
+    canvas: UVec2,
+) -> Option<(PixelRect, Vec<u8>)> {
+    debug_assert_eq!(src.len(), src_size.x as usize * src_size.y as usize * 4);
+
+    let (ox, oy) = at;
+    let y_from = (-oy).max(0);
+    let y_to = (canvas.y as i64 - oy).min(src_size.y as i64);
+    let x_from = (-ox).max(0);
+    let x_to = (canvas.x as i64 - ox).min(src_size.x as i64);
+    if y_to <= y_from || x_to <= x_from {
+        return None;
+    }
+
+    let width = (x_to - x_from) as usize;
+    let height = (y_to - y_from) as usize;
+    let mut bytes = Vec::with_capacity(width * height * 4);
+    for sy in y_from..y_to {
+        let start = ((sy * src_size.x as i64 + x_from) * 4) as usize;
+        bytes.extend_from_slice(&src[start..start + width * 4]);
+    }
+    Some((
+        PixelRect {
+            x: (x_from + ox) as u32,
+            y: (y_from + oy) as u32,
+            width: width as u32,
+            height: height as u32,
+        },
+        bytes,
+    ))
+}
+
+/// Copy a layer's own rectangle into a canvas-sized buffer.
+///
+/// The dense form of [`crop`], kept for the flattened fallbacks — a
+/// `mergedimage.png` is one picture at the origin and there is nothing sparse
+/// about it — and for the tests that hold the two in step.
 ///
 /// Both buffers are plain RGBA8 in the same encoding; this is a copy, not a
 /// composite.

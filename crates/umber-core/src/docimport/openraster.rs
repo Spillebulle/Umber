@@ -62,8 +62,8 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
-    check_bounds, disable_effects_over_budget, flat, history, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat,
+    StackSize, check_bounds, disable_effects_over_budget, flat, history, srgb,
 };
 use crate::color::Color;
 use crate::docformat;
@@ -169,7 +169,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
             .background
             .map_or(Background::Transparent, Background::opaque);
     }
-    check_bounds(
+    let mut budget = check_bounds(
         FORMAT,
         size.x,
         size.y,
@@ -185,6 +185,11 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         progress(done as u32, total);
         match load_layer(&mut zip, &spec, size, &mut warnings) {
             Ok(layer) => {
+                // Charged as it lands rather than once at the end: what this
+                // bounds is the *accumulation*, and a stack of sixty-four PNGs
+                // each declaring 16384² must not all be decoded before anybody
+                // objects. See `PieceBudget`.
+                budget.charge(&layer)?;
                 if spec.selected {
                     active = Some(layers.len());
                 }
@@ -544,15 +549,18 @@ fn load_layer(
     // layer-texture buffer is the wrong thing to hash.
     let text = load_text(zip, spec, &image, warnings);
 
-    let mut pixels = vec![0u8; canvas.x as usize * canvas.y as usize * 4];
-    container::blit(
-        &mut pixels,
-        canvas,
-        &image.rgba,
-        image.size,
-        (spec.x, spec.y),
-    );
-    srgb::encode_buffer(&mut pixels);
+    // **One piece: the layer's own rectangle clipped to the canvas.** An ORA
+    // layer is one PNG at an offset, so that rectangle is exactly what the file
+    // holds and there is nothing finer to cut it into. A layer entirely off the
+    // page yields no piece, which is the same picture the canvas of zeroes used
+    // to be — `PixelPiece`'s rule 3.
+    let pixels = match container::crop(&image.rgba, image.size, (spec.x, spec.y), canvas) {
+        Some((rect, mut bytes)) => {
+            srgb::encode_buffer(&mut bytes);
+            vec![PixelPiece::new(rect, bytes)]
+        }
+        None => Vec::new(),
+    };
 
     let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
     layer.text = text;
@@ -670,7 +678,7 @@ fn load_mask(
     spec: &LayerSpec,
     canvas: UVec2,
     warnings: &mut Vec<ImportWarning>,
-) -> Option<Vec<u8>> {
+) -> Option<Vec<PixelPiece>> {
     let src = spec.mask_src.as_ref()?;
     let decoded = container::read_optional_entry(zip, src, FORMAT)
         .ok()
@@ -678,7 +686,11 @@ fn load_mask(
         .and_then(|png| flat::decode_png(&png, FORMAT).ok())
         .filter(|image| image.size == canvas);
     match decoded {
-        Some(image) => Some(image.rgba),
+        // One canvas piece, and the filter above is why it can be nothing else:
+        // an Umber mask entry is written at the canvas's own size and one that
+        // is not is refused rather than placed. See `PixelPiece`'s rule 3 for
+        // why a mask may not go sparse yet in any case.
+        Some(image) => Some(vec![PixelPiece::whole(canvas, image.rgba)]),
         None => {
             warnings.push(ImportWarning::MaskIgnored {
                 layer: spec.name.clone(),
@@ -779,7 +791,7 @@ fn flattened_fallback(
         layers: vec![ImportedLayer::new(
             "Merged image",
             BlendMode::Normal,
-            pixels,
+            vec![PixelPiece::whole(canvas, pixels)],
         )],
         active: None,
         // `mergedimage.png` already has the background composited into it, so
