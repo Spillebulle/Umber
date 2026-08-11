@@ -33,7 +33,7 @@ mod pattern_table;
 pub mod preset;
 pub mod preview;
 pub mod selection;
-mod sqlite;
+pub mod sqlite;
 pub mod stroke;
 pub mod style;
 pub mod text;

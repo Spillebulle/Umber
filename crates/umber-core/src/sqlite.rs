@@ -367,23 +367,43 @@ impl<'a> Database<'a> {
         Ok(&self.bytes[start..start + self.page_size])
     }
 
+    /// `sqlite_master`, the one table whose shape is not written down anywhere:
+    /// it is always rooted at page 1 with these five columns.
+    fn master() -> Table {
+        Table {
+            root: 1,
+            columns: ["type", "name", "tbl_name", "rootpage", "sql"]
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+        }
+    }
+
+    /// Every table the schema declares, in the order it declares them.
+    ///
+    /// [`Self::table`] answers about a name somebody already has, which is what
+    /// a reader wants and is exactly wrong for a *survey*: a question of the
+    /// form "does this file hold a cached raster anywhere" cannot be asked by
+    /// guessing names, and a list guessed wrong reads as an answer of "no".
+    /// Used by `examples/survey-clip-schema.rs`; no reader calls it, and none
+    /// should — a reader that walked the schema would be one whose behaviour
+    /// depended on a table it had never been written against.
+    pub fn table_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .rows(&Self::master())?
+            .iter()
+            .filter(|row| row.get(0).as_str() == Some("table"))
+            .filter_map(|row| row.get(1).as_str().map(str::to_string))
+            .collect())
+    }
+
     /// Look a table up in the schema.
     ///
     /// `Ok(None)` for a database that simply has no such table, which is a
     /// thing a caller reasonably tolerates — a `.sut` written by an older Clip
     /// Studio has fewer of them.
     pub fn table(&self, name: &str) -> Result<Option<Table>> {
-        // `sqlite_master` is the one table whose shape is not written down
-        // anywhere: it is always rooted at page 1 with these five columns.
-        let master = Table {
-            root: 1,
-            columns: ["type", "name", "tbl_name", "rootpage", "sql"]
-                .iter()
-                .map(|c| (*c).to_string())
-                .collect(),
-        };
-
-        for row in self.rows(&master)? {
+        for row in self.rows(&Self::master())? {
             if row.get(0).as_str() != Some("table") {
                 continue;
             }
