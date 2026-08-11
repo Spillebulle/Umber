@@ -774,8 +774,15 @@ fn flattened_fallback(
     dpi: Option<f32>,
     mut warnings: Vec<ImportWarning>,
 ) -> Result<ImportedDocument, ImportError> {
-    let merged = container::read_optional_entry(zip, "mergedimage.png", FORMAT)?
-        .ok_or(ImportError::Empty { format: FORMAT })?;
+    // No reasons, for the reason `krita::flatten` gives: what failed is the
+    // absence of `mergedimage.png`, not a stack every layer of which was
+    // refused.
+    let merged = container::read_optional_entry(zip, "mergedimage.png", FORMAT)?.ok_or(
+        ImportError::Empty {
+            format: FORMAT,
+            because: Vec::new(),
+        },
+    )?;
     let image = flat::decode_png(&merged, FORMAT)?;
 
     let mut pixels = vec![0u8; canvas.x as usize * canvas.y as usize * 4];

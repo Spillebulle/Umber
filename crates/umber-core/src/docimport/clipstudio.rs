@@ -54,6 +54,14 @@
 //!   3D object — arrives as the pixels Clip Studio rendered for it and is named
 //!   as rasterised, because it cannot be edited as what it was any more. That
 //!   is what Clip Studio's own PSD export does with them.
+//! - **A placed image** — an image file imported into the document and left
+//!   resizable — is refused and named, and it is **not** a vector layer though
+//!   it was reported as one until somebody looked. Clip Studio stores the
+//!   picture that was imported in a second mipmap chain named by
+//!   `ResizableOriginalMipmap`, plus the placement in a 184-byte
+//!   `ResizableImageInfo` blob, and leaves the render chain's external chunks
+//!   out of the file entirely — so the *pixels are there* and where they go is
+//!   not. See "The pixels a placed image keeps" below.
 //! - **A folder's opacity, blend mode and mask.** Umber's folders are
 //!   pass-through and carry none of the three, and unlike ORA and Krita there
 //!   is nothing to fold an opacity into: the contents are already built by the
@@ -77,6 +85,55 @@
 //! `ImportedDocument::dpi` already follows: it changes no pixel, the picture is
 //! identical either way, and a line on every layer of every import is the noise
 //! that stops the list being read. A full lock does come across.
+//!
+//! # The pixels a placed image keeps, and why they are not taken
+//!
+//! This is on record because the pixels genuinely are in the file, so the next
+//! person to look will ask, and the answer took a day's measurement.
+//!
+//! An artist's 45 MB document was refused whole as holding no layers. It is an
+//! A4 page at 600 dpi carrying a Paper sheet and four placed images and nothing
+//! else. Each of the four has a seven-level render chain (100%, 50%, … 1%)
+//! whose **every** level names an external chunk the container does not hold,
+//! and a `ResizableOriginalMipmap` chain whose base level names one it does:
+//! 11,103,575 bytes, a 4961×7016 bitmap, exactly the canvas. 44.4 MB of the
+//! 45.4 MB file is those four originals.
+//!
+//! **They are not placed at the identity, and that is what settles it.**
+//! `ResizableImageInfo` is 184 bytes holding, among six fields nothing here can
+//! explain, a scale, a centre, a half-extent and a destination quad. On that
+//! document the four are scaled by 0.4434 into the four quadrants of the page —
+//! a contact sheet. Blitting the originals where the layer's offsets say (all
+//! zero) would stack four full-page copies on top of one another: not subtly
+//! wrong, but wrong, and wearing the artist's own artwork while it was. A
+//! second real document places a 10000×5000 original on a 5000×5000 canvas at
+//! 0.8409, running off the page.
+//!
+//! So taking them needs two things this reader will not invent:
+//!
+//! 1. **A resampler.** The map is an affine one into a quad, so the source has
+//!    to be filtered into canvas space. `umber-core` has none, deliberately —
+//!    see the transform rules in `CLAUDE.md`: filtering is the hardware
+//!    sampler's, and an importer cannot reach it.
+//! 2. **A reading of `ResizableImageInfo` that is not a guess.** The layout
+//!    above is inferred from five layers in two documents, every one of them at
+//!    zero rotation with a uniform positive scale, and six of its twenty-three
+//!    fields are unexplained. A wrong reading puts somebody's picture in the
+//!    wrong place at the wrong size and says nothing — the failure that keeps
+//!    the MediaBang reader unwritten and makes an unrecognised `CanvasUnit` a
+//!    refusal rather than a guess.
+//!
+//! The one instrument that would make it evidence rather than a story is
+//! already in the file: `CanvasPreview` is a flattened PNG of what the document
+//! actually looks like, so a candidate placement can be *compared* rather than
+//! argued. Whoever builds this should start there — and note that it verifies
+//! the rotations the samples happen to contain, which is none of them.
+//!
+//! **The thumbnails are not a substitute.** `LayerThumbnail` holds one per
+//! layer and they are 528 to 3,616 bytes; `CanvasPreview` is flattened, so it
+//! has no layers in it at all. Both are the blurry, plausible, subtly wrong
+//! output this module refuses everywhere else, and `docimport::preview` already
+//! says nothing that decides pixels may read it.
 //!
 //! # What has and has not been checked against a real file
 //!
@@ -212,7 +269,13 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     }
 
     if out.iter().all(|l| l.folder) {
-        return Err(ImportError::Empty { format: FORMAT });
+        // Everything that was dropped said why on the way past, and that list
+        // is the only thing an artist can act on — a bare "contains no layers"
+        // sent one looking for a corrupt file that was perfectly intact.
+        return Err(ImportError::Empty {
+            format: FORMAT,
+            because: ImportError::reasons_from(&warnings),
+        });
     }
 
     Ok(ImportedDocument {
@@ -541,7 +604,7 @@ pub(super) fn residency(
                 return None;
             }
             let Some((attribute, chunk)) = tables.offscreen(mipmap) else {
-                return Some(Err(row.no_pixels_reason().to_string()));
+                return Some(Err(row.no_pixels_reason().unwrap_or(NO_PIXELS).to_string()));
             };
             // `read_bitmap`'s own refusals are kept, packing included — the
             // survey has to describe the slices Umber would actually store,
@@ -556,11 +619,14 @@ pub(super) fn residency(
                     // the bug that made every real vector layer report a damaged
                     // file, and a survey that miscounts them miscounts what it
                     // could not measure.
+                    // Substituted only for the generic absence, exactly as
+                    // `build` does — a survey that reported a bounds refusal as
+                    // a placed image would miscount what it could not measure
+                    // *and* misname it.
                     Err(reason) => {
-                        return Some(Err(if row.kind == VECTOR_KIND {
-                            row.no_pixels_reason().to_string()
-                        } else {
-                            reason
+                        return Some(Err(match row.no_pixels_reason() {
+                            Some(named) if reason == NO_PIXELS => named.to_string(),
+                            _ => reason,
                         }));
                     }
                 };
@@ -754,6 +820,16 @@ struct LayerRow {
     /// `SpecialRenderType`, whose 20 is the **Paper** layer — the flat sheet
     /// Clip Studio puts under every new document. See [`LayerRow::paper`].
     special_render: i64,
+    /// `ResizableOriginalMipmap`: the chain holding the **source** picture of a
+    /// layer that is a placed image rather than paint.
+    ///
+    /// Non-zero only on a resizable-image layer, and it is the one column that
+    /// tells such a layer apart from a vector one — see
+    /// [`LayerRow::no_pixels_reason`], which read every one of them as a vector
+    /// layer until this was added. Nothing follows the chain: what it holds is
+    /// the picture *before* placement, and where the placement lives is
+    /// `ResizableImageInfo`, which is not read. See the module docs.
+    resizable_original: i64,
     /// `DrawColorMainRed`/`Green`/`Blue`, each `0..=u32::MAX` rather than a
     /// byte. Only meaningful on a layer that draws a flat colour.
     draw_colour: (i64, i64, i64),
@@ -790,6 +866,13 @@ const BITMAP_MAX_SIDE: u32 = 4 * ImportedDocument::MAX_DIMENSION;
 /// terms. 1024² is one megapixel, about 5 MB to inflate, which is the ceiling
 /// the pathological 1×1 canvas is held to.
 const BITMAP_AREA_FLOOR: u64 = 1024 * 1024;
+
+/// What is said where the absence of a layer's pixels has no cause this reader
+/// can name.
+///
+/// One statement of it, because [`read_bitmap`] produces the same sentence and
+/// the two must not drift into being different wordings of one condition.
+const NO_PIXELS: &str = "the file does not hold its pixels";
 
 /// `LayerType`'s value for a **vector** layer.
 ///
@@ -830,13 +913,62 @@ impl LayerRow {
     /// `LayerType` is the reading, and 0 is what a vector layer carries;
     /// `VectorNormalStrokeIndex` is set beside it on one that has been drawn
     /// on, but not on an empty one, so the type is the reliable half.
-    fn no_pixels_reason(&self) -> &'static str {
-        if self.kind == VECTOR_KIND {
-            "it is a vector layer, which Clip Studio stores as strokes rather \
-             than pixels; rasterise it in Clip Studio and save again to bring \
-             it across"
+    ///
+    /// **`LayerType == 0` is not enough on its own, and reading it as though it
+    /// were called a real document's every layer a vector layer.** A *placed
+    /// image* — an image file imported into a document and left resizable
+    /// rather than rasterised — carries `LayerType` 0 as well, has the same
+    /// empty render chain, and is a different thing with a different cause:
+    /// Clip Studio keeps the picture that was imported plus the size and
+    /// position it was given, and redraws it on demand. `ResizableOriginalMipmap`
+    /// is what tells the two apart, so it is asked **first**.
+    ///
+    /// Measured over the same 33 documents: 5 of the 28 layers this used to
+    /// call vector are placed images, and 4 of those 5 are every painted layer
+    /// of one document — which is exactly the file that was refused whole as
+    /// holding no layers.
+    ///
+    /// **The remedy is the same sentence and the cause is not**, which is the
+    /// point: Layer → Rasterize fixes both, and an artist told their imported
+    /// photograph is a vector layer has been told something false about their
+    /// own document.
+    /// **`None` is "this reader cannot name a cause", and it is an `Option` so
+    /// that the four sites which ask cannot disagree about which layers have
+    /// one.** Two of those sites reach this through a *generic* failure —
+    /// `read_bitmap` saying the chunk is absent — and each used to decide for
+    /// itself, by restating `kind == VECTOR_KIND`, whether to override that
+    /// sentence. That is two copies of the list of causes, and adding the
+    /// placed-image cause to one and not the other would have left every
+    /// placed image in a real document still reporting a damaged file, which is
+    /// precisely the bug the vector arm was added to fix, one revision later.
+    /// The fallback now lives at the call site and the *list* lives here once.
+    ///
+    /// **What is guarded and what is structural.** `build`'s two drop sites are
+    /// both driven —
+    /// `a_layer_that_names_no_rendered_bitmap_still_names_its_own_cause`
+    /// reaches the first and the placed-image and vector tests reach the
+    /// second — and both were demonstrated by mutation. `residency`'s two are
+    /// **not**: they are the survey path, they build no document, and a wrong
+    /// sentence there is a wrong row in a report rather than a wrong thing said
+    /// to an artist. So the `Option` makes all four agree by construction and
+    /// tests hold two of them; do not read the first sentence as claiming more.
+    fn no_pixels_reason(&self) -> Option<&'static str> {
+        if self.resizable_original != 0 {
+            Some(
+                "it is an image placed into the document rather than painted, so \
+                 Clip Studio keeps the picture that was imported and redraws it at \
+                 the size and position you gave it instead of saving it as pixels; \
+                 select it in Clip Studio, use Layer then Rasterize, and save again \
+                 to bring it across",
+            )
+        } else if self.kind == VECTOR_KIND {
+            Some(
+                "it is a vector layer, which Clip Studio stores as strokes rather \
+                 than pixels; rasterise it in Clip Studio and save again to bring \
+                 it across",
+            )
         } else {
-            "the file does not hold its pixels"
+            None
         }
     }
 
@@ -939,6 +1071,7 @@ impl Tables {
                         int("LayerMaskOffscrOffsetY"),
                     ),
                     special_render: int("SpecialRenderType"),
+                    resizable_original: int("ResizableOriginalMipmap"),
                     draw_colour: (
                         int("DrawColorMainRed"),
                         int("DrawColorMainGreen"),
@@ -1206,7 +1339,7 @@ fn build(
     let Some((attribute, chunk)) = tables.offscreen(row.render_mipmap) else {
         warnings.push(ImportWarning::LayerSkipped {
             layer: name,
-            reason: row.no_pixels_reason().to_string(),
+            reason: row.no_pixels_reason().unwrap_or(NO_PIXELS).to_string(),
         });
         return None;
     };
@@ -1229,13 +1362,24 @@ fn build(
             // at, because the strokes were never rasterised into a block. So
             // the honest sentence has to be reached from both sites, and
             // guarding only the earlier one left every real vector layer still
-            // reporting a file with something missing.
+            // reporting a file with something missing. A **placed image** is
+            // the same shape for a different reason and arrives here too.
             warnings.push(ImportWarning::LayerSkipped {
                 layer: name,
-                reason: if row.kind == VECTOR_KIND {
-                    row.no_pixels_reason().to_string()
-                } else {
-                    reason
+                // **Only the generic absence is replaced**, which is narrower
+                // than substituting on the row's kind alone. `read_bitmap` also
+                // refuses a bitmap whose shape will not read or whose packing
+                // it does not know, and those are statements about *this*
+                // bitmap that the layer's kind does not override — telling
+                // somebody whose placed image met a bounds refusal to go and
+                // rasterise it is a remedy for a cause they did not meet. No
+                // layer in the 33 real documents reaches here with anything but
+                // `NO_PIXELS`, so nothing observable moved; what changed is
+                // that the claim is checked against the failure rather than
+                // assumed from the row.
+                reason: match row.no_pixels_reason() {
+                    Some(named) if reason == NO_PIXELS => named.to_string(),
+                    _ => reason,
                 },
             });
             return None;
@@ -1389,7 +1533,7 @@ fn read_bitmap<'a>(
     let data = container
         .external
         .get(chunk)
-        .ok_or_else(|| "the file does not hold its pixels".to_string())?;
+        .ok_or_else(|| NO_PIXELS.to_string())?;
     Ok((bitmap, packing, data))
 }
 
@@ -1945,6 +2089,207 @@ mod tests {
         assert_eq!(doc.layers[0].name, "Ink");
     }
 
+    /// **A placed image is not a vector layer**, and calling it one told an
+    /// artist something false about their own document.
+    ///
+    /// Both carry `LayerType` 0 and neither has a rendered bitmap, so the type
+    /// alone cannot tell them apart — and the reader read the type alone. Over
+    /// the 33 real documents, 5 of the 28 layers it called vector are placed
+    /// images, and 4 of those 5 are every painted layer of one file.
+    ///
+    /// The distinguishing evidence is `ResizableOriginalMipmap`, and the
+    /// fixture writes the real shape: a full render chain with its chunk
+    /// withheld, beside a resizable-original chain whose pixels are present.
+    #[test]
+    fn a_placed_image_is_named_as_one_rather_than_as_a_vector_layer() {
+        let bytes = fixtures::clip(
+            64,
+            64,
+            &[
+                ClipLayer::flat("Ink", 64, 64, [255, 0, 0, 255]),
+                ClipLayer::placed_image("Photo", 64, 64),
+            ],
+        );
+        let doc = read(&bytes).expect("a document");
+
+        let said: Vec<String> = doc.warnings.iter().map(|w| w.to_string()).collect();
+        let about = said
+            .iter()
+            .find(|s| s.contains("Photo"))
+            .unwrap_or_else(|| panic!("nothing said about the placed image: {said:?}"));
+        assert!(
+            about.contains("placed into the document"),
+            "it has to name the cause it actually met: {about}"
+        );
+        assert!(
+            !about.contains("vector layer"),
+            "this is the false diagnosis the column exists to prevent: {about}"
+        );
+        assert!(
+            about.contains("Rasterize"),
+            "the sentence has to say what to do about it: {about}"
+        );
+        assert!(
+            !about.contains("does not hold its pixels"),
+            "that wording reads as a damaged file: {about}"
+        );
+
+        // And nothing about the rest of the document moved.
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].name, "Ink");
+    }
+
+    /// **A document whose every layer was refused says why, and does not read
+    /// as a damaged file.**
+    ///
+    /// This is the artist's own document: an A4 page holding four images
+    /// placed on it and nothing else. Every layer is dropped for a reason the
+    /// reader knows and states, and the reasons live on
+    /// [`ImportedDocument::warnings`] — which never reaches the caller, because
+    /// there is no document to carry them. What the artist saw was "The Clip
+    /// Studio Paint file contains no layers", of a file that is perfectly
+    /// intact.
+    ///
+    /// The Paper sheet is in the fixture deliberately: it is taken out before
+    /// the count, so a document of paper-plus-refusals is exactly the shape
+    /// that reaches this refusal in the real file.
+    #[test]
+    fn a_document_of_nothing_but_refused_layers_says_why_it_was_refused() {
+        let bytes = fixtures::clip(
+            64,
+            64,
+            &[
+                ClipLayer::paper([255, 255, 255]),
+                ClipLayer::placed_image("Illustration", 64, 64),
+                ClipLayer::placed_image("Illustration 2", 64, 64),
+                ClipLayer::vector("Lines", 64, 64),
+            ],
+        );
+        let err = read(&bytes).expect_err("nothing paintable in it");
+        let said = err.to_string();
+
+        assert!(
+            !said.contains("contains no layers"),
+            "that is the sentence that reads as a corrupt file: {said}"
+        );
+        assert!(
+            said.contains("Umber read this Clip Studio Paint file"),
+            "saying the file was read is what stops it reading as damage: {said}"
+        );
+        // **And it must not go further than that.** Some reasons a layer is
+        // refused do mean the file may be damaged — "Umber could not read the
+        // shape of its bitmap" is one, and `openraster`'s "it names no image
+        // file" is another whose own comment calls the file malformed — and
+        // this heading is shared by every one of them, so a claim that the
+        // document is intact would be false in exactly the case an artist most
+        // needs the truth.
+        assert!(
+            !said.contains("not damaged") && !said.contains("intact"),
+            "the heading may not promise something its reasons can contradict: {said}"
+        );
+        // Both causes, counted, and each said once rather than once per layer.
+        // The count trails the reason so that a plural tally does not sit in
+        // front of a clause written with a singular subject.
+        assert!(
+            said.contains("It is an image placed into the document"),
+            "the reason stands as its own sentence: {said}"
+        );
+        assert!(
+            said.contains("(2 layers.)"),
+            "the two placed images are one sentence with a count: {said}"
+        );
+        assert!(
+            said.contains("It is a vector layer"),
+            "and the vector layer keeps its own cause: {said}"
+        );
+        assert!(
+            said.contains("(one layer.)"),
+            "one is spelled out, as it is everywhere else: {said}"
+        );
+        assert!(
+            !said.contains("layers: it is") && !said.contains("layer: it is"),
+            "a plural tally must not head a singular clause: {said}"
+        );
+        assert!(
+            said.contains("Rasterize"),
+            "every cause here has a remedy and it has to survive: {said}"
+        );
+        // The Paper sheet became the background, so it is not a refused layer
+        // and must not be named as one.
+        assert!(
+            !said.to_lowercase().contains("paper"),
+            "the background is not a layer that was refused: {said}"
+        );
+    }
+
+    /// **The reader's *first* drop site names a cause too, and nothing reached
+    /// it.**
+    ///
+    /// A layer whose bitmap is missing can fail in two places: naming no render
+    /// mipmap at all, or naming one whose external chunk is absent. Every
+    /// fixture in this file took the second route, because they all write a
+    /// chain and withhold only the chunk — which is right, and left the first
+    /// site covered by nothing. Demonstrated by mutation: replacing that site's
+    /// whole sentence with a marker string left all 1,120 tests green.
+    ///
+    /// Both kinds are driven, because the two arms of `no_pixels_reason` are
+    /// what the site has to route between and a fixture carrying one of them
+    /// would test the arm it happened to pick.
+    #[test]
+    fn a_layer_that_names_no_rendered_bitmap_still_names_its_own_cause() {
+        // `kind` 0 with no resizable original is a vector layer; a placed image
+        // cannot reach this site, since it is `flat`-derived and so always has
+        // a chain.
+        let bytes = fixtures::clip(
+            8,
+            8,
+            &[
+                ClipLayer::flat("Ink", 8, 8, [255, 0, 0, 255]),
+                ClipLayer::no_render_bitmap("Lines", VECTOR_KIND),
+                // `kind` 1 is an ordinary raster layer, which has no cause this
+                // reader can name — so it must fall back rather than borrow
+                // somebody else's sentence.
+                ClipLayer::no_render_bitmap("Blank", LAYER_IS_PIXEL),
+            ],
+        );
+        let doc = read(&bytes).expect("a document");
+        let said: Vec<String> = doc.warnings.iter().map(ToString::to_string).collect();
+
+        let lines = said
+            .iter()
+            .find(|s| s.contains("Lines"))
+            .unwrap_or_else(|| panic!("nothing said about it: {said:?}"));
+        assert!(
+            lines.contains("vector layer"),
+            "the first site has to name the cause the second one does: {lines}"
+        );
+        let blank = said
+            .iter()
+            .find(|s| s.contains("Blank"))
+            .unwrap_or_else(|| panic!("nothing said about it: {said:?}"));
+        assert!(
+            blank.contains(NO_PIXELS),
+            "and fall back where there is no cause to name: {blank}"
+        );
+    }
+
+    /// A refusal with nothing to explain reads exactly as it always did.
+    ///
+    /// The `because` list is an addition, not a replacement: a document that is
+    /// genuinely empty has no reasons to give, and inventing a heading over an
+    /// empty list would be a message about nothing.
+    #[test]
+    fn a_document_refused_with_no_reasons_keeps_the_plain_sentence() {
+        let err = ImportError::Empty {
+            format: FORMAT,
+            because: Vec::new(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "The Clip Studio Paint file contains no layers."
+        );
+    }
+
     /// **A document filed into folders is not charged for its filing**, which
     /// is the bug an artist met: a 15000×5000 `.clip` refused with "the canvas
     /// is larger than Umber can open", a canvas well inside `MAX_DIMENSION`.
@@ -2498,6 +2843,7 @@ mod tests {
                 mask_offset: (0, 0),
                 mask_offscreen_offset: (0, 0),
                 special_render: 0,
+                resizable_original: 0,
                 draw_colour: (0, 0, 0),
             }
         }
@@ -2667,6 +3013,7 @@ mod tests {
             mask_offset: (0, 0),
             mask_offscreen_offset: (0, 0),
             special_render: 0,
+            resizable_original: 0,
             draw_colour: (0, 0, 0),
         }
     }

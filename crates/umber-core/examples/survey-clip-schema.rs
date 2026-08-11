@@ -39,6 +39,12 @@ use std::path::PathBuf;
 
 use umber_core::sqlite::{Database, Table, Value};
 
+/// Every `CHNKExta` in the container, as its `extrnlid…` name and its length.
+type Directory = Vec<(String, usize)>;
+
+/// Where the `CHNKSQLi` payload sits in the file, as a half-open byte range.
+type DatabaseSpan = Option<(usize, usize)>;
+
 /// The chunk directory: which `extrnlid…` names the container holds, and how
 /// many bytes each carries.
 ///
@@ -47,7 +53,7 @@ use umber_core::sqlite::{Database, Table, Value};
 /// alternative — widening a reader's API so an example can see inside it — is
 /// the drift this codebase refuses elsewhere. What is duplicated is thirty
 /// lines of framing that no pixel depends on; nothing here decides a pixel.
-fn chunks(bytes: &[u8]) -> (Vec<(String, usize)>, Option<(usize, usize)>) {
+fn chunks(bytes: &[u8]) -> (Directory, DatabaseSpan) {
     let be64 = |at: usize| -> Option<usize> {
         let raw = bytes.get(at..at.checked_add(8)?)?;
         usize::try_from(u64::from_be_bytes(raw.try_into().ok()?)).ok()
@@ -128,7 +134,10 @@ fn main() {
             continue;
         };
         let rows = db.rows(&table).map(|r| r.len()).unwrap_or(0);
-        println!("  {name:<28} {rows:>6} rows, {} columns", table.columns().len());
+        println!(
+            "  {name:<28} {rows:>6} rows, {} columns",
+            table.columns().len()
+        );
     }
     println!();
 
@@ -176,9 +185,7 @@ fn main() {
     println!();
 
     let rows_of = |t: &Option<Table>| -> Vec<umber_core::sqlite::Row> {
-        t.as_ref()
-            .and_then(|t| db.rows(t).ok())
-            .unwrap_or_default()
+        t.as_ref().and_then(|t| db.rows(t).ok()).unwrap_or_default()
     };
     let mipmap_rows = rows_of(&mipmap);
     let info_rows = rows_of(&info);
@@ -264,7 +271,11 @@ fn main() {
         println!("no Layer table");
         return;
     };
-    println!("Layer columns ({}): {:?}\n", layers.columns().len(), layers.columns());
+    println!(
+        "Layer columns ({}): {:?}\n",
+        layers.columns().len(),
+        layers.columns()
+    );
     let layer_rows = db.rows(&layers).expect("its Layer table could be read");
 
     for row in &layer_rows {
