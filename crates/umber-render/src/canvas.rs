@@ -6828,8 +6828,14 @@ impl CanvasRenderer {
                 | EffectShape::Raw => false,
             };
         }
-        let holding_unwanted =
-            (scratch.seeds.is_some() && !wants_seeds) || (scratch.band.is_some() && !wants_band);
+        // Nothing to bake at all is the case `forget_all` does not cover: it
+        // runs when the *document* holds no effect, and a document whose every
+        // effect is on a hidden layer holds several. The working set's four
+        // mandatory planes are 400 MB at 100 Mpx, for a bake that is not going
+        // to happen until something is shown again.
+        let holding_unwanted = drawn.is_empty()
+            || (scratch.seeds.is_some() && !wants_seeds)
+            || (scratch.band.is_some() && !wants_band);
         if holding_unwanted {
             self.effects.scratch = None;
         }

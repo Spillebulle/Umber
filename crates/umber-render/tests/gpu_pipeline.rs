@@ -6222,11 +6222,35 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
 
     // (45, 32) is inside where the shadow would have fallen and clear of the
     // square, so it is the pixel that would move if any of this were unsound.
-    for (x, y) in [(45, 32), (32, 32), (24, 24), (0, 0)] {
+    let probes = [(45, 32), (32, 32), (24, 24), (0, 0)];
+    for (x, y) in probes {
         assert_eq!(
             h.composite_pixel(&baked.draws, x, y),
             h.composite_pixel(&plain, x, y),
             "the picture moved at ({x}, {y}) when the effect was elided"
+        );
+    }
+
+    // **And the elision itself is what has to be shown safe.** The loop above
+    // compares two lists that are equal whenever the code is right, so on its
+    // own it agrees with itself. This drives `composite.wgsl` directly instead:
+    // an effect draw of a hidden layer, present and invisible, over a slice full
+    // of ink loud enough that any leak would be obvious, against the same stack
+    // with it taken out. If an invisible unclipped draw could ever reach `acc`
+    // or leave `clip_alpha` somewhere the layer's own draw does not, this is
+    // where it shows.
+    h.write_block(3, WHOLE, [0, 255, 0, 255]);
+    let ghost = LayerDraw {
+        visible: false,
+        ..layer(3, 1.0, BlendMode::Normal)
+    };
+    let with_ghost = [floor, ghost, hidden, clipped];
+    for (x, y) in probes {
+        assert_eq!(
+            h.composite_pixel(&with_ghost, x, y),
+            h.composite_pixel(&plain, x, y),
+            "an invisible effect draw was not free at ({x}, {y}), so eliding \
+             one is not free either"
         );
     }
 
