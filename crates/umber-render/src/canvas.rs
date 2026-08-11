@@ -3257,38 +3257,46 @@ impl CanvasRenderer {
     ///   is unclipped rather than one clipped to the wrong place — but it also
     ///   leaves the outline on screen describing nothing, so do not forget.
     ///
-    /// # A known limitation: this carries the old canvas's slice count
+    /// # `live` is the slice count the new array is built at
     ///
-    /// **The array is rebuilt at `self.layers.capacity`, and that figure was
-    /// decided against the canvas being left behind.** [`grown_capacity`] keeps
-    /// speculative slices under [`GROWTH_DOUBLING_BUDGET_BYTES`], but the budget
-    /// is in *bytes* and a resize changes what a slice costs, so a capacity that
-    /// was inside it stops being. A 512² document legitimately holding 256
-    /// slices is 256 MiB; resized to 2048² it is **4.29 GB**, and to 10000²,
-    /// **102.4 GB** — the same figures the growth rule exists to prevent,
-    /// arrived at through a dialog instead. It predates that rule and is not
-    /// caused by it.
+    /// **`LayerStack::slot_capacity_needed()`**, threaded in from
+    /// `App::apply_canvas` — not `Editor::apply_canvas`, which shares the name,
+    /// returns a `bool` and never touches a renderer. This used to rebuild at
+    /// `self.layers.capacity`, a figure decided against the canvas being left
+    /// behind: [`grown_capacity`] keeps speculative slices under
+    /// [`GROWTH_DOUBLING_BUDGET_BYTES`], but the budget is in *bytes* and a
+    /// resize changes what a slice costs, so a capacity that was inside it stops
+    /// being. A 512² document legitimately holding 256 slices is 256 MiB;
+    /// resized to 2048² it was **4.29 GB**, and to 10000², **102.4 GB** — the
+    /// figures the growth rule exists to prevent, arrived at through a dialog
+    /// instead.
     ///
-    /// **It is not fixed here because it cannot be, from inside this method.**
-    /// Shrinking means allocating fewer slices than the array holds, and this
-    /// type does not know which of them hold pixels — `LayerStack` does. A
-    /// resize that guessed would drop layers, which is far worse than holding
-    /// memory, so it deliberately holds memory.
+    /// **The renderer cannot work `live` out for itself, which is why it is a
+    /// parameter.** Shrinking means allocating fewer slices than the array
+    /// holds, and this type does not know which of them hold pixels —
+    /// `LayerStack` does, and a resize that guessed would drop layers.
     ///
-    /// A fix needs the live slot count threaded in from the caller. That is
-    /// **`App::apply_canvas`**, the one production call site, which reaches it
-    /// as `self.editor.layers.slot_capacity_needed()`; not
-    /// `Editor::apply_canvas`, which shares the name, returns a `bool` and never
-    /// touches a renderer. With it this could rebuild at
-    /// `grown_capacity(0, live, slice_bytes(new_size))` and copy only that
-    /// depth. It is a signature change through one call site and it belongs in
-    /// a branch about resizing rather than one about growth.
+    /// **Why `slot_capacity_needed()` really does describe the array here, when
+    /// `docs/perf/slot-lifecycle-and-vram.md` §5.1 says it does not in
+    /// general.** Two things sit *above* it: the slice a floating transform
+    /// previews into, and every effect slice. This method has already given both
+    /// back before it allocates — `end_float` and `EffectCache::forget_all` are
+    /// called above, in that order and deliberately before the rebuild rather
+    /// than after it. So this is the one moment in the program when the model's
+    /// claim count is the whole of what the array has to hold, and it is the one
+    /// shrink with **no transient at all**: a resize allocates a fresh array
+    /// whatever happens, so shrinking makes that peak smaller rather than
+    /// larger. Do not copy this reasoning to a shrink anywhere else.
+    ///
+    /// The copy depth is `min(old, new)`. Copying slices that are about to be
+    /// discarded is the same waste in traffic that the capacity is in bytes.
     pub fn resize(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         new_size: UVec2,
         anchor: Anchor,
+        live: u32,
     ) {
         let new_size = new_size.max(UVec2::ONE);
         if new_size == self.doc_size {
@@ -3306,6 +3314,17 @@ impl CanvasRenderer {
         // set, whose textures are the old canvas's size — and the bind groups
         // with it, which name a layer array this method is about to replace.
         self.effects.forget_all();
+        // Its base and its floating copy are canvas-sized and its rectangles
+        // name pixels that no longer exist. Thrown away rather than resampled,
+        // for the reason the scratch is: a half-finished gesture has no meaning
+        // at a new size, and the caller owes this no stroke and no float in
+        // flight anyway.
+        //
+        // **Before the rebuild, with `forget_all` above it.** Both are what make
+        // `live` an honest description of the new array — see the note on that
+        // parameter. Moved up from below the copy for exactly that reason;
+        // nothing else about the float depends on where this runs.
+        self.end_float();
         let plan = CanvasCopy::plan(self.doc_size, new_size, anchor);
         log::info!(
             "resizing canvas {} x {} -> {} x {}, {anchor:?}",
@@ -3315,13 +3334,19 @@ impl CanvasRenderer {
             new_size.y,
         );
 
-        let resized = LayerStore::new(device, new_size, self.layers.capacity);
+        // The growth rule, asked afresh against what a slice costs at the *new*
+        // size. `.min(MAX_SLOTS)` for the reason `ensure_slots` has one: this is
+        // the other place a slice index is decided, and a capacity past the
+        // device's ceiling is a validation error rather than a wrong picture.
+        let capacity = grown_capacity(0, live, slice_bytes(new_size)).min(MAX_SLOTS as u32);
+        let resized = LayerStore::new(device, new_size, capacity);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("resize-canvas"),
         });
         for view in &resized.slot_views {
             clear_view(&mut enc, view, "clear-resized-slot");
         }
+        let carried = self.layers.capacity.min(capacity);
         enc.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.layers.texture,
@@ -3346,7 +3371,7 @@ impl CanvasRenderer {
             wgpu::Extent3d {
                 width: plan.size.x,
                 height: plan.size.y,
-                depth_or_array_layers: self.layers.capacity,
+                depth_or_array_layers: carried,
             },
         );
         queue.submit(Some(enc.finish()));
@@ -3371,12 +3396,6 @@ impl CanvasRenderer {
         self.clear_stroke(&mut enc);
         queue.submit(Some(enc.finish()));
 
-        // Its base and its floating copy are canvas-sized and its rectangles
-        // name pixels that no longer exist. Thrown away rather than resampled,
-        // for the reason the scratch is: a half-finished gesture has no meaning
-        // at a new size, and the caller owes this no stroke and no float in
-        // flight anyway.
-        self.end_float();
         // A sample recorded against the old canvas would be read back as if it
         // belonged to the new one.
         self.reset_probes();

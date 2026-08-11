@@ -4204,12 +4204,29 @@ impl UmberApp {
         self.stop_autosave_of(id);
         let doc = change.doc;
         let resized = self.editor.apply_canvas(doc);
+        // What the new array has to hold. Read *after* `apply_canvas`, which is
+        // what drops the selection and clears the history — neither of which
+        // moves a claim, but the number has to be the one the stack ends the
+        // command with rather than the one it started it with.
+        //
+        // A resize used to rebuild at the old canvas's slice count, so a 512²
+        // document holding 256 slices came back as 102.4 GB at 10000². See
+        // `CanvasRenderer::resize`; the float is already down (`finish_transform`
+        // above) and the renderer gives its effect slices back itself, so this
+        // figure really is the whole of what the array must carry.
+        let live = self.editor.layers.slot_capacity_needed();
 
         if let Some(gfx) = self.gfx.as_mut()
             && let Some(canvas) = gfx.canvases.get_mut(&id)
         {
             if resized {
-                canvas.resize(&gfx.gpu.device, &gfx.gpu.queue, doc.size, change.anchor);
+                canvas.resize(
+                    &gfx.gpu.device,
+                    &gfx.gpu.queue,
+                    doc.size,
+                    change.anchor,
+                    live,
+                );
             }
             canvas.set_background(doc.background);
         }

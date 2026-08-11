@@ -3319,6 +3319,7 @@ fn resizing_the_canvas_carries_the_artwork_to_its_anchor() {
         &h.gpu.queue,
         UVec2::splat(128),
         Anchor::Centre,
+        1,
     );
     assert_eq!(h.canvas.doc_size(), UVec2::splat(128));
 
@@ -3351,6 +3352,7 @@ fn cropping_a_canvas_keeps_the_anchored_corner() {
         &h.gpu.queue,
         UVec2::splat(32),
         Anchor::TopLeft,
+        1,
     );
     assert_eq!(h.canvas.doc_size(), UVec2::splat(32));
     assert_eq!(h.pixel_in(0, 8, 8)[3], 255, "the near mark should survive");
@@ -3371,6 +3373,7 @@ fn every_layer_moves_together_when_the_canvas_does() {
         &h.gpu.queue,
         UVec2::new(96, 96),
         Anchor::BottomRight,
+        2,
     );
 
     // Held at the bottom right, growing by 32 on each axis offsets by 32.
@@ -3395,6 +3398,7 @@ fn a_stroke_painted_after_a_resize_lands_where_it_is_aimed() {
         &h.gpu.queue,
         UVec2::splat(128),
         Anchor::TopLeft,
+        1,
     );
 
     h.stamp(&[dab(100.0, 100.0, 5.0, 1.0)]);
@@ -3405,6 +3409,58 @@ fn a_stroke_painted_after_a_resize_lands_where_it_is_aimed() {
         h.pixel_in(0, 60, 60)[3],
         0,
         "and it should not be elsewhere"
+    );
+}
+
+/// A resize rebuilds the array at the *live* slice count, not the one the old
+/// canvas happened to be holding.
+///
+/// The failure this guards is silent and enormous: a 512² document legitimately
+/// holding 256 slices is 256 MiB, and the same capacity carried onto a 10000²
+/// canvas is 102.4 GB. The document arrives at it through a dialog rather than
+/// through the growth rule, so nothing in `grown_capacity` can see it.
+///
+/// **It measures the capacity that was allocated**, which is the output, rather
+/// than restating the rule — and it drives the *shrink*, which is the direction
+/// the bug is in. A capacity of 64 was reachable here before this test existed;
+/// two live slices at 128² is a capacity of two.
+#[test]
+fn a_resize_rebuilds_at_the_live_slice_count_and_carries_the_picture() {
+    let mut h = harness_or_skip!();
+    // Deliberately far more than the document holds. `ensure_slots` never
+    // shrinks, so this is exactly the state a delete-then-add session leaves.
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 64);
+    assert_eq!(h.canvas.slot_capacity(), 64, "the array should have grown");
+
+    h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
+    h.stamp(&[dab(20.0, 20.0, 5.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(128),
+        Anchor::TopLeft,
+        2,
+    );
+
+    assert_eq!(
+        h.canvas.slot_capacity(),
+        2,
+        "the new array carried the old canvas's slice count"
+    );
+    // And the shorter copy still carried every slice that mattered: the depth
+    // is `min(old, new)`, so trimming the capacity must not trim the picture.
+    assert_near(
+        h.pixel_in(0, 20, 20),
+        [200, 40, 40],
+        2,
+        "slot 0 after a shrinking resize",
+    );
+    assert_eq!(
+        h.pixel_in(1, 20, 20)[3],
+        255,
+        "slot 1 after a shrinking resize"
     );
 }
 
@@ -4334,6 +4390,7 @@ fn a_capture_of_a_large_document_never_costs_a_frame() {
         &h.gpu.queue,
         UVec2::splat(BIG),
         Anchor::Centre,
+        1,
     );
     h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, LAYERS);
     let mut enc = h.encoder();
@@ -5580,6 +5637,7 @@ fn a_thumbnail_shows_the_layers_content_and_not_the_whole_canvas() {
         &h.gpu.queue,
         UVec2::splat(SIDE),
         Anchor::TopLeft,
+        1,
     );
 
     assert!(
