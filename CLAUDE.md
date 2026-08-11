@@ -2072,7 +2072,34 @@ when nobody asked for it.
   it.**
 - **A failure says so once and carries on.** A broken autosave must never
   become a dialog that reappears over somebody's canvas every five minutes, and
-  it must never stop somebody painting.
+  it must never stop somebody painting. **Two latches, not one**, and at most one
+  failure leaves any drain: that sentence was written for one *document* failing
+  repeatedly, and folding a dead writer into the same latch made the two kinds
+  compete for the run's single interruption. `collect` shows the last notice it
+  is handed and drops the rest, so two failures in one batch spent two latches to
+  show one dialog.
+- **A dead writer is respawned by dropping its sender, and told about once.**
+  `Autosave::writer` starts a thread only where `tx` is `None`, so `lose_writer`
+  clearing it *is* the respawn — and `Report::NoWriter` is what makes the
+  sentence honest, because a notice promising Umber will try again is a promise
+  only that clearing keeps. One variant covers a thread that died and one that
+  could not be started: they differ only in a detail the artist cannot act on,
+  and they are reachable one from the other, since a death clears `tx` precisely
+  so the next `send` starts a thread and *that* spawn can fail. The sentence says
+  "may not have been written", because "stopped" is false of a thread that never
+  ran and "was not written" is false when the writer died between jobs.
+- **The capture in flight is marked, not abandoned, and then thrown away.**
+  `flight` is what `capturing_id` answers with and `collect` reaches the
+  renderer's readback only through it, so clearing it strands the job for the
+  life of the renderer — the disowned-job bug `settle_capture` exists to undo. So
+  it is marked `doomed` and `finish` drops it. Sent on, it would reach a fresh
+  writer holding none of the slices the dead one ate, be refused as
+  `NotSupplied`, and come back as a `Report::Failed` naming the *document* — a
+  second interruption, blaming a painting for a thread's death.
+- **`send` logs and `poll` recovers, which is one owner rather than two.** The
+  disconnect on `rx` is the only evidence the artist is ever told from, so a
+  `send` that quietly replaced the pair would take the detection away from the
+  one place that reports it.
 - **The window's close is refused until every unsaved document is accounted
   for.** `WindowEvent::CloseRequested` used to exit on the spot. The prompt
   names each document rather than counting them, and recomputes the list every
@@ -3156,6 +3183,41 @@ The rules, and they are cheap:
   assumed, and the comment names the hole instead of claiming the array cannot
   be forgotten. The only complete fix is a macro deriving the enum and `ALL`
   from one list, judged against this codebase's taste for per-variant rustdoc.
+- **`try_recv` has three readings, and dropping one is how a dead worker becomes
+  silence.** `Empty` is "not yet"; `Disconnected` is "every sender is gone",
+  which for a worker channel can only be a panic in it. Two spellings collapse
+  them: `try_recv().ok()`, and `while let Ok(x) = rx.try_recv()`, which exits
+  identically on both. Both shipped. `Loading::take` was the first and left an
+  **uncancellable modal over every open tab for the life of the process** —
+  `editor.loading` is cleared from one place and only on a `Some`,
+  `tabs::loading` deliberately draws no Cancel, and no further wake ever arrives.
+  `Autosave::poll` was the second and was worse for being quiet: `writer`
+  respawns only where `tx.is_none()`, so a panicked thread left a live-looking
+  disconnected sender that was never replaced, every later capture ran in full
+  and paid its GPU readback, nothing was written for the rest of the run, and
+  `Report::Failed` — the one route to the artist — travelled down the same dead
+  channel. **The rule is `match`, not the spelling**: a grep for
+  `try_recv().ok()` finds one of those two and reads as complete. Six sites in
+  `umber-app`; `update::Updates::poll` and `textpanel::Fonts::poll` were right
+  all along and are the shape to copy.
+- **A worker's panic is not reported by the panicker, so the waiter must
+  notice.** `crash::report_panic` returns early for any thread that is not
+  `main`, correctly — a box saying Umber stopped would be false. What follows is
+  that a worker's channel is the *only* detector of its own worker's death.
+- **Noticing is half of it; something has to be looking.** The loop is
+  `ControlFlow::Wait`, so a reading nobody asks for is a reading nobody takes —
+  and a panic reaches none of a worker's own wakes. The wake therefore has to be
+  a **destructor**, which unwinding runs. And it has to fire **after** the sender
+  is dropped, or the woken frame reads `Empty` and sleeps again: a body local
+  declared first does *not* drop last, because a captured upvar is a field of the
+  closure environment and the environment goes after every body local. That was
+  asserted in a comment, was false, and was measured on both paths. Own the
+  sender in the guard and drop it inside `drop`, so the order is a property of
+  the type rather than of where a `let` sits.
+- **A flat array indexed by `enum as usize` is `Effect::rank`'s hazard in its
+  other form.** `complained: [bool; 2]` compiles for a third variant and panics
+  out of bounds on the frame path. Named fields plus an exhaustive accessor make
+  it a compile error asking where the new flag goes.
 - **A rule enforced by threading a parameter is enforced at the call sites that
   thread it, and the compiler will not tell you which those are.** A growth
   replaces the atlas texture, so its old-to-new copy has to be recorded into
@@ -5368,6 +5430,13 @@ parts that mattered are not the obvious ones.
   the same turn the commitment is made. That one is easy to get wrong because
   the promise *feels* discharged when the coordinator has been told, and the
   coordinator is the one who asked.
+- **A second critic earns its place on the *remedies*.** The first critic's six
+  findings on one branch were all real; its fix for one of them introduced a
+  **blocking defect of its own** — a `Drop` guard whose comment asserted a drop
+  order Rust does not have, which restored the very uncancellable modal the
+  branch existed to remove. Ask the second critic explicitly to check the
+  remedies as well as to look afresh, and settle a language-semantics claim with
+  a ten-line program rather than with confidence.
 - **A lead that says "no critic reviewed this" is worth more than one that says
   a review happened.** Several critics returned nothing at all this session,
   twice on one branch. The right response is to say so and run an independent
