@@ -89,7 +89,7 @@ impl Harness {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
         Some(Self {
@@ -735,6 +735,64 @@ fn smudged_dabs_still_do_not_compound() {
     );
 }
 
+/// A canvas too large to speculate on gives the per-dab colour scratch back
+/// when the stroke that used it ends, and the next smudge still paints.
+///
+/// 800 MB at 100 Mpx, held for the session after one smudging stroke. The
+/// threshold is `GROWTH_DOUBLING_BUDGET_BYTES` — this codebase's own test for
+/// "too large to guess on somebody's behalf" — which a real canvas reaches at
+/// about 8192². `set_speculation_limit` is how a document small enough to check
+/// by hand drives it, exactly as `set_readback_limit` drives the banded reader.
+///
+/// **Both directions, because either alone agrees with itself.** Under the
+/// limit the texture must survive, or an ordinary document reallocates a
+/// canvas-sized texture at the start of every blending stroke; over it the
+/// texture must go, *and the mark it makes afterwards must be unchanged*, which
+/// is the pixel this whole item is not allowed to move.
+#[test]
+fn a_large_canvas_gives_the_colour_scratch_back_when_a_stroke_ends() {
+    let mut h = harness_or_skip!();
+    let red = coloured_dab(32.0, 32.0, 12.0, 1.0, [1.0, 0.0, 0.0]);
+
+    // Under the limit: the ordinary case, and it must not change.
+    h.stamp_colored(&[red], true);
+    assert!(
+        h.canvas.holds_stroke_color(),
+        "a smudging stroke recorded no colour"
+    );
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+    let ordinary = h.pixel(32, 32);
+    assert_near(ordinary, [255, 0, 0], 4, "a smudged dab under the limit");
+    assert!(
+        h.canvas.holds_stroke_color(),
+        "an ordinary canvas gave the colour scratch back, so every blending \
+         stroke now reallocates one"
+    );
+
+    // Over it. Zero rather than a contrived figure: no canvas has a slice of
+    // no bytes, so this is "always too large" and says so.
+    h.canvas.set_speculation_limit(0);
+    let mut enc = h.encoder();
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+    assert!(
+        !h.canvas.holds_stroke_color(),
+        "a canvas too large to speculate on held the colour scratch anyway"
+    );
+
+    // And the next stroke paints the same mark, out of a texture that had to be
+    // allocated again.
+    h.fill(0, Color::from_srgb_u8(0, 0, 0, 0));
+    h.stamp_colored(&[red], true);
+    assert!(h.canvas.holds_stroke_color());
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+    assert_eq!(
+        h.pixel(32, 32),
+        ordinary,
+        "the mark moved when the colour scratch was reallocated"
+    );
+}
+
 #[test]
 fn later_dabs_win_the_colour_where_a_smudge_crosses_itself() {
     // Colour blends `over`, so a pixel ends up wearing the most recent dab that
@@ -974,7 +1032,7 @@ fn whole(h: &Harness) -> PixelRect {
 fn reset(h: &mut Harness) {
     let mut enc = h.encoder();
     h.canvas.clear_all_layers(&mut enc);
-    h.canvas.clear_stroke(&mut enc);
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
 }
 
@@ -3870,7 +3928,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     canvas.clear_all_layers(&mut enc);
-    canvas.clear_stroke(&mut enc);
+    canvas.clear_stroke(&gpu.device, &mut enc);
     canvas.draw_dabs(
         &gpu.device,
         &gpu.queue,
@@ -5040,7 +5098,7 @@ fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
         // Layer-texture form, and **every pixel of it is exactly valid
@@ -5384,7 +5442,7 @@ fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     canvas.clear_all_layers(&mut enc);
-    canvas.clear_stroke(&mut enc);
+    canvas.clear_stroke(&gpu.device, &mut enc);
     gpu.queue.submit(Some(enc.finish()));
 
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
@@ -5772,7 +5830,7 @@ fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
         .for_document(&h.gpu.device, UVec2::new(width, HEIGHT), 1);
     let mut enc = h.encoder();
     canvas.clear_all_layers(&mut enc);
-    canvas.clear_stroke(&mut enc);
+    canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
 
     let column: Vec<u8> = [255u8, 0, 0, 255].repeat(HEIGHT as usize);
@@ -6195,6 +6253,75 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
         h.canvas.effect_bakes() > before_bakes,
         "showing the layer again drew a shadow nothing had baked"
     );
+}
+
+/// A canvas too large to speculate on gives the effect working set's optional
+/// planes back once nothing wants them, and the picture is unchanged.
+///
+/// `ensure_effect_scratch` keeps the seed pair and the band plane once they have
+/// been allocated, because an effect whose spread is dragged crosses zero
+/// repeatedly. Sound at 2048², where the pair is 16 MB; at 100 Mpx it is 800 MB.
+///
+/// **Three readings and a pixel.** The seed pair arrives with a flooding effect,
+/// stays while the document still wants it, goes when the spread reaches zero,
+/// and the shadow the document then draws is byte for byte the shadow a document
+/// that never had a spread draws. The last is the one that matters: nothing here
+/// may move a pixel.
+#[test]
+fn a_large_canvas_gives_the_effect_working_set_back_when_nothing_wants_it() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    h.canvas.set_speculation_limit(0);
+
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let probes = [(45, 32), (32, 32), (24, 24)];
+
+    // The reference, taken before a seed pair has ever existed: a shadow with
+    // no spread needs no flood.
+    let flat = [shadow(Color::BLACK, 180.0, 12.0)];
+    let baked = h.bake(&[effected(draw, &flat)], 1);
+    assert!(
+        !h.canvas.effect_working_set().1,
+        "a shadow with no spread allocated a seed pair"
+    );
+    let reference: Vec<[u8; 4]> = probes
+        .iter()
+        .map(|(x, y)| h.composite_pixel(&baked.draws, *x, *y))
+        .collect();
+
+    // Give it a spread, which is what needs the flood and its seed pair.
+    let spread = [Effect {
+        spread: 4.0,
+        ..shadow(Color::BLACK, 180.0, 12.0)
+    }];
+    h.bake(&[effected(draw, &spread)], 1);
+    assert_eq!(
+        h.canvas.effect_working_set(),
+        (true, true, false),
+        "a flooding effect did not allocate the seed pair"
+    );
+
+    // Still wanted, so still held: this is not a per-frame drop.
+    h.bake(&[effected(draw, &spread)], 1);
+    assert_eq!(
+        h.canvas.effect_working_set(),
+        (true, true, false),
+        "the seed pair was dropped while an effect still wanted it"
+    );
+
+    // Spread back to zero: nothing wants the seeds, and on this canvas they go.
+    let baked = h.bake(&[effected(draw, &flat)], 1);
+    assert!(
+        !h.canvas.effect_working_set().1,
+        "a canvas too large to speculate on held the seed pair anyway"
+    );
+    for ((x, y), was) in probes.iter().zip(&reference) {
+        assert_eq!(
+            h.composite_pixel(&baked.draws, *x, *y),
+            *was,
+            "the shadow moved at ({x}, {y}) when the working set was trimmed"
+        );
+    }
 }
 
 /// **The second gate.** A drop shadow at Multiply multiplies against *the
@@ -7106,7 +7233,7 @@ fn a_cancelled_stroke_rebakes_the_effect_it_was_showing() {
     // Cancelled, not committed: the scratch is thrown away and the layer is
     // untouched.
     let mut enc = h.encoder();
-    h.canvas.clear_stroke(&mut enc);
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
     let before = h.canvas.effect_bakes();
     h.bake(&[effected(draw, &ring)], 1);

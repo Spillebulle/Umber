@@ -195,7 +195,7 @@ impl Graphics {
                 label: Some("init-document"),
             });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&self.gpu.device, &mut enc);
         self.gpu.queue.submit(Some(enc.finish()));
 
         self.canvases.insert(id, canvas);
@@ -470,7 +470,7 @@ impl UmberApp {
         let Some(rect) = bounds.to_pixels_clamped(self.editor.doc.size) else {
             // Stroke fell entirely outside the canvas — nothing to commit, but
             // the scratch surface may still hold dabs.
-            canvas.clear_stroke(&mut enc);
+            canvas.clear_stroke(&gfx.gpu.device, &mut enc);
             gfx.gpu.queue.submit(Some(enc.finish()));
             return;
         };
@@ -543,7 +543,7 @@ impl UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cancel-stroke"),
             });
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gfx.gpu.device, &mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
     }
 
@@ -617,7 +617,7 @@ impl UmberApp {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("begin-stroke"),
                 });
-            canvas.clear_stroke(&mut enc);
+            canvas.clear_stroke(&gfx.gpu.device, &mut enc);
             gfx.gpu.queue.submit(Some(enc.finish()));
         }
     }
@@ -2052,7 +2052,7 @@ impl UmberApp {
                 label: Some("clear"),
             });
         canvas.clear_layer(&mut enc, slot);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gfx.gpu.device, &mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
         // Undo entries reference pixels that no longer exist in any meaningful
         // sense; keeping them would let undo resurrect part of a cleared layer.
@@ -4959,7 +4959,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                 label: Some("init"),
             });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
         splash.show(splash::Stage::Fonts);

@@ -2268,6 +2268,23 @@ pub struct CanvasRenderer {
     /// 8192² canvas to reach.
     readback_limit: u64,
 
+    /// How large one layer slice may be before this renderer stops holding
+    /// anything **in case it is wanted again**.
+    ///
+    /// [`GROWTH_DOUBLING_BUDGET_BYTES`] — the same figure `grown_capacity` and
+    /// `initial_slots` refuse to speculate past, which is this codebase's own
+    /// test for "this canvas is too large to guess on somebody's behalf". Two
+    /// allocations answer to it, both lazy and both previously kept for the
+    /// document's life: the per-dab colour scratch, and the effect working set's
+    /// two optional planes. Under it nothing changes at all; above it the cost
+    /// of giving one back is one reallocation on the next stroke or the next
+    /// parameter change, which is latency and not a pixel.
+    ///
+    /// Held as a field for the reason [`Self::readback_limit`] is: the real
+    /// figure is reached at about 8192², which is more memory than a test should
+    /// ask a CI runner for. See [`Self::set_speculation_limit`].
+    speculation_limit: u64,
+
     dab_bind_group: wgpu::BindGroup,
     dab_uniforms: wgpu::Buffer,
     dab_instances: wgpu::Buffer,
@@ -3122,6 +3139,7 @@ impl CanvasRenderer {
                 .collect(),
             capture: None,
             readback_limit: device.limits().max_buffer_size,
+            speculation_limit: GROWTH_DOUBLING_BUDGET_BYTES,
             dab_bind_group,
             dab_uniforms,
             dab_instances,
@@ -3424,7 +3442,7 @@ impl CanvasRenderer {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("clear-resized-scratch"),
         });
-        self.clear_stroke(&mut enc);
+        self.clear_stroke(device, &mut enc);
         queue.submit(Some(enc.finish()));
 
         // A sample recorded against the old canvas would be read back as if it
@@ -3713,12 +3731,24 @@ impl CanvasRenderer {
 
     /// Give the stroke somewhere to record a colour per dab.
     ///
-    /// Allocated the first time a smudging stroke needs it and kept thereafter:
-    /// a painter who reaches for a blender once will reach for it again, and
-    /// re-allocating a document-sized texture per stroke would be a stutter at
-    /// exactly the wrong moment. The two bind groups that name it have to be
-    /// rebuilt, which is why this is not simply a lazy getter.
-    fn ensure_stroke_color(&mut self, device: &wgpu::Device) {
+    /// Allocated the first time a smudging stroke needs it, and kept thereafter
+    /// **while the canvas is small enough to speculate on**: a painter who
+    /// reaches for a blender once will reach for it again, and re-allocating a
+    /// document-sized texture per stroke would be a stutter at exactly the wrong
+    /// moment. Past [`Self::speculation_limit`] the texture is 800 MB and
+    /// `clear_stroke` gives it back, so this really does run once a stroke
+    /// there. The two bind groups that name it have to be rebuilt, which is why
+    /// this is not simply a lazy getter.
+    ///
+    /// **The fresh texture is cleared**, which it was not while this ran once a
+    /// session. Nothing reads it where no dab has landed — the coverage plane
+    /// and the colour plane are two attachments of the same pass, so a texel
+    /// with coverage has had a fragment write its colour, and the composite
+    /// scales the colour by that coverage — but "held over from the previous
+    /// stroke" is exactly what `clear_stroke` exists to prevent, and once this
+    /// can run per stroke the argument would have to be re-made every time
+    /// anything about the coverage blend moved.
+    fn ensure_stroke_color(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         if self.has_stroke_color {
             return;
         }
@@ -3727,6 +3757,7 @@ impl CanvasRenderer {
             .stroke_color
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.has_stroke_color = true;
+        clear_view(encoder, &self.stroke_color_view, "clear-stroke-colour");
 
         self.composite_bind_group = make_composite_bind_group(
             device,
@@ -3770,7 +3801,7 @@ impl CanvasRenderer {
         }
         let colored = style.per_dab_color;
         if colored {
-            self.ensure_stroke_color(device);
+            self.ensure_stroke_color(device, encoder);
         }
         let room = MAX_DABS_PER_FRAME.saturating_sub(self.dabs_this_frame as usize);
         if room == 0 {
@@ -3993,7 +4024,7 @@ impl CanvasRenderer {
         let blends = style.mode == BrushMode::Paint && !style.on_mask;
         if blends && style.blend != BlendMode::Normal {
             self.commit_blended(device, encoder, slot, pieces, style);
-            self.clear_stroke(encoder);
+            self.clear_stroke(device, encoder);
             self.touch_slot(slot);
             return;
         }
@@ -4047,7 +4078,7 @@ impl CanvasRenderer {
             }
         }
 
-        self.clear_stroke(encoder);
+        self.clear_stroke(device, encoder);
         self.touch_slot(slot);
     }
 
@@ -4279,11 +4310,62 @@ impl CanvasRenderer {
     /// Both halves of it. Leaving stale colour behind would be the same class
     /// of bug as leaving stale coverage: the next smudging stroke would pick up
     /// the previous one's smear wherever its own dabs had not yet reached.
-    pub fn clear_stroke(&self, encoder: &mut wgpu::CommandEncoder) {
+    ///
+    /// **Above [`Self::speculation_limit`] the colour half is given back rather
+    /// than wiped**, which is a stronger wipe and not a weaker one. This is the
+    /// one place every path that ends a stroke passes through — `commit_stroke`
+    /// finishes here on both its branches, and the app's cancel and its
+    /// stroke-fell-off-the-canvas path call it directly — so putting the release
+    /// here is what makes "a large canvas does not hold the colour scratch
+    /// between strokes" a property of one function rather than of three call
+    /// sites remembering. It takes a device for that and for nothing else.
+    pub fn clear_stroke(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         clear_view(encoder, &self.stroke_view, "clear-stroke");
-        if self.has_stroke_color {
-            clear_view(encoder, &self.stroke_color_view, "clear-stroke-colour");
+        if !self.has_stroke_color {
+            return;
         }
+        if self.may_speculate() {
+            clear_view(encoder, &self.stroke_color_view, "clear-stroke-colour");
+        } else {
+            self.release_stroke_color(device);
+        }
+    }
+
+    /// Give the per-dab colour scratch back.
+    ///
+    /// 800 MB at 100 Mpx, held for the session after one smudging stroke on the
+    /// reasoning that "a painter who reaches for a blender once will reach for
+    /// it again" — sound at 2048², where it is 32 MB, and speculation on
+    /// somebody's behalf at a size this codebase has already decided not to
+    /// speculate at. The cost of being wrong is one reallocation at the start of
+    /// the next smudging stroke, which is latency and not a pixel.
+    ///
+    /// Back to the 1x1 stand-in [`Self::with_shared`] starts with, not to
+    /// nothing: the bind group layout must not vary, so the binding has to be
+    /// filled whether or not a stroke is recording colour.
+    fn release_stroke_color(&mut self, device: &wgpu::Device) {
+        self.stroke_color = make_stroke_color_texture(device, UVec2::ONE);
+        self.stroke_color_view = self
+            .stroke_color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.has_stroke_color = false;
+        self.composite_bind_group = make_composite_bind_group(
+            device,
+            &self.shared.composite_layout,
+            &self.view_uniforms,
+            &self.layers.array_view,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
+        self.commit_bind_group = make_commit_bind_group(
+            device,
+            &self.shared.commit_layout,
+            &self.commit_uniforms,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
     }
 
     /// Wipe one layer.
@@ -6110,6 +6192,10 @@ impl CanvasRenderer {
             })
             .collect();
 
+        // And give back a working-set plane the document has stopped wanting,
+        // on a canvas too large to hold one in case.
+        self.trim_effect_scratch(&drawn);
+
         if self.effects.base != base {
             self.effects.forget_entries();
             self.effects.base = base;
@@ -6684,6 +6770,63 @@ impl CanvasRenderer {
         Ok(())
     }
 
+    /// Give the working set back where it is holding a plane **the document**
+    /// no longer wants, on a canvas too large to hold one in case.
+    ///
+    /// [`Self::ensure_effect_scratch`] keeps the two lazy planes once they have
+    /// been allocated, on the argument that an effect whose spread is dragged
+    /// crosses zero repeatedly. That argument is sound at 2048², where the seed
+    /// pair is 16 MB; at 100 Mpx it is 800 MB and the band plane another 100,
+    /// which is exactly the speculation [`Self::speculation_limit`] exists to
+    /// refuse. The whole working set goes rather than one plane, because the
+    /// bind groups name the views and rebuilding them is rebuilding it.
+    ///
+    /// **The question is what the *document* wants, not what this frame's bake
+    /// wants**, and that is the whole of why this is here rather than inside
+    /// `ensure_effect_scratch`. That one is handed the passes of the effects
+    /// that happen to be stale this frame, so a document with one flooding
+    /// effect and one plain one would drop the seed pair on every frame that
+    /// rebaked only the plain one and allocate it again on the next — 800 MB
+    /// each way, at the frame rate. Asked over `drawn` it moves only when a
+    /// parameter does.
+    ///
+    /// An effect the composite discards is not in `drawn`, so hiding the only
+    /// layer with a wide outline on it gives the seed pair back too.
+    fn trim_effect_scratch(&mut self, drawn: &[(usize, Effect)]) {
+        if self.may_speculate() {
+            return;
+        }
+        let Some(scratch) = self.effects.scratch.as_ref() else {
+            return;
+        };
+        // What `plan_effect` would ask for, read the same way it reads it: the
+        // flood is recorded where the reach is positive, and the band plane only
+        // for the one shape that needs two fields. An exhaustive `match` rather
+        // than `== EffectShape::Centre`, for the reason that planner gives — a
+        // sixth shape needing two fields would otherwise be silently told there
+        // was no band plane to be had.
+        let (mut wants_seeds, mut wants_band) = (false, false);
+        for (_, effect) in drawn {
+            let plan = effect_field(effect);
+            if plan.reach <= 0.0 {
+                continue;
+            }
+            wants_seeds = true;
+            wants_band |= match plan.shape {
+                EffectShape::Centre => true,
+                EffectShape::Dilate
+                | EffectShape::Outer
+                | EffectShape::Inner
+                | EffectShape::Raw => false,
+            };
+        }
+        let holding_unwanted =
+            (scratch.seeds.is_some() && !wants_seeds) || (scratch.band.is_some() && !wants_band);
+        if holding_unwanted {
+            self.effects.scratch = None;
+        }
+    }
+
     /// Build the canvas-sized working set if it is missing or the wrong shape.
     fn ensure_effect_scratch(&mut self, device: &wgpu::Device, seeds: bool, band: bool) {
         let stale = match self.effects.scratch.as_ref() {
@@ -7029,6 +7172,46 @@ impl CanvasRenderer {
     /// silently returns a sheared picture.
     pub fn set_readback_limit(&mut self, bytes: u64) {
         self.readback_limit = bytes;
+    }
+
+    /// Pretend a slice of this canvas costs more than it does, so the paths that
+    /// stop holding an allocation "in case" can be driven on a document small
+    /// enough to check by hand.
+    ///
+    /// Exists for the tests, like [`Self::set_readback_limit`], and for the same
+    /// reason: the real figure is a canvas of about 8192², where the colour
+    /// scratch alone is 1.07 GB. See [`Self::speculation_limit`].
+    pub fn set_speculation_limit(&mut self, bytes: u64) {
+        self.speculation_limit = bytes;
+    }
+
+    /// Is this canvas small enough to hold an allocation on the chance it is
+    /// wanted again?
+    ///
+    /// One reading, so the colour scratch and the effect working set cannot
+    /// answer differently. See [`Self::speculation_limit`].
+    fn may_speculate(&self) -> bool {
+        slice_bytes(self.doc_size) <= self.speculation_limit
+    }
+
+    /// Whether the per-dab colour scratch is allocated at canvas size.
+    ///
+    /// Observation only, and the only way a test can say that a large canvas
+    /// gave it back when a stroke ended — the same role
+    /// [`Self::effect_bakes`] plays for the bake.
+    pub fn holds_stroke_color(&self) -> bool {
+        self.has_stroke_color
+    }
+
+    /// Whether the effect working set is allocated at all, and whether it is
+    /// still holding its two optional planes.
+    ///
+    /// `(working set, seed pair, band plane)`. Observation only.
+    pub fn effect_working_set(&self) -> (bool, bool, bool) {
+        match self.effects.scratch.as_ref() {
+            None => (false, false, false),
+            Some(s) => (true, s.seeds.is_some(), s.band.is_some()),
+        }
     }
 
     /// Read a rectangle of one layer back to the CPU, for the undo stack.
