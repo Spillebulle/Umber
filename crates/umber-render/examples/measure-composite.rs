@@ -52,6 +52,10 @@
 //!   is therefore not a candidate; it is here to price the ceiling, because
 //!   without it a refusal of gather reads as "nothing can be done" when what the
 //!   run actually says is "not this way". [`HW_FAST_BODY`].
+//! - **prologue** — everything `tile_bilinear` does *except* read the atlas.
+//!   Timing only, like `table`, and it exists because `table`'s prologue is much
+//!   shorter than the real one, so "everything but the fetch" had never actually
+//!   been measured. [`PROLOGUE_BODY`].
 //!
 //! # Residency is the axis that can reverse the sign
 //!
@@ -179,15 +183,20 @@ enum Variant {
     /// therefore not a candidate on its own terms — it is here to price the
     /// ceiling the other two are measured against. See [`HW_FAST_BODY`].
     HwFast,
+    /// Everything `tile_bilinear` does **except read the atlas**: the whole
+    /// prologue, the page-table load, the fast-path test and both branches.
+    /// Timing only, like `table`. See [`PROLOGUE_BODY`].
+    Prologue,
 }
 
 impl Variant {
-    const ALL: [Variant; 5] = [
+    const ALL: [Variant; 6] = [
         Variant::Tiled,
         Variant::Sampled,
         Variant::Table,
         Variant::Gather,
         Variant::HwFast,
+        Variant::Prologue,
     ];
 
     fn label(self) -> &'static str {
@@ -197,6 +206,7 @@ impl Variant {
             Variant::Table => "table",
             Variant::Gather => "gather",
             Variant::HwFast => "hw-fast",
+            Variant::Prologue => "prologue",
         }
     }
 }
@@ -327,6 +337,67 @@ fn tile_bilinear(
 /// about *where* the rounding falls and a single frame on a single adapter is
 /// one sample of that. Read the column as a ceiling on what any fast-path
 /// change could buy, and nothing more.
+/// Everything `tile_bilinear` does except read the atlas, and why the table
+/// needed a second control beside `table`.
+///
+/// `table` was written to split the atlas's cost into "the dependent page-table
+/// read" and "the taps that hang off it", and §11.3 read the split off
+/// `sampled` minus `table`. That reading has a hole in it, and the `hw-fast`
+/// column is what exposed it: `table` does a **much shorter prologue** than the
+/// real fast path — one clamp and one integer divide, against a floor, two
+/// clamps, two divides, a comparison and the second branch — and `sampled` does
+/// no prologue at all. So "everything but the fetch" was never measured, and
+/// the difference between the shipped path and the pre-atlas one was being
+/// attributed entirely to the fetch by elimination.
+///
+/// This variant closes it. Same prologue, same page-table load, same fast-path
+/// test, both branches present, and no atlas read anywhere. The return is
+/// derived from the resolved atlas coordinate *and* the interpolation weights,
+/// so nothing the real path computes can be folded away as dead; its picture is
+/// meaningless and it is excluded from the checks for the reason `table` is.
+///
+/// Read the columns as: `prologue` is the loop, the ALU, the encode, the page
+/// table and the fast-path structure; `hw-fast` minus `prologue` is one atlas
+/// tap; `tiled` minus `prologue` is four `textureLoad`s and the hand lerp.
+const PROLOGUE_BODY: &str = r#"
+fn tile_bilinear(
+    atlas: texture_2d_array<f32>,
+    table: texture_2d_array<u32>,
+    slot: i32,
+    doc: vec2<f32>,
+    doc_size: vec2<i32>,
+    empty: vec4<f32>,
+) -> vec4<f32> {
+    let centred = doc - vec2<f32>(0.5);
+    let base = floor(centred);
+    let w = centred - base;
+    let hi = doc_size - vec2<i32>(1);
+    let lo = clamp(vec2<i32>(base), vec2<i32>(0), hi);
+    let up = clamp(vec2<i32>(base) + vec2<i32>(1), vec2<i32>(0), hi);
+
+    let t_lo = lo / TILE;
+    let t_up = up / TILE;
+    if (t_lo.x == t_up.x && t_lo.y == t_up.y) {
+        let entry = textureLoad(table, t_lo, slot, 0).r;
+        if (entry == TILE_UNBACKED) {
+            return empty;
+        }
+        let at = tile_atlas_texel(entry, lo, t_lo);
+        // Depends on the resolved coordinate, on the page and on both weights,
+        // so none of the work above is dead.
+        let k = f32(at.x + at.y + i32(entry >> TILE_PAGE_SHIFT));
+        return vec4<f32>(fract(k * 0.001 + w.x * 0.5 + w.y * 0.25) * 0.25);
+    }
+
+    let e00 = textureLoad(table, vec2<i32>(lo.x, lo.y) / TILE, slot, 0).r;
+    let e10 = textureLoad(table, vec2<i32>(up.x, lo.y) / TILE, slot, 0).r;
+    let e01 = textureLoad(table, vec2<i32>(lo.x, up.y) / TILE, slot, 0).r;
+    let e11 = textureLoad(table, vec2<i32>(up.x, up.y) / TILE, slot, 0).r;
+    let mixed = (e00 ^ e10 ^ e01 ^ e11) & 255u;
+    return vec4<f32>(f32(mixed) * (0.25 / 255.0) + (w.x + w.y) * 0.001);
+}
+"#;
+
 const HW_FAST_BODY: &str = r#"
 fn tile_bilinear(
     atlas: texture_2d_array<f32>,
@@ -432,6 +503,7 @@ fn shader_source(variant: Variant, page: UVec2) -> String {
         .to_string(),
         Variant::Gather => GATHER_BODY.to_string(),
         Variant::HwFast => HW_FAST_BODY.to_string(),
+        Variant::Prologue => PROLOGUE_BODY.to_string(),
     };
     format!(
         "{}{}{}{}{}",
@@ -1491,13 +1563,14 @@ fn sweep_canvas(
     // ---- the sweep ------------------------------------------------------
     println!();
     println!(
-        "  {:<6} {:<5} {:<8} {:>11} {:>11} {:>11} {:>11} {:>11} {:>8} {:>8} {:>8}",
+        "  {:<6} {:<5} {:<8} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>8} {:>8} {:>8}",
         "zoom",
         "lyrs",
         "residency",
         "tiled ms",
         "gather ms",
         "hw-fast ms",
+        "prologue ms",
         "sampled ms",
         "table ms",
         "tiled/s",
@@ -1559,9 +1632,17 @@ fn sweep_canvas(
                     target_view,
                     plan,
                 ));
+                let prologue = summarise(time_cell(
+                    gpu,
+                    find_pipeline(Variant::Prologue),
+                    bg,
+                    target_view,
+                    plan,
+                ));
                 println!(
                     "  {:<6} {:<5} {:<8} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} \
-                     {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>7.2}x {:>7.2}x {:>7.2}x",
+                     {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} {:>7.3} ±{:<3.0} \
+                     {:>7.2}x {:>7.2}x {:>7.2}x",
                     zoom.label(),
                     layers,
                     residency.label(),
@@ -1571,6 +1652,8 @@ fn sweep_canvas(
                     spread_pct(&gather),
                     hw_fast.median,
                     spread_pct(&hw_fast),
+                    prologue.median,
+                    spread_pct(&prologue),
                     sampled.median,
                     spread_pct(&sampled),
                     table.median,
