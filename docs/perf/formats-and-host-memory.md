@@ -747,6 +747,18 @@ and the accumulation.
    three quarters again, because a forked mask is read back at 1 B/px rather
    than 1.33. The figure is right; it was right for the wrong design.)*
 
+**What has been built, as of Stage 4.** Fix (2) is done and fix (1)'s
+*interface* is done — `docformat::Canvas`/`Canvases`, the entry-at-a-time form
+this section called the only real interface change here — but **the table above
+still stands for the autosave**, and the reason is worth being exact about.
+`DocumentCapture` arrives whole from `CanvasRenderer::take_capture`, so the
+twenty-four slices are resident before the writer thread starts; what fix (2)
+removed is the two rows *under* them, the accumulated PNGs and the whole
+archive. Encoding a slice as it comes home needs the renderer to release
+finished slices one at a time, which is `canvas.rs` and therefore Stage 3's.
+Fix (3) is §5's and is handed to the atlas. `docs/perf/roadmap.md`'s Stage 4
+entry records the same split.
+
 ### 10.2 The explicit Save — the same shape, synchronously
 
 `app.rs` builds `pixels: Vec<Vec<u8>>` and `masks: Vec<Option<Vec<u8>>>` by
@@ -756,6 +768,14 @@ and quotes 2048² figures ("16 MB each ... a few hundred megabytes"); at the
 reference canvas the same sentence reads **10 GB**. Fix (1) above serves both
 paths, which is the argument for doing it once in `docformat` rather than twice
 at the call sites.
+
+**Done.** `SaveSource` reads one slice off the GPU as the archive reaches it,
+so nothing here follows the layer count any more. What is resident per layer is
+the fetched buffer *and* `trim`'s content-rectangle copy — the row this section
+already listed separately — so it is about two canvases rather than one, and
+`crates/umber-core/tests/save_peak.rs` is what measures it rather than
+reasoning about it: 27 KB per extra layer, which is an XML element and a ZIP
+directory record and nothing canvas-sized.
 
 ### 10.3 Export
 

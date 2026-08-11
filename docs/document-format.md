@@ -458,13 +458,25 @@ Written, read back, and asserted on in `docformat`'s tests:
 
 ## Failure, and not losing work
 
-The archive is built whole in memory and written to a temporary neighbour
-(`sketch.ora.saving`), which is then renamed into place. A save that fails
-halfway — a full disk, a pulled drive — would otherwise leave a truncated
+The archive is **streamed into** a temporary neighbour
+(`sketch.ora.saving-<pid>-<n>`), which is then renamed into place. A save that
+fails halfway — a full disk, a pulled drive — would otherwise leave a truncated
 archive where the artist's last good version used to be, which is the one
 failure a save must not have.
 
-Refusals happen before anything is written:
+Both details of that sentence used to read differently and each changed for a
+reason. It said the archive was **built whole in memory**, which cost N+1
+canvases plus every layer's PNG plus the archive itself — ten gigabytes on the
+documents `docs/perf/formats-and-host-memory.md` argues from — and
+`docformat::encode` still does that for callers that genuinely want the bytes.
+And the temporary was `sketch.ora.saving`, one name for every writer of that
+file, which was safe only while the window between creating it and renaming it
+was a single write: it is now the whole encode, and two writers of one document
+sharing a name truncate each other's work.
+
+Refusals happen before anything is written, or — for a buffer the writer
+*fetches* rather than being handed — at the moment it is asked for, which is
+still before the temporary replaces anything:
 
 | Refusal | Reason |
 |---|---|

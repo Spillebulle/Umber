@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use glam::UVec2;
 use umber_core::damage::TileMask;
-use umber_core::docformat::{self, SaveDocument, SaveHistory, SaveLayer};
+use umber_core::docformat::{self, Canvas, SaveDocument, SaveHistory, SaveLayer};
 use umber_core::document::Background;
 use umber_core::geom::PixelRect;
 use umber_core::history::{Edit, EditKind, History, PatchPiece, PixelPatch};
@@ -266,7 +266,7 @@ fn main() {
         active: 0,
         background: Background::WHITE,
         dpi: 72.0,
-        merged: &layer,
+        merged: Canvas::Held(&layer),
         history: None,
     };
 

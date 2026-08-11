@@ -751,13 +751,28 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(decode(&std::fs::read(&path).unwrap()).dimensions(), (2, 2));
+        // A substring sweep of the directory rather than two exact names.
+        // `docformat::write_with`'s temporary carries a process id and a
+        // counter now, so an assertion naming `"landing.png.saving"` exactly
+        // would pass whatever was left behind — a guard that stops guarding
+        // without ever failing.
+        //
+        // **It does not cover which extension the temporary took**, and the
+        // pair it replaced did not either: a successful write renames the
+        // temporary away whatever it was called, so `!landing.ora.saving`
+        // was a path that never existed under either naming. Saying so is
+        // better than keeping an assertion that agrees with everything.
+        // `docformat`'s own `a_save_whose_source_fails_halfway_leaves_the_old_
+        // file_alone` is what drives a temporary that survives at all.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".saving"))
+            .collect();
         assert!(
-            !dir.join("landing.png.saving").exists(),
-            "the temporary file was left behind"
-        );
-        assert!(
-            !dir.join("landing.ora.saving").exists(),
-            "the temporary was named after the document format, not the export"
+            leftovers.is_empty(),
+            "a temporary was left behind: {leftovers:?}"
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

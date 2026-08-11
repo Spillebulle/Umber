@@ -31,6 +31,18 @@
 //!   the point of an autosave, and the internal copy is what survives the file
 //!   being overwritten by something else, or a drive going away.
 //!
+//! One archive still reaches both, and it is no longer one `Vec<u8>` doing it.
+//! `docformat::save_from` *streams* the archive into the internal copy as it is
+//! built — the whole thing in memory was every layer's PNG at once plus the
+//! doubling a growing `Vec` pays, which on the documents
+//! `docs/perf/formats-and-host-memory.md` argues from is gigabytes every five
+//! minutes — and the painter's own file is a copy of that finished file, made
+//! through the same `docformat::write_with` so there is still exactly one
+//! temp-and-rename. Where the internal copy could not be written there is
+//! nothing to copy from, so the document is encoded a second time straight into
+//! the painter's file; that is only possible because [`CaptureSource`] borrows
+//! the capture rather than consuming it.
+//!
 //! Autosaving to the document's own path **overwrites it without asking**. That
 //! is deliberate and it is what was asked for; it is also why the tab's dot is
 //! cleared when — and only when — the document has not moved since the capture
@@ -82,6 +94,7 @@
 //! number first, and rebuilt only when that number moves. That is what lets a
 //! document closed or saved after its copy was written stop being offered.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,7 +103,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
-use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::docformat::{self, Canvas, SaveDocument, SaveLayer};
 use umber_core::textobj::TextObject;
 use umber_core::{Background, BlendMode, Effect};
 use umber_render::{CanvasRenderer, DocumentCapture, Gpu};
@@ -258,8 +271,11 @@ pub struct Expired {
 ///   plain file" before it is even resolved.
 /// * The comparison is *parent equals root*, not "starts with", so the reaper
 ///   cannot descend. It never recurses either.
-/// * Only names an autosave writes are candidates: a `.ora`, or the
-///   `.ora.saving` temporary a write that died halfway leaves behind.
+/// * Only names an autosave writes are candidates: a `.ora`, or one of the
+///   `.ora.saving-<pid>-<n>` temporaries a write that died halfway leaves
+///   behind. That is now the *only* thing that clears one — the name is unique
+///   per writer, so the next save no longer overwrites it. See
+///   [`is_autosave_name`].
 ///
 /// `a_reaper_refuses_a_path_outside_its_root` and
 /// `a_documents_own_file_survives_its_internal_copy_expiring` pin the two that
@@ -347,14 +363,38 @@ impl Reaper {
 }
 
 /// True for the two names an autosave writes: the archive, and the temporary
-/// neighbour `docformat::write_encoded` renames into place.
+/// neighbour `docformat::write_with` renames into place.
+///
+/// **The temporary is `<name>.ora.saving-<pid>-<n>` and not `<name>.ora.saving`**,
+/// so this matches on the prefix of the tail rather than on the whole of it.
+/// `write_with` made the name unique because two writers of one document
+/// sharing it truncate each other's work; the price is that a temporary a hard
+/// kill leaves behind is no longer overwritten by the next save, which makes
+/// *this* the thing that clears it up. Matching only the old exact spelling
+/// would have left every such file in the autosave directory for ever.
 fn is_autosave_name(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
     let ext = format!(".{}", docformat::EXTENSION);
-    lower.ends_with(&ext) || lower.ends_with(&format!("{ext}.saving"))
+    if lower.ends_with(&ext) {
+        return true;
+    }
+    // The temporary, in both spellings it has had. What follows `.ora.saving`
+    // has to be nothing or `write_with`'s `-<pid>-<n>`, rather than merely
+    // *containing* the phrase: this decides what `Reaper` deletes, and a
+    // `notes.ora.saving.bak` somebody dropped in the folder is not Umber's to
+    // remove. `rsplit_once` so the tail is what follows the last occurrence.
+    match lower.rsplit_once(format!("{ext}.saving").as_str()) {
+        Some((_, tail)) => {
+            tail.is_empty()
+                || (tail.starts_with('-')
+                    && tail.len() > 1
+                    && tail[1..].bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+        }
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1968,17 +2008,14 @@ fn run_task(task: Task) -> Vec<Report> {
     // Zipped by `pixel_index` rather than positionally: a folder is an entry
     // with no slice, so the capture is shorter than the stack and a positional
     // zip would pair every layer above a folder with the pixels of the one
-    // below it — and then truncate the top of the stack away entirely.
-    let empty: Vec<u8> = Vec::new();
+    // below it — and then truncate the top of the stack away entirely. That
+    // mapping is `CaptureSource`'s now, stated once, so the layers below carry
+    // no bytes at all.
     let layers: Vec<SaveLayer<'_>> = doc
         .layers
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let px = doc
-                .pixel_index(i)
-                .and_then(|k| pixels.layers.get(k))
-                .map_or(&empty[..], Vec::as_slice);
             SaveLayer {
                 visible: l.visible,
                 opacity: l.opacity,
@@ -1986,10 +2023,11 @@ fn run_task(task: Task) -> Vec<Report> {
                 // `Candidate::slots`. A mask the capture did not bring back is
                 // written as no mask at all rather than as a blank one: an autosave
                 // that invented an empty mask would hide the layer it belonged to.
+                // `mask_index` answers that without the bytes.
                 mask: doc
                     .mask_index(i)
-                    .and_then(|k| pixels.layers.get(k))
-                    .map(Vec::as_slice),
+                    .filter(|k| pixels.layers.get(*k).is_some())
+                    .map(|_| Canvas::Deferred),
                 // The snapshot's, not the live stack's: this runs on the
                 // writer thread, minutes after the document was described.
                 effects: &l.effects,
@@ -2003,7 +2041,7 @@ fn run_task(task: Task) -> Vec<Report> {
                 link: l.link,
                 depth: l.depth,
                 folder: l.folder,
-                ..SaveLayer::new(&l.name, l.blend, px)
+                ..SaveLayer::new(&l.name, l.blend, Canvas::Deferred)
             }
         })
         .collect();
@@ -2016,22 +2054,12 @@ fn run_task(task: Task) -> Vec<Report> {
         active: doc.active_layer,
         background: doc.background,
         dpi: doc.dpi,
-        merged: &pixels.merged,
+        merged: Canvas::Deferred,
         history: None,
     };
-
-    let encoded = match docformat::encode(&document) {
-        // Warnings are dropped rather than shown. They say the same thing on
-        // every autosave of the same document, and an explicit Save already
-        // reports them — a notice raised by a timer would be a dialog appearing
-        // over somebody's canvas every five minutes.
-        Ok((bytes, _)) => bytes,
-        Err(e) => {
-            return vec![Report::Failed {
-                title: doc.title,
-                message: e.to_string(),
-            }];
-        }
+    let mut source = CaptureSource {
+        doc: &doc,
+        pixels: &pixels,
     };
 
     let mut reports = Vec::new();
@@ -2040,13 +2068,28 @@ fn run_task(task: Task) -> Vec<Report> {
     // The internal copy first. It is the one that exists for every document,
     // saved or not, and writing it before the painter's own file means a
     // failure to replace theirs still leaves a recoverable copy somewhere.
-    if let Some(path) = &internal
-        && let Err(message) = write_internal(path, &encoded)
-    {
-        reports.push(Report::Failed {
-            title: doc.title.clone(),
-            message,
-        });
+    //
+    // It is also the one the archive is *encoded into*. The archive is streamed
+    // into the file as it is built rather than assembled in a `Vec<u8>` first —
+    // the reference document's every layer PNG at once, plus the doubling a
+    // growing `Vec` costs — so there is no longer one buffer for two
+    // destinations to share. What they share instead is the finished file, and
+    // a copy of it is *closer* to one archive in two places than two encodings
+    // would have been.
+    //
+    // Warnings are dropped rather than shown. They say the same thing on every
+    // autosave of the same document, and an explicit Save already reports them —
+    // a notice raised by a timer would be a dialog appearing over somebody's
+    // canvas every five minutes.
+    let mut encoded_at: Option<&Path> = None;
+    if let Some(path) = &internal {
+        match write_internal(path, &document, &mut source) {
+            Ok(()) => encoded_at = Some(path),
+            Err(message) => reports.push(Report::Failed {
+                title: doc.title.clone(),
+                message,
+            }),
+        }
     }
 
     // Then the document's own file, which this **overwrites without asking**.
@@ -2056,10 +2099,21 @@ fn run_task(task: Task) -> Vec<Report> {
     // path nobody has saved to. Overwriting *without asking* is right where the
     // painter put the document at that path themselves and is not where Umber
     // did. See `Candidate::write_own_file`.
+    //
+    // Copied from the internal archive where there is one and encoded afresh
+    // where there is not — which also covers the internal write having *failed*,
+    // so a full autosave directory still leaves the painter's own file written.
+    // That was true when both came off one `Vec<u8>` and it has to stay true;
+    // it is only possible because the source reads a capture that is still in
+    // hand rather than consuming it.
     if let Some(path) = &doc.path
         && doc.write_own_file
     {
-        match docformat::write_encoded(path, &encoded) {
+        let written = match encoded_at {
+            Some(from) => copy_archive(from, path),
+            None => docformat::save_from(path, &document, &mut source).map(|_| ()),
+        };
+        match written {
             Ok(()) => {
                 wrote_user_file = true;
                 log::debug!("autosaved {}", path.display());
@@ -2071,15 +2125,46 @@ fn run_task(task: Task) -> Vec<Report> {
         }
     }
 
-    // Swept against the directory the internal copy was *just written to*,
-    // rather than against a directory named separately. It is a small thing and
-    // it is the same principle as `Reaper` itself: the only place expiry can
-    // reach is the place Umber puts its own copies, and there is no second
-    // statement of where that is to drift.
+    // **`Report::Written` is a claim that a file exists, so nothing reaching
+    // the disk means nothing to report.**
+    //
+    // It used to be free: an encode that failed returned before any of this,
+    // so a `Written` could only follow bytes that had been built. Streaming
+    // moved the encode *inside* the two destinations, and with the early
+    // return gone every encode-class failure — a short capture, a canvas that
+    // changed size, a stack too deep — fell through to an unconditional
+    // `Written`. That is not merely a wrong log line: `app.rs` hands it to
+    // `crash::note_autosave`, which would then name an internal copy that was
+    // never written, at a revision it never held, for a crash box to offer
+    // back. Same rule as `Report::rescued`'s — claiming work is safe when it
+    // is not is worse than claiming nothing.
+    //
+    // The gate is "either destination landed" rather than the old "the encode
+    // succeeded", which also closes the half that predates this: both writes
+    // failing used to report `Written` too.
+    //
+    // **The sweep is above it and not behind it**, which is not tidiness. Expiry
+    // deletes copies that are already *old*; whether this write landed is a
+    // different question, and the case where neither destination did is
+    // overwhelmingly the full-disk one — exactly where deleting what has expired
+    // might let the next attempt through. Behind the gate, an autosave that had
+    // started failing would never expire anything again until the next launch,
+    // because `sweep_once` runs once a run.
+    //
+    // Swept against the directory the internal copy was *aimed at*, rather than
+    // against a directory named separately. It is a small thing and it is the
+    // same principle as `Reaper` itself: the only place expiry can reach is the
+    // place Umber puts its own copies, and there is no second statement of where
+    // that is to drift.
     let expired = match (&internal, expiry) {
         (Some(path), Some(max_age)) => path.parent().map(|d| sweep_with(d, max_age)).unwrap_or(0),
         _ => 0,
     };
+
+    if !(encoded_at.is_some() || wrote_user_file) {
+        return reports;
+    }
+
     reports.push(Report::Written {
         id: doc.id,
         revision: doc.revision,
@@ -2089,15 +2174,101 @@ fn run_task(task: Task) -> Vec<Report> {
     reports
 }
 
-fn write_internal(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_internal(
+    path: &Path,
+    document: &SaveDocument<'_>,
+    source: &mut dyn docformat::Canvases,
+) -> Result<(), String> {
     if let Some(dir) = path.parent()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
         return Err(format!("{} could not be created: {e}", dir.display()));
     }
-    docformat::write_encoded(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    docformat::save_from(path, document, source).map_err(|e| format!("{}: {e}", path.display()))?;
     log::debug!("autosave copy at {}", path.display());
     Ok(())
+}
+
+/// Put the archive at `from` at `to` as well, whole or not at all.
+///
+/// Through `docformat::write_with`, so this is the *one* temp-and-rename and
+/// not a second one — which matters more here than anywhere: what it is
+/// replacing is the artist's own document.
+///
+/// `std::io::copy` rather than reading the archive into a `Vec<u8>` first,
+/// because a `Vec` of it is exactly what streaming the encode got rid of.
+fn copy_archive(from: &Path, to: &Path) -> Result<(), docformat::SaveError> {
+    docformat::write_with(to, |file| {
+        let mut source = std::fs::File::open(from)?;
+        std::io::copy(&mut source, file)?;
+        Ok(())
+    })
+}
+
+/// Where an autosave's canvas-sized buffers come from: the capture that has
+/// already come home.
+///
+/// It **borrows** rather than taking, which is deliberate and is what lets the
+/// painter's own file be encoded afresh when the internal copy could not be
+/// written. Taking would drop each buffer a little earlier and buy nothing: the
+/// capture's peak is reached the moment the last slice arrives, before the
+/// writer thread starts, and the archive is streamed so nothing accumulates
+/// beside it.
+///
+/// **The N canvases the capture holds are what is left of
+/// `docs/perf/formats-and-host-memory.md` §10.1, and they are not this
+/// module's to release.** `DocumentCapture` arrives whole from
+/// `CanvasRenderer::take_capture`; encoding each slice *as it comes home* needs
+/// the renderer to hand finished slices over one at a time, which is a change to
+/// `canvas.rs`.
+struct CaptureSource<'a> {
+    doc: &'a Candidate,
+    pixels: &'a DocumentCapture,
+}
+
+impl CaptureSource<'_> {
+    /// The capture's buffer at `index`, or a refusal naming what was missing.
+    ///
+    /// A slice the capture did not bring back is refused rather than written
+    /// blank: an autosave that quietly replaced somebody's layer with nothing is
+    /// the worst thing on this path, and the timer's next attempt is minutes
+    /// away rather than never.
+    ///
+    /// The sentence the artist sees is not this one — `docformat::resolve`
+    /// replaces it with the layer's *name*, which this side does not have, and
+    /// the replacement is what `write_internal` then formats into the failure
+    /// report. So this string reaches **nobody** today: it is what a direct
+    /// caller would get, and there are none outside the tests. It says which
+    /// slice of the capture was missing because that is the only thing this
+    /// side knows, not because anything reads it.
+    fn at(
+        &self,
+        index: Option<usize>,
+        what: impl FnOnce() -> String,
+    ) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        index
+            .and_then(|k| self.pixels.layers.get(k))
+            .map(|bytes| Cow::Borrowed(bytes.as_slice()))
+            .ok_or_else(|| docformat::SaveError::NotSupplied { what: what() })
+    }
+}
+
+impl docformat::Canvases for CaptureSource<'_> {
+    fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.at(self.doc.pixel_index(index), || {
+            format!("pixels the capture did not bring back for stack entry {index}")
+        })
+    }
+
+    fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.at(self.doc.mask_index(index), || {
+            format!("mask the capture did not bring back for stack entry {index}")
+        })
+    }
+
+    fn merged(&mut self) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        Ok(Cow::Borrowed(&self.pixels.merged))
+    }
 }
 
 /// One expiry sweep of `dir`. Returns how many were deleted.
@@ -2586,11 +2757,197 @@ mod tests {
         // file that means anything.
         assert!(umber_core::docimport::import(&theirs).is_ok());
         assert!(umber_core::docimport::import(&ours).is_ok());
-        // And the temporary neighbour the atomic write goes through is gone.
-        assert!(!theirs.with_extension("ora.saving").exists());
-        assert!(!ours.with_extension("ora.saving").exists());
+        // And the temporary neighbour the atomic write goes through is gone,
+        // in both directories. A substring sweep rather than an exact name:
+        // `docformat::write_with`'s temporary carries a process id and a
+        // counter now, so naming `"hands.ora.saving"` would pass whatever was
+        // left behind — and it is `is_autosave_name`'s job to recognise the
+        // same shape, which `an_autosave_name_is_the_archive_or_its_temporary`
+        // pins.
+        for dir in [&documents, &internal] {
+            let left: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".saving"))
+                .collect();
+            assert!(left.is_empty(), "a temporary was left in {dir:?}: {left:?}");
+        }
 
         let _ = std::fs::remove_dir_all(&internal);
+        let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// **One archive still reaches two places, and this is what now says so.**
+    ///
+    /// It used to be free: both destinations were `write_encoded` calls over
+    /// one `Vec<u8>`, so they could not differ. The archive is streamed into
+    /// the internal copy now and the painter's file is a copy of that finished
+    /// file, so "the same archive" is a property of `copy_archive` rather than
+    /// of a shared buffer — and the failure it guards against is the one nobody
+    /// would look for: two encodes of the same document, differing in whatever
+    /// a second pass over the source happened to change.
+    #[test]
+    fn both_copies_of_one_autosave_are_the_same_bytes() {
+        let internal = scratch("same-internal");
+        let documents = scratch("same-documents");
+        let theirs = documents.join("both.ora");
+
+        let mut doc = candidate(Session::default().active_id(), "both.ora");
+        doc.path = Some(theirs.clone());
+        doc.size = UVec2::ONE;
+        let ours = internal.join("both-6666666666666666.ora");
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours.clone()),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}"
+        );
+        assert_eq!(
+            std::fs::read(&ours).expect("the internal copy"),
+            std::fs::read(&theirs).expect("the painter's file"),
+            "the two destinations of one autosave hold different archives"
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
+        let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// **An autosave that wrote nothing reports nothing written.**
+    ///
+    /// `Report::Written` is a claim that a file exists, and `app.rs` spends it:
+    /// it hands the internal copy's *chosen* path to `crash::note_autosave`, so
+    /// a `Written` after a total failure puts a file in the next crash box that
+    /// was never written, at a revision it never held.
+    ///
+    /// It used to be free. An encode that failed returned before either
+    /// destination was reached, so a `Written` could only follow bytes that had
+    /// been built — and streaming moved the encode *inside* the two writes, at
+    /// which point every encode-class failure fell through to an unconditional
+    /// one. Nothing else in this module could see that: every other test here
+    /// has at least one destination succeed.
+    ///
+    /// Driven through a capture that came home a slice short, because that is
+    /// the failure the artist can actually meet — the readback giving up is a
+    /// runtime event, where a canvas of the wrong size or a stack too deep are
+    /// not reachable from a running editor.
+    #[test]
+    fn an_autosave_that_wrote_nothing_claims_nothing() {
+        let blocked = scratch("nothing-internal");
+        let wall = blocked.join("wall");
+        std::fs::write(&wall, b"not a directory").expect("write");
+        let ours = wall.join("copies").join("nothing-1111111111111111.ora");
+
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        // No path, so the painter's own file is not a destination either: the
+        // internal copy is the only one, and it cannot be created.
+        doc.path = None;
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "the failure was not reported at all: {reports:?}"
+        );
+        assert!(
+            !reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "nothing reached the disk and the autosave said it had: {reports:?}"
+        );
+
+        // And the same when the *encode* is what fails, which is the case
+        // streaming moved inside the write. A capture one slice short of the
+        // stack is what a readback that gave up leaves behind.
+        let internal = scratch("nothing-short");
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        doc.path = None;
+        let short = DocumentCapture {
+            size: UVec2::ONE,
+            layers: Vec::new(),
+            merged: vec![200, 40, 40, 255],
+        };
+        let reports = run_task(Task {
+            doc,
+            internal: Some(internal.join("short-2222222222222222.ora")),
+            pixels: short,
+            expiry: None,
+        });
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "a capture missing a slice was written as a blank layer: {reports:?}"
+        );
+        assert!(
+            !reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "an encode that failed still reported a file: {reports:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocked);
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
+    /// A failed internal copy still leaves the painter's own file written.
+    ///
+    /// It used to be free for the same reason: the encode had already happened
+    /// and the second `write_encoded` did not care that the first had failed.
+    /// Now the painter's file is normally a *copy* of the internal one, so this
+    /// is the path where there is nothing to copy from and the document has to
+    /// be encoded a second time — and a source that could only be read once
+    /// would have made that impossible, which is why `CaptureSource` borrows
+    /// rather than takes.
+    #[test]
+    fn a_failed_internal_copy_still_writes_the_painters_own_file() {
+        let blocked = scratch("blocked-internal");
+        let documents = scratch("blocked-documents");
+        let theirs = documents.join("rescued.ora");
+
+        // A file where the internal copy wants a directory, so `create_dir_all`
+        // refuses on every platform.
+        let wall = blocked.join("wall");
+        std::fs::write(&wall, b"not a directory").expect("write");
+        let ours = wall.join("copies").join("rescued-4444444444444444.ora");
+
+        let mut doc = candidate(Session::default().active_id(), "rescued.ora");
+        doc.path = Some(theirs.clone());
+        doc.size = UVec2::ONE;
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "the internal copy failed silently: {reports:?}"
+        );
+        assert!(
+            matches!(
+                reports.last(),
+                Some(Report::Written {
+                    wrote_user_file: true,
+                    ..
+                })
+            ),
+            "{reports:?}"
+        );
+        assert!(
+            umber_core::docimport::import(&theirs).is_ok(),
+            "the painter's own file was not written, or is not a document"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocked);
         let _ = std::fs::remove_dir_all(&documents);
     }
 
@@ -2842,6 +3199,60 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&internal);
         let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// **Expiry still runs when the write failed, which is the run where it
+    /// matters most.**
+    ///
+    /// The sweep and `Report::Written` answer different questions — one is about
+    /// copies that are already old, the other about whether *this* write landed
+    /// — and gating the first on the second is the shape a `return` invites.
+    /// It went in that way: the gate that stops an autosave claiming a file it
+    /// never wrote was put above the sweep, so an autosave that had begun
+    /// failing stopped expiring anything until the next launch. That is exactly
+    /// backwards, because the reason both destinations fail is usually a full
+    /// disk, and expiry is what might give the next attempt room.
+    ///
+    /// Nothing else here can see it: every other test in this module has at
+    /// least one destination succeed, so the sweep runs either way.
+    #[test]
+    fn an_autosave_that_could_not_write_still_expires_what_is_old() {
+        let internal = scratch("expire-anyway");
+        let stale = internal.join("something-old-9999999999999999.ora");
+        touch(&stale, Duration::from_secs(400 * 24 * 3600));
+
+        // A *directory* where the copy wants to be: the parent exists, so the
+        // sweep can reach it, and the rename onto it fails, so nothing lands.
+        // A path that could not be created at all would take the parent with
+        // it and there would be nothing to sweep.
+        let blocked = internal.join("blocked-1212121212121212.ora");
+        std::fs::create_dir_all(&blocked).expect("a directory in the way");
+
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        doc.path = None;
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(blocked),
+            pixels: one_pixel_capture(),
+            expiry: Some(Duration::from_secs(30 * 24 * 3600)),
+        });
+
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "the fixture stopped failing to write: {reports:?}"
+        );
+        assert!(
+            !reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "nothing landed and the autosave said it had: {reports:?}"
+        );
+        assert!(
+            !stale.exists(),
+            "a failed autosave stopped expiring old copies"
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
     }
 
     /// **The one that would cost somebody a painting.** A document recovered
@@ -3792,8 +4203,47 @@ mod tests {
         assert!(is_autosave_name(Path::new("hands-0.ora")));
         assert!(is_autosave_name(Path::new("hands-0.ORA")));
         assert!(is_autosave_name(Path::new("hands-0.ora.saving")));
+        // The shape `docformat::write_with` actually writes, which is the one
+        // this has to recognise: the process and a counter follow `.saving`,
+        // so the old exact match would leave every abandoned temporary in the
+        // directory for ever — and it is now the only thing that clears one,
+        // because a unique name means the next save no longer overwrites it.
+        // Built from the real writer rather than typed out, so the two cannot
+        // drift: whatever `write_with` names a temporary, this is asked about.
+        let dir = scratch("temporary-shape");
+        let target = dir.join("hands-0.ora");
+        let seen = std::sync::Mutex::new(Vec::new());
+        umber_core::docformat::write_with(&target, |_| {
+            seen.lock().unwrap().extend(
+                std::fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned()),
+            );
+            Ok(())
+        })
+        .expect("write");
+        let live = seen.into_inner().unwrap();
+        assert_eq!(live.len(), 1, "expected one temporary, saw {live:?}");
+        assert_ne!(
+            live[0], "hands-0.ora.saving",
+            "the name stopped being unique"
+        );
+        assert!(
+            is_autosave_name(Path::new(&live[0])),
+            "`{}` is a temporary the reaper would refuse to clear up",
+            live[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
         assert!(!is_autosave_name(Path::new("hands.png")));
         assert!(!is_autosave_name(Path::new("hands")));
         assert!(!is_autosave_name(Path::new("orafile")));
+        // Widening the temporary's spelling must not widen what the reaper
+        // will delete. Anything after `.ora.saving` that is not the writer's
+        // own `-<pid>-<n>` is a file somebody else put in Umber's folder.
+        assert!(!is_autosave_name(Path::new("hands-0.ora.saving.bak")));
+        assert!(!is_autosave_name(Path::new("hands-0.ora.savings")));
+        assert!(!is_autosave_name(Path::new("hands-0.ora.saving-notes.txt")));
     }
 }
