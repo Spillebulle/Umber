@@ -3089,10 +3089,12 @@ impl UmberApp {
     ///
     /// The rule itself is [`crate::autosave::interrupt`]'s, in the module that
     /// owns both halves of it and can be driven by a test; all this does is
-    /// find the canvas, which is the one thing that needs `self`.
+    /// reach the canvases, which is the one thing that needs `self`. It hands
+    /// over the **map** rather than a canvas it looked up, so the id it names
+    /// and the renderer that is cancelled cannot come apart.
     fn stop_autosave_of(&mut self, id: DocId) {
-        let canvas = self.gfx.as_mut().and_then(|gfx| gfx.canvases.get_mut(&id));
-        crate::autosave::interrupt(&mut self.editor.autosave, canvas, id);
+        let canvases = self.gfx.as_mut().map(|gfx| &mut gfx.canvases);
+        crate::autosave::interrupt(&mut self.editor.autosave, canvases, id);
     }
 
     fn save_document(&mut self, always_ask: bool) -> bool {

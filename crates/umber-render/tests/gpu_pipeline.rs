@@ -5068,11 +5068,14 @@ fn settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone() {
     // frames with the settler as the *only* thing asking after it: it must
     // still be in flight at the end, waiting for the owner that never came.
     //
-    // Enough frames for a real capture several times over. A settle that
-    // reached this one would have finished it long before the last of them —
-    // demonstrated by mutation, taking the abandoned-or-failed test out.
+    // Enough frames for a real capture several times over — a settle that
+    // reached this one finishes it in about four, demonstrated by mutation,
+    // taking the abandoned-or-failed test out. Only the first iteration records
+    // anything: `drive_capture` declines a step while one is `Rendering`, which
+    // is exactly the point, since nothing but the settler is here to advance
+    // it.
     assert!(h.canvas.begin_capture(&[0], &draws));
-    for _ in 0..100 {
+    for _ in 0..40 {
         let mut enc = h.encoder();
         h.canvas
             .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
@@ -5082,8 +5085,8 @@ fn settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone() {
             break;
         }
         // As in `drive_to_completion`: the poll does not wait, so this loop has
-        // to, or a hundred iterations pass before the GPU finishes the first
-        // copy and the test proves nothing.
+        // to, or forty iterations pass before the GPU finishes the first copy
+        // and the test proves nothing.
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(
@@ -5092,13 +5095,12 @@ fn settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone() {
          document went nowhere"
     );
 
-    // Cancelled part-way through a step — a copy recorded, no map outstanding —
-    // which is the state a Save mid-capture leaves behind and the one that
-    // needs both halves of `settle_capture` to move.
-    let mut enc = h.encoder();
-    h.canvas
-        .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
-    h.gpu.queue.submit(Some(enc.finish()));
+    // That leaves the job exactly where a Save mid-capture leaves one: a copy
+    // recorded and no map outstanding, which is the state that needs *both*
+    // halves of `settle_capture` to move — `submit_capture` to map it and
+    // `take_capture` to unmap it and let it go. It is a different state from
+    // the one `a_cancelled_capture_hands_its_buffers_back_rather_than_being_
+    // dropped` cancels in, which is already mapping.
     h.canvas.cancel_capture();
 
     for _ in 0..2000 {

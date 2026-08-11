@@ -1947,15 +1947,30 @@ pub fn drive(
 /// and the scheduler stops waiting for pixels that are not coming; telling one
 /// and not the other is a whole capture stranded. Here rather than in `app.rs`
 /// so the rule can be driven by a test — `app.rs`'s `stop_autosave_of` is the
-/// call site and does nothing but find the canvas.
+/// call site and does nothing but hand over the map.
 ///
-/// `canvas` is an `Option` because a document may have no renderer: the resume
-/// path rebuilds them, and a document without one has no capture to cancel.
-pub fn interrupt(autosave: &mut Autosave, canvas: Option<&mut CanvasRenderer>, id: DocId) {
+/// **It takes the whole map and finds the canvas itself**, rather than being
+/// handed one beside an `id`. The two would have to correspond and nothing
+/// would make them: hand it the wrong canvas and it cancels one document's
+/// capture while forgetting another's, which is the stranded job this whole
+/// change is about, arrived at from the other side. `next_due` picks the first
+/// *modified* tab and every caller passes the **active** document, so the two
+/// genuinely differ in an ordinary session — this is not a hypothetical
+/// mismatch. `an_interrupt_naming_another_document_leaves_the_capture_alone`
+/// is the guard.
+///
+/// The map is an `Option` because there may be no renderer at all: the resume
+/// path rebuilds them, and until then there is no capture to cancel — but the
+/// scheduler still has to be told, or it waits for pixels nothing will produce.
+pub fn interrupt(
+    autosave: &mut Autosave,
+    canvases: Option<&mut HashMap<DocId, CanvasRenderer>>,
+    id: DocId,
+) {
     if autosave.capturing_id() != Some(id) {
         return;
     }
-    if let Some(canvas) = canvas {
+    if let Some(canvas) = canvases.and_then(|c| c.get_mut(&id)) {
         canvas.cancel_capture();
     }
     autosave.abandon();
@@ -2038,6 +2053,15 @@ pub fn collect(
     // special case: its live job is refused by that same test, and a job the
     // collect above found failed is dropped here a frame earlier than it would
     // have been rather than differently.
+    //
+    // **Every canvas rather than the active one is insurance, not a case
+    // anybody can reach today**, and saying which is the point: every caller of
+    // `interrupt` names the active document or drops the renderer a line later,
+    // so narrowing this to the active canvas would pass every test. What it
+    // would also do is make `collect` — which finds its canvas by
+    // `capturing_id` and never by which tab is in front — depend on the tab
+    // strip, so the day an interruption names a background document the bug
+    // comes back with nothing to catch it.
     for canvas in canvases.values_mut() {
         canvas.settle_capture(&gpu.device);
     }
@@ -4005,8 +4029,7 @@ mod tests {
         // Exactly what an explicit Save does, through the one function that
         // states the rule.
         let id = loops.id;
-        let canvas = loops.canvases.get_mut(&id);
-        interrupt(&mut loops.editor.autosave, canvas, id);
+        interrupt(&mut loops.editor.autosave, Some(&mut loops.canvases), id);
         assert!(
             !loops.editor.autosave.capturing(),
             "the scheduler went on waiting for a capture it had given up on"
@@ -4025,6 +4048,59 @@ mod tests {
             !loops.editor.session.active_tab().modified,
             "the tab's dot should come off once its own file has been written"
         );
+    }
+
+    /// Interrupting **another** document must leave the capture in flight
+    /// alone, and this is the one predicate `settle_capture` cannot back up.
+    ///
+    /// A live job is refused by the settler on purpose, so the way to
+    /// reintroduce the stranded capture after that fix is to reach
+    /// `Autosave::abandon` while the renderer's job is *not* marked — which is
+    /// what a wrong id does. And the two genuinely differ in an ordinary
+    /// session: `next_due` picks the first **modified** tab while
+    /// `save_document`, `flip_canvas` and `apply_canvas` all pass the
+    /// **active** one, so a Save of the document in front while a background
+    /// tab is being captured is the common case rather than a contrived one.
+    ///
+    /// Measured by whether the capture still completes, not by reading a flag
+    /// off the scheduler: a capture the interrupt half-cancelled would still
+    /// report `capturing()`.
+    #[test]
+    fn an_interrupt_naming_another_document_leaves_the_capture_alone() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "other-document");
+
+        loops.frame(gpu, true);
+        assert!(
+            loops.editor.autosave.capturing(),
+            "there was no capture in flight to leave alone"
+        );
+
+        // A document this session has never opened — the id `Session::open`
+        // would have to mint many tabs to reach.
+        let elsewhere = DocId::for_test(u64::MAX);
+        assert_ne!(elsewhere, loops.id);
+        interrupt(
+            &mut loops.editor.autosave,
+            Some(&mut loops.canvases),
+            elsewhere,
+        );
+        assert_eq!(
+            loops.editor.autosave.capturing_id(),
+            Some(loops.id),
+            "interrupting one document gave up on another's capture"
+        );
+
+        loops.run_until_written(gpu);
+        assert!(
+            loops.theirs.exists() && loops.ours.exists(),
+            "the capture never finished: naming another document cancelled the \
+             renderer's half of this one",
+        );
+        assert!(umber_core::docimport::import(&loops.theirs).is_ok());
     }
 
     #[test]

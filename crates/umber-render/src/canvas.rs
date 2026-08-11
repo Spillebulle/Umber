@@ -9677,6 +9677,10 @@ impl CanvasRenderer {
     /// has to go on asking**, which is [`Self::settle_capture`]'s whole reason
     /// for existing: the caller that cancels usually forgets the capture in the
     /// same breath and then has nothing left to drive it with.
+    ///
+    /// The exception is a document being **closed**, where nothing asks again
+    /// and nothing needs to: the whole renderer is dropped a moment later, and
+    /// wgpu keeps a buffer alive until its outstanding map resolves.
     pub fn cancel_capture(&mut self) {
         if let Some(job) = self.capture.as_mut() {
             job.abandoned = true;
@@ -9696,10 +9700,23 @@ impl CanvasRenderer {
     /// document. Nothing said so: the artist believes their work is being
     /// autosaved every five minutes and it is not.
     ///
-    /// **A live capture is left strictly alone.** Its owner drives it, and a
-    /// second `submit_capture` from the side is not what that owner is
-    /// expecting — so this acts only on a job that has been abandoned or has
-    /// failed, which is exactly the set nobody else will come back for.
+    /// **A live capture is left strictly alone**, and what is at stake is not
+    /// tidiness: [`Self::take_capture`] hands the finished document to whoever
+    /// asks, so a settle that reached a live job would collect it and drop it
+    /// on the floor, and its owner would end having written nothing. Hence the
+    /// test, and hence
+    /// `settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone`
+    /// spending a whole capture's worth of frames proving it.
+    ///
+    /// **The `failed` half of that test is unreachable today and no test drives
+    /// it**, which is said here rather than left to be discovered: a job is only
+    /// ever failed by [`Self::drive_capture`] or [`Self::take_capture`], both of
+    /// which run while the scheduler is still tracking the document, and that
+    /// caller settles it itself. It is kept because the *contract* is "a job
+    /// nobody is coming back for" rather than "an abandoned job", and a failed
+    /// one on a canvas nobody tracks would strand exactly as an abandoned one
+    /// did. It costs one bool load.
+    ///
     /// Idempotent, and free on a canvas with no capture at all: one `Option`
     /// test, no device poll.
     pub fn settle_capture(&mut self, device: &wgpu::Device) {
