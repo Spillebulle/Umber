@@ -3890,10 +3890,9 @@ mod tests {
         /// Folder, masked layer, text layer, effected layer, background, a
         /// blend mode that warns — everything with a branch in `write_archive`.
         fn layers(&self, deferred: bool) -> Vec<SaveLayer<'_>> {
-            let px = |has: bool| match (deferred, has) {
-                (_, false) => Canvas::Held(&[]),
-                (true, true) => Canvas::Deferred,
-                (false, true) => Canvas::Held(&self.pixels),
+            let px = || match deferred {
+                true => Canvas::Deferred,
+                false => Canvas::Held(&self.pixels),
             };
             let mask = || match deferred {
                 true => Canvas::Deferred,
@@ -3903,7 +3902,7 @@ mod tests {
                 SaveLayer {
                     mask: Some(mask()),
                     locked: true,
-                    ..SaveLayer::new("Wash", BlendMode::Add, px(true))
+                    ..SaveLayer::new("Wash", BlendMode::Add, px())
                 },
                 SaveLayer::folder("Group", 0, true),
                 SaveLayer {
@@ -3911,12 +3910,12 @@ mod tests {
                     clipped: true,
                     link: Some(2),
                     effects: &self.effects,
-                    ..SaveLayer::new("Shadowed", BlendMode::Multiply, px(true))
+                    ..SaveLayer::new("Shadowed", BlendMode::Multiply, px())
                 },
                 SaveLayer {
                     depth: 1,
                     text: Some(&self.text),
-                    ..SaveLayer::new("Caption", BlendMode::Normal, px(true))
+                    ..SaveLayer::new("Caption", BlendMode::Normal, px())
                 },
             ]
         }
