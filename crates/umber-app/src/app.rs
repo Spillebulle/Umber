@@ -4652,31 +4652,19 @@ impl UmberApp {
     ///
     /// Called once per frame from [`Self::render`]. The GPU half runs here, on
     /// the drawing thread, because only this thread has the device — and it is
-    /// free, being the 0 ms end of the measurement.
+    /// free, being the 0 ms end of the measurement. Everything else, including
+    /// both ways a decode can end with no document, is
+    /// [`loading::collect`]'s, so it can be driven without a window.
     fn collect_loading(&mut self) {
-        let Some(result) = self
-            .editor
-            .loading
-            .as_ref()
-            .and_then(loading::Loading::take)
-        else {
+        let Some(collected) = loading::collect(&mut self.editor) else {
             return;
         };
-        // Taken out before either arm, so a refusal cannot leave the dialog up.
-        let Some(load) = self.editor.loading.take() else {
-            return;
-        };
-        match result {
-            Ok(imported) => {
-                self.install_import(imported, load.name, load.record_path, load.modified);
+        match collected {
+            loading::Collected::Opened(imported, load) => {
+                self.install_import(*imported, load.name, load.record_path, load.modified);
             }
-            Err(error) => {
-                log::warn!("could not open {}: {error}", load.path.display());
-                self.editor.notice = Some(Notice {
-                    title: format!("Could not open “{}”", load.name),
-                    lines: vec![error.to_string()],
-                });
-            }
+            // The dialog is already down and the notice already up.
+            loading::Collected::Refused => {}
         }
         self.request_redraw();
     }
