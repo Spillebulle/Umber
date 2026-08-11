@@ -238,12 +238,42 @@ pub const EXTENSION: &str = "ora";
 /// nothing but open and save. That is exactly the property masks and clipping
 /// were refused for.
 ///
+/// **4 is a mask's coverage becoming linear**, and it is the one revision here
+/// that is not about something an older build would *drop*. It is about
+/// something an older build would **show wrongly**, which is a worse failure and
+/// therefore an easier call. A mask slice used to hold sRGB-encoded coverage,
+/// inherited from the layer array it borrows a slice of rather than chosen for
+/// it, and it now holds the linear multiplier every source format and every
+/// consumer already meant — 256 reachable states against 183. The byte in
+/// `umber/masks/` goes in raw at both ends, so its *meaning* moved with it: a
+/// build reading revision 3 would take the new byte for the old form and
+/// decode it through the transfer function, putting every mask in the document
+/// a full gamma curve out. A layer the artist hid by half would come back hidden
+/// by four fifths — visibly, silently, on a picture that opened without a word.
+/// So an older build refuses the file instead.
+///
+/// The other direction is handled rather than refused: this build reads a
+/// revision-3 mask and converts it, in `docimport::srgb::decode_v3_mask_buffer`,
+/// which states what that costs. It is **not** a lossless round trip and is not
+/// claimed to be.
+///
 /// **`docs/group-compositing.md` §4.3 also proposes 3, for a folder with an
-/// opacity or a blend mode of its own. Effects landed first and took 3, so
-/// group compositing takes 4.** Only one feature can have a number, and the
-/// decision belongs in whichever lands second rather than to
-/// [`required_version`] to reconcile.
-pub const VERSION: u32 = 3;
+/// opacity or a blend mode of its own. Effects landed first and took 3; this
+/// took 4, so group compositing takes 5.** Only one feature can have a number,
+/// and the decision belongs in whichever lands next rather than to
+/// [`required_version`] to reconcile. That document still says 4 and has not
+/// been rewritten here, because it is somebody's design and this is a comment.
+pub const VERSION: u32 = 4;
+
+/// The first revision whose mask bytes are the linear multiplier.
+///
+/// Named rather than written as a literal because **two** readers have to agree
+/// about it and they are in different modules: a layer's mask entry under
+/// `umber/masks/`, and a mask patch inside a saved undo history. A document that
+/// declares less than this holds the sRGB form in both, and one that declares
+/// this or more holds the linear form in both — there is no file in which they
+/// differ, because they are written by the same save.
+pub const LINEAR_MASK_VERSION: u32 = 4;
 
 /// The lowest revision that describes `layers`.
 ///
@@ -282,10 +312,18 @@ fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
     let layers = || layers.iter().filter(|l| !l.folder);
 
     // Highest first: a version number is a statement about what a file
-    // contains, and effects are the newest thing it can contain.
-    if layers().any(|l| !l.effects.is_empty()) {
+    // contains, and a linear mask is the newest thing it can contain.
+    //
+    // **A mask now decides 4 rather than 2**, and it is the same test either
+    // way because the bytes are the same bytes — what moved is what they mean.
+    // Clipping keeps 2 on its own: a clipped layer with no mask carries nothing
+    // whose meaning changed, and pushing it to 4 would shut it out of every
+    // older Umber for a flag those builds read correctly.
+    if layers().any(|l| l.mask.is_some()) {
+        4
+    } else if layers().any(|l| !l.effects.is_empty()) {
         3
-    } else if layers().any(|l| l.mask.is_some() || l.clipped) {
+    } else if layers().any(|l| l.clipped) {
         2
     } else {
         1
@@ -2802,17 +2840,24 @@ mod tests {
 
         // A document that carries a mask needs the revision that was raised
         // for one, so an older build refuses it rather than opening a picture
-        // with the mask silently gone.
+        // whose masks are all a gamma curve out.
         //
-        // **2 as a literal, not `VERSION`.** It read `VERSION` until effects
+        // **4 as a literal, not `VERSION`.** It read `VERSION` until effects
         // took that to 3, at which point this assertion said "the newest
         // revision this build knows about" rather than "the revision a mask
         // needs" — and it would then have passed for a writer that declared
         // every file at the newest number, which is exactly what
-        // `required_version` exists to prevent.
+        // `required_version` exists to prevent. The two coincide again today,
+        // and the literal is what keeps that a coincidence.
+        //
+        // It said 2 until a mask's coverage became linear. That is a different
+        // *kind* of bump from the one 2 was: 2 was about what an older build
+        // would drop, and 4 is about what it would show — the same bytes read
+        // through the transfer function, so a layer hidden by half comes back
+        // hidden by four fifths. See `VERSION`.
         assert!(
-            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"2\"")),
-            "a masked document must declare revision 2 and no higher"
+            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"4\"")),
+            "a masked document must declare revision 4 and no higher"
         );
         // And the mask lives outside the ORA stack, so no other reader shows it
         // as a layer nobody made.
@@ -3013,13 +3058,23 @@ mod tests {
             ..effected()
         };
 
+        // **Clipping and a mask took the same revision and no longer do**, and
+        // the pair below is what holds them apart. A mask's bytes changed
+        // meaning at 4; a clipped layer's did not, and pushing it up with them
+        // would shut a document out of every older Umber for a flag those builds
+        // read perfectly well.
         for (expected, layers) in [
             (1, vec![plain()]),
-            (2, vec![masked()]),
+            (4, vec![masked()]),
             (2, vec![clipped()]),
             (3, vec![effected()]),
-            (3, vec![both()]),
+            (4, vec![both()]),
             (3, vec![plain(), effected()]),
+            // The highest wins whichever order the stack is in, which is the
+            // half a single-layer sweep cannot see.
+            (4, vec![effected(), masked()]),
+            (4, vec![masked(), effected()]),
+            (2, vec![plain(), clipped()]),
         ] {
             assert_eq!(
                 required_version(&layers),

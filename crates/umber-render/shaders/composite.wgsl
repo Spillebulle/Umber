@@ -105,6 +105,23 @@ struct View {
 @group(0) @binding(4) var stroke_color_tex: texture_2d<f32>;
 // Where each of each slot's tiles lives, or that it lives nowhere.
 @group(0) @binding(5) var page_table: texture_2d_array<u32>;
+// **The same texture as `layer_tex`, without the transfer function**, and the
+// only thing that reads it here is the mask tap below.
+//
+// A mask multiplies the layer's *alpha*, and alpha is linear everywhere in
+// Umber — `LAYER_FORMAT` encodes RGB only. Reading a mask through the sRGB view
+// therefore decoded coverage that was never encoded for any consumer's benefit,
+// and the map is not injective: only 183 of the 256 multipliers this pass's own
+// 8-bit output can express were reachable, the 73 missing ones all in the upper
+// reveal range where a mask is visible. Through the raw view a stored byte over
+// 255 *is* the multiplier.
+//
+// Two bindings of one texture rather than a `pow` on the tap, because the tap is
+// four `textureLoad`s reconstructing a bilinear filter and a per-sample transfer
+// function would be the cost this exists to avoid — and re-encoding what the
+// hardware had just decoded is a promise about rounding rather than about bytes,
+// the same argument `flip.wgsl` makes for reading raw.
+@group(0) @binding(6) var mask_tex: texture_2d_array<f32>;
 
 // The stroke's colour at this fragment.
 //
@@ -226,10 +243,14 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // so an absent tile has to read 1.0 — taking it for zero hides the layer
         // everywhere nobody painted, which is the bug `clipstudio.rs` records
         // fixing on the import side, in the same format at the same block size.
+        //
+        // **Out of `mask_tex` and never out of `layer_tex`**, which are the same
+        // texture and not the same numbers: see that binding. A mask slice holds
+        // the linear multiplier, so this is the byte over 255 and nothing else.
         var m = 1.0;
         if (has_mask) {
             m = tile_bilinear(
-                layer_tex, page_table, mask_slot, doc, doc_texels, vec4<f32>(1.0)
+                mask_tex, page_table, mask_slot, doc, doc_texels, vec4<f32>(1.0)
             ).r;
         }
         // A stroke on the mask previews by blending into `m` here. THIS MUST

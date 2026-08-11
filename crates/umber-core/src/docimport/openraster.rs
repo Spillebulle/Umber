@@ -154,7 +154,13 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
 
     let stack_xml = container::read_entry(&mut zip, "stack.xml", FORMAT)?;
     let mut warnings = Vec::new();
-    let (size, dpi, manifest, mut specs) = parse_stack(&stack_xml, &mut warnings)?;
+    let Stack {
+        size,
+        dpi,
+        history: manifest,
+        version,
+        layers: mut specs,
+    } = parse_stack(&stack_xml, &mut warnings)?;
 
     // The background is a layer in the file and a property here, so it comes
     // out of the list before anything counts or decodes it. Removed rather than
@@ -183,7 +189,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let total = specs.len() as u32;
     for (done, spec) in specs.into_iter().enumerate() {
         progress(done as u32, total);
-        match load_layer(&mut zip, &spec, size, &mut warnings) {
+        match load_layer(&mut zip, &spec, size, version, &mut warnings) {
             Ok(layer) => {
                 // Charged as it lands rather than once at the end: what this
                 // bounds is the *accumulation*, and a stack of sixty-four PNGs
@@ -230,7 +236,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     // positions are the whole of how a patch finds its layer again.
     let history = manifest.and_then(|path| {
         let names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
-        history::read(&mut zip, &path, size, &names, &mut warnings)
+        history::read(&mut zip, &path, size, &names, version, &mut warnings)
     });
 
     Ok(ImportedDocument {
@@ -245,6 +251,30 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     })
 }
 
+/// What `stack.xml` says about the document as a whole, beside its layers.
+///
+/// A struct rather than the tuple this was, because [`Self::version`] would have
+/// made it five wide. It is the *reader's* copy of the header: the size and the
+/// resolution decide the canvas, `history` names the saved undo history's
+/// manifest when there is one, and the version decides how some of the bytes
+/// underneath are to be read.
+struct Stack {
+    size: UVec2,
+    dpi: Option<f32>,
+    /// `umber-history`, the entry naming the saved undo history's manifest.
+    history: Option<String>,
+    /// `umber-version`, or **1** where the attribute is absent — which is every
+    /// file no Umber wrote, and every Umber file from before the attribute
+    /// existed.
+    ///
+    /// Retained rather than merely checked because a mask's bytes changed
+    /// meaning at revision 4: below it they are sRGB-encoded coverage and above
+    /// it they are the linear multiplier. Reading either correctly is the whole
+    /// reason this number survives past the refusal above.
+    version: u32,
+    layers: Vec<LayerSpec>,
+}
+
 /// Read `stack.xml`.
 ///
 /// The stack is walked depth first. **The first element in a stack is the
@@ -253,13 +283,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
 /// this backwards inverts the whole image and is not obvious on a symmetrical
 /// test file, so `layers_arrive_bottom_first` pins it down.
 ///
-/// The third value is `umber-history` — the entry naming the saved undo
-/// history's manifest, when there is one.
-#[allow(clippy::type_complexity)]
-fn parse_stack(
-    xml: &[u8],
-    warnings: &mut Vec<ImportWarning>,
-) -> Result<(UVec2, Option<f32>, Option<String>, Vec<LayerSpec>), ImportError> {
+fn parse_stack(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<Stack, ImportError> {
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
 
@@ -283,6 +307,10 @@ fn parse_stack(
     let mut size: Option<UVec2> = None;
     let mut dpi: Option<f32> = None;
     let mut manifest: Option<String> = None;
+    // 1 rather than 0 where the attribute is absent: revision 1 is what a file
+    // carrying none of Umber's extensions declares, and it is what every other
+    // application's ORA amounts to.
+    let mut version = 1u32;
     let mut specs: Vec<LayerSpec> = Vec::new();
     let mut depth = 0usize;
 
@@ -317,14 +345,17 @@ fn parse_stack(
                         manifest = attrs.string(docformat::HISTORY_ATTR);
 
                         // Checked before a single pixel is decoded, so a file
-                        // from a future Umber costs nothing to refuse.
-                        if let Some(version) = attrs.parse::<u32>(docformat::VERSION_ATTR)
-                            && version > docformat::VERSION
-                        {
-                            return Err(ImportError::NewerVersion {
-                                version,
-                                supported: docformat::VERSION,
-                            });
+                        // from a future Umber costs nothing to refuse. Kept
+                        // afterwards because a mask's bytes changed meaning at
+                        // revision 4 — see `Stack::version`.
+                        if let Some(declared) = attrs.parse::<u32>(docformat::VERSION_ATTR) {
+                            if declared > docformat::VERSION {
+                                return Err(ImportError::NewerVersion {
+                                    version: declared,
+                                    supported: docformat::VERSION,
+                                });
+                            }
+                            version = declared;
                         }
                     }
                     b"stack" => {
@@ -497,13 +528,20 @@ fn parse_stack(
     let size = size.ok_or_else(|| malformed("stack.xml has no <image> element".into()))?;
     // Top first in the file, bottom first in the stack.
     specs.reverse();
-    Ok((size, dpi, manifest, specs))
+    Ok(Stack {
+        size,
+        dpi,
+        history: manifest,
+        version,
+        layers: specs,
+    })
 }
 
 fn load_layer(
     zip: &mut Zip<'_>,
     spec: &LayerSpec,
     canvas: UVec2,
+    version: u32,
     warnings: &mut Vec<ImportWarning>,
 ) -> Result<ImportedLayer, String> {
     // A folder has no `src` and nothing to decode. It still becomes an entry,
@@ -572,7 +610,7 @@ fn load_layer(
     layer.clipped = spec.clipped;
     layer.locked = spec.locked;
     layer.link = spec.link;
-    layer.mask = load_mask(zip, spec, canvas, warnings);
+    layer.mask = load_mask(zip, spec, canvas, version, warnings);
     layer.effects = load_effects(zip, spec, warnings);
     Ok(layer)
 }
@@ -663,10 +701,20 @@ fn load_effects(
 
 /// A layer's mask, when the file names one.
 ///
-/// Canvas-sized and **not** put through `srgb`: the bytes went in raw, because
-/// a mask is coverage rather than colour and nothing but Umber reads them.
-/// `decode_png` widens the greyscale entry back to `(g, g, g, 255)`, which is
-/// exactly what a mask slice holds.
+/// Canvas-sized, and the bytes go in raw for a revision-4 document: a mask holds
+/// coverage as a **linear** multiplier at both ends, so the byte in the file is
+/// the byte in the slice and there is nothing to convert. `decode_png` widens
+/// the greyscale entry back to `(g, g, g, 255)`, which is exactly what a mask
+/// slice holds.
+///
+/// **A document written before revision 4 is the exception**, and it is the one
+/// thing here that reads the document's version. Those files hold the sRGB
+/// encoding of the multiplier, because a mask slice used to be read through the
+/// layer array's sRGB view, so every byte goes through
+/// [`srgb::decode_v3_mask_buffer`]. That conversion is not a lossless round trip
+/// and its own docs say what it costs; what it guarantees is that the multiplier
+/// does not move by a level of the layer's own alpha, so an old document opens
+/// looking exactly as it did.
 ///
 /// A mask that is named and then cannot be read is a *warning*, not a skipped
 /// layer: the pixels are all there, and a layer that comes back showing more
@@ -677,6 +725,7 @@ fn load_mask(
     zip: &mut Zip<'_>,
     spec: &LayerSpec,
     canvas: UVec2,
+    version: u32,
     warnings: &mut Vec<ImportWarning>,
 ) -> Option<Vec<PixelPiece>> {
     let src = spec.mask_src.as_ref()?;
@@ -690,7 +739,13 @@ fn load_mask(
         // an Umber mask entry is written at the canvas's own size and one that
         // is not is refused rather than placed. See `PixelPiece`'s rule 3 for
         // why a mask may not go sparse yet in any case.
-        Some(image) => Some(vec![PixelPiece::whole(canvas, image.rgba)]),
+        Some(image) => {
+            let mut rgba = image.rgba;
+            if version < docformat::LINEAR_MASK_VERSION {
+                srgb::decode_v3_mask_buffer(&mut rgba);
+            }
+            Some(vec![PixelPiece::whole(canvas, rgba)])
+        }
         None => {
             warnings.push(ImportWarning::MaskIgnored {
                 layer: spec.name.clone(),

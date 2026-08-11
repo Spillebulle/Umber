@@ -162,6 +162,13 @@ const SHAPE_RAW: u32 = 4u;
 // front of this file: `layers` is a tile atlas, so a document texel of a slot is
 // `tile_load`'s to find rather than a plain `textureLoad`.
 @group(0) @binding(6) var page_table: texture_2d_array<u32>;
+// The same atlas without the transfer function, for the mask tap in
+// `fs_extract` and nothing else. `composite.wgsl`'s binding 6 has the argument:
+// a mask holds the linear multiplier, and reading it through the sRGB view costs
+// 73 of its 256 states. The extract has to agree with the composite about what a
+// mask means or a shadow is derived from a different coverage than the one the
+// picture shows.
+@group(0) @binding(7) var mask_tex: texture_2d_array<f32>;
 // Whatever the previous pass wrote — the wet stroke's scratch for `fs_extract`,
 // a coverage field for everything else.
 @group(0) @binding(2) var src: texture_2d<f32>;
@@ -233,7 +240,7 @@ fn fs_extract(@builtin(position) f: vec4<f32>) -> @location(0) f32 {
     var a = tile_load(layers, page_table, c.slot, p, vec4<f32>(0.0)).a;
     var m = 1.0;
     if (c.has_mask != 0u) {
-        m = tile_load(layers, page_table, c.mask_slot, p, vec4<f32>(1.0)).r;
+        m = tile_load(mask_tex, page_table, c.mask_slot, p, vec4<f32>(1.0)).r;
     }
     if (c.stroke_here != 0u) {
         let s = at(src, p, lim) * c.stroke_opacity;

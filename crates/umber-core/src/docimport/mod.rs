@@ -214,7 +214,7 @@ impl SourceFormat {
 ///    clears the whole array before the upload loop and nothing distinguishes a
 ///    mask slice from a layer's. **So a mask may not yet be sparse**, and no
 ///    reader makes one so: a mask's empty value is *white*, and
-///    `srgb::encode_coverage(0)` is `[0, 0, 0, 255]` rather than four zeroes, so
+///    `srgb::mask_pixel(0)` is `[0, 0, 0, 255]` rather than four zeroes, so
 ///    even a fully hidden region is not what the clear leaves. When the tiled
 ///    store gives a slot class its own empty value this rule is what a mask
 ///    reader will be able to lean on; until then the rule it is actually held to
@@ -394,14 +394,16 @@ pub struct ImportedLayer {
     /// The layer's mask, in the same form as `pixels` — so it goes straight to
     /// `write_texture` like everything else here.
     ///
-    /// Only the **red** channel is ever read, and it holds sRGB-encoded
-    /// coverage rather than a linear multiplier; `srgb::encode_coverage` is
-    /// the one place another application's mask byte becomes one of these.
+    /// Only the **red** channel is ever read, and it holds coverage as a
+    /// **linear** multiplier on the layer's alpha — the form every source format
+    /// already states one in, so `srgb::mask_buffer` widens rather than
+    /// converts. It used to hold the sRGB encoding of that, which cost 73 of its
+    /// 256 states; see that module.
     ///
     /// **Every reader yields exactly one canvas-sized piece here**, and
     /// [`PixelPiece`]'s rule 3 says why: a mask's empty value is white, the
-    /// upload's clear delivers transparent black, and `encode_coverage(0)` is
-    /// not four zeroes either. A sparse mask waits for a store that gives a slot
+    /// upload's clear delivers transparent black, and `mask_pixel(0)` is not
+    /// four zeroes either. A sparse mask waits for a store that gives a slot
     /// class its own empty value.
     ///
     /// Filled by ORA, by `.kra`'s transparency masks and by `.clip`'s layer

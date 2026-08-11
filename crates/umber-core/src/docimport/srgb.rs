@@ -30,23 +30,46 @@
 //! actually hold, or a document would drift a little every time it was saved and
 //! reopened; `saving_and_reopening_does_not_move_a_pixel` pins that down.
 //!
-//! # A mask is the same question with a different answer
+//! # A mask is *not* the same question, and this file used to answer it wrongly
 //!
-//! A mask is another slice of the *same* layer array, and `composite.wgsl`
-//! reads its **red** channel — through the array's `Rgba8UnormSrgb` view, so
-//! the sampler decodes it on the way out. The number the shader multiplies the
-//! layer by is therefore `srgb_decode(red / 255)` and not `red / 255`: a mask
-//! slice holds **sRGB-encoded coverage** exactly as a layer slice holds
-//! sRGB-encoded colour, and `a_mask_hides_what_it_covers` in `gpu_pipeline.rs`
-//! reads the stored 188 as a half.
+//! A mask is another slice of the same layer array, so for a long time it was
+//! read through the same `Rgba8UnormSrgb` view a layer's colour is read
+//! through — which meant the stored byte was **sRGB-encoded coverage**, and
+//! every source format's linear multiplier had to be encoded on the way in.
+//! This module carried a `coverage_table` doing exactly that.
 //!
-//! Every other application stores a mask as a **linear** multiplier on alpha —
-//! Krita's transparency mask is a byte of its ALPHA colour space and
-//! Photoshop's is a greyscale channel, and both mean "times `byte / 255`". So
-//! a source byte of 128 means a half, and a half is stored here as 188.
-//! Copying the byte across unchanged is the tempting one-liner and is wrong by
-//! a full gamma curve: a layer the artist hid by half would arrive hidden by
-//! four fifths. [`encode_coverage`] is the one place that conversion happens.
+//! That was inherited rather than chosen, and it cost precision. A mask is a
+//! multiplier on **alpha**, and alpha is not gamma-encoded anywhere in Umber:
+//! `LAYER_FORMAT`'s own docs say an sRGB format encodes RGB only, and
+//! `STROKE_FORMAT` is justified as being exactly as wide as the linear alpha it
+//! lands in. Squeezing coverage through the transfer function is therefore a
+//! conversion into a space nothing downstream wanted, and the map is **not
+//! injective**: `round(linear_to_srgb(v/255)·255)` has a slope below one from
+//! input 75 upward, so 73 of 256 inputs collide with their neighbour. Measured
+//! both ways and it is the same figure from either end — an sRGB-stored mask can
+//! express only **183** of the 256 multipliers the composite's own 8-bit alpha
+//! can show, all 73 of the missing ones in the upper *reveal* range where a mask
+//! is actually visible. Adjacent stored bytes differ by 0.0089 in the multiplier
+//! at the reveal end, against a uniform 0.0039 for linear.
+//!
+//! So a mask slice now holds **linear coverage**, read through the array's
+//! `LAYER_FORMAT_LINEAR` view — the same raw view `flip.wgsl` has always used,
+//! and for the same reason: these bytes are not colour and must not go through a
+//! transfer function. `byte / 255` *is* the multiplier, all 256 of them, and a
+//! source format's byte is now copied across unchanged because it already means
+//! what this one means. [`mask_pixel`] is the whole of the conversion, and it is
+//! a widen rather than a conversion.
+//!
+//! [`decode_v3_mask_buffer`] is what remains of the old map: a document written
+//! before this change holds the sRGB form, and its bytes are converted on the
+//! way in. **That cannot be a lossless migration and is not claimed to be** —
+//! the old encode collapsed 73 of its inputs, so the state that produced a given
+//! stored byte is not recoverable. What is recoverable is the *multiplier*,
+//! which is the whole of what a mask does, and requantising it onto the linear
+//! grid moves it by at most 0.499 of one level of the layer's own 8-bit alpha —
+//! under the rounding the composite's multiply already performs. So an old
+//! document opens looking as it did, and a version-3 file taken to 4 and back
+//! would not come back byte for byte. No route asks it to.
 
 use std::sync::OnceLock;
 
@@ -100,47 +123,82 @@ pub fn encode_buffer(buf: &mut [u8]) {
     }
 }
 
-/// `linear coverage -> the byte a mask slice holds`. 256 entries, built once.
+/// Widen one byte of a mask into the four a mask slice holds.
 ///
-/// Small enough to compute per call and deliberately not: a canvas-sized mask
-/// on a 4096² import is 16 million `powf` pairs, which is the cost [`TABLE`]
-/// exists to avoid on the colour path.
-static COVERAGE: OnceLock<[u8; 256]> = OnceLock::new();
+/// The input is coverage as every source format states it and as a mask slice
+/// now holds it — a **linear** multiplier on the layer's alpha, `0` hiding and
+/// `255` revealing. There is no conversion: the composite reads a mask through
+/// the layer array's `LAYER_FORMAT_LINEAR` view, so the stored byte over 255 is
+/// the multiplier, and the source already means that. See the module docs for
+/// what this used to do and what it cost.
+///
+/// Opaque in the fourth byte because a mask slice is read on one channel and
+/// nothing looks at the others; writing the coverage there as well would make
+/// a half-hidden layer's mask *itself* half transparent the day something does.
+pub fn mask_pixel(coverage: u8) -> [u8; 4] {
+    [coverage, coverage, coverage, 255]
+}
 
-fn coverage_table() -> &'static [u8; 256] {
-    COVERAGE.get_or_init(|| {
+/// Widen a canvas of coverage bytes into a mask slice.
+pub fn mask_buffer(coverage: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(coverage.len() * 4);
+    for &c in coverage {
+        out.extend_from_slice(&mask_pixel(c));
+    }
+    out
+}
+
+/// `stored byte -> the byte a mask slice holds`, for a document written before
+/// [`crate::docformat::VERSION`] 4.
+///
+/// Those files hold sRGB-encoded coverage, so the multiplier they meant is
+/// `srgb_to_linear(s / 255)` and the byte that means the same thing now is that
+/// figure back in eight bits.
+///
+/// **This cannot be a lossless migration and must not be described as one.**
+/// The old encode collapsed 73 of its 256 inputs onto a neighbour, so the state
+/// that produced a given stored byte is not recoverable — only the multiplier
+/// is, and that is what matters, because the multiplier is the whole of what a
+/// mask does. What the requantisation costs is bounded and was measured: the
+/// worst multiplier shift over all 256 stored bytes is 0.499 of one level of the
+/// layer's own 8-bit alpha, which is under the rounding the composite already
+/// performs when it multiplies. So a version-3 document's picture cannot move by
+/// a level. A version-3 file converted to 4 and then read by a version-3 build
+/// would not come back byte for byte, and there is no route that asks it to.
+///
+/// It takes the widened `(g, g, g, 255)` form both the reader and the saved
+/// history produce, and rewrites all three colour bytes, because nothing
+/// downstream promises which channel it reads: `composite.wgsl` takes `.r` and
+/// `docformat`'s writer takes `px[0]`, and a slice whose channels disagreed
+/// would be a trap for whichever is asked next.
+///
+/// **One function rather than a scalar with a buffer wrapper**, so there is no
+/// second statement of the map to drift, and so the table is fetched once per
+/// call rather than three times per pixel — a canvas-sized mask is millions of
+/// them. A table for the reason [`TABLE`] is one: this is a `powf` per byte
+/// otherwise.
+static V3_COVERAGE: OnceLock<[u8; 256]> = OnceLock::new();
+
+fn v3_coverage_table() -> &'static [u8; 256] {
+    V3_COVERAGE.get_or_init(|| {
         let mut t = [0u8; 256];
-        for (v, out) in t.iter_mut().enumerate() {
-            *out = (linear_to_srgb(v as f32 / 255.0) * 255.0 + 0.5) as u8;
+        for (s, out) in t.iter_mut().enumerate() {
+            *out = (srgb_to_linear(s as f32 / 255.0) * 255.0 + 0.5) as u8;
         }
         t
     })
 }
 
-/// Turn one byte of another application's mask into the four a mask slice
-/// holds.
-///
-/// The input is coverage as every source format states it — a linear multiplier
-/// on the layer's alpha, `0` hiding and `255` revealing. The output is
-/// `(g, g, g, 255)` with `g` sRGB-encoded, which is what
-/// [`crate::docformat`]'s greyscale mask PNG round-trips and what the composite
-/// samples. See the module docs for why the encode is not a no-op.
-///
-/// Opaque in the fourth byte because a mask slice is read on one channel and
-/// nothing looks at the others; writing the coverage there as well would make
-/// a half-hidden layer's mask *itself* half transparent the day something does.
-pub fn encode_coverage(coverage: u8) -> [u8; 4] {
-    let g = coverage_table()[coverage as usize];
-    [g, g, g, 255]
-}
-
-/// Widen a canvas of coverage bytes into a mask slice.
-pub fn encode_coverage_buffer(coverage: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(coverage.len() * 4);
-    for &c in coverage {
-        out.extend_from_slice(&encode_coverage(c));
+/// A whole pre-version-4 mask slice, converted in place. See [`V3_COVERAGE`].
+pub fn decode_v3_mask_buffer(buf: &mut [u8]) {
+    debug_assert_eq!(buf.len() % 4, 0, "not a whole number of RGBA pixels");
+    let t = v3_coverage_table();
+    for px in buf.chunks_exact_mut(4) {
+        let c = t[px[0] as usize];
+        px[0] = c;
+        px[1] = c;
+        px[2] = c;
     }
-    out
 }
 
 /// `[alpha][stored] -> straight byte`. The inverse of [`TABLE`].
@@ -280,52 +338,121 @@ mod tests {
     fn a_mask_that_hides_nothing_and_one_that_hides_everything_are_exact() {
         // The two ends have to be exact or every unmasked pixel of an imported
         // mask moves: 255 must reveal completely and 0 must hide completely.
-        assert_eq!(encode_coverage(255), [255, 255, 255, 255]);
-        assert_eq!(encode_coverage(0), [0, 0, 0, 255]);
+        // They were exact under the old sRGB encode too — the endpoints are the
+        // transfer function's fixed points, which is exactly why a fixture whose
+        // coverage is only 0 or 255 can see none of what follows.
+        assert_eq!(mask_pixel(255), [255, 255, 255, 255]);
+        assert_eq!(mask_pixel(0), [0, 0, 0, 255]);
     }
 
     #[test]
-    fn half_coverage_is_stored_as_the_byte_the_composite_reads_as_a_half() {
-        // The whole point, and the mask's version of
-        // `half_alpha_white_is_linear_not_srgb_half`. Krita and Photoshop both
-        // mean "half the alpha" by a mask byte of 128; the composite samples
-        // the slice through an sRGB view, so a half is stored as ~188. Copying
-        // 128 straight across would hide four fifths of the layer.
-        let out = encode_coverage(128);
-        assert!(
-            (out[0] as i32 - 188).abs() <= 1,
-            "expected ~188, got {out:?}"
-        );
-
-        // Said the other way round, which is the way the shader says it: the
-        // stored byte, decoded the way the sampler decodes it, is the source's
-        // own multiplier back again.
-        let decoded = srgb_to_linear(out[0] as f32 / 255.0);
-        assert!(
-            (decoded - 128.0 / 255.0).abs() < 0.005,
-            "the composite would read {decoded}, not {}",
-            128.0 / 255.0
-        );
-    }
-
-    #[test]
-    fn coverage_encoding_is_monotone_and_never_inverts() {
-        // A mask that got darker where the source got lighter is the worst
-        // shape this bug takes, because it looks deliberate.
-        let mut last = 0;
+    fn every_coverage_a_source_states_survives_into_the_slice() {
+        // **The guard that was missing.** What stood here was
+        // `coverage_encoding_is_monotone_and_never_inverts`, and monotone is
+        // not injective: `round(linear_to_srgb(v/255)·255)` is monotone and
+        // collapses 73 of its 256 inputs onto a neighbour, all of them above
+        // input 75, which is the whole upper reveal range. Counting is what
+        // catches it, and counting is three lines.
+        let mut seen = [false; 256];
         for c in 0..=255u8 {
-            let g = encode_coverage(c)[0];
-            assert!(g >= last, "coverage {c} encoded to {g} after {last}");
-            last = g;
+            let px = mask_pixel(c);
+            assert_eq!(px[0], c, "coverage {c} did not survive");
+            assert_eq!(px, [c, c, c, 255], "all three channels carry the coverage");
+            seen[px[0] as usize] = true;
+        }
+        assert_eq!(
+            seen.iter().filter(|s| **s).count(),
+            256,
+            "a mask slice must be able to hold every coverage a source states"
+        );
+    }
+
+    #[test]
+    fn a_mask_multiplier_reaches_every_level_the_composite_can_show() {
+        // Stated at the far end rather than at this function, because that is
+        // where it is spent: a mask multiplies an opaque layer's alpha and the
+        // result lands in an 8-bit linear channel, so what the picture can show
+        // is `round(m · 255)` over every byte a slice can hold. Linear reaches
+        // all 256. The sRGB form this replaced reached 183, and the second half
+        // measures that rather than asserting it, so the figure in the module
+        // docs is one a test prints.
+        let reach = |m: fn(u8) -> f32| {
+            let mut seen = [false; 256];
+            for s in 0..=255u8 {
+                seen[(m(s) * 255.0 + 0.5) as usize] = true;
+            }
+            seen.iter().filter(|s| **s).count()
+        };
+        assert_eq!(reach(|s| s as f32 / 255.0), 256, "linear coverage");
+        assert_eq!(
+            reach(|s| srgb_to_linear(s as f32 / 255.0)),
+            183,
+            "the sRGB form this replaced, for the record"
+        );
+    }
+
+    #[test]
+    fn the_mask_buffer_and_the_single_byte_agree() {
+        let out = mask_buffer(&[0, 40, 128, 255]);
+        assert_eq!(out.len(), 16);
+        for (i, c) in [0u8, 40, 128, 255].into_iter().enumerate() {
+            assert_eq!(&out[i * 4..i * 4 + 4], mask_pixel(c));
         }
     }
 
+    /// Every stored byte a pre-version-4 mask could hold, put through the
+    /// migration — as a real buffer, because that is the only entry point.
+    fn v3_converted() -> Vec<u8> {
+        let mut buf: Vec<u8> = (0..=255u8).flat_map(mask_pixel).collect();
+        decode_v3_mask_buffer(&mut buf);
+        buf
+    }
+
     #[test]
-    fn the_coverage_buffer_and_the_single_byte_agree() {
-        let out = encode_coverage_buffer(&[0, 40, 128, 255]);
-        assert_eq!(out.len(), 16);
-        for (i, c) in [0u8, 40, 128, 255].into_iter().enumerate() {
-            assert_eq!(&out[i * 4..i * 4 + 4], encode_coverage(c));
+    fn a_version_three_mask_keeps_the_multiplier_it_meant() {
+        // The migration's whole claim, and it is about the *multiplier* rather
+        // than about the byte — the old encode was not injective, so the byte
+        // cannot come back and does not need to. What must not move is what the
+        // composite multiplies by, and the bound is half a level of the layer's
+        // own alpha, which is under the rounding the multiply already does.
+        //
+        // Swept over the whole domain rather than sampled: the failure this
+        // would catch is a wrong direction or a wrong rounding, and both are
+        // invisible at the two ends, which are the bytes a fixture reaches for.
+        let out = v3_converted();
+        for s in 0..=255usize {
+            let meant = srgb_to_linear(s as f32 / 255.0);
+            let now = out[s * 4] as f32 / 255.0;
+            assert!(
+                (meant - now).abs() * 255.0 <= 0.5,
+                "stored {s} meant {meant} and now reads {now}"
+            );
+        }
+        // The two ends are exact, so a fully revealed or fully hidden mask out
+        // of an old document is untouched — which is most of every mask.
+        assert_eq!(out[0], 0);
+        assert_eq!(out[255 * 4], 255);
+        // And it really is a conversion rather than a copy: 188 was the old
+        // form's half, and the direction matters — the mirrored bug hands back
+        // 229 and makes every old mask *reveal* more than it did.
+        assert!(
+            (out[188 * 4] as i32 - 128).abs() <= 1,
+            "188 meant a half, got {}",
+            out[188 * 4]
+        );
+    }
+
+    #[test]
+    fn converting_a_version_three_mask_rewrites_every_colour_channel() {
+        // `composite.wgsl` reads `.r` and `docformat`'s writer reads `px[0]`,
+        // and nothing promises the next reader will pick the same one, so a
+        // conversion that touched only red would leave a trap for whichever is
+        // asked next.
+        let out = v3_converted();
+        for (s, px) in out.chunks_exact(4).enumerate() {
+            assert_eq!(px[0], px[1], "stored {s}");
+            assert_eq!(px[0], px[2], "stored {s}");
+            assert_eq!(px[3], 255, "stored {s} lost its opaque fourth byte");
         }
     }
 
