@@ -6249,6 +6249,14 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
     };
     let baked = h.bake_frame(&stack, 4, painting);
 
+    // The capacity first, deliberately: it is the reading a shorter test would
+    // never reach, because the draw count below fails on the same mutation and
+    // would mask it.
+    assert_eq!(
+        h.canvas.slot_capacity(),
+        before_slots,
+        "a hidden layer's effect took a canvas-sized slice"
+    );
     assert_eq!(
         baked.draws.len(),
         3,
@@ -6259,11 +6267,6 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
         h.canvas.effect_bakes(),
         before_bakes,
         "a hidden layer's effect was baked into a slice nothing reads"
-    );
-    assert_eq!(
-        h.canvas.slot_capacity(),
-        before_slots,
-        "a hidden layer's effect took a canvas-sized slice"
     );
     assert_eq!(
         baked.active_index, 1,
