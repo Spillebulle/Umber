@@ -3201,6 +3201,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&documents);
     }
 
+    /// **Expiry still runs when the write failed, which is the run where it
+    /// matters most.**
+    ///
+    /// The sweep and `Report::Written` answer different questions — one is about
+    /// copies that are already old, the other about whether *this* write landed
+    /// — and gating the first on the second is the shape a `return` invites.
+    /// It went in that way: the gate that stops an autosave claiming a file it
+    /// never wrote was put above the sweep, so an autosave that had begun
+    /// failing stopped expiring anything until the next launch. That is exactly
+    /// backwards, because the reason both destinations fail is usually a full
+    /// disk, and expiry is what might give the next attempt room.
+    ///
+    /// Nothing else here can see it: every other test in this module has at
+    /// least one destination succeed, so the sweep runs either way.
+    #[test]
+    fn an_autosave_that_could_not_write_still_expires_what_is_old() {
+        let internal = scratch("expire-anyway");
+        let stale = internal.join("something-old-9999999999999999.ora");
+        touch(&stale, Duration::from_secs(400 * 24 * 3600));
+
+        // A *directory* where the copy wants to be: the parent exists, so the
+        // sweep can reach it, and the rename onto it fails, so nothing lands.
+        // A path that could not be created at all would take the parent with
+        // it and there would be nothing to sweep.
+        let blocked = internal.join("blocked-1212121212121212.ora");
+        std::fs::create_dir_all(&blocked).expect("a directory in the way");
+
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        doc.path = None;
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(blocked),
+            pixels: one_pixel_capture(),
+            expiry: Some(Duration::from_secs(30 * 24 * 3600)),
+        });
+
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "the fixture stopped failing to write: {reports:?}"
+        );
+        assert!(
+            !reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "nothing landed and the autosave said it had: {reports:?}"
+        );
+        assert!(
+            !stale.exists(),
+            "a failed autosave stopped expiring old copies"
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
     /// **The one that would cost somebody a painting.** A document recovered
     /// out of a copy carries the file the painter chose, so that Save writes
     /// where they expect — and the timer must not, because they may have opened
