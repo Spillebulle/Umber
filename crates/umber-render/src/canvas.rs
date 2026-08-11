@@ -7771,6 +7771,60 @@ impl CanvasRenderer {
         }
     }
 
+    /// The canvas's tile grid.
+    ///
+    /// Observation only, and what a test needs to name a tile at all.
+    #[doc(hidden)]
+    pub fn tile_grid(&self) -> Grid {
+        self.layers.grid
+    }
+
+    /// Take one tile of one slot out of the page table, so it reads as the
+    /// slot's empty value — transparent for a layer, white for a mask.
+    ///
+    /// **Exists for the tests, and it is the only thing that drives the
+    /// unbacked path at all.** Residency is the identity everywhere else today,
+    /// so without this the `select` in `tiles.wgsl` would be a branch nothing
+    /// had ever taken — which is exactly the shape of code that is discovered to
+    /// be wrong on the day it first runs, in front of somebody's document. It is
+    /// also the shape the sparse stage's `clear_layer` takes, so what these
+    /// tests pin is that stage's substitution rather than a curiosity.
+    #[doc(hidden)]
+    pub fn unback_tile_for_test(&mut self, queue: &wgpu::Queue, slot: u32, tile: (u32, u32)) {
+        self.write_entry(queue, slot, tile, Entry::UNBACKED);
+    }
+
+    /// Point one tile of `slot` at wherever `from` keeps the same tile.
+    ///
+    /// For the tests, and for one property: with the identity table adjacent
+    /// logical tiles are adjacent *in the atlas too*, so nothing can tell a
+    /// correct resolve from a shader that ignored the table and read across the
+    /// boundary. Pointing one tile somewhere else makes the two answers
+    /// different, which is what
+    /// `a_tap_across_a_tile_boundary_blends_the_logical_neighbour` needs — and
+    /// it is the whole of what an apron would have existed to make true.
+    #[doc(hidden)]
+    pub fn borrow_tile_for_test(
+        &mut self,
+        queue: &wgpu::Queue,
+        slot: u32,
+        tile: (u32, u32),
+        from: u32,
+    ) {
+        let grid = self.layers.grid;
+        let at = from as usize * grid.tiles_per_page() as usize + grid.index(tile.0, tile.1);
+        let entry = self.layers.entries[at];
+        self.write_entry(queue, slot, tile, entry);
+    }
+
+    fn write_entry(&mut self, queue: &wgpu::Queue, slot: u32, tile: (u32, u32), entry: Entry) {
+        let grid = self.layers.grid;
+        let at = slot as usize * grid.tiles_per_page() as usize + grid.index(tile.0, tile.1);
+        self.layers.entries[at] = entry;
+        self.layers.upload_table(queue);
+        self.touch_slot(slot);
+    }
+
     /// Pretend this device will not allocate a staging buffer larger than
     /// `bytes`, so the banded readback path can be driven on a document small
     /// enough to check by hand.
@@ -10107,6 +10161,39 @@ mod tests {
                 .guaranteed_format_features(wgpu::Features::empty())
                 .allowed_usages
                 .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        );
+    }
+
+    /// **The page table is readable and writable on every device the
+    /// specification describes.**
+    ///
+    /// A weaker demand than [`SEED_FORMAT`]'s — it is only ever loaded with
+    /// `textureLoad` and filled with `write_texture`, never rendered into — and
+    /// weaker is not none. Asked of `guaranteed_format_features` rather than of
+    /// the adapter in front of us, for the reason
+    /// `the_seed_format_is_a_render_target_on_every_device` gives: the failure
+    /// is a `create_texture` validation error, which `crash::device_error` makes
+    /// fatal, and it would appear on somebody else's machine and not on this
+    /// one. Without a page table there is nowhere for a layer's texels to be.
+    #[test]
+    fn the_page_table_format_is_readable_on_every_device() {
+        let features = PAGE_TABLE_FORMAT.guaranteed_format_features(wgpu::Features::empty());
+        for usage in [
+            wgpu::TextureUsages::TEXTURE_BINDING,
+            wgpu::TextureUsages::COPY_DST,
+        ] {
+            assert!(
+                features.allowed_usages.contains(usage),
+                "{PAGE_TABLE_FORMAT:?} does not guarantee {usage:?}: {:?}",
+                features.allowed_usages
+            );
+        }
+        // And it is an *integer* format, which is what `page_table_entry`'s
+        // `TextureSampleType::Uint` says and what makes filtering meaningless
+        // rather than merely unwanted.
+        assert_eq!(
+            PAGE_TABLE_FORMAT.sample_type(None, None),
+            Some(wgpu::TextureSampleType::Uint)
         );
     }
 

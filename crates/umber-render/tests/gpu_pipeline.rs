@@ -7653,3 +7653,300 @@ fn add_glow_matches_add_over_an_opaque_backdrop_and_differs_over_a_soft_one() {
         "`plus` adds alpha as well as colour: {soft_glow:?} against {soft_add:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The tile atlas
+//
+// A layer's texels live in 256-square tiles of a page atlas, and a page table
+// says where each one is. Residency is the identity today — page `n` holds slot
+// `n`'s tiles at their own coordinates — so nothing below could be told from the
+// dense array it replaced *unless* the table is deliberately rearranged. That is
+// what `unback_tile_for_test` and `borrow_tile_for_test` are for, and they are
+// the only thing that runs the substitution or the cross-tile tap at all.
+// ---------------------------------------------------------------------------
+
+/// Two tiles on a side. The harness's 64 is one tile, so it has no boundary to
+/// straddle and no second tile to be pointed at.
+const TILED: u32 = 512;
+
+/// A renderer over a `TILED`-square canvas with `slots` slices, cleared.
+fn tiled_canvas(gpu: &Gpu, slots: u32) -> CanvasRenderer {
+    let mut canvas = CanvasRenderer::new(
+        &gpu.device,
+        &gpu.queue,
+        UVec2::splat(TILED),
+        TARGET_FORMAT,
+        slots,
+    );
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.clear_all_layers(&mut enc);
+    canvas.clear_stroke(&gpu.device, &mut enc);
+    gpu.queue.submit(Some(enc.finish()));
+    canvas
+}
+
+fn fill_tiled_slot(gpu: &Gpu, canvas: &mut CanvasRenderer, slot: u32, rgba: [u8; 4]) {
+    let bytes: Vec<u8> = rgba
+        .iter()
+        .copied()
+        .cycle()
+        .take((TILED as usize) * (TILED as usize) * 4)
+        .collect();
+    canvas.write_layer_rect(
+        &gpu.device,
+        &gpu.queue,
+        slot,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: TILED,
+            height: TILED,
+        },
+        &bytes,
+    );
+}
+
+/// Composite into an offscreen target and read one pixel.
+///
+/// `zoom` above one is what makes a bilinear tap straddle anything at all: at
+/// zoom 1 every sample lands on a texel centre and the filter is the identity.
+fn tiled_composite(
+    gpu: &Gpu,
+    canvas: &CanvasRenderer,
+    layers: &[LayerDraw],
+    zoom: f32,
+    center: Vec2,
+    x: u32,
+    y: u32,
+) -> [u8; 4] {
+    const VIEW: u32 = 64;
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tiled-target"),
+        size: wgpu::Extent3d {
+            width: VIEW,
+            height: VIEW,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TARGET_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.composite(
+        &gpu.queue,
+        &mut enc,
+        &view,
+        &CompositeParams {
+            camera: &Camera { center, zoom },
+            pivot: Vec2::splat(VIEW as f32 * 0.5),
+            layers,
+            backdrop: [0.0, 0.0, 0.0],
+            // Export, so what comes back is the stack alone: the checkerboard
+            // the screen path lays under it would make "is anything here"
+            // answerable only by knowing which square this pixel fell in.
+            export: true,
+            active_index: u32::MAX,
+            stroke: StrokeStyle {
+                opacity: 0.0,
+                ..StrokeStyle::default()
+            },
+        },
+    );
+    let row = VIEW * 4;
+    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tiled-readback"),
+        size: (row * VIEW) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(VIEW),
+            },
+        },
+        wgpu::Extent3d {
+            width: VIEW,
+            height: VIEW,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+    let mapped = slice.get_mapped_range();
+    let at = (y * row + x * 4) as usize;
+    let out = [mapped[at], mapped[at + 1], mapped[at + 2], mapped[at + 3]];
+    drop(mapped);
+    staging.unmap();
+    out
+}
+
+/// A tile nothing is stored for reads as the slot's **empty value**, and for a
+/// layer that is transparent black — byte for byte what a dense slice held
+/// there.
+///
+/// This is the whole of what will make a sparse layer cost what it covers, and
+/// today it is reachable only from a test: residency is the identity, so
+/// without `unback_tile_for_test` the branch in `tiles.wgsl` would never once
+/// have run.
+#[test]
+fn an_unbacked_layer_tile_reads_as_nothing() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 1);
+    fill_tiled_slot(gpu, &mut canvas, 0, [255, 0, 0, 255]);
+
+    let draws = [layer(0, 1.0, BlendMode::Normal)];
+    // An eighth puts the whole 512 canvas inside the 64 view, so pixel 8 is
+    // around document 64 (tile 0,0) and pixel 40 around document 320 (tile 1,0).
+    let zoom = 0.125;
+    let centre = Vec2::splat(TILED as f32 * 0.5);
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 8)[3],
+        255,
+        "the layer starts opaque everywhere"
+    );
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8)[3],
+        255
+    );
+
+    canvas.unback_tile_for_test(&gpu.queue, 0, (1, 0));
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 8),
+        [255, 0, 0, 255],
+        "the tile that is still stored is untouched"
+    );
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8),
+        [0, 0, 0, 0],
+        "a tile nothing is stored for is transparent, not whatever was there"
+    );
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 40),
+        [255, 0, 0, 255],
+        "and the tile below it is untouched"
+    );
+}
+
+/// A **mask's** empty value is white, not zero.
+///
+/// A mask multiplies the layer's alpha and a mask nobody has painted on reveals
+/// everything, so taking an absent tile for zero hides the layer everywhere
+/// nobody painted. That is the same bug `clipstudio.rs` records fixing on the
+/// import side, in the same format at the same block size, and it is the one
+/// place the substitution is not "whatever a cleared slice held".
+#[test]
+fn an_unbacked_mask_tile_reveals_the_layer_rather_than_hiding_it() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+    fill_tiled_slot(gpu, &mut canvas, 0, [255, 0, 0, 255]);
+    // A mask slice holds coverage on its red channel. Black hides everything.
+    fill_tiled_slot(gpu, &mut canvas, 1, [0, 0, 0, 255]);
+
+    let draws = [LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: BlendMode::Normal.index(),
+        visible: true,
+        mask: Some(1),
+        clipped: false,
+    }];
+    let zoom = 0.125;
+    let centre = Vec2::splat(TILED as f32 * 0.5);
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8)[3],
+        0,
+        "a black mask hides the layer"
+    );
+
+    canvas.unback_tile_for_test(&gpu.queue, 1, (1, 0));
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8),
+        [255, 0, 0, 255],
+        "where the mask stores nothing the layer is revealed whole"
+    );
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 8)[3],
+        0,
+        "and the tile the mask does store still hides"
+    );
+}
+
+/// A bilinear tap that straddles a tile boundary blends the **logical**
+/// neighbour, not whatever tile happens to sit beside it in the atlas.
+///
+/// This is the failure the whole design has to answer for. The usual answer is
+/// an apron — a copy of the neighbour's edge texels around every tile, refreshed
+/// by whoever writes — whose failure mode is a one-texel seam at some zooms on
+/// some layers when one writer forgets. `composite.wgsl` reconstructs the tap
+/// through the page table instead, so there is nothing to go stale.
+///
+/// **Under the identity table this is untestable**, because adjacent logical
+/// tiles are then adjacent in the atlas too and a shader that ignored the table
+/// would give the same answer. `borrow_tile_for_test` is what makes the two
+/// answers differ: slot 0's right-hand tile is pointed at slot 1's storage, so a
+/// physical read gives red where a resolved one gives blue.
+///
+/// Demonstrated by mutation: read `c10` and `c11` from `lo` instead of `up` in
+/// `tile_bilinear` — a lerp that never crosses a texel — and the straddling
+/// pixel comes back pure red.
+#[test]
+fn a_tap_across_a_tile_boundary_blends_the_logical_neighbour() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+    fill_tiled_slot(gpu, &mut canvas, 0, [255, 0, 0, 255]);
+    fill_tiled_slot(gpu, &mut canvas, 1, [0, 0, 255, 255]);
+    canvas.borrow_tile_for_test(&gpu.queue, 0, (1, 0), 1);
+
+    let draws = [layer(0, 1.0, BlendMode::Normal)];
+    // Zoom 2 with the camera on the boundary: screen pixel 31's centre is 31.5,
+    // which is document 255.75 — a quarter of a texel short of the boundary at
+    // 256 — so the tap reaches texel 255 (red, tile 0,0) and texel 256 (blue,
+    // through the borrow).
+    let zoom = 2.0;
+    let centre = Vec2::new(TILED as f32 * 0.5, 64.0);
+
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 16, 32),
+        [255, 0, 0, 255],
+        "well inside the left tile the tap lands on one texel and is exact"
+    );
+    assert_eq!(
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 48, 32),
+        [0, 0, 255, 255],
+        "and inside the borrowed tile it reads what the table points at"
+    );
+
+    let straddling = tiled_composite(gpu, &canvas, &draws, zoom, centre, 31, 32);
+    assert!(
+        straddling[2] > 8,
+        "the tap must reach the logical neighbour: got {straddling:?}, which is \
+         what reading the physically adjacent tile would give"
+    );
+    assert!(
+        straddling[0] > 8 && straddling[0] < 255,
+        "and it must still be a blend rather than the neighbour alone: {straddling:?}"
+    );
+}
