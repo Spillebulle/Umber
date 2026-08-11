@@ -3329,9 +3329,9 @@ impl CanvasRenderer {
     /// `docs/perf/slot-lifecycle-and-vram.md` §5.1 says it does not in
     /// general.** Two things sit *above* it: the slice a floating transform
     /// previews into, and every effect slice. This method has already given both
-    /// back before it allocates — `end_float` and `EffectCache::forget_all` are
-    /// called above, in that order and deliberately before the rebuild rather
-    /// than after it. So this is the one moment in the program when the model's
+    /// back before it allocates — `EffectCache::forget_all` and then
+    /// `end_float`, deliberately before the rebuild rather than after it. So
+    /// this is the one moment in the program when the model's
     /// claim count is the whole of what the array has to hold, and it is the one
     /// shrink with **no transient at all**: a resize allocates a fresh array
     /// whatever happens, so shrinking makes that peak smaller rather than
