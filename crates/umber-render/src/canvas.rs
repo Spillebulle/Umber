@@ -1230,6 +1230,18 @@ fn average_probe(bytes: &[u8]) -> [f32; 4] {
 /// and costs only a few more frames — see [`Capture::copy_chunk`].
 const CAPTURE_CHUNK_BYTES: usize = 4 << 20;
 
+/// The fewest steps any capture may spend re-reading what an edit made stale,
+/// however few steps it has.
+///
+/// [`Capture::rereads`] is the step count, so the worst case is twice the work.
+/// That is the right shape on a document large enough for an edit to land inside
+/// a capture at all, and degenerate on a small one: one disturbance costs two
+/// re-reads — the layer, then the preview — so a single-layer document's two
+/// steps buy exactly one, and it gives up on the *second*. The floor is what
+/// keeps a small document from giving up almost at once for want of a budget it
+/// could spend in a couple of frames.
+const REREAD_FLOOR: usize = 4;
+
 /// Where a [`Capture`]'s one staging buffer has got to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StepState {
@@ -1304,25 +1316,70 @@ struct Capture {
     /// One of the `PROBE_*` constants, for the reason [`Probe::outcome`] is.
     outcome: Arc<AtomicU8>,
     state: StepState,
-    /// The step in flight, or the next to be recorded. `slots.len()` is the
-    /// flattened preview, which goes last.
+    /// How far the linear pass has walked. `slots.len()` is the flattened
+    /// preview, which goes last; `steps()` means the pass is done and whatever
+    /// is left is a re-read. See [`Self::stale`].
     step: usize,
+    /// The step being re-read, once the linear pass is over. `None` while the
+    /// pass is still walking, which is what makes [`Self::reading`] one answer
+    /// rather than two that can disagree.
+    redo: Option<usize>,
+    /// Steps whose bytes are no longer what the document holds, because the
+    /// slice was written to after they were read.
+    ///
+    /// **A capture spans many frames — about ninety seconds on the reference
+    /// 20000×5000 document — so an edit landing inside one is ordinary rather
+    /// than exotic.** Left alone, the file holds that layer as it was and every
+    /// other as it is: a document that never existed, written silently. So the
+    /// step is marked and read again once the linear pass is over, and the
+    /// preview after it, until nothing is stale — which is a fixed point that
+    /// settles the moment somebody stops painting for the length of two steps.
+    ///
+    /// **Re-reading the steps that moved rather than restarting the capture is
+    /// the whole of why this is affordable.** A restart throws away the other
+    /// fifty-two layers, so on the reference document it would need a
+    /// ninety-second pause to ever complete and would in practice mean *never
+    /// autosaved* — silently, which is worse than the mixed file it was fixing.
+    /// One layer and the preview is a couple of seconds.
+    ///
+    /// A write to a step the pass has **not reached** marks nothing: what is
+    /// read afterwards is the new content, and every step already read is
+    /// untouched, so the file is the document as it now stands. That is what
+    /// keeps this rare — a stroke on a layer high in the stack disturbs a
+    /// capture only once the capture has walked past it.
+    ///
+    /// One entry per step, so index `slots.len()` is the preview's.
+    stale: Vec<bool>,
+    /// How many further steps this capture may spend re-reading before it gives
+    /// up and lets the next one start fresh.
+    ///
+    /// Somebody painting without pause on a layer low in the stack can keep a
+    /// capture stale for ever, and only one capture runs at a time — so an
+    /// unbounded fixed point would starve **every other open document's**
+    /// autosave rather than only this one's. The budget is the capture's own
+    /// step count, so the worst case is twice the work and no more, with a floor
+    /// so a one-layer document still gets a couple of tries.
+    rereads: usize,
     /// One entry per step, filled in as each comes home — and emptied again by
     /// [`CanvasRenderer::take_capture_slice`] as each is handed over.
     results: Vec<Option<Vec<u8>>>,
-    /// How many layer slices have been handed over.
+    /// Which layer slices have been handed over at least once.
     ///
-    /// **This is what stops the whole document being resident at once.** The
-    /// readback is already banded and already spread across frames, so the
+    /// **Draining is what stops the whole document being resident at once.**
+    /// The readback is already banded and already spread across frames, so the
     /// pixels arrive incrementally; without a way out they were then *held*,
     /// which is 10 GB on the reference document and is
     /// `docs/perf/formats-and-host-memory.md` §10.1's whole figure. A caller
     /// that drains each slice as it lands and encodes it leaves this holding
     /// one.
     ///
+    /// A flag per slice rather than a count, because a re-read hands the same
+    /// index over twice: the writer keys its images by index and replaces, so
+    /// what a count would measure is no longer "how many are still to come".
+    ///
     /// The flattened preview is never drained: it is the last step, it is what
     /// the thumbnail is scaled from, and it is one canvas rather than N.
-    taken: usize,
+    handed: Vec<bool>,
     /// The step in flight, as far as it has been copied out of the mapped
     /// buffer. See [`Capture::copy_chunk`].
     partial: Option<Vec<u8>>,
@@ -1372,9 +1429,51 @@ impl Capture {
         self.slots.len() + 1
     }
 
-    /// True once every step has its bytes.
+    /// The step whose bytes are being assembled: the linear pass's cursor while
+    /// that lasts, and the re-read afterwards.
+    fn reading(&self) -> usize {
+        self.redo.unwrap_or(self.step)
+    }
+
+    /// True once this step's bytes have started to arrive, so a write to its
+    /// slice invalidates what has been read rather than merely arriving before
+    /// it.
+    ///
+    /// A step sitting in [`StepState::Waiting`] with nothing accumulated has
+    /// been *chosen* and not yet read, which is the state between two steps —
+    /// so a write then is a write the capture is about to pick up anyway.
+    fn started(&self) -> bool {
+        self.state != StepState::Waiting || self.partial.is_some()
+    }
+
+    /// True once every step has its bytes and none of them has gone stale.
     fn complete(&self) -> bool {
-        self.step >= self.steps()
+        self.step >= self.steps() && self.redo.is_none() && !self.stale.iter().any(|s| *s)
+    }
+
+    /// Note that `slot` has been written to.
+    ///
+    /// Marks the step reading that slice stale if it has already been read; see
+    /// [`Self::stale`] for why a step the pass has not reached needs nothing.
+    /// The preview is deliberately **not** marked here — it is marked when a
+    /// layer is actually re-read. Where the pass has not reached it, marking it
+    /// early would buy a second whole-canvas read of a preview that was going to
+    /// be composited afterwards and be right anyway; where the pass *has*
+    /// reached it, which is the ordinary case, the preview is stale and gets
+    /// marked a moment later by the re-read that repairs the layer. Either way
+    /// the cost falls on the re-read rather than on every write.
+    ///
+    /// The test is against the **linear cursor** and not against
+    /// [`Self::reading`]: once the pass is over `step` is `steps()`, so every
+    /// index counts as read — including the ones a re-read of some lower step
+    /// has already walked past.
+    fn disturb(&mut self, slot: u32) {
+        let Some(index) = self.slots.iter().position(|s| *s == slot) else {
+            return;
+        };
+        if index < self.step || (index == self.step && self.started()) {
+            self.stale[index] = true;
+        }
     }
 
     /// True once nothing is outstanding on the GPU, so the job can be dropped.
@@ -3154,6 +3253,13 @@ pub struct CanvasRenderer {
     /// per document: a second would double the staging cost for a job that is
     /// already going to be repeated in five minutes.
     capture: Option<Capture>,
+    /// A capture gave up because edits kept outrunning it. Latched for
+    /// [`CanvasRenderer::take_capture_gave_up`], which is what tells the
+    /// scheduler to wait rather than start another into the same painting.
+    capture_gave_up: bool,
+    /// How many have, ever. For the tests, which otherwise cannot tell a capture
+    /// that gave up from one that was interrupted.
+    captures_given_up: u64,
     /// The largest buffer this device will create, in bytes.
     ///
     /// Taken from the device rather than assumed, and honoured by every
@@ -4231,6 +4337,8 @@ impl CanvasRenderer {
                 })
                 .collect(),
             capture: None,
+            capture_gave_up: false,
+            captures_given_up: 0,
             readback_limit: device.limits().max_buffer_size,
             page_ceiling: MAX_SLOTS as u32,
             speculation_limit: GROWTH_DOUBLING_BUDGET_BYTES,
@@ -6414,7 +6522,7 @@ impl CanvasRenderer {
     pub fn clear_layer(&mut self, queue: &wgpu::Queue, slot: u32) {
         self.set_class(slot, SlotClass::Layer);
         self.release_slot(queue, slot);
-        self.touch_slot(slot);
+        self.wipe_slot(slot);
     }
 
     /// Make one slot a **mask**, revealing everything — what a new mask starts
@@ -6436,7 +6544,7 @@ impl CanvasRenderer {
     /// side, which is the same pair of claims with the arithmetic taken out of
     /// one of them.
     pub fn fill_layer_white(&mut self, queue: &wgpu::Queue, slot: u32) {
-        self.touch_slot(slot);
+        self.wipe_slot(slot);
         self.set_class(slot, SlotClass::Mask);
         self.release_slot(queue, slot);
     }
@@ -7871,9 +7979,16 @@ impl CanvasRenderer {
     /// Note that a slice's pixels have changed.
     ///
     /// Called by every method here that writes one, and by nothing outside this
-    /// type. A thumbnail of that slice in flight is disowned in the same
-    /// breath: it is a picture of the layer as it was a moment ago, and drawing
-    /// it would show the stroke that has just landed as missing.
+    /// type. Two jobs in flight are told, and for the same reason — each is
+    /// reading a picture of the layer as it was a moment ago:
+    ///
+    /// - A **thumbnail** of that slice is disowned, or it would draw the stroke
+    ///   that has just landed as missing.
+    /// - A **capture** that has already read that slice is marked, because
+    ///   otherwise the autosaved file holds this layer as it was and every other
+    ///   as it is — a document that never existed, written silently. It is not
+    ///   thrown away: see [`Capture::stale`] for why one layer is re-read rather
+    ///   than the whole document restarted.
     fn touch_slot(&mut self, slot: u32) {
         if let Some(rev) = self.slot_revisions.get_mut(slot as usize) {
             *rev += 1;
@@ -7883,14 +7998,60 @@ impl CanvasRenderer {
         {
             job.abandoned = true;
         }
+        if let Some(job) = self.capture.as_mut() {
+            job.disturb(slot);
+        }
+    }
+
+    /// Note that a slice's contents have been thrown away wholesale rather than
+    /// painted over.
+    ///
+    /// [`Self::touch_slot`] plus giving up on a capture that named the slice,
+    /// and the difference is **that a wipe may be a slice changing hands**. A
+    /// capture names slots and its `Candidate` was snapshotted when it began, so
+    /// it believes slot *S* belongs to the layer that held it then; deleting a
+    /// layer parks its slice, the undo budget can evict the parked entry, and
+    /// the next layer added claims that slice — and is handed it through
+    /// `clear_layer`, exactly here. Marking the step stale would then read it
+    /// again off whoever holds the slice *now* and file the new layer's pixels
+    /// under the old layer's name, which is worse than the staleness the mark
+    /// exists to repair. There is nothing to repair, so the capture goes.
+    ///
+    /// "Clear layer" and adding a mask reach this too and would have been safe
+    /// to re-read; they are rare, and one rule that cannot tell a recycle from a
+    /// wipe is better than two that have to.
+    ///
+    /// Only where the capture actually named the slice: a brand new layer's
+    /// fresh slice is not in `slots`, so the ordinary case of adding one costs
+    /// a capture nothing.
+    fn wipe_slot(&mut self, slot: u32) {
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(|job| job.slots.contains(&slot))
+        {
+            self.cancel_capture();
+        }
+        self.touch_slot(slot);
     }
 
     /// Note that every slice has changed — a flip, a resize, a fresh document.
+    ///
+    /// A capture is **given up on** rather than marked. The two callers are
+    /// `resize`, which changes the canvas out from under it, and
+    /// `clear_all_layers`, which replaces the document wholesale; neither leaves
+    /// anything worth re-reading. `resize` cancelled by hand already and
+    /// `clear_all_layers` did not, so putting it here is what covers the second
+    /// and whatever a third turns out to be — the rule this file applies to
+    /// `slot_revision` itself. (`flip_layers` is *not* one of them: it touches
+    /// each slot in turn and cancels by hand, because its pixels move rather
+    /// than go.)
     fn touch_all_slots(&mut self) {
         for rev in &mut self.slot_revisions {
             *rev += 1;
         }
         self.cancel_thumb();
+        self.cancel_capture();
     }
 
     /// True while a thumbnail is in flight, abandoned or otherwise.
@@ -9286,6 +9447,10 @@ impl CanvasRenderer {
         if self.capture.is_some() || slots.is_empty() {
             return false;
         }
+        // A latch belonging to the capture that has just ended, cleared here as
+        // well as by the read — see [`Self::take_capture_gave_up`] for the Save
+        // that can leave one with no owner.
+        self.capture_gave_up = false;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded = (self.doc_size.x * 4).div_ceil(align) * align;
         self.capture = Some(Capture {
@@ -9299,10 +9464,13 @@ impl CanvasRenderer {
             outcome: Arc::new(AtomicU8::new(PROBE_PENDING)),
             state: StepState::Waiting,
             step: 0,
+            redo: None,
             // One per layer, and one for the flattened preview the format
             // requires.
+            stale: vec![false; slots.len() + 1],
+            rereads: (slots.len() + 1).max(REREAD_FLOOR),
             results: (0..slots.len() + 1).map(|_| None).collect(),
-            taken: 0,
+            handed: vec![false; slots.len()],
             partial: None,
             merged_target: None,
             abandoned: false,
@@ -9337,7 +9505,46 @@ impl CanvasRenderer {
             return;
         }
 
-        let index = job.step;
+        // The linear pass is over and something behind it has gone stale, or
+        // `complete` would have returned above. Pick the lowest — layers before
+        // the preview, since the preview's index is last — and mark the preview
+        // with it: replacing a layer's bytes is exactly what makes the
+        // composited preview disagree with them. See [`Capture::stale`].
+        //
+        // The flag is cleared **here** rather than when the bytes land: a write
+        // arriving while this very step is being re-read has to mark it again,
+        // and clearing on completion would swallow that one.
+        if job.redo.is_none() && job.step >= job.steps() {
+            let Some(next) = job.stale.iter().position(|s| *s) else {
+                self.capture = Some(job);
+                return;
+            };
+            if job.rereads == 0 {
+                // Somebody is painting faster than the document can be read.
+                // Giving up beats re-reading for ever: only one capture runs at
+                // a time, so a capture that never settles starves every other
+                // open document's autosave as well as its own. The caller reads
+                // `take_capture_gave_up` and waits for the ordinary interval
+                // rather than starting another into the same painting.
+                log::warn!(
+                    "a document capture was disturbed by edits more often than it \
+                     could re-read; it will be tried again later"
+                );
+                job.abandoned = true;
+                self.captures_given_up += 1;
+                self.capture_gave_up = true;
+                self.capture = Some(job);
+                return;
+            }
+            job.rereads -= 1;
+            job.stale[next] = false;
+            if next < job.slots.len() {
+                job.stale[job.slots.len()] = true;
+            }
+            job.redo = Some(next);
+        }
+
+        let index = job.reading();
         job.band = band_rows(self.readback_limit, job.padded, job.size.y);
         let (band_first, band_last) = job.band_span();
         let height = band_last as u32 - band_first as u32;
@@ -9567,8 +9774,14 @@ impl CanvasRenderer {
                             job.row += job.band;
                             if job.step_done() {
                                 job.row = 0;
+                                let index = job.reading();
                                 if let Some(bytes) = job.partial.take() {
-                                    job.results[job.step] = Some(bytes);
+                                    job.results[index] = Some(bytes);
+                                }
+                                // A re-read replaces what that step held and
+                                // leaves the linear cursor where it was; only
+                                // the pass itself advances it.
+                                if job.redo.take().is_none() {
                                     job.step += 1;
                                 }
                                 // The flattened preview has been read out of;
@@ -9610,10 +9823,23 @@ impl CanvasRenderer {
         // a layer is the worst thing on this path, and `CaptureSource` refuses
         // a slice it was never given — so this is the diagnosis rather than the
         // defence.
-        if job.taken < job.slots.len() {
+        // Handed over at least once **and** holding nothing now. The second
+        // clause is what makes this see a *re-read* nobody drained: `handed`
+        // latches on the first hand-over, so a step read again after an edit and
+        // then left in `results` would pass a flag-only count while the writer
+        // kept the image from before the edit — the very bug the re-read exists
+        // to repair, arriving through the diagnostic that exists to report it.
+        // Unreachable today, and only because choosing a layer to re-read marks
+        // the preview too, so at least one more step and therefore one more of
+        // the caller's drain passes always follows. That is a property of
+        // another function; this is the reading that does not depend on it.
+        let missed = (0..job.slots.len())
+            .filter(|i| !job.handed[*i] || job.results[*i].is_some())
+            .count();
+        if missed > 0 {
             log::error!(
                 "a capture was collected with {} of {} slices never taken",
-                job.slots.len() - job.taken,
+                missed,
                 job.slots.len(),
             );
         }
@@ -9644,9 +9870,11 @@ impl CanvasRenderer {
     /// reported autosave failure and not a damaged file; `take_capture` logs the
     /// count as the diagnosis.
     ///
-    /// In the order the caller asked for the slots, which is the order they are
-    /// read back, and never the flattened preview: that one is the last step and
-    /// [`Self::take_capture`] hands it over whole.
+    /// Lowest index first, and never the flattened preview: that one is the last
+    /// step and [`Self::take_capture`] hands it over whole. That is the order
+    /// the caller asked for the slots *while the linear pass lasts* and no
+    /// longer once a step has been read again — index 0 can arrive after
+    /// `1..n` — which is what the scan below is for.
     ///
     /// `None` means nothing more has landed *yet*, not that nothing more is
     /// coming. An abandoned or failed capture answers `None` too, and its
@@ -9654,12 +9882,18 @@ impl CanvasRenderer {
     /// taken some of them is told by `take_capture` never answering.
     pub fn take_capture_slice(&mut self) -> Option<CaptureSlice> {
         let job = self.capture.as_mut()?;
-        if job.abandoned || job.failed || job.taken >= job.slots.len() {
+        if job.abandoned || job.failed {
             return None;
         }
-        let index = job.taken;
-        let pixels = job.results[index].take()?;
-        job.taken += 1;
+        // The lowest layer step holding bytes nobody has taken. A scan rather
+        // than a cursor, because a step re-read after an edit lands a *second*
+        // time and has to be handed over again — the writer keys its images by
+        // index and replaces, so the later one wins.
+        let index = job.results[..job.slots.len()]
+            .iter()
+            .position(Option::is_some)?;
+        let pixels = job.results[index].take().expect("just found");
+        job.handed[index] = true;
         Some(CaptureSlice {
             index,
             size: job.size,
@@ -9733,6 +9967,57 @@ impl CanvasRenderer {
         // cancelled capture settles in a frame or two.
         self.submit_capture();
         let _ = self.take_capture(device);
+    }
+
+    /// Whether the capture that has just ended gave up because edits kept
+    /// outrunning it, rather than being interrupted or failing. Clears on read.
+    ///
+    /// The two want opposite things of the caller. An interrupted capture — a
+    /// Save, a flip, a resize — should be started again at once, and
+    /// `a_capture_interrupted_by_a_save_does_not_stop_the_next_autosave` is what
+    /// holds that. One that gave up should **not**: the document is being
+    /// painted faster than it can be read, so another attempt begun on the next
+    /// frame would spend the same budget on the same painting and give up again,
+    /// for as long as somebody is working — and since only one capture runs at a
+    /// time, that is every other open document's autosave starved by this one.
+    /// The caller waits for the ordinary interval instead.
+    ///
+    /// A latch rather than a reading of the job, because by the time the
+    /// scheduler notices the capture has gone the job is already dropped. The
+    /// shape [`Self::take_effect_refusal`] keeps — and, like that one, it is
+    /// **cleared by [`Self::begin_capture`]** as well as by the read: the only
+    /// reader is a branch the caller takes when it notices the capture has gone,
+    /// and a Save landing between the giving-up frame and that notice empties
+    /// the caller's own tracking, so the branch never runs and a latch with no
+    /// owner would be spent on some later capture that failed for another
+    /// reason.
+    pub fn take_capture_gave_up(&mut self) -> bool {
+        std::mem::take(&mut self.capture_gave_up)
+    }
+
+    /// How many captures have given up over this renderer's life.
+    ///
+    /// For the tests: a run that ends in a written file cannot otherwise say
+    /// whether the giving-up path was ever taken, so a guard for it would be
+    /// green whether or not the budget existed.
+    #[doc(hidden)]
+    pub fn captures_given_up(&self) -> u64 {
+        self.captures_given_up
+    }
+
+    /// How far the capture in flight has walked: its linear step, and the first
+    /// row of the band it is on within that step. `None` where there is none.
+    ///
+    /// For the tests, and for one thing only: a guard about an edit landing
+    /// *inside* a capture has to know where it landed. Timing it by counting
+    /// frames would make the guard vacuous the day a step takes one frame more —
+    /// an edit arriving before its layer is read disturbs nothing, and the
+    /// assertion would then pass for the wrong reason. The row is what tells a
+    /// guard that a step is part-read, which on a banded capture is the case
+    /// where the layer itself comes back torn across two instants.
+    #[doc(hidden)]
+    pub fn capture_progress_for_test(&self) -> Option<(usize, u32)> {
+        self.capture.as_ref().map(|job| (job.step, job.row))
     }
 
     /// Take one tile of one slot out of the page table, so it reads as the

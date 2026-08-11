@@ -1971,6 +1971,49 @@ when nobody asked for it.
   one no id names — and that function acts only on an abandoned or failed job,
   because `take_capture` hands the finished document to whoever asks and a settle
   reaching a live capture would collect it and drop it.
+- **A write to a slice a capture has already read is *re-read*, not ignored and
+  not a restart.** `touch_slot` told the thumbnail of that slice and told the
+  capture nothing, so an undo, a "Clear layer", a mask fill, a text placement, a
+  float commit or an ordinary stroke commit landing inside a capture left the
+  file holding that layer as it was and `mergedimage.png` as it now is — a
+  document that never existed, written silently, five minutes at a time. `quiet`
+  gates only the *start*, so a stroke is in that list. A capture spans about
+  ninety seconds on the reference 20000×5000 document, which makes an edit inside
+  one ordinary rather than exotic. `Capture::stale` marks the step; once the
+  linear pass is over the marked steps are read again, and the preview after
+  them, to a fixed point.
+  - **A write to a step the pass has not reached marks nothing**, because what is
+    read afterwards is the new content and every step already read is untouched —
+    the file is then the document as it stands. That is what keeps this rare: a
+    stroke on a layer high in the stack disturbs a capture only once the capture
+    has walked past it.
+  - **Re-reading rather than restarting is what makes "retry" affordable at
+    all.** A restart throws away the other fifty-two layers, so on the reference
+    document it would need a ninety-second pause to ever complete and would in
+    practice mean *never autosaved* — silently, which is worse than the mixed
+    file it was fixing. One layer and the preview is a couple of seconds, so the
+    fixed point settles at the first ordinary pause.
+  - **It is bounded, and what it protects is the other tabs.** Somebody painting
+    without pause on a layer low in the stack can hold a capture away from its
+    fixed point for ever, and only one capture runs at a time — so an unbounded
+    one starves *every other open document's* autosave as well as its own.
+    `Capture::rereads` is the capture's own step count with a floor: worst case
+    twice the work. Exhausting it gives the capture up and latches
+    `take_capture_gave_up`, which `collect` reads to `defer` — another capture
+    begun on the next frame would spend the same budget on the same painting,
+    every frame, for as long as somebody is working.
+  - **A *wipe* is not a write and gives the capture up instead**, because a wipe
+    may be the slice **changing hands**: a `Candidate` is snapshotted when the
+    capture begins, deleting a layer parks its slice, the undo budget can evict
+    the parked entry, and the next layer added claims that slice and is handed it
+    through `clear_layer`. Re-reading would then file the new layer's pixels under
+    the old layer's name — a hole the mark would have *opened*, since before it
+    such a capture wrote the old layer's real pixels. `wipe_slot` is
+    `clear_layer`'s and `fill_layer_white`'s door, and only where the capture
+    named the slice, so a brand new layer's fresh slice costs a capture nothing.
+  - **`touch_all_slots` cancels the capture as well as the thumbnail.** `resize`
+    cancelled by hand and `clear_all_layers` did not; the rule belongs inside the
+    method for the reason `slot_revision` is bumped there.
 - **The generalisable shape is: when something is cancelled, ask who drives it
   afterwards.** `take_thumb` already fixed the identical failure by dropping an
   abandoned job at the top of the function, and its comment spells the mechanism
@@ -2170,12 +2213,20 @@ reporter's own window.
   says what happened instead of `wgpu_core`'s line number. It stays fatal: a
   device that has reported an uncaptured error produces undefined results from
   then on, and a quietly wrong canvas is what this codebase refuses everywhere.
-- **`panic = "abort"` changes nothing and there is no `catch_unwind`.** The hook
-  runs before the abort exactly as it runs before unwinding, and nothing here
-  needs the stack unwound. Catching around `run_app` would happen *after* every
-  destructor that produced the second panic, `run_app` is not `UnwindSafe`, and
-  on Windows the loop unwinds through a Win32 message callback where catching is
-  not dependable.
+- **Panics *unwind*, and this bullet said the opposite for a long time.**
+  `panic = "abort"` is set in **no** `Cargo.toml` in the workspace — the claim
+  was asserted here and reasoned from, and it is false. What the retracted
+  sentence got right is that the hook would run before an abort exactly as it
+  runs before unwinding, and that nothing here needs the stack unwound; what it
+  got wrong matters in two places. **`umber-shellext::guard` is load-bearing
+  precisely because panics unwind** — unwinding into COM is undefined behaviour,
+  so catching at every entry point is required rather than belt-and-braces, and
+  under a real `abort` it would be pointless. And a **worker** thread that panics
+  merely ends, which is what makes "a dead worker becomes silence" reachable at
+  all; see `Loading::take`. There is still no `catch_unwind` around `run_app`,
+  and those reasons stand: it would run *after* every destructor that produced
+  the second panic, `run_app` is not `UnwindSafe`, and on Windows the loop
+  unwinds through a Win32 message callback where catching is not dependable.
 - **The "Copy details" button copies `Report::details`, the same string the
   block beside it draws, and it sits *above* that block** — a backtrace is
   unbounded, so a control after it is one somebody scrolls a page of frame
@@ -4149,6 +4200,20 @@ method rather than as an anecdote:
   frame later and the file appears anyway. "Measure the output, never restate the
   rule" is the right default and is not always available; where it is not, the
   honest move is to name the half that is doing the work.
+- **A one-layer fixture cannot test which layer anything landed on**, because
+  every index is zero and every wrong index is the right one. `disturb` writing
+  `stale[0]` whatever slot it was handed passed four guards until the autosave's
+  `FrameLoop` was given a second layer and the edit was aimed at the *upper* one.
+  Same shape as the square-tile-grid trap: ask what the fixture's values have in
+  common before believing the assertion.
+- **A guard about an edit landing inside a capture has to time the edit off the
+  capture's own cursor, not off a count of frames.** `capture_progress_for_test`
+  answers the step and the band. An edit arriving *before* its layer is read
+  disturbs nothing, so a frame-counting guard would go quiet the day a step took
+  one frame more and would then pass for the wrong reason. The two halves of the
+  predicate also need different fixtures: an edit between two steps is caught by
+  `index < step` alone, while one part way through a *banded* step needs
+  `set_readback_limit` and shows up as a single layer torn across two instants.
 - **A fixture carrying only what a real file produces is a test of the fixture.**
   The same shape recurred twice in one branch and both times the fixture was
   doing no work: a save fixture whose every layer covers its canvas trims to
