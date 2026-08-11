@@ -1294,6 +1294,25 @@ is §13.13's rule, unchanged, with a fairer view of what taking it costs. What
 should decide between them is `measure-composite.rs` reporting both, not this
 paragraph.
 
+**And it has, so the ranking is corrected again — the other way.** The hand lerp
+shipped, and `composite-throughput.md` §11.3 and §11.6 are the numbers. Both
+predictions in this section held: four `textureLoad`s of an adjacent 2×2 do hit
+the cache lines a bilinear tap would have fetched anyway, and the extra cost over
+one hardware tap is **+0.20 ms** at 54 layers on a fully painted 1920x1080
+document — 2.49 ms against 2.29. What neither this section nor §11.3's first
+draft saw is that the *addressing* costs more than the taps do: 0.76 ms of the
+atlas's 1.23 ms is the prologue and the page-table read, not the fetch.
+
+So an apron is worth **8% of the composite pass**, and that is the whole of what
+it could deliver, because it changes only the fast path and the fast path is
+where 99.2% of samples already are. Against 8% it costs the refresh rule §8.3
+itself calls "the real risk in the whole design", and it costs the tile pitch —
+which is what lets a page be the canvas rounded up and never larger than a limit
+the canvas was already inside. **The apron is therefore not worth building at
+that price**, and `textureGather`, the cheaper middle §11.3 named, was measured
+and is *slower* than the loads. §13.13's rule stands and has nothing left to
+fire on.
+
 ### 8.2 Where the neighbour is not backed
 
 The apron then holds the neighbour's **empty value** — zero for a layer, white
