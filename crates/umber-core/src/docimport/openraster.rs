@@ -885,6 +885,54 @@ mod tests {
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 
+    /// **An ORA layer yields its own rectangle and not the canvas**, which is
+    /// what makes Umber's own documents cheap to reopen: `docformat::trim`
+    /// writes each layer cropped to its content with an offset, so a stack of
+    /// sketches on a large canvas costs what the sketches cost.
+    ///
+    /// The picture is checked against an expectation built from the fixture, the
+    /// piece rules are driven, and the sparsity is asserted — the third is what
+    /// a version that went back to a canvas-sized buffer would fail.
+    #[test]
+    fn a_layer_yields_only_its_own_rectangle() {
+        let canvas = UVec2::new(64, 64);
+        // The fixture places a layer smaller than the canvas at (1, 1).
+        let ora = fixtures::ora(
+            canvas.x,
+            canvas.y,
+            &[fixtures::OraLayer::new("Ink", 8, 8, &[1, 2, 3, 255])],
+        );
+        let doc = read(&ora).unwrap();
+        let layer = &doc.layers[0];
+
+        crate::docimport::check_piece_rules(&layer.pixels, canvas);
+        assert_eq!(layer.pixels.len(), 1, "one PNG is one rectangle");
+        assert_eq!(
+            layer.pixels[0].rect,
+            crate::geom::PixelRect {
+                x: 1,
+                y: 1,
+                width: 8,
+                height: 8
+            }
+        );
+
+        let mut expected = vec![0u8; (canvas.x * canvas.y * 4) as usize];
+        for y in 1..9usize {
+            for x in 1..9usize {
+                let px = (y * canvas.x as usize + x) * 4;
+                expected[px..px + 4].copy_from_slice(&[1, 2, 3, 255]);
+            }
+        }
+        assert_eq!(layer.dense(canvas), expected, "the picture moved");
+
+        assert_eq!(layer.pixel_bytes(), 8 * 8 * 4);
+        assert!(
+            layer.pixel_bytes() * 16 < u64::from(canvas.x) * u64::from(canvas.y) * 4,
+            "an 8-square layer on a 64-square page must not be charged the page"
+        );
+    }
+
     #[test]
     fn a_small_layer_lands_at_its_offset() {
         // The 1×1 blue top layer sits at x=1,y=1 in the fixture.

@@ -2061,6 +2061,57 @@ mod tests {
         assert_eq!(pixels[3], 128);
     }
 
+    /// **The reader yields the blocks the file holds and nothing else**, which
+    /// is the whole of Stage 2 on the format that motivated it.
+    ///
+    /// Three claims, and each would be a separate way to get this wrong:
+    ///
+    /// - the *picture* is unchanged, which is the one that must never move: the
+    ///   assembled canvas is exactly what a dense reader would have produced,
+    ///   built here from the fixture's own colour rather than from the reader's
+    ///   output, so it agrees with nothing but the file;
+    /// - the pieces obey rules 1 and 2 — inside the canvas, not overlapping;
+    /// - and it is genuinely **sparse**. That last is the one a version that
+    ///   quietly went back to one canvas piece would fail, and it is stated as a
+    ///   fraction of the canvas rather than as a piece count, because the piece
+    ///   count is a property of the block grid and the fraction is the thing
+    ///   anybody cares about.
+    #[test]
+    fn a_layer_yields_only_the_blocks_the_file_stores() {
+        // A 300-square bitmap in the corner of a 1024-square canvas: 2×2 blocks
+        // of the nine a dense layer would occupy, and 8.6% of the page.
+        let canvas = UVec2::new(1024, 1024);
+        let bytes = fixtures::clip(
+            canvas.x,
+            canvas.y,
+            &[ClipLayer::flat("Ink", 300, 300, [10, 120, 240, 255]).placed((300, 300), (0, 0))],
+        );
+        let doc = read(&bytes).expect("a document");
+        let layer = &doc.layers[0];
+
+        crate::docimport::check_piece_rules(&layer.pixels, canvas);
+
+        // What a dense reader would have written, built from the fixture rather
+        // than from the reader.
+        let mut expected = vec![0u8; (canvas.x * canvas.y * 4) as usize];
+        for y in 0..300usize {
+            for x in 0..300usize {
+                let px = (y * canvas.x as usize + x) * 4;
+                expected[px..px + 4].copy_from_slice(&[10, 120, 240, 255]);
+            }
+        }
+        assert_eq!(layer.dense(canvas), expected, "the picture moved");
+
+        // And it did not cost a canvas to say so. Four 256-squares clipped to
+        // the bitmap is 300×300 pixels; a dense reader spent 1024×1024.
+        assert_eq!(layer.pixel_bytes(), 300 * 300 * 4);
+        assert!(
+            layer.pixel_bytes() * 10 < u64::from(canvas.x) * u64::from(canvas.y) * 4,
+            "a layer covering 8.6% of the page must not be charged the page: {} bytes",
+            layer.pixel_bytes()
+        );
+    }
+
     /// A block Clip Studio did not store is transparent on a layer — the state
     /// of every corner nobody painted on. The fixture omits an all-zero block,
     /// which is what a real writer does.

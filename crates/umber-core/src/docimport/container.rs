@@ -274,6 +274,65 @@ mod tests {
         vec![0; size.x as usize * size.y as usize * 4]
     }
 
+    /// **The one guard that says the sparse path did not move a pixel.**
+    ///
+    /// `crop` replaced `blit` on the ORA layer path, and the two are the same
+    /// two intersections written twice — which is exactly the shape this
+    /// codebase distrusts. So they are driven against each other over every
+    /// offset that can arise from a real file: inside, hanging off each edge,
+    /// hanging off two at once, and missing the canvas entirely. The source
+    /// carries a different byte in every pixel, so a copy that is out by a row
+    /// or a column cannot pass by accident.
+    ///
+    /// Demonstrated by mutation: change either clamp in `crop` by one and this
+    /// fails; drop the `x_from` term from the destination and it fails.
+    #[test]
+    fn cropping_agrees_with_the_dense_blit_it_replaced() {
+        let size = UVec2::new(7, 5);
+        let src_size = UVec2::new(4, 3);
+        // Every byte distinct, so a shift shows up rather than cancelling.
+        let src: Vec<u8> = (0..(src_size.x * src_size.y * 4) as u8).collect();
+
+        for oy in -4i64..=6 {
+            for ox in -5i64..=8 {
+                let mut dense = canvas(size);
+                blit(&mut dense, size, &src, src_size, (ox, oy));
+
+                let mut sparse = canvas(size);
+                if let Some((rect, bytes)) = crop(&src, src_size, (ox, oy), size) {
+                    assert!(
+                        rect.x + rect.width <= size.x && rect.y + rect.height <= size.y,
+                        "a crop must land inside the canvas: {rect:?} at ({ox}, {oy})"
+                    );
+                    assert_eq!(bytes.len() as u64, rect.area() * 4);
+                    for row in 0..rect.height as usize {
+                        let from = row * rect.width as usize * 4;
+                        let to = (rect.y as usize + row) * size.x as usize * 4
+                            + rect.x as usize * 4;
+                        let len = rect.width as usize * 4;
+                        sparse[to..to + len].copy_from_slice(&bytes[from..from + len]);
+                    }
+                }
+                assert_eq!(sparse, dense, "offset ({ox}, {oy})");
+            }
+        }
+    }
+
+    /// A layer entirely off the page yields no piece, which is the same picture
+    /// the canvas of zeroes was — and is the case that makes "no piece means
+    /// the empty value" load-bearing rather than decorative.
+    #[test]
+    fn a_layer_that_misses_the_canvas_yields_nothing_at_all() {
+        let size = UVec2::new(4, 4);
+        let src = vec![255u8; 2 * 2 * 4];
+        for at in [(-2, 0), (4, 0), (0, -2), (0, 4), (-9, -9)] {
+            assert!(
+                crop(&src, UVec2::new(2, 2), at, size).is_none(),
+                "a 2×2 layer at {at:?} does not reach a 4×4 canvas"
+            );
+        }
+    }
+
     #[test]
     fn a_layer_lands_at_its_offset() {
         let size = UVec2::new(4, 4);

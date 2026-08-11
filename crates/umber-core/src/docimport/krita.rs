@@ -1083,6 +1083,52 @@ mod tests {
         );
     }
 
+    /// **The reader yields the tiles the file stores and nothing else.**
+    ///
+    /// Krita keeps a 64-square tile only where something was painted, so a
+    /// layer with one tile on a 256-square canvas is one sixteenth of the page.
+    /// The picture is checked against an expectation built from the fixture
+    /// rather than from the reader, the pieces are held to rules 1 and 2, and
+    /// the sparsity is asserted as a fraction — a version that quietly went back
+    /// to one canvas piece would pass the first two and fail the third.
+    ///
+    /// **The coloured-`.defaultpixel` case is not driven here, and that is a
+    /// gap rather than an omission**: the fixture builder has no way to write
+    /// one, so the dense fallback in `load_layer` is reached by no test. What
+    /// holds it is that it is the *old* code path unchanged, guarded by a
+    /// comparison against `[0, 0, 0, 0]` that a reader cannot get subtly wrong —
+    /// it is either the whole canvas or the tiles.
+    #[test]
+    fn a_layer_yields_only_the_tiles_the_file_stores() {
+        let canvas = UVec2::new(256, 256);
+        let kra = fixtures::kra(
+            canvas.x,
+            canvas.y,
+            &[KraLayer::new("Paint")
+                .pixel(3, 5, [200, 100, 50, 255])
+                .pixel(60, 60, [1, 2, 3, 255])],
+        );
+        let doc = read(&kra).unwrap();
+        let layer = &doc.layers[0];
+
+        crate::docimport::check_piece_rules(&layer.pixels, canvas);
+
+        let mut expected = vec![0u8; (canvas.x * canvas.y * 4) as usize];
+        for (x, y, rgba) in [(3usize, 5usize, [200, 100, 50, 255]), (60, 60, [1, 2, 3, 255])] {
+            let px = (y * canvas.x as usize + x) * 4;
+            expected[px..px + 4].copy_from_slice(&rgba);
+        }
+        assert_eq!(layer.dense(canvas), expected, "the picture moved");
+
+        // One 64-square tile, not a 256-square canvas.
+        assert_eq!(layer.pixel_bytes(), 64 * 64 * 4);
+        assert!(
+            layer.pixel_bytes() * 8 < u64::from(canvas.x) * u64::from(canvas.y) * 4,
+            "one tile of sixteen must not be charged the page: {} bytes",
+            layer.pixel_bytes()
+        );
+    }
+
     #[test]
     fn an_uncompressed_tile_reads_the_same_as_a_compressed_one() {
         let compressed = fixtures::kra(

@@ -338,6 +338,42 @@ pub(crate) fn overlapping_pieces(pieces: &[PixelPiece]) -> Option<(usize, usize)
     None
 }
 
+/// Drive [`PixelPiece`]'s rules 1 and 2 over one reader's output.
+///
+/// **For a reader's own tests**, because that is where the rules can be
+/// enforced: `validate` cannot assert rule 2 over a foreign file without turning
+/// a malformed archive into a panic, and rule 1 read off a fixture is a claim
+/// about the reader rather than about the type. Every reader that yields more
+/// than one piece calls this on a layer it produced.
+#[cfg(test)]
+pub(crate) fn check_piece_rules(pieces: &[PixelPiece], canvas: UVec2) {
+    for piece in pieces {
+        assert!(
+            u64::from(piece.rect.x) + u64::from(piece.rect.width) <= u64::from(canvas.x)
+                && u64::from(piece.rect.y) + u64::from(piece.rect.height) <= u64::from(canvas.y),
+            "rule 1: {:?} reaches outside a {canvas:?} canvas",
+            piece.rect
+        );
+        assert!(
+            piece.rect.width > 0 && piece.rect.height > 0,
+            "an empty piece is a write of nothing: {:?}",
+            piece.rect
+        );
+        assert_eq!(
+            piece.bytes.len() as u64,
+            piece.rect.area() * 4,
+            "a piece's bytes must be exactly its own rectangle: {:?}",
+            piece.rect
+        );
+    }
+    if let Some((a, b)) = overlapping_pieces(pieces) {
+        panic!(
+            "rule 2: {:?} and {:?} overlap",
+            pieces[a].rect, pieces[b].rect
+        );
+    }
+}
+
 /// One imported layer, as the rectangles of it the file actually holds.
 ///
 /// Source formats store layers as sub-rectangles with an offset; that offset is
