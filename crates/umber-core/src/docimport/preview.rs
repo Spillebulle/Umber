@@ -417,12 +417,15 @@ mod tests {
         assert_eq!(square.fit_within(64).size, UVec2::new(64, 64));
 
         // The property the caller actually depends on, over both orientations
-        // and a box each side of the awkward ratios.
+        // and a box each side of the awkward ratios. The preview is built once
+        // per shape and cloned per box rather than rebuilt: `fit_within`
+        // consumes `self`, and two of these are 18.5 MB, so constructing inside
+        // the inner loop is 150 MB of churn for a test whose subject is
+        // arithmetic.
         for (w, h) in [(1810, 2560), (2560, 1810), (5, 10000), (10000, 5), (7, 9)] {
+            let shape = Preview::new(w, h, vec![0; (w * h * 4) as usize]).expect("a preview");
             for box_edge in [1, 16, 64, 256] {
-                let fitted = Preview::new(w, h, vec![0; (w * h * 4) as usize])
-                    .expect("a preview")
-                    .fit_within(box_edge);
+                let fitted = shape.clone().fit_within(box_edge);
                 assert!(
                     fitted.size.x <= box_edge && fitted.size.y <= box_edge,
                     "{w}x{h} into {box_edge} came back {}x{}, which is past the \

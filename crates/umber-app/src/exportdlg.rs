@@ -447,12 +447,24 @@ mod tests {
         );
     }
 
-    /// The matte control is drawn only where it changes a pixel. `needs_matte`
-    /// is false both when the format keeps alpha and when the document has
-    /// none, and a knob that does nothing is worse than one that is not drawn.
+    /// The matte control is drawn only where it changes a pixel, and a knob
+    /// that does nothing is worse than one that is not drawn.
+    ///
+    /// **What this can and cannot see.** The comparison is against
+    /// `export::needs_matte`, which is the same call the panel's gate makes, so
+    /// it catches the panel *forgetting to ask* — the `if true` and
+    /// `let transparent = true` mutations, both of which it does fail on — and
+    /// it cannot catch a mutation inside `needs_matte` itself, because that
+    /// moves both sides together. That half is `umber-core`'s to guard and is
+    /// guarded there, against literal expectations.
+    ///
+    /// The count is the anchor that keeps this from being purely relative: a
+    /// `needs_matte` that answered `false` everywhere would agree with a panel
+    /// that had stopped drawing the control at all, and the pair would pass.
     #[test]
     fn the_matte_control_appears_only_where_it_would_change_a_pixel() {
         const HEADING: &str = "Transparency becomes";
+        let mut drew_count = 0;
         for format in ExportFormat::ALL {
             for background in [Background::Transparent, Background::opaque(Color::WHITE)] {
                 let transparent = background == Background::Transparent;
@@ -464,7 +476,16 @@ mod tests {
                     "{format:?} on a {} document drew the matte control: {drew}",
                     if transparent { "transparent" } else { "white" },
                 );
+                drew_count += usize::from(drew);
             }
         }
+        // Three of the ten pairs: JPEG, GIF and BMP over a transparent
+        // document. PNG and TIFF carry alpha and an opaque document has none to
+        // lose, so seven pairs draw nothing.
+        assert_eq!(
+            drew_count, 3,
+            "the matte control is drawn on a different number of the ten \
+             format/background pairs than this test is about"
+        );
     }
 }

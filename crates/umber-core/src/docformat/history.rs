@@ -1534,8 +1534,10 @@ mod tests {
 
     // ------------------------------------------------- the reader's own bounds
     //
-    // `docimport::history::load` has eleven ways to refuse a file and four of
-    // them are reached from the round trips above — where every assertion is
+    // `docimport::history::load` refuses a file in **thirteen** distinct
+    // sentences — counted, because this comment said eleven until somebody
+    // counted — and four of them are reached from the round trips above, where
+    // every assertion is
     // `matches!(w, HistoryDropped { .. })`, so **no `reason` is ever read** and
     // any refusal stands in for any other. The bounds checks are reached by
     // none of them, and they are the ones between a malformed `.ora` somebody
@@ -1662,6 +1664,16 @@ mod tests {
     /// wearing a different shape. No fixture value stands in that relation
     /// today, which is exactly why it would go unnoticed later, so the digit
     /// after the match is checked rather than assumed.
+    ///
+    /// **That check covers the numeric patterns and the callers cover the
+    /// rest**, which is worth saying rather than leaving the promise to look
+    /// wider than it is. A number cannot be extended leftwards, because every
+    /// numeric pattern opens with the key's own quote; it cannot be confused
+    /// with a longer *key* for the same reason, nor with a key it is a prefix
+    /// of, because the closing quote is in the pattern too. What none of that
+    /// reaches is a **textual** value: bare `Paper` matches inside `Paperwork`
+    /// and the byte after it is a letter. So the one textual caller passes its
+    /// value quoted, and this is where that is written down.
     fn once(json: &str, from: &str, to: &str) -> String {
         let at: Vec<usize> = json.match_indices(from).map(|(i, _)| i).collect();
         assert_eq!(
@@ -1765,7 +1777,7 @@ mod tests {
     ///
     /// `a_history_that_cannot_be_placed_is_dropped_rather_than_replayed` drives
     /// four of these and asserts `matches!(w, HistoryDropped { .. })` on each,
-    /// so all four would pass if the reader answered any one of its eleven
+    /// so all four would pass if the reader answered any one of its thirteen
     /// sentences for all of them — including one that named the wrong cause and
     /// sent somebody looking for a damaged file, which is the failure that
     /// module's own docs record for a dropped *layer*. These pin which is which.
@@ -1774,23 +1786,33 @@ mod tests {
         for (what, doctor, wanted) in [
             (
                 "a newer revision",
-                Box::new(|j: String| once(&j, "\"version\":3", "\"version\":99"))
+                // Off [`VERSION`] rather than the literal 3. When that moves to
+                // 4 the literal would make `once` report "`\"version\":3` is
+                // not a unique field of this manifest" — a diagnosis of the
+                // wrong thing entirely, for a fixture that has merely gone
+                // stale.
+                Box::new(|j: String| once(&j, &format!("\"version\":{VERSION}"), "\"version\":99"))
                     as Box<dyn Fn(String) -> String>,
                 "newer form than this build reads",
             ),
             (
                 "a resized canvas",
                 Box::new(|j: String| once(&j, "\"canvas\":[70,50]", "\"canvas\":[70,51]")),
-                // **Not "canvas".** Two of the reader's eleven sentences carry
-                // that word — this one and "covers an area outside the canvas"
-                // — so matching on it would reopen, for the very pair the two
-                // tests above are about, exactly the hole this test exists to
-                // close.
+                // **Not "canvas".** Two of the reader's thirteen sentences
+                // carry that word — this one and "covers an area outside the
+                // canvas" — so matching on it would reopen, for the very pair
+                // the two tests above are about, exactly the hole this test
+                // exists to close.
                 "it was recorded on a",
             ),
             (
                 "renamed layers",
-                Box::new(|j: String| once(&j, "Paper", "Card")),
+                // **Quoted**, which is what makes `once`'s promise true of this
+                // call as well as of the numeric ones: bare `Paper` would match
+                // once inside a layer called `Paperwork` and rewrite it
+                // mid-word, and the digit check below cannot see that because
+                // the character after it is a letter.
+                Box::new(|j: String| once(&j, "\"Paper\"", "\"Card\"")),
                 "no longer the ones it was recorded against",
             ),
             (

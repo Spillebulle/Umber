@@ -622,15 +622,17 @@ mod com_tests {
         /// against its own buffer, and a bottom-up one comes back identical:
         /// the flip is GDI's own answer to the question, rather than ours.
         ///
-        /// **What that instrument costs is a portability surface, and it is
-        /// worth naming rather than discovering.** Asking `GetDIBits` for a
-        /// 32-bit `BI_RGB` copy is not contractually alpha-preserving, and no
-        /// runner has executed this yet — CI builds this crate for
-        /// `windows-11-arm` as well. A driver that zeroed the alpha byte would
-        /// make the answer neither the buffer nor its mirror, which is why
-        /// [`read_back`] compares against **both** and fails naming exactly
-        /// that rather than silently reporting "bottom-up". A mystifying red
-        /// build is the failure this two-way comparison is here to prevent.
+        /// **The comparison is on colour alone**, because that instrument
+        /// carries a portability surface the rest of this test does not: a
+        /// 32-bit `BI_RGB` copy out of `GetDIBits` is not contractually
+        /// alpha-preserving, CI builds this crate for `windows-11-arm`, and no
+        /// runner has ever executed it. Dropping the alpha byte from the
+        /// comparison costs nothing — the flip is unambiguous from RGB, and
+        /// every alpha assertion lives on `bmBits`, which is the section's own
+        /// storage and goes through no conversion. What is kept as a backstop
+        /// is the two-way test: an answer that is neither the buffer nor its
+        /// mirror fails naming exactly that, rather than silently reporting
+        /// "bottom-up".
         top_down: bool,
     }
 
@@ -707,31 +709,45 @@ mod com_tests {
         let _ = unsafe { DeleteDC(dc) };
         assert_eq!(lines, height, "GetDIBits did not return every row");
 
+        // **Compared on colour alone, with the alpha byte dropped.** The
+        // orientation is unambiguous from RGB with this fixture, and asking
+        // `GetDIBits` for a 32-bit `BI_RGB` copy is not contractually
+        // alpha-preserving — so a driver that zeroed that byte would turn a
+        // correct build red for a reason that has nothing to do with the code
+        // under test. Nothing is given up: the alpha assertions live on
+        // `bmBits`, which is the DIB section's own storage and goes through no
+        // conversion at all. CI builds this crate for `windows-11-arm` and no
+        // runner has ever executed this test, which is why the risk is removed
+        // rather than documented.
         let stride = width as usize * 4;
-        let flipped: Vec<u8> = pixels
+        let rgb =
+            |b: &[u8]| -> Vec<u8> { b.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect() };
+        let upright = rgb(&pixels);
+        let flipped: Vec<u8> = rgb(&pixels
             .chunks_exact(stride)
             .rev()
             .flatten()
             .copied()
-            .collect();
+            .collect::<Vec<u8>>());
+        let seen = rgb(&bottom_up);
         // Without this the reading is a coin toss: a picture that is its own
         // mirror answers both ways at once, and the caller's fixture is the
         // only thing stopping it. The same trap as a square fixture one line
         // up, so it is refused here rather than remembered there.
         assert_ne!(
-            flipped, pixels,
+            flipped, upright,
             "this picture is its own vertical mirror, so nothing about it can \
              say which way up it is"
         );
         assert!(
-            bottom_up == flipped || bottom_up == pixels,
+            seen == flipped || seen == upright,
             "GetDIBits returned neither the buffer nor its mirror, so this \
              reading says nothing about the orientation"
         );
         ReadBack {
             width: width as u32,
             height: height as u32,
-            top_down: bottom_up == flipped,
+            top_down: seen == flipped,
             pixels,
         }
     }
@@ -932,7 +948,7 @@ mod com_tests {
         // safe from the harness's parallel threads. It is not: the two loads
         // are a whole object's lifetime apart, so a sibling test holding a
         // provider across that window makes the second one larger and the
-        // assertion below false. Six tests here build one.
+        // assertion below false. Six other tests here build one.
         let _live = live_lock();
         let before = LIVE.load(Ordering::Relaxed);
         assert_eq!(before, 0, "the lock did not keep the other tests out");
