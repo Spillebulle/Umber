@@ -217,9 +217,19 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
 - **The selection is per-document and the draft is not.** `Selection` lives in
   `DocumentState`; `SelectionDraft` is the gesture, and belongs to the pointer,
   so a tab switch abandons it.
-- **The outline is a dashed line, not marching ants.** Animating it means
+- **The outline marches, at `ANT_SPEED`'s sixteen frames a second, and this
+  file said for a long time that it did not.** The original decision was that a
+  dashed line was worth having and an animation was not, because animating means
   requesting a frame for ever, which is the cost `render`'s `repaint_at` exists
-  to avoid.
+  to avoid. The animation was then built with its own argument — below about ten
+  the dashes visibly hop rather than slide, above about twenty nothing is gained
+  that anybody can see in a four-point dash — and it reads egui's own clock, so a
+  dropped frame slides the pattern further rather than letting it fall behind.
+  What is worth keeping from the retracted sentence is the **cost model**, which
+  the animation inherits and which does not survive a large canvas: sixteen
+  recomposites a second of a fifty-four-layer 20000×5000 stack, for as long as
+  anything is selected. The animation is not what to reconsider there; the
+  missing composite cache is. See `docs/perf/composite-throughput.md` R6.
 - **A live selection carries three real buttons over the canvas** — Deselect,
   Copy, Cut — so their rectangles go in `Editor::selection_buttons` and through
   `canvas_overlay_owns_pointer`, exactly as the transform tool's flip pair and
@@ -1071,6 +1081,21 @@ are the contiguous run immediately below it whose `depth` is greater.
   region deliberately runs off the canvas where clamp-to-edge would smear the
   edge row across the margin. The frame never magnifies past 1:1, so a single
   dab reads as a single dab.
+- **`MAX_TAPS` was reachable and the comment saying it was not is the third
+  `using_resolution` bug.** It argued no canvas could exceed the clamp because
+  `max_texture_dimension_2d` capped below it; `using_resolution` raises exactly
+  that limit from the adapter and `MAX_EDGE` is 32768. Stepping costs the two
+  passes different things and this is the part to keep straight: the picture
+  pass's mean divides by the taps it took, so a step is *aliasing*; the bounds
+  pass's `max` simply loses the mark, so a painted layer reports **empty**.
+  **The picture pass sets the bound anyway** — `framed` inflates the region by
+  `1/(1 − 2·PADDING)`, giving a worst span of 611 against the bounds pass's 513,
+  and it bites from a content box of about 13710 px, which is *inside* 16384 and
+  so reachable on every D3D12 and Metal device, WARP and lavapipe included. This
+  was never a large-canvas Vulkan defect. Removing the clamp raised the worst
+  pass four to six times (about 1.5 G texels at 32768, into the frame's
+  encoder); if that ever bites the answer is a compute reduction or a mip chain,
+  **never a step**.
 - **The invalidation rule is `CanvasRenderer::slot_revision`, bumped inside
   every method that writes a slice** — commit, float commit, `write_layer_rect`,
   clear, mask fill, flip, resize. Putting it inside the method rather than
@@ -1592,6 +1617,24 @@ when nobody asked for it.
   composited once per step rather than once per band. Driven in the tests by
   `set_readback_limit`, because reaching the real limit needs a canvas too large
   to ask a CI runner for.
+- **The write side bands too, and `readback_limit` is the wrong kind of bound
+  there.** `write_layer_rect` goes through `band_rows` for the reason every
+  readback does — a canvas-sized `write_texture` asks for a canvas-sized staging
+  buffer, 400 MB at 10000². But that allocation is **not validated**:
+  `StagingBuffer::new` goes straight to the HAL with no `max_buffer_size` check,
+  so the figure is a *self-imposed proxy* borrowed from the reader rather than a
+  limit the call is measured against. What makes it worth borrowing is the
+  failure: `handle_hal_error` calls `lose` on an out-of-memory as well as on a
+  lost device, so no error scope catches it and the device is gone. **A submit
+  does not release staging** — it hands it to that submission's fence — so
+  banding alone bounds nothing; the banded path therefore *waits* per band,
+  which is what makes the staging alive at any instant exactly one band, and is
+  affordable only because the paths that band (an import, an undo on a very
+  large canvas) already block. **Any loop of `write_layer_rect` still
+  accumulates**: `install_import` held 8.4 GB of staging for a twenty-one-layer
+  hundred-megapixel document, and `swap_patch` is the same shape bounded by the
+  undo budget instead. `upload_coverage` is the second unbanded canvas-sized
+  write and is **not** fixed — Select All is 1.07 GB of staging at 32768².
 - **A cancelled capture is marked, not dropped**, for the reason `reset_probes`
   gives. Both halves have to be told — the renderer gives its buffer back, the
   scheduler stops waiting — which is what `app.rs`'s `stop_autosave_of` is for.
@@ -1863,6 +1906,23 @@ reporter's own window.
   support added **no dependency**. Two copies of the block framing is the drift
   `docformat`'s "there must never be a second ORA reader" refuses, so it is one
   module and `csmaterial` is a caller.
+- **A `.clip` states which 256-blocks it stores, so layer residency is
+  answerable without decoding anything.** `csblocks::stored_blocks` walks the
+  presence words; `docimport::residency` turns them into canvas tiles. Measured
+  over the 33 real documents `examples/survey-residency.rs` was written for:
+  **13.5% of a dense store's tiles actually hold paint**, 59.33 GB against
+  8.35 GB, and the median layer covers 12.1% of its canvas. Two thirds of all
+  layers are under a quarter covered and nineteen hold nothing at all. **The
+  correlation is what matters: the bigger the document, the sparser it is** —
+  everything over 1 GB dense measures between 6.4% and 25%, and every document
+  above 40% is small. **Presence over-reports residency by 1.13× across the
+  corpus and by up to 1.58× on one document** — good enough for a verdict, not
+  good enough to size an allocation — because Clip Studio stores a block the
+  artist *touched*, not one where paint survived. Re-run it before quoting any
+  of these figures. **Blank is measured against the *fill*, not against zero**:
+  a mask's absent block is all-ones, so a full-reveal mask tile is as redundant
+  as a transparent layer tile, and testing both against zero reports every
+  masked layer as dense.
 - **A `.clip`'s stack runs bottom to top, and that was established from files
   rather than assumed.** `Canvas.CanvasRootFolder` → `LayerFirstChildIndex` →
   `LayerNextIndex`. A reader that gets this backwards still produces a picture,
@@ -2633,10 +2693,13 @@ The rules, and they are cheap:
   while `using_resolution` raises that same limit from the adapter, so the real
   domain was sixteen times larger. The arithmetic was right and it was asking
   about a smaller world than the one it protected, reading 37 passes against a
-  real worst of 45. **`using_resolution` has now caused two bugs in one
-  session** — this, and `MAX_SLOTS = 257` — both by looking like it raises a
-  limit it does not, or not raising one it does. Check which of the two it is
-  doing to any limit you reason about.
+  real worst of 45. **`using_resolution` has now caused three bugs** — this,
+  `MAX_SLOTS = 257`, and the thumbnail pass's tap clamp — all by looking like it
+  raises a limit it does not, or not raising one it does. Check which of the two
+  it is doing to any limit you reason about. **The third is the purest form of
+  it**: the constant was fine, the arithmetic was fine, and the *comment* was
+  what asserted the case could not arise. A ceiling nobody can reach and a
+  ceiling somebody's document sits above look identical in the code.
 - **A test can agree for the wrong reason, and the cheap way to find out is to
   mutate the code it claims to cover.** An outline-position test read the
   *layer's* slice instead of the effect's, and the layer's first lit texel
