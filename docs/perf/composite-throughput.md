@@ -1459,14 +1459,32 @@ nothing folds away. At 1920x1080, 1:1, 54 layers, dense, output 1920x1080:
 | `tiled` — `prologue` plus four `textureLoad`s and the lerp | 2.49 | +0.47 ms over `prologue` |
 | `gather` — `prologue` plus four `textureGather`s and the same lerp | 2.76 | +0.74 ms over `prologue` |
 
-So the atlas's +1.23 ms over the dense slice is **62% the addressing and 38% the
-taps**, and the honest ratio of "four scalar loads and a lerp" to "one TMU
-instruction" *inside the same shader structure* is **1.7:1, not 16:1**. Four
-adjacent texels are close to the cost of one, which is what a texture cache is
-for; what is not free is arriving at the address.
-
 Two rounds on a quiet machine, spreads of ±2% to ±5% on every figure in that
 table, and a third standalone run agrees to within 0.05 ms.
+
+**Read the deltas carefully, because the obvious subtraction is not the
+addressing.** `prologue − sampled` is 0.76 ms and it is tempting to call that the
+prologue's cost; it is not, because `sampled` contains one hardware bilinear tap
+and `prologue` contains none, so that figure is *the addressing minus one tap*.
+Taking the tap from `hw-fast − prologue = 0.27 ms`, the arithmetic is:
+
+- **the addressing** — prologue, page table, fast-path test, branch — **≈1.03 ms**
+- **one hardware bilinear tap** ≈0.27 ms
+- **four `textureLoad`s and the hand lerp** 0.47 ms
+- and the atlas's +1.23 ms is `1.03 + 0.47 − 0.27`, which checks out.
+
+So the split is **84% addressing and 16% the tap upgrade**, not 62/38 — the
+first draft of this correction made the same misnomer one level down, which is
+worth leaving visible. The honest ratio of "four scalar loads and a lerp" to
+"one TMU instruction" *inside the same shader structure* is **1.7:1, not 16:1**,
+and the difference between them costs **0.20 ms**, which is `tiled − hw-fast` and
+needs no control at all. Four adjacent texels are close to the cost of one, which
+is what a texture cache is for; what is not free is arriving at the address.
+
+The one assumption in that is that the two taps cost the same — `sampled`'s is
+independent and `hw-fast`'s hangs off the page-table read. On the dense store the
+layout is the identity, so they touch the same texels in the same order, which is
+the closest the harness can come to holding it.
 
 **So `tiles.wgsl`'s refusal of the apron is what this costs**, and that refusal
 is now priced rather than argued — but the price is *not* what an apron would
@@ -1589,7 +1607,7 @@ in the roadmap at all, which is what a measurement is for.
 ### 11.6 What the second run did to that ranking
 
 `textureGather` is measured and refused (§11.3a) and the four loads turn out to
-be 38% rather than substantially all of the atlas's cost (§11.3). Both move the
+be 16% rather than substantially all of the atlas's cost (§11.3). Both move the
 middle item down rather than off, and the reasons are worth separating.
 
 - **The middle item is now "the apron", not "the apron or `textureGather`".**
@@ -1613,8 +1631,10 @@ middle item down rather than off, and the reasons are worth separating.
   as this one does, is one sample of where a rounding falls rather than evidence
   it cannot fall the other way.
 - **What is actually left is the addressing, and nothing in the programme
-  targets it.** 0.76 ms of the 1.23 is the prologue: a floor, two clamps, two
-  integer divides by 256, a tile comparison and a branch, per layer per fragment.
+  targets it.** About **1.03 ms of the 1.23** is the prologue — see §11.3 for why
+  it is 1.03 and not the 0.76 the obvious subtraction gives: a floor, two clamps,
+  two integer divides by 256, a tile comparison and a branch, per layer per
+  fragment.
   Two divides by a power of two ought to be shifts, and `lo / TILE` and
   `up / TILE` are recomputed where `t_lo` plus a comparison of the *offset within
   the tile* would do. Whether any of that survives the compiler is unknown and is

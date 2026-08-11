@@ -1300,8 +1300,11 @@ predictions in this section held: four `textureLoad`s of an adjacent 2×2 do hit
 the cache lines a bilinear tap would have fetched anyway, and the extra cost over
 one hardware tap is **+0.20 ms** at 54 layers on a fully painted 1920x1080
 document — 2.49 ms against 2.29. What neither this section nor §11.3's first
-draft saw is that the *addressing* costs more than the taps do: 0.76 ms of the
-atlas's 1.23 ms is the prologue and the page-table read, not the fetch.
+draft saw is that the *addressing* costs more than the taps do: about **1.03 ms**
+of the atlas's 1.23 ms is the prologue and the page-table read, not the fetch,
+and the tap upgrade is the remaining 0.20. (`prologue − sampled` reads 0.76 and
+is the addressing *minus one tap*, since `sampled` carries one and `prologue`
+carries none; §11.3 has the arithmetic.)
 
 So an apron is worth **8% of the composite pass**, and that is the whole of what
 it could deliver, because it changes only the fast path and the fast path is
