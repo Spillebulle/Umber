@@ -1489,6 +1489,20 @@ fn check_bounds(
 /// that drove the comparison directly instead would be restating the rule it
 /// claims to check. A test builds one of these with a small limit and charges
 /// real pieces through the real function.
+///
+/// **What holds the fifth call site is not a behavioural test, and saying which
+/// is the point.** Deleting `budget.charge(&layer)?` from a reader leaves every
+/// test green: the document is still refused, by
+/// [`ImportedDocument::validate`], but only *after* the memory has been spent —
+/// which is a bound on the result and not on the accumulation, and the
+/// accumulation is the whole reason the running charge exists. Demonstrated by
+/// mutation rather than assumed. Two things stand in the way and both are
+/// compiler-adjacent rather than behavioural: `#[must_use]` here, which under
+/// CI's `-D warnings` makes an uncharged budget a build failure, and
+/// `every_reader_that_checks_its_header_charges_what_it_decodes`, which reads
+/// the readers' own source. The second is the shape `SaveLayer::text`'s guard
+/// already takes — count the call sites rather than trust them to agree.
+#[must_use]
 struct PieceBudget {
     width: u32,
     height: u32,
@@ -1948,6 +1962,45 @@ mod tests {
         let mut broken = grid.clone();
         broken.push(cell(15, 15));
         assert!(overlapping_pieces(&broken).is_some());
+    }
+
+    /// **Every reader that checks its header charges what it decodes**, and
+    /// this counts the call sites rather than trusting them.
+    ///
+    /// It is a source scan, which is a shape worth defending. The property is
+    /// "the accumulation is bounded while the file is being read", and it is not
+    /// reachable behaviourally: driving a reader over `MAX_TOTAL_BYTES` means
+    /// building a 17.2 GB fixture, and the whole-document backstop in `validate`
+    /// refuses the same document either way — so a reader whose running charge
+    /// has been deleted passes every test there is. That was demonstrated by
+    /// mutation. `#[must_use]` on `PieceBudget` catches the plain deletion under
+    /// `-D warnings`; this catches the version that keeps the binding alive.
+    ///
+    /// **`flat.rs` is in the list deliberately**, though a one-layer PNG cannot
+    /// reach the bound: a reader that opts out of the rule for a good reason
+    /// today is a reader nobody re-examines when the reason stops holding.
+    #[test]
+    fn every_reader_that_checks_its_header_charges_what_it_decodes() {
+        for (name, source) in [
+            ("clipstudio", include_str!("clipstudio.rs")),
+            ("krita", include_str!("krita.rs")),
+            ("openraster", include_str!("openraster.rs")),
+            ("photoshop", include_str!("photoshop.rs")),
+            ("flat", include_str!("flat.rs")),
+        ] {
+            // Only the reader's own code, not its tests: a `charge` inside a
+            // `#[cfg(test)]` block would satisfy this while bounding nothing.
+            let code = source.split("\n#[cfg(test)]\n").next().unwrap_or(source);
+            assert!(
+                code.contains("check_bounds("),
+                "{name} does not check its header at all"
+            );
+            assert!(
+                code.contains("budget.charge("),
+                "{name} checks its header and never charges what it decodes, so a hostile \
+                 file is bounded only after the memory has been spent"
+            );
+        }
     }
 
     /// A folder is not merely uncharged, it may hold no pieces at all: it takes
