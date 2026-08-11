@@ -1951,7 +1951,32 @@ when nobody asked for it.
   the selection actually changed.
 - **A cancelled capture is marked, not dropped**, for the reason `reset_probes`
   gives. Both halves have to be told — the renderer gives its buffer back, the
-  scheduler stops waiting — which is what `app.rs`'s `stop_autosave_of` is for.
+  scheduler stops waiting — which is `autosave::interrupt`'s job; `app.rs`'s
+  `stop_autosave_of` does nothing but hand over the canvas map, so the rule lives
+  where a test can drive it. **It takes the map and finds the canvas itself**
+  rather than being handed one beside an id: the two would have to correspond and
+  nothing would make them, and they genuinely differ, because `next_due` picks
+  the first *modified* tab while every caller passes the *active* one.
+- **Telling both halves is not enough: something has to settle what is left, and
+  for a long time nothing did.** `cancel_capture` marks the job and deliberately
+  does not free it, while `interrupt` empties `capturing_id` in the same breath —
+  and `drive` and `collect` reach a canvas only through `capturing_id`. So a
+  Save, a canvas flip or a resize during a capture stranded the job for the life
+  of the renderer: `capture_in_flight` stayed true, `begin_capture` refused, and
+  that document was never autosaved again, **with nothing on screen saying so**.
+  It also starved every document after it in the tab strip, since `next_due` went
+  on nominating it, and snapshotted a fresh `Candidate` every frame on the
+  drawing path. `collect` therefore calls `CanvasRenderer::settle_capture` for
+  **every** canvas rather than the tracked one — the broken case is exactly the
+  one no id names — and that function acts only on an abandoned or failed job,
+  because `take_capture` hands the finished document to whoever asks and a settle
+  reaching a live capture would collect it and drop it.
+- **The generalisable shape is: when something is cancelled, ask who drives it
+  afterwards.** `take_thumb` already fixed the identical failure by dropping an
+  abandoned job at the top of the function, and its comment spells the mechanism
+  out; a capture cannot do that, because a map may be outstanding, so its fix has
+  to be a caller that keeps asking. A disowned job with no driver is the same bug
+  wherever it appears.
   Miss the scheduler half and *no* document is ever autosaved again, since only
   one capture runs at a time.
 - **The metadata is snapshotted when the capture begins.** The readback spans
@@ -4109,6 +4134,21 @@ method rather than as an anecdote:
   half reads **0 of 255 on the dense store** and 24 and 15 on the packed ones.
   Same shape as the squareness trap above — and the packed layout is the
   production one.
+- **A guard's first version can be vacuous because the state it starts from is
+  inert.** The live half of
+  `settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone` asserted that
+  a freshly *begun* capture survived several settles — true whatever the function
+  does, since a job with no step recorded sits in `Waiting`, where both halves of
+  the settle decline anyway. It has to spend a whole capture's worth of frames
+  with the settler as the only thing asking. Mutation found it; re-reading the
+  assertion would not have.
+- **Say which assertion catches the bug when two of them look equal.**
+  `an_interrupt_naming_another_document_leaves_the_capture_alone` reads a flag
+  *and* runs to a written file, and only the flag catches a wrong id: once
+  `collect` settles every canvas, a capture wrongly given up on is restarted a
+  frame later and the file appears anyway. "Measure the output, never restate the
+  rule" is the right default and is not always available; where it is not, the
+  honest move is to name the half that is doing the work.
 - **A fixture carrying only what a real file produces is a test of the fixture.**
   The same shape recurred twice in one branch and both times the fixture was
   doing no work: a save fixture whose every layer covers its canvas trims to
