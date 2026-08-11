@@ -1299,16 +1299,23 @@ pub enum Report {
     /// logged: a broken autosave must never become a dialog that keeps
     /// appearing while somebody is trying to paint.
     Failed { title: String, message: String },
-    /// The writer thread ended without being asked to, which can only be a
-    /// panic in it. See [`Autosave::poll`].
+    /// There is no writer thread: one panicked, or one could not be started.
+    /// See [`Autosave::poll`].
     ///
     /// **Not a [`Self::Failed`] naming a document**, and the difference is what
-    /// the artist has to act on: one document refused is one document, where a
-    /// writer that has gone is *every* autosave from then until it is started
-    /// again. Naming a document would understate it, and by the time this is
-    /// noticed the document that was being written has usually been handed over
-    /// and forgotten, so there is often no honest name to give.
-    WriterVanished,
+    /// the artist has to act on: one document refused is one document, where no
+    /// writer at all is *every* autosave from then until one runs again. Naming
+    /// a document would understate it, and by the time this is noticed the
+    /// document that was being written has usually been handed over and
+    /// forgotten, so there is often no honest name to give.
+    ///
+    /// **One variant for the two ways rather than two**, because they differ
+    /// only in a detail the artist cannot act on and are identical in
+    /// everything they can: nothing is being written, Umber will try again at
+    /// the next attempt, and Save still works. They are also reachable one from
+    /// the other — a death clears `tx` so the next `send` starts a thread, and
+    /// that spawn can be the thing that fails.
+    NoWriter,
 }
 
 impl Report {
@@ -1331,39 +1338,63 @@ impl Report {
                         .to_string(),
                 ],
             }),
-            // "Will start it again" is true because `poll` drops the sender:
-            // `writer` respawns only when it is `None`, so without that half
-            // this sentence would be a promise nothing keeps.
-            Self::WriterVanished => Some(Notice {
-                title: "Autosave has stopped".to_string(),
+            // **Every clause of this has to be true of all three ways in**, and
+            // two earlier drafts were not. "Stopped" is false where the thread
+            // could not be started; "the last copy was not written" is false
+            // where the writer died between jobs with the previous document
+            // safely on disk, and false again where it died holding a
+            // `Report::Written` this same drain has just applied. "May not have
+            // been" is what covers the set. "Will try again" is true only
+            // because `poll` drops the sender — `writer` starts a thread only
+            // where it is `None` — so without that half this is a promise
+            // nothing keeps.
+            Self::NoWriter => Some(Notice {
+                title: "Autosave is not running".to_string(),
                 lines: vec![
-                    "The part of Umber that writes autosave copies stopped \
-                     unexpectedly, so the last one was not written."
+                    "Something went wrong inside Umber's autosave, so the last \
+                     copy may not have been written."
                         .to_string(),
-                    "Umber will start it again at the next attempt. Your work is \
-                     not lost. Use File, Save to write it where you want it."
+                    "Umber will try again at the next autosave. Your work is not \
+                     lost. Use File, Save to write it where you want it."
                         .to_string(),
                 ],
             }),
         }
     }
 
-    /// The line the log gets, where this report is a failure.
+    /// The line the log gets and which latch holds it back, where this report
+    /// is a failure.
     ///
-    /// One reading for both failures, because [`Autosave::complained`] is about
-    /// how often somebody painting is interrupted rather than about which of
-    /// the two went wrong. Exhaustive for [`Self::notice`]'s reason.
-    fn complaint(&self) -> Option<String> {
+    /// **Two latches rather than one, and that is a change of meaning.** "A
+    /// failure says so once and carries on" was written for one *document*
+    /// failing over and over, and folding both kinds into one latch made them
+    /// compete for the run's single interruption: a writer that died would burn
+    /// the slot so a later "disk full" was never shown, and an earlier per
+    /// document failure would swallow the news that autosave had stopped
+    /// altogether. They are different statements about different things, so
+    /// each says itself once. Exhaustive for [`Self::notice`]'s reason.
+    fn complaint(&self) -> Option<(Latch, String)> {
         match self {
             Self::Written { .. } => None,
-            Self::Failed { title, message } => {
-                Some(format!("could not autosave “{title}”: {message}"))
-            }
-            Self::WriterVanished => {
-                Some("the autosave writer stopped; nothing was written".to_string())
-            }
+            Self::Failed { title, message } => Some((
+                Latch::Document,
+                format!("could not autosave “{title}”: {message}"),
+            )),
+            Self::NoWriter => Some((
+                Latch::Writer,
+                "there is no autosave writer; nothing was written".to_string(),
+            )),
         }
     }
+}
+
+/// Which "once per run" a failure answers to. See [`Report::complaint`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Latch {
+    /// A document could not be written.
+    Document,
+    /// There is no writer thread at all.
+    Writer,
 }
 
 /// The autosave's whole state: the schedule, what is in flight, and the thread
@@ -1380,8 +1411,17 @@ pub struct Autosave {
     token: u64,
     /// Numbers the never-saved documents within this run.
     seq: u64,
-    /// A failure has already been shown. See [`Report::Failed`].
-    complained: bool,
+    /// Which kinds of failure have already been shown. See
+    /// [`Report::complaint`] for why there are two of them.
+    complained: [bool; 2],
+    /// There is no writer and the artist has not been told.
+    ///
+    /// A flag rather than a report pushed where it is discovered, because both
+    /// discoveries happen where there is no channel left to push it down:
+    /// [`Autosave::writer_vanished`] has just dropped one, and
+    /// [`Autosave::writer`]'s failed spawn never made one. [`Autosave::poll`]
+    /// drains it.
+    lost: bool,
     /// The start-up expiry sweep has run. See [`Autosave::sweep_once`].
     swept: bool,
     /// Where this run's marker goes, and where a previous run's is looked for.
@@ -1438,7 +1478,8 @@ impl Default for Autosave {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
             seq: 0,
-            complained: false,
+            complained: [false; 2],
+            lost: false,
             swept: false,
             marks_dir: sessions_dir(),
             mark: None,
@@ -1832,25 +1873,33 @@ impl Autosave {
     ///
     /// [`update::Updates::poll`]: crate::update::Updates::poll
     pub fn poll(&mut self) -> Vec<Report> {
-        let Some(rx) = self.rx.take() else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(report) => self.note(report, &mut out),
-                // The writer is still there with nothing to say, which is
-                // almost every frame.
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.rx = Some(rx);
-                    break;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.writer_vanished();
-                    self.note(Report::WriterVanished, &mut out);
-                    break;
+        if let Some(rx) = self.rx.take() {
+            loop {
+                match rx.try_recv() {
+                    Ok(report) => self.note(report, &mut out),
+                    // The writer is still there with nothing to say, which is
+                    // almost every frame.
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.rx = Some(rx);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.writer_vanished();
+                        break;
+                    }
                 }
             }
+        }
+        // **After the channel, deliberately.** A writer that died holding a
+        // finished document has its `Report::Written` sitting in the queue
+        // ahead of the disconnect, and that document really was written — so
+        // it is applied first, and the sentence saying autosave has gone comes
+        // after it rather than instead of it. Drained here rather than at the
+        // top because that is also where a *failed spawn* lands, which is the
+        // one way in with no channel to have read.
+        if std::mem::take(&mut self.lost) {
+            self.note(Report::NoWriter, &mut out);
         }
         if out.iter().any(|r| matches!(r, Report::Written { .. })) {
             self.last_written = Some(Instant::now());
@@ -1858,15 +1907,16 @@ impl Autosave {
         out
     }
 
-    /// Log a report, and pass it on unless the artist has been interrupted by a
-    /// failure already.
+    /// Log a report, and pass it on unless its own kind of failure has already
+    /// interrupted the artist this run.
     fn note(&mut self, report: Report, out: &mut Vec<Report>) {
-        if let Some(line) = report.complaint() {
+        if let Some((latch, line)) = report.complaint() {
             log::warn!("{line}");
-            if self.complained {
+            let shown = &mut self.complained[latch as usize];
+            if *shown {
                 return;
             }
-            self.complained = true;
+            *shown = true;
         }
         out.push(report);
     }
@@ -1878,12 +1928,24 @@ impl Autosave {
     /// that is never started again — and every job after it silently dropped,
     /// for the rest of the run. Dropping it here is the whole of the respawn:
     /// the next `send` finds `None` and stands a fresh thread up. `rx` goes with
-    /// it because it can only ever answer `Disconnected` again.
+    /// it belt and braces — [`Self::poll`] is the only caller and has already
+    /// taken it — so that this is true of the function rather than of its one
+    /// call site.
     ///
-    /// The capture in flight is deliberately **left alone**. It will finish into
-    /// a fresh writer holding none of the slices the dead one ate, and
-    /// `CaptureSource` refuses a slice it was not given rather than writing a
-    /// layer blank — so that capture fails loudly and the next one is whole.
+    /// The capture in flight is deliberately **left alone**, and what makes that
+    /// safe is an ordering rather than a check. It finishes into a fresh writer
+    /// holding none of the slices the dead one ate; `CaptureSource::layer_image`
+    /// answers `None` for one it was not given, `docformat` turns that into
+    /// `SaveError::NotSupplied`, and the whole write is refused and reported.
+    /// **A missing *mask* is not refused** — `run_task` writes it as no mask at
+    /// all, because inventing an empty one would hide the layer it belongs to —
+    /// and that is safe only because `Candidate::slots` puts every layer slice
+    /// before every mask slice and `take_capture_slice` hands them over in
+    /// ascending order. What a dead writer loses is therefore always a prefix,
+    /// and any non-empty prefix contains a layer, which is what refuses. **If a
+    /// capture ever delivers a mask before every layer, this is the sentence
+    /// that stops being true.**
+    ///
     /// Clearing `flight` here instead would empty `capturing_id`, which is the
     /// only route `collect` has to the renderer's own job, and strand it for the
     /// life of the renderer: exactly the disowned-job bug `settle_capture`
@@ -1891,6 +1953,7 @@ impl Autosave {
     fn writer_vanished(&mut self) {
         self.tx = None;
         self.rx = None;
+        self.lost = true;
     }
 
     /// Where this document's internal copy has been put, if one has been.
@@ -2006,7 +2069,18 @@ impl Autosave {
                     self.rx = Some(report_rx);
                 }
                 Err(e) => {
+                    // **Said, not only logged**, and this became reachable
+                    // twice over when the respawn landed: a machine that
+                    // refuses a thread at start-up leaves `tx` and `rx` both
+                    // `None`, so `poll` reads no channel and every capture from
+                    // then on is a full GPU readback thrown away in silence —
+                    // bit for bit the failure the disconnect reading exists to
+                    // remove, through the one door it does not cover. And a
+                    // writer that dies clears `tx` precisely so this runs
+                    // again, so the sentence promising Umber will try again is
+                    // exactly the one a failure here would falsify.
                     log::warn!("could not start the autosave writer: {e}");
+                    self.lost = true;
                     return None;
                 }
             }
@@ -2247,7 +2321,7 @@ pub fn collect(
                 }
             }
             // Nothing to apply. What these two say is the notice above.
-            Report::Failed { .. } | Report::WriterVanished => {}
+            Report::Failed { .. } | Report::NoWriter => {}
         }
     }
     notice
@@ -3247,16 +3321,23 @@ mod tests {
     /// promising something nothing does. So this reads the **notice** rather
     /// than the flag, and then drives a real capture all the way to a file on
     /// disk — which is the only claim that means the writer is genuinely back.
+    ///
+    /// What it deliberately does **not** claim is that anything shows that
+    /// notice: `Report::notice` is a sentence and `collect` is what puts it in
+    /// front of somebody. That is
+    /// `a_writer_that_dies_reaches_the_artist_through_the_frame_loop`, which
+    /// needs a device — the two together are the rule, and neither is it alone.
     #[test]
     fn an_autosave_whose_writer_vanished_says_so_and_starts_another() {
         let internal = scratch("vanished-internal");
+        let sessions = scratch("vanished-sessions");
         let session = session_of(1);
         let id = session.active_id();
 
         let mut autosave = Autosave {
             interval: Duration::ZERO,
             expiry: None,
-            marks_dir: Some(scratch("vanished-sessions")),
+            marks_dir: Some(sessions.clone()),
             ..Autosave::default()
         };
         autosave.next_due(Instant::now(), true, &session);
@@ -3281,6 +3362,7 @@ mod tests {
         assert!(dead.join().is_err(), "the writer was supposed to panic");
         autosave.tx = Some(task_tx);
         autosave.rx = Some(report_rx);
+        autosave.lost = false;
 
         // What the artist is told. Read as the notice rather than the variant,
         // because a report nothing turns into a sentence is a failure nobody
@@ -3294,9 +3376,24 @@ mod tests {
             said[0],
         );
         assert!(
-            said[0].lines.iter().any(|l| l.contains("not written")),
-            "the notice does not say nothing was written: {:?}",
+            said[0]
+                .lines
+                .iter()
+                .any(|l| l.contains("not have been written")),
+            "the notice does not say the copy may be missing: {:?}",
             said[0],
+        );
+        assert!(
+            said[0].lines.iter().any(|l| l.contains("File, Save")),
+            "the notice leaves the artist nothing to do: {:?}",
+            said[0],
+        );
+        // A per-document failure afterwards must still be able to speak: the
+        // two failures answer to different latches, so a dead writer does not
+        // spend the run's one "disk full".
+        assert!(
+            !autosave.complained[Latch::Document as usize],
+            "a dead writer burned the latch a document failure needs",
         );
 
         // And the promise that notice makes, kept: an ordinary capture behind
@@ -3318,7 +3415,7 @@ mod tests {
         );
 
         let mut reports = Vec::new();
-        for _ in 0..4000 {
+        for _ in 0..2000 {
             reports.extend(autosave.poll());
             if !reports.is_empty() {
                 break;
@@ -3332,6 +3429,56 @@ mod tests {
         assert!(ours.exists(), "the internal copy was never written");
 
         let _ = std::fs::remove_dir_all(&internal);
+        let _ = std::fs::remove_dir_all(&sessions);
+    }
+
+    /// A machine that will not give Umber a thread is told about too.
+    ///
+    /// The third way into "there is no writer", and the one the disconnect
+    /// reading cannot cover: with no thread there is no channel, so `poll` has
+    /// nothing to read a `Disconnected` off. It was silent before and it is
+    /// **newly reachable** because of the respawn — a writer that dies clears
+    /// `tx` precisely so `writer` runs again, and that call is the one that can
+    /// fail. Left alone it would make `Report::NoWriter`'s own sentence, which
+    /// promises Umber will try again, the thing that turns out to be false.
+    ///
+    /// Driven by asking for the report the failed spawn raises rather than by
+    /// contriving a thread failure, which needs a machine out of handles: what
+    /// the spawn arm does is set the flag, and this is the whole of what the
+    /// flag then produces.
+    #[test]
+    fn an_autosave_that_cannot_start_a_writer_says_so_too() {
+        let mut autosave = Autosave {
+            marks_dir: Some(scratch("nowriter-sessions")),
+            ..Autosave::default()
+        };
+        // Exactly what `writer`'s `Err` arm leaves behind: no channel either
+        // side, and a run nobody has been told about.
+        autosave.lost = true;
+
+        let reports = autosave.poll();
+        let said: Vec<Notice> = reports.iter().filter_map(Report::notice).collect();
+        assert_eq!(
+            said.len(),
+            1,
+            "a writer that never started said nothing: {reports:?}",
+        );
+        // The sentence has to be true of a thread that never ran as well as of
+        // one that died, which is why it says "may not have been written"
+        // rather than naming a copy or claiming anything stopped.
+        assert!(
+            said[0]
+                .lines
+                .iter()
+                .any(|l| l.contains("may not have been")),
+            "the notice overstates what is known: {:?}",
+            said[0],
+        );
+        // Once per run, like every other failure here.
+        assert!(
+            autosave.poll().is_empty(),
+            "the artist would be interrupted again with nothing new to say",
+        );
     }
 
     /// **One archive still reaches two places, and this is what now says so.**
@@ -4229,6 +4376,61 @@ mod tests {
         assert!(
             !loops.editor.session.active_tab().modified,
             "the tab's dot should come off once its own file has been written"
+        );
+    }
+
+    /// A writer that dies reaches the artist, through the frame loop that
+    /// actually delivers.
+    ///
+    /// **A guard on `Report::notice` is not a guard on `collect`**, which is the
+    /// same failure `a_read_only_palette_cannot_be_changed_by_any_gesture`
+    /// records one level along, and the split made it easy to hit: the wording
+    /// moved into `Report::notice`, where it is driven, and the *delivery* is
+    /// three lines in [`collect`] that nothing reached. Deleting them left the
+    /// whole suite green while every autosave failure — this one and the
+    /// pre-existing `Report::Failed` — went silent again. So this drives the
+    /// real frame loop, exactly as `app.rs` spends a frame, and reads the
+    /// `Notice` that comes back out of it.
+    ///
+    /// Skips rather than fails with no adapter, and holds `gputest::lock` for
+    /// its whole length — see `crate::gputest`.
+    #[test]
+    fn a_writer_that_dies_reaches_the_artist_through_the_frame_loop() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "vanished-loop");
+
+        // A writer that has panicked, put where the frame loop will find it.
+        // The same shape as the unit guard above: a real unwind is what drops
+        // both ends without having sent.
+        let (task_tx, task_rx) = mpsc::channel::<Job>();
+        let (report_tx, report_rx) = mpsc::channel::<Report>();
+        let dead = std::thread::Builder::new()
+            .name("umber-autosave-test".to_owned())
+            .spawn(move || {
+                let _ends = (task_rx, report_tx);
+                panic!("the autosave writer panicked part way through a document");
+            })
+            .expect("a writer thread");
+        assert!(dead.join().is_err(), "the writer was supposed to panic");
+        loops.editor.autosave.tx = Some(task_tx);
+        loops.editor.autosave.rx = Some(report_rx);
+        loops.editor.autosave.lost = false;
+
+        // One ordinary frame is all it should take: `collect` polls on every
+        // one of them.
+        let notice = loops
+            .frame(gpu, true)
+            .expect("the frame loop said nothing about a writer that had gone");
+        assert!(
+            notice.title.contains("Autosave"),
+            "the notice does not name what went wrong: {notice:?}",
+        );
+        assert!(
+            notice.lines.iter().any(|l| l.contains("File, Save")),
+            "the notice leaves the artist nothing to do: {notice:?}",
         );
     }
 

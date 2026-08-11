@@ -42,6 +42,13 @@
 //! already do. It is deliberately **not** a Cancel on the dialog: that argument
 //! is `tabs::loading`'s and is untouched by this, since a Cancel that cannot
 //! interrupt the worker is a control that lies.
+//!
+//! **Noticing is only half of it: something has to be looking.** The loop runs
+//! at `ControlFlow::Wait`, so a reading nobody asks for is a reading nobody
+//! takes — and the worker's own wakes are the progress report and the one after
+//! the answer is sent, neither of which a panic reaches. So the wake is a
+//! destructor, [`WakeAtTheEnd`], which unwinding runs. Without it the fix was
+//! real and arrived on the artist's next mouse move.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +81,28 @@ pub struct Loading {
     progress: Arc<AtomicU32>,
     /// The finished document, once the worker has one.
     outcome: std::sync::mpsc::Receiver<Result<ImportedDocument, ImportError>>,
+}
+
+/// Wakes the event loop when the worker's stack unwinds, however it unwinds.
+///
+/// **The wake has to be a destructor, because a panic is not a return.** Under
+/// `ControlFlow::Wait` a value appearing in a channel is not an event, so the
+/// loop only looks at [`Loading::take`] on a frame something else asked for.
+/// The worker's own wakes are the per-layer progress report and the one after
+/// the answer is sent, and a panic reaches neither; dropping an
+/// [`EventLoopProxy`] wakes nothing on its own. So a reader that died left the
+/// modal on screen, correct in every respect except that nothing would look at
+/// it, until an unrelated window event happened to produce a frame. Unwinding
+/// runs destructors, so this fires on both paths and is the only statement of
+/// the wake.
+struct WakeAtTheEnd(EventLoopProxy<Wake>);
+
+impl Drop for WakeAtTheEnd {
+    fn drop(&mut self) {
+        // A failure here is the loop having gone, which is the application
+        // closing: there is nobody left to tell.
+        let _ = self.0.send_event(Wake);
+    }
 }
 
 /// Why a decode ended with no document.
@@ -188,9 +217,11 @@ impl Loading {
     ///
     /// **When this worker ends unexpectedly, [`collect`] is what notices**, by
     /// the `Disconnected` [`Self::take`] reads off `outcome`, and it takes the
-    /// modal down. Said beside the spawn rather than only at the collector: the
-    /// state a dead worker leaves is made here, and until somebody asked "who
-    /// notices if the answer never comes" the answer was nobody.
+    /// modal down — on the frame [`WakeAtTheEnd`] asks for, which is why that
+    /// exists and why this sentence would otherwise be true and useless. Said
+    /// beside the spawn rather than only at the collector: the state a dead
+    /// worker leaves is made here, and until somebody asked "who notices if the
+    /// answer never comes" the answer was nobody.
     pub fn start(
         path: PathBuf,
         name: String,
@@ -208,13 +239,28 @@ impl Loading {
         // report happens before the final layer is decoded, so nothing would
         // announce the finished document and it would sit in the channel until
         // the artist happened to move the pointer.
-        let finished = proxy.clone();
+        //
+        // **A `Drop` rather than a call at the end of the closure**, because the
+        // end of the closure is exactly where a panic does not reach. Under
+        // `ControlFlow::Wait` a value appearing in a channel is not an event and
+        // dropping an `EventLoopProxy` wakes nothing, so a reader that died left
+        // the modal on screen — correct in every respect except that nothing
+        // would look at it — until some unrelated window event produced a frame.
+        // Unwinding runs destructors, so this fires on the panic path and the
+        // ordinary one alike, and there is now one statement of the wake instead
+        // of two.
+        let finished = WakeAtTheEnd(proxy.clone());
         // Named, so the line `crash::report_panic` writes for a worker says
         // which worker. It is the only trace a panic in a reader leaves, since
         // no report is written for a thread that is not `main`.
         let started = std::thread::Builder::new()
             .name("umber-open".to_owned())
             .spawn(move || {
+                // Declared first so it drops **last**, after `sender`: the
+                // frame the wake produces must find the answer already in the
+                // channel, or on the ordinary path it would read `Empty` and
+                // wait for another event that never comes.
+                let _wake = finished;
                 // `Progress` is an `Fn`, so the last reading cannot be a captured
                 // `mut` — it lives in a cell of its own. An atomic rather than a
                 // `Cell` because the callback has to be `Sync` too, which is what
@@ -236,17 +282,14 @@ impl Loading {
                 // The send can fail only if the application has dropped the handle,
                 // which is a document nobody is waiting for any more.
                 let _ = sender.send(result);
-                // The wake that matters most: the last per-layer report happened
-                // before the final layer was decoded, so this is the only thing
-                // that says the document is ready.
-                let _ = finished.send_event(Wake);
             });
         if let Err(e) = started {
             // Nothing else to do, and deliberately so: the closure went with
             // the failure, taking `sender` with it, so the channel is already
-            // disconnected and `take` answers `WorkerVanished` on the very next
-            // frame. The dialog comes down and the artist is told, by the same
-            // route a panic in the reader takes.
+            // disconnected and `take` answers `WorkerVanished`. No wake is
+            // needed either — `begin_open` asks for a frame straight after this
+            // returns, and `collect_loading` runs early in `render`, so a
+            // refusal is settled before the modal is drawn even once.
             log::error!("could not start the document reader: {e}");
         }
 
@@ -353,14 +396,22 @@ mod tests {
         }
     }
 
-    /// Draw the two dialogs this rule moves between, and answer with every word
-    /// they put on the screen.
+    /// Draw one dialog and answer with every word it put on the screen.
     ///
     /// Reading egui's own output rather than the flag, because the flag is what
     /// the code sets and the words are what the artist gets: a guard that
     /// asserted `ed.loading.is_none()` and stopped could not see a modal still
     /// being drawn from somewhere else.
-    fn drawn(ed: &mut Editor) -> Vec<String> {
+    ///
+    /// **One dialog at a time, so "it is gone" is an empty list.** Asking both
+    /// together and then searching for the absence of a phrase makes the
+    /// assertion depend on `tabs::loading`'s own wording, which the code under
+    /// test is not obliged to keep — reword the modal and the negative half goes
+    /// quietly vacuous. Drawn in `ui::draw`'s order where both are asked for.
+    fn drawn(
+        ed: &mut Editor,
+        body: impl Fn(&mut egui::Ui, &crate::theme::Palette, &mut Editor),
+    ) -> Vec<String> {
         use crate::theme::{Palette, ThemeKind};
 
         let ctx = egui::Context::default();
@@ -376,14 +427,21 @@ mod tests {
         // Twice, for `canvasdlg`'s reason: a fresh context builds its font
         // atlas on the first pass and lays a modal out against a half-built one.
         for _ in 0..2 {
-            let output = ctx.run_ui(input.clone(), |ui| {
-                crate::tabs::loading(ui, &palette, ed);
-                crate::tabs::notice(ui, &palette, ed);
-            });
+            let output = ctx.run_ui(input.clone(), |ui| body(ui, &palette, ed));
             words.clear();
             collect_text(&output.shapes, &mut words);
         }
         words
+    }
+
+    /// What the loading modal draws, which is nothing at all once it is down.
+    fn loading_words(ed: &mut Editor) -> Vec<String> {
+        drawn(ed, |ui, p, ed| crate::tabs::loading(ui, p, ed))
+    }
+
+    /// What the notice draws.
+    fn notice_words(ed: &mut Editor) -> Vec<String> {
+        drawn(ed, crate::tabs::notice)
     }
 
     fn collect_text(shapes: &[egui::epaint::ClippedShape], into: &mut Vec<String>) {
@@ -420,10 +478,10 @@ mod tests {
         let mut ed = Editor::default();
         ed.loading = Some(vanished("Sketch.clip"));
 
-        let words = drawn(&mut ed);
+        let up = loading_words(&mut ed);
         assert!(
-            words.iter().any(|w| w.contains("Sketch.clip")),
-            "the loading modal was not drawn at all: {words:?}",
+            up.iter().any(|w| w.contains("Sketch.clip")),
+            "the loading modal was not drawn at all: {up:?}",
         );
 
         assert!(
@@ -431,23 +489,116 @@ mod tests {
             "a worker that ended without answering was read as one still reading",
         );
 
-        let words = drawn(&mut ed);
+        // Empty, not "does not contain some phrase": with `editor.loading`
+        // cleared that modal draws nothing whatever, so this cannot be made
+        // vacuous by rewording it.
+        let still = loading_words(&mut ed);
+        assert!(still.is_empty(), "the loading modal is still up: {still:?}");
+
+        let said = notice_words(&mut ed);
         assert!(
-            !words.iter().any(|w| w.contains("Opening")),
-            "the loading modal is still up: {words:?}",
-        );
-        assert!(
-            words
-                .iter()
+            said.iter()
                 .any(|w| w.contains("Could not open") && w.contains("Sketch.clip")),
-            "nothing on screen says what happened: {words:?}",
+            "nothing on screen says what happened: {said:?}",
+        );
+        // The body as well as the heading. A titled box with nothing in it
+        // would pass on the line above alone.
+        assert!(
+            said.iter().any(|w| w.contains("Nothing was changed")),
+            "the notice says nothing about what it cost: {said:?}",
         );
         // The route out. A notice with no way to dismiss it would be the same
         // defect wearing a different sentence.
         assert!(
-            words.iter().any(|w| w == "Close"),
-            "the notice cannot be dismissed: {words:?}",
+            said.iter().any(|w| w == "Close"),
+            "the notice cannot be dismissed: {said:?}",
         );
+    }
+
+    /// A file the reader *refuses* keeps the reader's own sentence.
+    ///
+    /// The arm the vanish guard cannot see, and the one that carries every
+    /// careful sentence `docimport` writes — "the file does not hold its
+    /// pixels", the canvas bound against the stack bound, the vector-layer
+    /// explanation. Answering `WorkerVanished` for a refusal compiles, keeps
+    /// the modal coming down, and replaces all of it with "something went
+    /// wrong": a silent downgrade of every refusal in the application, which
+    /// nothing else here would notice.
+    #[test]
+    fn a_file_the_reader_refuses_says_what_the_reader_said() {
+        let (sender, outcome) = std::sync::mpsc::channel();
+        sender
+            .send(Err(ImportError::UnsupportedExtension("qqq".to_owned())))
+            .expect("the receiver is alive");
+        let mut ed = Editor::default();
+        ed.loading = Some(Loading {
+            name: "Sketch.qqq".to_owned(),
+            path: PathBuf::from("Sketch.qqq"),
+            modified: false,
+            record_path: None,
+            progress: Arc::new(AtomicU32::new(0)),
+            outcome,
+        });
+
+        assert!(matches!(collect(&mut ed), Some(Collected::Refused)));
+        let said = notice_words(&mut ed);
+        let wanted = ImportError::UnsupportedExtension("qqq".to_owned()).to_string();
+        assert!(
+            said.contains(&wanted),
+            "the reader's own sentence was replaced: wanted {wanted:?}, drew {said:?}",
+        );
+    }
+
+    /// And a document that arrives is handed over rather than refused.
+    ///
+    /// The common path, and it had no cover at all: swap `collect`'s two arms
+    /// and every interactive open in the application fails silently while the
+    /// suite stays green. The refactor that split this out of `app.rs` is what
+    /// made the seam, so it is the refactor's job to close it.
+    #[test]
+    fn a_document_that_arrives_is_handed_over_to_be_installed() {
+        let (sender, outcome) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(ImportedDocument {
+                format: umber_core::docimport::SourceFormat::Png,
+                size: glam::UVec2::ONE,
+                layers: Vec::new(),
+                active: None,
+                background: umber_core::Background::Transparent,
+                dpi: None,
+                history: None,
+                warnings: Vec::new(),
+            }))
+            .expect("the receiver is alive");
+        let mut ed = Editor::default();
+        ed.loading = Some(Loading {
+            name: "Sketch.png".to_owned(),
+            path: PathBuf::from("Sketch.png"),
+            modified: true,
+            record_path: Some(PathBuf::from("Elsewhere.ora")),
+            progress: Arc::new(AtomicU32::new(0)),
+            outcome,
+        });
+
+        match collect(&mut ed) {
+            Some(Collected::Opened(_, load)) => {
+                // The request travels with the document, because the caller
+                // needs all three to make the tab: a name, where it points and
+                // whether it counts as modified.
+                assert_eq!(load.name, "Sketch.png");
+                assert_eq!(load.record_path, Some(PathBuf::from("Elsewhere.ora")));
+                assert!(load.modified);
+            }
+            other => panic!(
+                "a document that arrived was not handed over: {:?}",
+                other.is_some()
+            ),
+        }
+        assert!(
+            ed.notice.is_none(),
+            "a document that opened raised a notice"
+        );
+        assert!(ed.loading.is_none(), "the dialog was left up");
     }
 
     /// And a reader that is merely slow is left alone.
