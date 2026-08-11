@@ -2230,6 +2230,41 @@ mod tests {
                  file is bounded only after the memory has been spent"
             );
         }
+
+        // **And the one reader that cannot yield pieces reserves as well.**
+        // `psd` 0.3.5's `Layer::rgba()` hands back a canvas-sized buffer, so a
+        // claim *is* a cost there and a per-layer charge arrives after the
+        // gigabytes. Deleting the reserve leaves every other test green — no
+        // fixture can drive 17.2 GB — which is exactly why it is named here
+        // rather than trusted.
+        assert!(
+            include_str!("photoshop.rs").contains("budget.reserve("),
+            "the .psd reader densifies, so it must be refused off its header \
+             before it decodes a layer"
+        );
+    }
+
+    /// `reserve` looks ahead without committing, which is what lets a reader do
+    /// both: refuse the worst case up front, and still accumulate what the file
+    /// turned out to hold.
+    #[test]
+    fn a_reservation_refuses_without_spending_the_budget() {
+        let mut budget = PieceBudget {
+            width: 100,
+            height: 100,
+            layers: 4,
+            spent: 0,
+            limit: 1000,
+        };
+        assert!(budget.reserve(1001).is_err(), "past the limit");
+        assert!(budget.reserve(999).is_ok(), "inside it");
+        assert_eq!(budget.spent, 0, "a reservation is not a charge");
+
+        // It counts what has already been charged, so a reader that reserves
+        // after decoding part of a document is not handed the budget twice.
+        budget.spent = 900;
+        assert!(budget.reserve(101).is_err());
+        assert!(budget.reserve(100).is_ok());
     }
 
     /// A folder is not merely uncharged, it may hold no pieces at all: it takes
