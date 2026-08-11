@@ -7876,16 +7876,21 @@ impl CanvasRenderer {
     /// it would show the stroke that has just landed as missing.
     ///
     /// **"Every method" is a claim about a set somebody has to have counted**,
-    /// and it has been wrong twice. The first time was `render_float`, which
+    /// and it has been wrong three times. The first was `render_float`, which
     /// wrote the float's preview slice every frame of a drag and bumped
-    /// nothing; the second was a guard that said it drove every route and drove
+    /// nothing. The second was a guard that said it drove every route and drove
     /// three of nine, so `flip_layers`, `fill_layer_white`, `commit_float` and
     /// both of `commit_stroke`'s early-return arms could each have their
-    /// increment deleted with all 170 GPU tests still green. The set is now
-    /// enumerated in `writing_a_slice_moves_its_revision_and_leaves_the_others_
-    /// alone`, which names the two it does not drive and why. Adding a method
-    /// that writes a slice means adding a case there — a rule enforced inside N
-    /// methods still needs somebody to check that N is all of them.
+    /// increment deleted with all 170 GPU tests still green. The third was the
+    /// count itself: [`Self::touch_all_slots`] is a *second* mechanism, reached
+    /// from `resize` and `clear_all_layers`, and enumerating this one's call
+    /// sites alone left it out.
+    ///
+    /// The set is enumerated in `writing_a_slice_moves_its_revision_and_leaves_
+    /// the_others_alone`, which names the three it does not drive and why.
+    /// Adding a method that writes a slice means adding a case there — a rule
+    /// enforced inside N methods still needs somebody to check that N is all of
+    /// them, and that the methods are the only mechanism.
     fn touch_slot(&mut self, slot: u32) {
         if let Some(rev) = self.slot_revisions.get_mut(slot as usize) {
             *rev += 1;
@@ -7897,7 +7902,15 @@ impl CanvasRenderer {
         }
     }
 
-    /// Note that every slice has changed — a flip, a resize, a fresh document.
+    /// Note that every slice has changed — a resize, or a fresh document.
+    ///
+    /// **Not a flip**, and this comment said it was. `flip_layers` moves the
+    /// counters of the slots it was *given*, through the per-slot loop, because
+    /// a flip of two layers in a stack of ten leaves the other eight alone. The
+    /// wrong sentence here is what let the resize gap below stay hidden: it
+    /// reads as though the flip and the resize shared a mechanism, so
+    /// enumerating [`Self::touch_slot`]'s callers looked like enumerating
+    /// everything.
     fn touch_all_slots(&mut self) {
         for rev in &mut self.slot_revisions {
             *rev += 1;

@@ -103,7 +103,9 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 /// The comment on that test used to say it was safe because the reading was
 /// "relative to itself". Relative to itself is exactly what it cannot be: the
 /// two loads are a whole object's lifetime apart and anything may happen
-/// between them. Six tests here build a provider.
+/// between them. **Seven tests here build a provider** — six directly, and
+/// `the_dll_hands_out_the_class_it_is_registered_as` through the class factory,
+/// which is the one easiest to miss when counting.
 ///
 /// It lives beside the counter rather than inside `mod tests` for
 /// `prefs::prefs_lock`'s reason — the rule is about everything that touches the
@@ -619,6 +621,16 @@ mod com_tests {
         /// disagrees. So a source GDI holds as top-down comes back reversed
         /// against its own buffer, and a bottom-up one comes back identical:
         /// the flip is GDI's own answer to the question, rather than ours.
+        ///
+        /// **What that instrument costs is a portability surface, and it is
+        /// worth naming rather than discovering.** Asking `GetDIBits` for a
+        /// 32-bit `BI_RGB` copy is not contractually alpha-preserving, and no
+        /// runner has executed this yet — CI builds this crate for
+        /// `windows-11-arm` as well. A driver that zeroed the alpha byte would
+        /// make the answer neither the buffer nor its mirror, which is why
+        /// [`read_back`] compares against **both** and fails naming exactly
+        /// that rather than silently reporting "bottom-up". A mystifying red
+        /// build is the failure this two-way comparison is here to prevent.
         top_down: bool,
     }
 
@@ -643,6 +655,17 @@ mod com_tests {
         assert_eq!(ds.dsBm.bmBitsPixel, 32, "the shell was promised 32-bit");
 
         let (width, height) = (ds.dsBm.bmWidth, ds.dsBm.bmHeight);
+        // `BITMAP::bmHeight` is documented positive and measures positive here.
+        // Checked anyway, because this very struct's `dsBmih.biHeight` came
+        // back with a sign the documentation did not lead us to expect — so
+        // "GDI reports what the docs say" is a premise this function has
+        // already seen fail once. A negative here would make `height as usize`
+        // about 2^64 and the `from_raw_parts` below undefined behaviour rather
+        // than a failed assertion.
+        assert!(
+            width > 0 && height > 0,
+            "GDI reported a {width} x {height} bitmap"
+        );
         let count = width as usize * height as usize * 4;
         // SAFETY: `bmBits` is the buffer `CreateDIBSection` allocated for a
         // 32-bit bitmap of the shape GDI has just reported, and the bitmap

@@ -11,12 +11,17 @@
 //!
 //! **That "every" is a claim about a set somebody has to have counted, and it
 //! was not a guarantee.** The sentence above is true of the code and was
-//! untested for five of the renderer's nine routes: deleting the increment in
-//! `flip_layers`, in `fill_layer_white`, in `commit_float` or in either of
-//! `commit_stroke`'s early-return arms left every GPU test green, and the flip
-//! is the one that costs *every* layer in the picture its thumbnail. The set is
-//! enumerated now, in `writing_a_slice_moves_its_revision_and_leaves_the_others_
-//! alone`; a method added there that writes a slice needs a case beside it.
+//! untested for most of it. `slot_revision` is read by exactly one test in the
+//! repository, and that test drove three of the eleven routes: deleting the
+//! increment in `flip_layers`, in `fill_layer_white`, in `commit_float` or in
+//! either of `commit_stroke`'s early-return arms left every GPU test green, and
+//! so did a **resize**, which this paragraph names above and which reaches the
+//! counter by a second mechanism (`touch_all_slots`) rather than by the one an
+//! enumeration of `touch_slot`'s callers would find. The flip and the resize
+//! are the two that cost *every* layer in the picture its thumbnail at once.
+//! The set is enumerated now, in `writing_a_slice_moves_its_revision_and_
+//! leaves_the_others_alone`; a method added there that writes a slice needs a
+//! case beside it.
 //!
 //! What this module decides, and what makes it worth being a module:
 //!

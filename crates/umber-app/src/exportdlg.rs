@@ -346,36 +346,26 @@ mod tests {
             let output = ctx.run_ui(input.clone(), |ui| {
                 show(ui, &palette, &mut ed, &mut out);
             });
-            words.clear();
-            collect_text(&output.shapes, &mut words);
+            words = crate::paneltest::text_of(&output.shapes);
         }
         words
-    }
-
-    fn collect_text(shapes: &[egui::epaint::ClippedShape], into: &mut Vec<String>) {
-        fn walk(shape: &egui::Shape, into: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(text) => into.push(text.galley.text().to_owned()),
-                egui::Shape::Vec(inner) => {
-                    for shape in inner {
-                        walk(shape, into);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for clipped in shapes {
-            walk(&clipped.shape, into);
-        }
     }
 
     /// Whether `words` holds a line that is `loss`'s own sentence.
     ///
     /// Compared against `ExportLoss`'s `Display` rather than against a copy of
     /// its text, so a reworded warning moves this test with it instead of
-    /// leaving a guard pinned to a sentence nobody says any more. egui wraps a
-    /// long label into several galleys, so the comparison is over the words
-    /// joined back up with the wraps taken out.
+    /// leaving a guard pinned to a sentence nobody says any more.
+    ///
+    /// **The whitespace normalisation is insurance, not a workaround**, and the
+    /// distinction is worth drawing because the first version of this comment
+    /// got it wrong. A wrapped `ui.label` produces *one* `Shape::Text` carrying
+    /// one `Galley`, and `Galley::text()` hands back the layout job's source
+    /// string with no wrap breaks in it — so a bare `contains` would work
+    /// today. What the normalisation buys is that the comparison does not care
+    /// how the sentence is broken up, whichever way egui later decides to
+    /// break it. Stating the mechanism that is not the real one is the failure
+    /// `Pen::at`'s note records; better to say what it actually buys.
     fn names(words: &[String], loss: export::ExportLoss) -> bool {
         let flat = words
             .join(" ")
@@ -392,6 +382,7 @@ mod tests {
     /// case, because the interesting half of the rule is what is *not* said.
     #[test]
     fn the_dialog_names_every_loss_the_format_costs_this_document() {
+        let mut checked = 0;
         for format in ExportFormat::ALL {
             for background in [Background::Transparent, Background::opaque(Color::WHITE)] {
                 let transparent = background == Background::Transparent;
@@ -403,9 +394,23 @@ mod tests {
                          screen, so the artist finds out by looking at the file",
                         if transparent { "transparent" } else { "white" },
                     );
+                    checked += 1;
                 }
             }
         }
+        // **The loop above asserts nothing when `losses` is empty**, so without
+        // this the whole test passes by never running its own body — which is
+        // the vacuity it was written to fix, one level up. Seven is what the
+        // ten pairs actually produce: JPEG loses alpha and detail on a
+        // transparent document and detail alone on a white one, GIF the same
+        // with its palette, and BMP loses alpha on a transparent document only.
+        // PNG and TIFF lose nothing either way, which is the case the test
+        // below is about.
+        assert_eq!(
+            checked, 7,
+            "the formats stopped costing what this test is about, so it is no \
+             longer driving the sentences it claims to"
+        );
     }
 
     /// The other half, and the one a test built only out of the first would

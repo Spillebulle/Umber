@@ -1648,18 +1648,33 @@ mod tests {
         })
     }
 
-    /// Replace `from` with `to`, having checked `from` occurs exactly once.
+    /// Replace `from` with `to`, having checked `from` names exactly one whole
+    /// value.
     ///
     /// A `replace` matching nothing doctors nothing, the reader accepts the
     /// file, and the case reads as the bound having been enforced. A `replace`
     /// matching *twice* is worse: it is what made the per-piece bound
     /// unreachable in the first draft of these tests.
+    ///
+    /// **A count alone is not enough, because a match may be a prefix.**
+    /// `"h":21` occurs once inside `"h":213` and rewriting it there would move
+    /// a rectangle nobody named — the same failure the count exists to prevent,
+    /// wearing a different shape. No fixture value stands in that relation
+    /// today, which is exactly why it would go unnoticed later, so the digit
+    /// after the match is checked rather than assumed.
     fn once(json: &str, from: &str, to: &str) -> String {
+        let at: Vec<usize> = json.match_indices(from).map(|(i, _)| i).collect();
         assert_eq!(
-            json.matches(from).count(),
+            at.len(),
             1,
             "`{from}` is not a unique field of this manifest, so doctoring it \
              does not name one rectangle: {json}"
+        );
+        let after = json[at[0] + from.len()..].bytes().next();
+        assert!(
+            !after.is_some_and(|b| b.is_ascii_digit()),
+            "`{from}` is a prefix of a longer number here, so replacing it \
+             rewrites a value nobody named: {json}"
         );
         json.replace(from, to)
     }
@@ -1677,7 +1692,11 @@ mod tests {
 
         // `axis_blind` marks the cases a *transposed* check would refuse
         // anyway. They still say the axis runs at all, and it is worth saying
-        // out loud which half of the pair each case is doing.
+        // out loud which half of the pair each case is doing — and counting,
+        // because "this table catches a transposition" is a claim about the
+        // rows that are **not** blind, and a fixture edited later could leave
+        // none of them.
+        let mut discriminating = 0;
         for (what, from, to, axis_blind) in [
             // --- the piece bound, which nothing reached before ---
             //
@@ -1703,7 +1722,6 @@ mod tests {
             ("an entry too tall", "\"h\":44", "\"h\":60", false),
             ("an entry too wide", "\"w\":45", "\"w\":71", true),
         ] {
-            let _ = axis_blind;
             let (kept, warnings) = read_doctored(|json| once(&json, from, to));
             assert!(!kept, "{what}: a patch past the canvas was trusted");
             let reason = dropped_for(&warnings).unwrap_or_else(|| panic!("{what}: no reason"));
@@ -1711,7 +1729,13 @@ mod tests {
                 reason.contains("outside the canvas"),
                 "{what}: dropped for the wrong reason, so the bound did not run: {reason}"
             );
+            discriminating += usize::from(!axis_blind);
         }
+        assert_eq!(
+            discriminating, 3,
+            "the fixture stopped being able to tell a transposed bound from a \
+             working one, which is the whole reason its canvas is not square"
+        );
     }
 
     /// A rectangle of no area is refused, at both levels.
@@ -1757,7 +1781,12 @@ mod tests {
             (
                 "a resized canvas",
                 Box::new(|j: String| once(&j, "\"canvas\":[70,50]", "\"canvas\":[70,51]")),
-                "canvas",
+                // **Not "canvas".** Two of the reader's eleven sentences carry
+                // that word — this one and "covers an area outside the canvas"
+                // — so matching on it would reopen, for the very pair the two
+                // tests above are about, exactly the hole this test exists to
+                // close.
+                "it was recorded on a",
             ),
             (
                 "renamed layers",

@@ -6411,17 +6411,25 @@ fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
 /// list cache a picture and know exactly when it has stopped being true.
 ///
 /// **The list of routes is the point, and this test used to drive three of
-/// them.** `CanvasRenderer` calls `touch_slot` from nine places that a document
-/// can reach, and the guard covered `commit_stroke`'s ordinary arm,
-/// `clear_layer` and `write_layer_rect` — while its own first sentence, and
-/// `thumbs.rs`'s module docs, both said "every". Deleting the increment in
-/// `flip_layers`, in `fill_layer_white`, in `commit_float`, and in each of
-/// `commit_stroke`'s two early-return arms left all 170 tests in this file
-/// green. A canvas flip costs every layer in the picture its thumbnail's
+/// them.** There are two mechanisms and eleven routes a document can reach:
+/// `touch_slot`, called from nine places, and `touch_all_slots`, called from
+/// `resize` and `clear_all_layers`. The guard covered `commit_stroke`'s
+/// ordinary arm, `clear_layer` and `write_layer_rect` — while its own first
+/// sentence, and `thumbs.rs`'s module docs, both said "every". Deleting the
+/// increment in `flip_layers`, in `fill_layer_white`, in `commit_float`, or in
+/// either of `commit_stroke`'s early-return arms left all 170 tests in this
+/// file green. A canvas flip costs every layer in the picture its thumbnail's
 /// correctness, and it is the one of the five that is a whole-document
 /// operation.
 ///
-/// So the routes are enumerated here rather than described. The two that are
+/// **`touch_all_slots` was found while enumerating the other mechanism**, and
+/// is the same overclaim one level up: `slot_revision` is read by exactly one
+/// test in the repository — this one — so a resize was driven by nothing,
+/// despite `thumbs.rs` naming it out loud. Counting only `touch_slot`'s call
+/// sites would have left the sentence "every route" false again, for a route
+/// that costs *every* slice at once.
+///
+/// So the routes are enumerated here rather than described. The three that are
 /// *not* driven are named with the reason:
 ///
 /// * `draw_float`, which writes the float's **preview** slice every frame of a
@@ -6429,6 +6437,9 @@ fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
 ///   it` — deleting that one increment is the only one of the six that this
 ///   file already caught, which is worth knowing before assuming the coverage
 ///   here was uniform.
+/// * `clear_all_layers`, `touch_all_slots`'s other caller. It runs when a
+///   document is first built, before any thumbnail of it exists, so there is no
+///   cached picture for it to invalidate; the resize below drives the same line.
 /// * `write_entry`, which is reachable only from `unback_tile_for_test` and
 ///   `borrow_tile_for_test`. No document reaches it, so a thumbnail cannot go
 ///   stale through it.
@@ -6542,7 +6553,12 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
         .begin_float(
             &h.gpu.device,
             &h.gpu.queue,
-            1,
+            // 3, not 1: `fill_layer_white` just turned slot 1 into a **mask**,
+            // and a float's preview is RGBA. Nothing here reads those pixels,
+            // so either number passes — which is the reason to get it right
+            // now rather than leave an incoherent state for whoever
+            // strengthens this case.
+            3,
             &FloatSource {
                 slot: 0,
                 rect: mask,
@@ -6570,6 +6586,13 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
     // A canvas flip, which is the whole document at once — and the only route
     // here that has to move *several* counters. Driving it against a single
     // slot would leave the loop's body covered and the loop itself not.
+    //
+    // Worth knowing before strengthening this: the float above left slot 0
+    // owning a page, so `flip_layers`' `plans` filter skips it and the flip
+    // takes the whole-page `copy_texture_to_texture` branch rather than the
+    // tiled one. That is correct — it is residency planning, not a bug — but it
+    // means what is exercised here is the `touch_slot` loop against a
+    // page-backed slot, and the tiled path is somebody else's test.
     let flipped = [h.canvas.slot_revision(0), h.canvas.slot_revision(1)];
     let untouched = h.canvas.slot_revision(2);
     h.canvas
@@ -6584,6 +6607,30 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
         untouched,
         "a flip of two slots moved a third"
     );
+
+    // A resize, which goes through `touch_all_slots` rather than `touch_slot`
+    // and so is a **second mechanism** rather than a tenth call site. It was
+    // found while enumerating the first: `slot_revision` is read by exactly one
+    // test in the repository — this one — so both of its callers, `resize` and
+    // `clear_all_layers`, were driven by nothing at all, and `thumbs.rs`'s
+    // module docs name a resize out loud. Every thumbnail is a picture of a
+    // canvas that is about to stop existing, and a slice nobody painted on
+    // this session is exactly the one whose counter would otherwise never move.
+    let before_resize: Vec<u64> = (0..3).map(|s| h.canvas.slot_revision(s)).collect();
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(DOC * 2),
+        Anchor::Centre,
+        3,
+    );
+    for slot in 0..3u32 {
+        assert!(
+            h.canvas.slot_revision(slot) > before_resize[slot as usize],
+            "slot {slot} kept its revision across a resize, so the layer list \
+             would go on drawing a thumbnail of a canvas that no longer exists"
+        );
+    }
 }
 
 /// The mirror of a tightly packed square of RGBA8, done on the CPU.
