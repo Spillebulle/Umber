@@ -277,6 +277,34 @@ the programme found — `srgb::coverage_table` is non-injective and about 74 of
 256 states of an imported mask are unreachable — which deserves its own commit
 and its own guard rather than arriving inside a 2,000-line storage rewrite.
 
+**Built, after the atlas and as its own change, and it diverged from this
+paragraph in three places.** Recorded here rather than only in a commit message,
+because this is the paragraph the next person reads.
+
+- **The measured figure is 73 of 256, not "about 74"**, and the same 73 falls
+  out from the other end: an sRGB-stored mask could express only **183** of the
+  256 multipliers the composite's own 8-bit alpha can show.
+  `every_coverage_a_source_states_survives_into_the_slice` and
+  `a_mask_multiplier_reaches_every_level_the_composite_can_show` are the counts,
+  and `every_level_a_mask_can_hold_moves_the_picture` is the same claim measured
+  on the GPU.
+- **There is no dedicated linear array.** The mask stayed in the layer array and
+  took a second *view* of it — `LAYER_FORMAT_LINEAR`, the raw view `flip.wgsl`
+  already used. The composite and the effect extract bind it for their mask tap;
+  the commit renders a mask through linear page views with a pipeline pair
+  declaring that target format, picked off `SlotClass`. So the claim being "a tag
+  rather than a granularity" turned out to be truer than the wording suggested:
+  it needed no second store to thread through the atlas, the page table, the
+  flip, `resize` and the capture, and the byte-width saving a dedicated array
+  would have bought was never the point.
+- **`history::VERSION` did not move**, against §5.4. A mask patch's bytes did
+  change meaning, but a mask patch can only exist in a document that has a mask,
+  and such a document now declares `umber-version` 4 — which the reader has in
+  hand before it reads the history, and which an older build refuses outright.
+  The manifest's own shape is unchanged, and `history::VERSION` governs that.
+  This is exactly the argument `docformat::history::SaveEntry::mask` already
+  makes about revision 2, applied again.
+
 ### 2.4 The proxy's apron and the atlas's apron were reconciled to a constant that the sizing rule contradicts
 
 `tiled-layer-storage.md` §12.1 reconciles to "no chain on the atlas, one proxy

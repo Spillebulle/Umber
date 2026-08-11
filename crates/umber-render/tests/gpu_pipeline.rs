@@ -6363,6 +6363,53 @@ fn shadow(color: Color, angle: f32, distance: f32) -> Effect {
     }
 }
 
+/// **The extract must read a mask the way the composite does.**
+///
+/// An effect is derived from the layer's alpha *after* its mask, so the extract
+/// takes a mask tap of its own — a second reader of the same slice, in a second
+/// shader. If the two disagree about what a stored byte means, a shadow is
+/// derived from a coverage the picture never had, and the symptom is a shadow
+/// that is merely the wrong strength: plausible, and attributable to any of half
+/// a dozen parameters.
+///
+/// The mask is a **partial**, and that is the whole of what makes this a test.
+/// Under the raw reading 128 is a multiplier of 0.502; under the sRGB reading
+/// the same byte is 0.216, so the shadow comes back at 55 where it should be
+/// 128. At 0 or 255 the two readings agree exactly and this sees nothing —
+/// the same reason every mask fixture in this change carries a partial.
+///
+/// The shadow is inert apart from its distance: no spread, no softness, so the
+/// slice holds the coverage itself rather than something a kernel has been over.
+#[test]
+fn an_effect_reads_a_mask_the_way_the_composite_does() {
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    // A mask over the whole canvas, so the shadow's own displaced position is
+    // masked by the same value the shape is and there is one number in play.
+    h.write_block(1, WHOLE, [128, 128, 128, 255]);
+    h.canvas.mark_mask_slot(1);
+
+    let mut draw = layer(0, 1.0, BlendMode::Normal);
+    draw.mask = Some(1);
+    // Angle 180 puts the offset at +x, the convention
+    // `a_drop_shadow_at_multiply_multiplies_against_the_backdrop` already
+    // relies on, and 20 clears `SHAPE`'s 16-wide square entirely — so the point
+    // read below is solid shadow with none of the layer over it and none of the
+    // knockout taken out of it.
+    let effects = [shadow(Color::new(1.0, 0.0, 0.0, 1.0), 180.0, 20.0)];
+    let baked = h.bake(&[effected(draw, &effects)], 2);
+    let slot = baked.draws[0].slot;
+
+    // The middle of the shape displaced by 20 in x.
+    let a = slice_alpha(&h, slot, 52, 32);
+    assert!(
+        a.abs_diff(128) <= 3,
+        "the shadow of a half-masked layer came back at {a}; 128 is the mask \
+         read as the composite reads it and 55 is the sRGB reading this replaced"
+    );
+}
+
 /// An outline of `spread`, hard-edged, at `position`.
 fn outline(color: Color, spread: f32, position: OutlinePosition) -> Effect {
     Effect {
