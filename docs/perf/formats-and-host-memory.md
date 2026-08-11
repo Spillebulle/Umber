@@ -792,17 +792,45 @@ and the accumulation.
    three quarters again, because a forked mask is read back at 1 B/px rather
    than 1.33. The figure is right; it was right for the wrong design.)*
 
-**What has been built, as of Stage 4.** Fix (2) is done and fix (1)'s
-*interface* is done — `docformat::Canvas`/`Canvases`, the entry-at-a-time form
-this section called the only real interface change here — but **the table above
-still stands for the autosave**, and the reason is worth being exact about.
-`DocumentCapture` arrives whole from `CanvasRenderer::take_capture`, so the
-twenty-four slices are resident before the writer thread starts; what fix (2)
-removed is the two rows *under* them, the accumulated PNGs and the whole
-archive. Encoding a slice as it comes home needs the renderer to release
-finished slices one at a time, which is `canvas.rs` and therefore Stage 3's.
-Fix (3) is §5's and is handed to the atlas. `docs/perf/roadmap.md`'s Stage 4
-entry records the same split.
+**Fixes (1) and (2) are built and the table above no longer stands. Fix (3) is
+not, and a first draft of this paragraph said it was.** Fix (2) landed with
+Stage 4 and fix (1) after Stage 3, once the renderer could release finished
+slices.
+
+The retraction is worth stating rather than deleting, because the thing that
+made it plausible is still true and will make it plausible again. The atlas's
+linear mask changed how a mask is *encoded* and which view it is read through —
+so "the mask work landed" is a true sentence — and it changed nothing about
+bytes per pixel: a mask is still a slice of the same `Rgba8UnormSrgb` array
+(CLAUDE.md: "not a second `R8Unorm` one"), `begin_capture` still sizes every
+band at `doc_size.x * 4` whatever the slot's class, and `MaskImage::of` still
+reduces with the `chunks_exact(4).map(|px| px[0])` this section names by name.
+None of the promised three quarters of the readback is saved. Fix (3) needs the
+capture to read a mask slot at one byte, which needs a copy whose format is
+decided per slot — and that is a change to `Capture`, not to the mask's
+encoding.
+
+Fix (1) as built, because it diverged from the sketch above in one place that
+matters. `CanvasRenderer::take_capture_slice` hands over each layer slice as its
+last band leaves the staging buffer and `take_capture` returns the size and the
+flattened preview alone. **The preview is deliberately still pixels**: the
+archive's thumbnail is box-averaged down from it, so a PNG would have to be
+decoded again to make one — and it is one canvas rather than N.
+
+What the sketch called "the only real interface change here" turned out to be
+two. `Canvases` gaining an entry-at-a-time form was the first; the second is that
+a source has to be able to hand over something *already encoded*, because the
+archive is written top of the stack first and the capture comes home bottom
+first. No amount of asking one at a time fixes an order mismatch — the source
+would simply hold everything until the writer reached it. `LayerImage` and
+`MaskImage` are that form, and they are `write_archive`'s own `trim` and
+`write_png` with a different sink, so an archive built from them is byte for byte
+the archive built from the pixels.
+
+The autosave's writer channel became a three-message protocol for it (`Slice`,
+`Finish`, `Abandon`), because the deflate cannot happen on the frame path. What
+stands between captures is one `Encoded` on that thread, cleared by both the
+finish and the abandon.
 
 ### 10.2 The explicit Save — the same shape, synchronously
 

@@ -1307,8 +1307,22 @@ struct Capture {
     /// The step in flight, or the next to be recorded. `slots.len()` is the
     /// flattened preview, which goes last.
     step: usize,
-    /// One entry per step, filled in as each comes home.
+    /// One entry per step, filled in as each comes home — and emptied again by
+    /// [`CanvasRenderer::take_capture_slice`] as each is handed over.
     results: Vec<Option<Vec<u8>>>,
+    /// How many layer slices have been handed over.
+    ///
+    /// **This is what stops the whole document being resident at once.** The
+    /// readback is already banded and already spread across frames, so the
+    /// pixels arrive incrementally; without a way out they were then *held*,
+    /// which is 10 GB on the reference document and is
+    /// `docs/perf/formats-and-host-memory.md` §10.1's whole figure. A caller
+    /// that drains each slice as it lands and encodes it leaves this holding
+    /// one.
+    ///
+    /// The flattened preview is never drained: it is the last step, it is what
+    /// the thumbnail is scaled from, and it is one canvas rather than N.
+    taken: usize,
     /// The step in flight, as far as it has been copied out of the mapped
     /// buffer. See [`Capture::copy_chunk`].
     partial: Option<Vec<u8>>,
@@ -1439,17 +1453,40 @@ impl Capture {
     }
 }
 
-/// Everything a document needs written down, read back without a stall.
+/// One layer slice, off the GPU and out of the capture's hands.
 ///
-/// `layers` are in **layer-texture form** — sRGB with alpha premultiplied in
-/// linear space — which is what `umber_core::docformat::SaveLayer::pixels`
-/// wants. `merged` is straight-alpha sRGB, as `SaveDocument::merged` wants.
-/// Both come from the same passes the screen uses, so an autosaved file cannot
-/// disagree with what was on screen.
+/// In **layer-texture form** — sRGB with alpha premultiplied in linear space —
+/// which is what `umber_core::docformat::SaveLayer::pixels` wants, and what
+/// `docformat::LayerImage::of` and `MaskImage::of` take.
+pub struct CaptureSlice {
+    /// Which of the `slots` [`CanvasRenderer::begin_capture`] was given this is.
+    pub index: usize,
+    /// The canvas this was read at.
+    ///
+    /// Carried with the slice rather than looked up, because the caller encodes
+    /// it the frame it arrives and the renderer is the only thing that knows
+    /// what shape the capture in flight was begun at — `doc_size` is the
+    /// document's *now*, and a resize between the two is exactly the state a
+    /// silently sheared file comes out of.
+    pub size: UVec2,
+    pub pixels: Vec<u8>,
+}
+
+/// What is left of a document once every layer slice has been drained: its size
+/// and its flattened preview.
+///
+/// `merged` is straight-alpha sRGB, as `SaveDocument::merged` wants, and it
+/// comes from the same composite pass the screen uses — so an autosaved file
+/// cannot disagree with what was on screen.
+///
+/// **The layers are deliberately not here.** They are handed over one at a time
+/// by [`CanvasRenderer::take_capture_slice`], because holding all of them until
+/// the document was complete is the ten gigabytes
+/// `docs/perf/formats-and-host-memory.md` §10.1 is about. The preview stays
+/// whole: it is one canvas rather than N, and the archive's thumbnail is scaled
+/// from its pixels rather than from its PNG.
 pub struct DocumentCapture {
     pub size: UVec2,
-    /// One buffer per slot asked for, in that order.
-    pub layers: Vec<Vec<u8>>,
     pub merged: Vec<u8>,
 }
 
@@ -2392,6 +2429,121 @@ struct EffectCache {
     /// How many bakes have run. Observation only, and the only way a test can
     /// say "this frame rebaked nothing".
     bakes: u64,
+    /// A page the device refused during a bake, waiting to be said out loud.
+    ///
+    /// Taken by [`CanvasRenderer::take_effect_refusal`]. `None` is "nothing to
+    /// report", which is not the same as "nothing was refused" — see
+    /// [`Self::refusing`].
+    refused: Option<Vram>,
+    /// The last bake was refused a page **by the device**.
+    ///
+    /// **The latch is what makes the refusal reportable at all.** A bake runs
+    /// every frame an effect is stale, and a document the card cannot find a
+    /// page for is refused on every one of them — so setting [`Self::refused`]
+    /// each time would put a dialog over the canvas at sixty hertz. It is set on
+    /// the *transition* into the refused state, so an artist who closes
+    /// something else and carries on is told again if it happens again. Same
+    /// shape as `Autosave::complained`, which exists for exactly this on a
+    /// five-minute timer rather than a per-frame one.
+    ///
+    /// **`bake_effects` takes it at the top and puts it back only on that one
+    /// arm**, rather than clearing it at each path that does not refuse — there
+    /// are five returns and one of them is a document with no effects at all, so
+    /// switching an effect off and on again after a refusal would otherwise
+    /// produce no second notice and a silently plain picture.
+    refusing: bool,
+}
+
+/// Why a slot could not be given a whole page of its own.
+///
+/// **Two arms because only one of them is the artist's to act on.** The device
+/// declining an allocation is a memory refusal with a figure and a remedy;
+/// running out of *pages* is [`MAX_SLOTS`], which is Umber's own ceiling and
+/// which no amount of closing other applications moves. Collapsing them into one
+/// `Vram` sends `vram::effect_refused` — "this graphics card could not provide
+/// it, close other applications" — to somebody whose card was never asked, which
+/// is the refusal naming the wrong bound that `check_bounds` was split apart to
+/// stop.
+/// **No test reaches `Ceiling`, and that is a property of the arithmetic rather
+/// than a gap somebody could close.** A page holds exactly one canvas's worth of
+/// tiles, so `MAX_SLOTS` pages need `MAX_SLOTS` slots' worth of paint — at which
+/// point `bake_effects`' `capacity == 0` has already refused the bake, because
+/// there is no slice left above the stack for an effect to use. `begin_float`
+/// refuses at `reserved >= MAX_SLOTS` for the same reason. It is written because
+/// the alternative is a synthesised `Vram`, which is wrong whether or not
+/// anything can produce it.
+enum PageRefusal {
+    /// The device would not allocate the grown atlas.
+    Device(Vram),
+    /// [`MAX_SLOTS`] pages already, and none of them whole and free.
+    Ceiling,
+}
+
+impl std::fmt::Display for PageRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Device(v) => write!(
+                f,
+                "the device refused {} page(s) of {} bytes",
+                v.slices, v.slice_bytes
+            ),
+            Self::Ceiling => write!(f, "the atlas is at its ceiling of {MAX_SLOTS} pages"),
+        }
+    }
+}
+
+/// Why a bake was abandoned part way.
+///
+/// Two arms rather than a string, because the two want different things said.
+/// Every [`BakeError::Wrong`] is a state this crate believes unreachable — a
+/// pass budget already bounded upstream, a working set that was just
+/// allocated — so it is a log line naming what happened and nothing more.
+/// [`BakeError::Refused`] is the device declining a page on an ordinary frame,
+/// which is a sentence the artist has to see and a figure they can act on.
+enum BakeError {
+    /// The device would not give the bake the page an effect slice needs.
+    Refused(Vram),
+    /// Something this crate got wrong, named for the log.
+    Wrong(String),
+}
+
+impl From<PageRefusal> for BakeError {
+    /// **The ceiling becomes a [`BakeError::Wrong`], deliberately.** It is a
+    /// bake that did not happen and is reported the same way — the plain draw
+    /// list, `dropped` counting what is not drawn — but it raises no notice,
+    /// because there is nothing an artist could do about `MAX_SLOTS` and the
+    /// remedies `vram::effect_refused` offers are all about the card.
+    fn from(refused: PageRefusal) -> Self {
+        match refused {
+            PageRefusal::Device(v) => Self::Refused(v),
+            PageRefusal::Ceiling => Self::Wrong(PageRefusal::Ceiling.to_string()),
+        }
+    }
+}
+
+impl From<String> for BakeError {
+    fn from(what: String) -> Self {
+        Self::Wrong(what)
+    }
+}
+
+impl From<&str> for BakeError {
+    fn from(what: &str) -> Self {
+        Self::Wrong(what.to_string())
+    }
+}
+
+impl std::fmt::Display for BakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(v) => write!(
+                f,
+                "the device refused {} page(s) of {} bytes",
+                v.slices, v.slice_bytes
+            ),
+            Self::Wrong(what) => f.write_str(what),
+        }
+    }
 }
 
 /// The page table's texel format.
@@ -3005,25 +3157,36 @@ pub struct CanvasRenderer {
     /// The largest buffer this device will create, in bytes.
     ///
     /// Taken from the device rather than assumed, and honoured by every
-    /// readback here — see [`band_rows`] — and by
-    /// [`CanvasRenderer::write_layer_rect`]. For a readback it is the *real*
-    /// bound: those go through the validated `create_buffer`. For a write it is
-    /// a **self-imposed proxy**, because a `write_texture` staging buffer is not
-    /// validated against it at all; see `write_layer_rect`.
+    /// readback here — see [`band_rows`] — by
+    /// [`CanvasRenderer::write_layer_rect`], and by [`upload_coverage`]. For a
+    /// readback it is the *real* bound: those go through the validated
+    /// `create_buffer`. For a write it is a **self-imposed proxy**, because a
+    /// `write_texture` staging buffer is not validated against it at all; see
+    /// `write_layer_rect`.
     ///
-    /// **It is not the only canvas-sized write in this file, and a comment here
-    /// used to say it was.** `upload_coverage`, reached from `set_selection`,
-    /// puts one byte per document pixel into a coverage texture in a single
-    /// unbanded `write_texture` — 256 MiB of staging for Select All on a 16384²
-    /// canvas and 1.07 GB at 32768², on the same fatal allocation path. It is
-    /// left alone here deliberately: it is a different function with a different
-    /// caller, and one change should not quietly become two. Anybody bounding it
-    /// wants this field and `band_rows` and nothing else new.
+    /// **`upload_coverage` is the second write it bounds, and it was named here
+    /// as unfixed before it was fixed.** A selection's coverage is one byte per
+    /// document pixel, so Select All asked for 256 MiB of staging at 16384² and
+    /// 1.07 GB at 32768² in one `write_texture`, on the same fatal allocation
+    /// path. It bands now, and — unlike `write_layer_rect`, whose callers are an
+    /// import and an undo — the caller is `App::start_stroke`. What makes the
+    /// per-band wait payable there is stated at `upload_coverage`.
     ///
     /// Held as a field so a test can lower it and drive the banded path on a
     /// document small enough to check by hand; on a real device it would take a
     /// 8192² canvas to reach.
     readback_limit: u64,
+
+    /// How deep the atlas may grow before [`CanvasRenderer::try_ensure_pages`]
+    /// declines, standing in for the device declining it.
+    ///
+    /// [`MAX_SLOTS`] in every build that ships, where `growth_for` has already
+    /// capped below it and it can never fire. It is a field for the reason
+    /// [`Self::readback_limit`] is: what has to be tested is what a caller does
+    /// about being refused a page, and a runner has no card to put under memory
+    /// pressure. See [`Self::set_page_ceiling_for_test`], which says why it is
+    /// read on the fallible path alone.
+    page_ceiling: u32,
 
     /// How large one layer slice may be before this renderer stops holding
     /// anything **in case it is wanted again**.
@@ -4069,6 +4232,7 @@ impl CanvasRenderer {
                 .collect(),
             capture: None,
             readback_limit: device.limits().max_buffer_size,
+            page_ceiling: MAX_SLOTS as u32,
             speculation_limit: GROWTH_DOUBLING_BUDGET_BYTES,
             dab_bind_group,
             dab_uniforms,
@@ -4313,6 +4477,25 @@ impl CanvasRenderer {
         let Some(capacity) = self.growth_for(pages) else {
             return Ok(());
         };
+        // The test hook, and it sits **here** rather than in `growth_for` on
+        // purpose: what it stands in for is a device declining the allocation,
+        // and a device declining is only ever *visible* on this path. Put in
+        // `growth_for` it would cap the infallible `ensure_pages` too, which
+        // makes the two indistinguishable — and a guard that cannot tell them
+        // apart cannot say that a caller was moved onto the fallible one, which
+        // is the whole of the change it is guarding. Demonstrated by mutation:
+        // with the cap shared, swapping `try_ensure_pages` back for
+        // `ensure_pages` in `take_whole_page` left the guard green.
+        // `MAX_SLOTS` in every shipping build, where `growth_for` has already
+        // capped below it and this can never fire.
+        if capacity > self.page_ceiling {
+            return Err(Vram {
+                slices: capacity,
+                held: self.layers.pages,
+                slice_bytes: slice_bytes(self.doc_size),
+                doc_size: self.doc_size,
+            });
+        }
         // The atlas this one replaces is still resident while it is made — the
         // copy is recorded against both — so it is what `Vram::peak_bytes` adds.
         //
@@ -4399,6 +4582,12 @@ impl CanvasRenderer {
             slice_bytes(self.doc_size),
         )
         .min(MAX_SLOTS as u32);
+        // A ceiling already met is nothing to grow, and saying so here rather
+        // than letting a `Some(capacity)` through is what stops a growth that
+        // reallocates the atlas at exactly the size it already is.
+        if capacity <= self.layers.pages {
+            return None;
+        }
         Some(capacity)
     }
 
@@ -4528,22 +4717,28 @@ impl CanvasRenderer {
     /// The page is cleared to the slot's empty value first, because the cells it
     /// is made of are recycled; then the slot's backed tiles are copied into
     /// their identity positions and their old cells go back to the pool.
+    ///
+    /// **Fallible, because this is the one canvas-sized allocation the artist
+    /// did not ask for by name.** A bake promotes every slice it targets and
+    /// runs on an ordinary frame, so a promotion that reached the infallible
+    /// `ensure_pages` could take an out-of-memory straight to
+    /// `crash::device_error` while somebody was painting. `Err` says the slot is
+    /// exactly as it was — nothing moved, no cell changed hands — which is the
+    /// rule `try_reserve` and `plan_set_effect` already keep, and which is what
+    /// lets a caller treat it as "this did not happen".
     fn promote(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         slot: u32,
-    ) {
+    ) -> Result<(), PageRefusal> {
         if slot as usize >= MAX_SLOTS || self.layers.owned_page(slot).is_some() {
-            return;
+            return Ok(());
         }
         // A whole free page, or one more. Asked for *before* anything moves, so
         // a refusal leaves the slot exactly as it was.
-        let Some(page) = self.take_whole_page(device, queue, encoder) else {
-            log::error!("no page for slot {slot}");
-            return;
-        };
+        let page = self.take_whole_page(device, queue, encoder)?;
         let class = self.class_of(slot);
         let cells: Vec<Entry> = (0..self.layers.grid.tiles.y)
             .flat_map(|ty| (0..self.layers.grid.tiles.x).map(move |tx| (tx, ty)))
@@ -4598,15 +4793,24 @@ impl CanvasRenderer {
         }
         self.layers.use_of[page as usize] = PageUse::Owned(slot);
         self.layers.upload_slot(queue, slot);
+        Ok(())
     }
 
     /// A page no slot holds any cell of, growing the atlas if there is none.
+    ///
+    /// **Through the fallible growth**, which is the whole of what makes an
+    /// effect bake survivable: `try_ensure_pages` pushes an `OutOfMemory` scope
+    /// around the allocation and hands back a [`Vram`] rather than letting the
+    /// device error reach `crash::device_error`. A growth that simply did not
+    /// happen — the ceiling, which `growth_for` answers `None` for — is reported
+    /// the same way, with the capacity that was wanted, because from the
+    /// caller's side the two are one outcome: there is no page.
     fn take_whole_page(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         into: &mut wgpu::CommandEncoder,
-    ) -> Option<u32> {
+    ) -> Result<u32, PageRefusal> {
         let per = self.layers.grid.tiles_per_page() as usize;
         let whole = |store: &LayerStore| -> Option<u32> {
             (0..store.pages).find(|p| {
@@ -4616,16 +4820,26 @@ impl CanvasRenderer {
         };
         if let Some(page) = whole(&self.layers) {
             self.layers.free.retain(|c| c.page() != page);
-            return Some(page);
+            return Ok(page);
         }
         let pages = self.layers.pages;
-        self.ensure_pages(device, queue, Some(into), pages + 1);
-        if self.layers.pages == pages {
-            return None;
+        self.try_ensure_pages(device, queue, Some(into), pages + 1)
+            .map_err(PageRefusal::Device)?;
+        // Grew, or was already at [`MAX_SLOTS`], which `growth_for` declines to
+        // pass and reports as `Ok(())` — it is not an allocation failure and
+        // must not be dressed as one. **That distinction is the whole of this
+        // arm.** A synthesised `Vram` here would send `vram::effect_refused` to
+        // an artist whose card was never asked, telling them to close other
+        // applications about a ceiling `MAX_SLOTS` sets; a refusal naming the
+        // wrong bound is worse than a vague one, which is the rule
+        // `check_bounds` already lives by.
+        match whole(&self.layers) {
+            Some(page) => {
+                self.layers.free.retain(|c| c.page() != page);
+                Ok(page)
+            }
+            None => Err(PageRefusal::Ceiling),
         }
-        let page = whole(&self.layers)?;
-        self.layers.free.retain(|c| c.page() != page);
-        Some(page)
     }
 
     /// Give up every effect slice **and its page**.
@@ -5180,7 +5394,7 @@ impl CanvasRenderer {
                 let (sx, sy) = mask.aspect();
                 self.dab_state.tip_scale = [sx, sy];
                 self.dab_state.use_tip = 1;
-                (upload_mask(device, queue, mask), true)
+                (upload_mask(device, queue, mask, self.readback_limit), true)
             }
             None => {
                 self.dab_state.tip_scale = [1.0, 1.0];
@@ -5267,7 +5481,7 @@ impl CanvasRenderer {
 
         if !same_tile {
             let texture = match &tile {
-                Some(mask) => upload_mask(device, queue, mask),
+                Some(mask) => upload_mask(device, queue, mask, self.readback_limit),
                 None => make_tip_texture(device, 1, 1),
             };
             self.grain_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -5322,6 +5536,7 @@ impl CanvasRenderer {
                     rect.height,
                     sel.coverage(),
                     "umber-selection-mask",
+                    self.readback_limit,
                 )
             }
             None => {
@@ -6676,13 +6891,27 @@ impl CanvasRenderer {
         // The layer's own page stays after the commit. That is a real cost — a
         // transformed layer stops being sparse — and it is bounded by how many
         // layers the artist actually transforms.
+        //
+        // **A refused promotion refuses the whole float**, and it has to be
+        // checked rather than assumed: the lines below read
+        // `owned_page(source.slot)` and used to `expect` it, so a promotion that
+        // could not find a page was a panic — which is what a fallible
+        // `take_whole_page` would otherwise have turned an out-of-memory into.
+        // The already-recorded copies are submitted either way; a source that
+        // was promoted before the preview was refused is a layer holding a page
+        // it does not need, which costs storage and moves no pixel.
         {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("float-promote"),
             });
-            self.promote(device, queue, &mut enc, source.slot);
-            self.promote(device, queue, &mut enc, preview_slot);
+            let promoted = self
+                .promote(device, queue, &mut enc, source.slot)
+                .and_then(|()| self.promote(device, queue, &mut enc, preview_slot));
             queue.submit(Some(enc.finish()));
+            if let Err(refused) = promoted {
+                log::error!("no page for a transform preview: {refused}");
+                return None;
+            }
         }
 
         let base = self.make_float_texture(device, "umber-float-base");
@@ -6704,6 +6933,7 @@ impl CanvasRenderer {
                         r.height,
                         sel.coverage(),
                         "umber-float-mask",
+                        self.readback_limit,
                     ),
                     [r.x as f32, r.y as f32],
                     [r.width as f32, r.height as f32],
@@ -8129,6 +8359,16 @@ impl CanvasRenderer {
             active_index: frame.active_index,
         };
 
+        // **The refusal latch is cleared here and re-set below, which is what
+        // makes "the last bake was refused" true rather than sticky.** Clearing
+        // it at each of the paths that *do not* refuse is the tempting shape and
+        // is the "forgotten at the sixth" failure: `bake_effects` has five
+        // returns, and one of them is a document that simply has no effects —
+        // so switching an effect off and on again after a refusal would produce
+        // no second notice and a silently plain picture. Taking it at the top
+        // means every path but the one that re-sets it re-arms by construction.
+        let was_refusing = std::mem::replace(&mut self.effects.refusing, false);
+
         // Every effect the document would draw, bottom to top, as
         // (stack position, effect).
         //
@@ -8385,11 +8625,31 @@ impl CanvasRenderer {
             // with it, so the next frame rebakes from nothing rather than
             // trusting a stamp recorded for a pass that did not run.
             log::error!("effect bake abandoned: {what}");
+            // **A refusal that cannot be reported is not a refusal.** The device
+            // declining a page is the only arm an artist can act on, and it is
+            // latched rather than raised per bake: a bake runs every frame an
+            // effect is stale, so raising it each time would be a dialog at the
+            // frame rate. See `EffectCache::refusing`.
+            if let BakeError::Refused(refused) = what {
+                self.effects.refusing = true;
+                if !was_refusing {
+                    self.effects.refused = Some(refused);
+                }
+            }
             self.release_effect_pages(queue);
             self.effects.dropped = wanted.len();
             return plain(wanted.len());
         }
         self.baked(stack, &drawn, &slots, frame)
+    }
+
+    /// A page the device refused during a bake, once.
+    ///
+    /// Taken rather than read, so the caller cannot show the same refusal twice;
+    /// answers `Some` at most once per episode of refusal, for the reason
+    /// `EffectCache::refusing` gives. `umber-app::vram` is the sentence.
+    pub fn take_effect_refusal(&mut self) -> Option<Vram> {
+        self.effects.refused.take()
     }
 
     /// The draw list, with each kept effect spliced in beside its layer.
@@ -8734,13 +8994,17 @@ impl CanvasRenderer {
     }
 
     /// Write every planned pass's uniform block, then record every pass.
+    ///
+    /// The error is a [`BakeError`] rather than a string because one of the ways
+    /// this fails is the device declining a page, and that one carries a figure
+    /// the artist has to be shown. See [`CanvasRenderer::take_effect_refusal`].
     fn run_effect_steps(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         steps: &[EffectStep],
-    ) -> Result<(), String> {
+    ) -> Result<(), BakeError> {
         // Unreachable: `bake_effects` bounds the number of effects it plans by
         // this buffer's capacity, and drops the rest through the *visible* path.
         // Kept because what it prevents is a dynamic offset past the end of a
@@ -8751,7 +9015,8 @@ impl CanvasRenderer {
             return Err(format!(
                 "{} passes against {EFFECT_PASS_BLOCKS} uniform blocks",
                 steps.len()
-            ));
+            )
+            .into());
         }
         let needs_seeds = steps
             .iter()
@@ -8779,9 +9044,17 @@ impl CanvasRenderer {
                 _ => None,
             })
             .collect();
+        //
+        // **A refusal here is the one entry on `try_reserve`'s fatal list the
+        // artist did not ask for by name**, and it is why `promote` reports
+        // rather than dying. Nothing has been written at this point — the passes
+        // are recorded below — so abandoning is a bake that did not happen, and
+        // `bake_effects` draws the stack plain and says so once.
         for slot in slices {
-            self.promote(device, queue, encoder, slot);
+            self.promote(device, queue, encoder, slot)?;
         }
+        // `?` above goes through `From<PageRefusal>`, which is where the device
+        // refusal and the ceiling stop being one thing.
         // **After the promotion, not before**, because a promotion may grow the
         // atlas and the working set's bind groups name the array view. Built
         // first, they would have the effect extract reading the atlas the growth
@@ -8825,7 +9098,11 @@ impl CanvasRenderer {
                     .and_then(|p| self.layers.page_views.get(p as usize))
                 {
                     Some(view) => view,
-                    None => return Err(format!("effect slice {slot} owns no page")),
+                    // Unreachable now that the promotion above is checked: a
+                    // slot that could not be given a page returned before any
+                    // of this. Kept, because what it prevents is a pass with no
+                    // attachment.
+                    None => return Err(format!("effect slice {slot} owns no page").into()),
                 },
             };
             let pipeline = match step.pass {
@@ -9025,6 +9302,7 @@ impl CanvasRenderer {
             // One per layer, and one for the flattened preview the format
             // requires.
             results: (0..slots.len() + 1).map(|_| None).collect(),
+            taken: 0,
             partial: None,
             merged_target: None,
             abandoned: false,
@@ -9326,18 +9604,66 @@ impl CanvasRenderer {
             return None;
         }
 
-        let job = self.capture.take().expect("checked above");
+        // Every layer slice has to have been drained, or the caller has not
+        // been asking and the buffers are about to be dropped on the floor.
+        // Loud rather than silent: an autosave written from a document missing
+        // a layer is the worst thing on this path, and `CaptureSource` refuses
+        // a slice it was never given — so this is the diagnosis rather than the
+        // defence.
+        if job.taken < job.slots.len() {
+            log::error!(
+                "a capture was collected with {} of {} slices never taken",
+                job.slots.len() - job.taken,
+                job.slots.len(),
+            );
+        }
+        let mut job = self.capture.take().expect("checked above");
         let size = job.size;
-        let mut buffers: Vec<Vec<u8>> = job
+        let merged = job
             .results
-            .into_iter()
-            .map(|r| r.expect("a complete capture has every buffer"))
-            .collect();
-        let merged = buffers.pop().expect("the preview is the last step");
-        Some(DocumentCapture {
-            size,
-            layers: buffers,
-            merged,
+            .pop()
+            .flatten()
+            .expect("a complete capture has its preview");
+        Some(DocumentCapture { size, merged })
+    }
+
+    /// The next layer slice that has come home, taken out of the capture.
+    ///
+    /// Called in a **loop**, every frame, before [`Self::take_capture`]: each
+    /// slice is handed over as soon as its last band is out of the staging
+    /// buffer, so the capture holds the one it is assembling rather than the
+    /// whole document. The caller is expected to encode it and drop the buffer —
+    /// `docformat::LayerImage` is what for.
+    ///
+    /// **The loop is the contract and not a suggestion.** More than one slice
+    /// can land in a frame — a small document reads a whole slice per step and
+    /// several steps can complete between two calls — so a caller taking one per
+    /// frame strands the tail, and `take_capture` then hands back a document
+    /// whose layers it cannot supply. That is refused rather than written blank
+    /// (`CaptureSource::layer` answers `NotSupplied`), so the failure is a
+    /// reported autosave failure and not a damaged file; `take_capture` logs the
+    /// count as the diagnosis.
+    ///
+    /// In the order the caller asked for the slots, which is the order they are
+    /// read back, and never the flattened preview: that one is the last step and
+    /// [`Self::take_capture`] hands it over whole.
+    ///
+    /// `None` means nothing more has landed *yet*, not that nothing more is
+    /// coming. An abandoned or failed capture answers `None` too, and its
+    /// buffers are dropped rather than handed out — a caller that had already
+    /// taken some of them is told by `take_capture` never answering.
+    pub fn take_capture_slice(&mut self) -> Option<CaptureSlice> {
+        let job = self.capture.as_mut()?;
+        if job.abandoned || job.failed || job.taken >= job.slots.len() {
+            return None;
+        }
+        let index = job.taken;
+        let pixels = job.results[index].take()?;
+        job.taken += 1;
+        Some(CaptureSlice {
+            index,
+            size: job.size,
+            pixels,
         })
     }
 
@@ -9428,6 +9754,35 @@ impl CanvasRenderer {
     /// silently returns a sheared picture.
     pub fn set_readback_limit(&mut self, bytes: u64) {
         self.readback_limit = bytes;
+    }
+
+    /// Pretend the device will not allocate an atlas deeper than `pages`, so
+    /// the paths that have to survive being refused one can be driven without a
+    /// card under memory pressure.
+    ///
+    /// Exists for the tests, like [`Self::set_readback_limit`]. What it stands
+    /// in for is `try_reserve` catching an out-of-memory, which is why it is
+    /// read **only by [`Self::try_ensure_pages`]** — the infallible
+    /// [`Self::ensure_pages`] goes on growing past it. That asymmetry is
+    /// deliberate and is what makes a guard able to say which of the two a
+    /// caller reaches: capping both would leave "the bake still grows fatally"
+    /// indistinguishable from "the bake asks and is refused", and the real thing
+    /// has the same asymmetry — an infallible allocation is not refused, it
+    /// takes the process down, which no test can reproduce.
+    #[doc(hidden)]
+    pub fn set_page_ceiling_for_test(&mut self, pages: u32) {
+        self.page_ceiling = pages;
+    }
+
+    /// What [`Self::set_readback_limit`] would be putting back.
+    ///
+    /// Exists so a test that lowers the limit to drive one banded path can
+    /// restore the device's own figure before measuring something else — a
+    /// comparison taken while the limit is still low is a comparison of two
+    /// banded paths, which is a different claim from the one such a test makes.
+    #[doc(hidden)]
+    pub fn readback_limit_for_test(&self) -> u64 {
+        self.readback_limit
     }
 
     /// Pretend a slice of this canvas costs more than it does, so the paths that
@@ -10012,7 +10367,20 @@ fn clear_view(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, labe
 }
 
 /// Upload an 8-bit mask — a tip or a paper tile — into a fresh texture.
-fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wgpu::Texture {
+///
+/// `limit` is [`CanvasRenderer::readback_limit`], passed because
+/// [`upload_coverage`] bands against it. Nothing here ever reaches it: a tip
+/// document is 256 square and the largest grain tile anybody has imported is
+/// 500 square, so `band_rows` hands back the whole mask and the upload is the
+/// single `write_texture` it always was. It is threaded anyway rather than
+/// giving the tip path its own unbanded copy of the function, which is the
+/// second statement of a rule this file refuses everywhere else.
+fn upload_mask(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mask: &TipMask,
+    limit: u64,
+) -> wgpu::Texture {
     upload_coverage(
         device,
         queue,
@@ -10020,10 +10388,38 @@ fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wg
         mask.height(),
         mask.coverage(),
         "umber-brush-tip",
+        limit,
     )
 }
 
 /// Put `bytes` — one per texel, row-major — into a new coverage texture.
+///
+/// **Banded against `limit`, for the reason [`CanvasRenderer::write_layer_rect`]
+/// is.** `Queue::write_texture` allocates a staging buffer the size of the
+/// upload, and a selection's coverage is one byte per *document* pixel: Select
+/// All is 256 MiB at 16384² and 1.07 GB at 32768². `StagingBuffer::new` reports
+/// a failed allocation through the fatal `handle_hal_error`, which calls `lose`,
+/// so no error scope catches it and the device is gone — which is why the
+/// figure is worth bounding even though nothing validates it. `band_rows`
+/// returns the whole image whenever it fits, so a tip, a paper tile and every
+/// selection on an ordinary canvas take exactly the one `write_texture` they
+/// always did.
+///
+/// **Where it does band it waits**, because a submit hands staging to that
+/// submission's fence rather than releasing it — so banding without waiting
+/// bounds the size of one allocation and not how many are alive, which is the
+/// half `write_layer_rect`'s docs say is not a bound at all.
+///
+/// **That wait is on the pen-down path and the case is what makes it
+/// payable.** `set_selection` is called from `App::start_stroke`, so this runs
+/// as the nib touches the glass — but only when the selection has actually
+/// changed (compared by `Arc` identity), and it only *bands* when the mask
+/// outruns what the device guarantees for one buffer. On a device reporting
+/// `downlevel_defaults`' 256 MiB that is a selection past 16384 square, which is
+/// a canvas D3D12 and Metal cannot make at all and a Vulkan one where a single
+/// layer slice is 4.3 GB. The first stroke after a Select All there pays a poll
+/// per band; every canvas below it pays nothing, and no stroke pays anything on
+/// the second and later strokes.
 fn upload_coverage(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -10031,29 +10427,52 @@ fn upload_coverage(
     height: u32,
     bytes: &[u8],
     label: &str,
+    limit: u64,
 ) -> wgpu::Texture {
     let texture = make_coverage_texture(device, width, height, label);
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            // One byte per texel: R8Unorm is all a coverage mask needs, matching
-            // the stroke scratch it feeds.
-            bytes_per_row: Some(width),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+    // One byte per texel: R8Unorm is all a coverage mask needs, matching the
+    // stroke scratch it feeds. `Queue::write_texture` takes tightly packed rows
+    // — the 256-byte alignment is `copy_buffer_to_texture`'s — so the row stride
+    // is the width and a band is a contiguous slice of `bytes`.
+    let band = band_rows(limit, width.max(1), height);
+    let row = width as usize;
+    let mut first = 0;
+    while first < height {
+        let rows = band.min(height - first);
+        let from = row * first as usize;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: first,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes[from..from + row * rows as usize],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        first += rows;
+        if band < height {
+            // Flush this band's staging into a submission of its own and wait
+            // for the fence, so the staging alive at any instant is one band.
+            // Only where the upload was banded at all: an ordinary mask must
+            // not gain a submit, let alone a stall.
+            queue.submit([]);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+    }
     texture
 }
 

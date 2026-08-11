@@ -16,9 +16,16 @@
 //!    four megabytes per frame, collected by a poll that never waits. Measured
 //!    on a 2048-square eight-layer document, the worst frame it adds is about a
 //!    millisecond.
-//! 3. **The encode and the writing happen on a thread.** Deflating eight
-//!    canvas-sized PNGs is seconds of CPU; none of it belongs on the frame
-//!    loop. The writer here is the same shape as the one in [`crate::prefs`].
+//! 3. **The encode and the writing happen on a thread, one slice at a time.**
+//!    Deflating eight canvas-sized PNGs is seconds of CPU; none of it belongs
+//!    on the frame loop. The writer here is the same shape as the one in
+//!    [`crate::prefs`], with one difference that is the whole of
+//!    `docs/perf/formats-and-host-memory.md` §10.1: each slice is sent to it as
+//!    it comes home rather than the document being handed over whole, so the
+//!    canvas-sized buffer is encoded and dropped instead of waiting for the
+//!    rest of the stack. Twenty-four slices at 400 MB were resident at once
+//!    before the writer had started; what stands now is the PNG the archive was
+//!    going to hold anyway, plus the flattened preview.
 //!
 //! # Where it writes
 //!
@@ -41,7 +48,8 @@
 //! temp-and-rename. Where the internal copy could not be written there is
 //! nothing to copy from, so the document is encoded a second time straight into
 //! the painter's file; that is only possible because [`CaptureSource`] borrows
-//! the capture rather than consuming it.
+//! what it serves rather than consuming it, which survived the move to encoded
+//! slices — two passes over a `LayerImage` are two writes of the same bytes.
 //!
 //! Autosaving to the document's own path **overwrites it without asking**. That
 //! is deliberate and it is what was asked for; it is also why the tab's dot is
@@ -1235,13 +1243,44 @@ struct InFlight {
     internal: Option<PathBuf>,
 }
 
-/// One document, ready to be encoded and written.
+/// One document, ready to be written, once every slice has been encoded.
 struct Task {
     doc: Candidate,
     internal: Option<PathBuf>,
     pixels: DocumentCapture,
     /// Applied after the write. `None` keeps internal copies for ever.
     expiry: Option<Duration>,
+}
+
+/// What the writer thread is told, in the order it happens.
+///
+/// **A protocol rather than one message, and the capture is why.** The readback
+/// bands across frames, so the slices arrive one at a time over several seconds;
+/// handing the writer a whole `DocumentCapture` meant every one of them was
+/// resident before it started, which is
+/// `docs/perf/formats-and-host-memory.md` §10.1's ten gigabytes. Each is sent as
+/// it lands, encoded on the thread, and the canvas-sized buffer dropped —
+/// leaving the PNG, which is what the archive was going to hold anyway.
+///
+/// One capture runs at a time (`begin_capture` refuses a second) and the channel
+/// is in order, so the thread needs no key: [`Job::Slice`]s accumulate,
+/// [`Job::Finish`] consumes them and [`Job::Abandon`] throws them away.
+enum Job {
+    /// One layer or mask slice, off the GPU.
+    Slice {
+        /// Its position in `Candidate::slots`, which is what
+        /// `Candidate::pixel_index` and `mask_index` answer in.
+        index: usize,
+        /// Which of the two it is. The app decides, off the snapshot, because
+        /// the renderer knows only that it was asked for a slot.
+        mask: bool,
+        size: UVec2,
+        pixels: Vec<u8>,
+    },
+    /// Everything else about the document, once the capture is complete.
+    Finish(Box<Task>),
+    /// The capture is not coming. Drop whatever has been encoded.
+    Abandon,
 }
 
 /// What the writer thread has to say when it is done.
@@ -1302,7 +1341,7 @@ pub struct Autosave {
     /// When the last document was written, for the settings dialog.
     pub last_written: Option<Instant>,
 
-    tx: Option<mpsc::Sender<Task>>,
+    tx: Option<mpsc::Sender<Job>>,
     rx: Option<mpsc::Receiver<Report>>,
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -1411,18 +1450,68 @@ impl Autosave {
     }
 
     /// Note that a capture has started for `doc`.
+    ///
+    /// The writer is told to throw away whatever it holds, which is belt and
+    /// braces: [`Self::abandon`] and [`Self::finish`] are the only two ways a
+    /// capture ends and both clear it. Cheap, and it makes "the thread's
+    /// accumulator belongs to the capture in flight" true locally rather than by
+    /// an argument about the other two.
     pub fn begin(&mut self, doc: Candidate) {
         let internal = self.internal_path_for(&doc);
+        self.send(Job::Abandon);
         self.flight = Some(InFlight { doc, internal });
+    }
+
+    /// Hand one finished slice to the writer, which encodes it and drops the
+    /// canvas-sized buffer.
+    ///
+    /// Called every frame, for whatever has come home, **before**
+    /// [`Self::finish`]. Costs a channel send here; the deflate is the writer's.
+    ///
+    /// Which slices are masks is the snapshot's answer and not the renderer's:
+    /// `Candidate::slots` puts every layer first and every mask after, so the
+    /// count of entries holding a slice is the boundary.
+    pub fn note_slice(&mut self, slice: umber_render::CaptureSlice) {
+        let Some(flight) = self.flight.as_ref() else {
+            return;
+        };
+        let layers = flight
+            .doc
+            .layers
+            .iter()
+            .filter(|l| l.slot.is_some())
+            .count();
+        self.send(Job::Slice {
+            index: slice.index,
+            mask: slice.index >= layers,
+            size: slice.size,
+            pixels: slice.pixels,
+        });
     }
 
     /// Give up on the capture in flight — the document is closing, is being
     /// resized, or has just been saved explicitly.
     ///
-    /// The renderer's own `cancel_capture` is the caller's to make; this only
-    /// forgets what the pixels were going to become.
+    /// The renderer's own `cancel_capture` is the caller's to make; this forgets
+    /// what the pixels were going to become **and** tells the writer to throw
+    /// away the slices it has already encoded. Missing the second half would
+    /// leave one capture's images standing while the next filled in around them,
+    /// which is a document written out of two different instants.
     pub fn abandon(&mut self) {
         self.flight = None;
+        self.send(Job::Abandon);
+    }
+
+    /// Put one job on the writer's queue, starting it if this is the first.
+    fn send(&mut self, job: Job) {
+        match self.writer() {
+            Some(tx) => {
+                if tx.send(job).is_err() {
+                    log::error!("the autosave writer has gone; nothing was written");
+                }
+            }
+            None => log::error!("no autosave writer; nothing was written"),
+        }
     }
 
     /// Restart a document's clock, because it has just been written by
@@ -1468,14 +1557,7 @@ impl Autosave {
             pixels,
             expiry: self.expiry,
         };
-        match self.writer() {
-            Some(tx) => {
-                if tx.send(task).is_err() {
-                    log::error!("the autosave writer has gone; nothing was written");
-                }
-            }
-            None => log::error!("no autosave writer; nothing was written"),
-        }
+        self.send(Job::Finish(Box::new(task)));
     }
 
     /// Claim this run's marker, and collect what a session that did not end
@@ -1721,16 +1803,52 @@ impl Autosave {
     }
 
     /// The background writer, started on first use.
-    fn writer(&mut self) -> Option<&mpsc::Sender<Task>> {
+    ///
+    /// It holds one [`Encoded`] — the slices of the capture in flight, since
+    /// only one runs at a time — and the whole of what it does with a
+    /// [`Job::Slice`] is encode it and let the buffer go. That is the frame-path
+    /// cost of the change being zero: the drain is a pointer move and a channel
+    /// send, and the deflate happens here.
+    fn writer(&mut self) -> Option<&mpsc::Sender<Job>> {
         if self.tx.is_none() {
-            let (task_tx, task_rx) = mpsc::channel::<Task>();
+            let (task_tx, task_rx) = mpsc::channel::<Job>();
             let (report_tx, report_rx) = mpsc::channel::<Report>();
             let waker = self.waker.clone();
             let spawned = std::thread::Builder::new()
                 .name("umber-autosave".to_owned())
                 .spawn(move || {
-                    while let Ok(task) = task_rx.recv() {
-                        for report in run_task(task) {
+                    let mut images = Encoded::default();
+                    while let Ok(job) = task_rx.recv() {
+                        let task = match job {
+                            Job::Slice {
+                                index,
+                                mask,
+                                size,
+                                pixels,
+                            } => {
+                                images.add(index, mask, size, &pixels);
+                                // Said out loud rather than implied: this is the
+                                // moment a canvas-sized buffer stops existing.
+                                drop(pixels);
+                                continue;
+                            }
+                            Job::Abandon => {
+                                images.clear();
+                                continue;
+                            }
+                            Job::Finish(task) => *task,
+                        };
+                        log::debug!(
+                            "autosave writing “{}” from {} encoded slice(s), {} KB held",
+                            task.doc.title,
+                            images.images.iter().flatten().count(),
+                            images.bytes() / 1024,
+                        );
+                        let reports = run_task(task, &images);
+                        // Before the reports go out, so nothing of this document
+                        // is still held while the next capture is starting.
+                        images.clear();
+                        for report in reports {
                             if report_tx.send(report).is_err() {
                                 return;
                             }
@@ -1863,6 +1981,14 @@ pub fn collect(
         && let Some(canvas) = canvases.get_mut(&id)
     {
         canvas.submit_capture();
+        // **Drained before the collect, and that ordering is the change.**
+        // Every slice that has come home goes to the writer, which encodes it
+        // and drops the canvas-sized buffer — so the document is never resident
+        // whole. `take_capture` hands over the flattened preview alone, and it
+        // says so loudly if a slice was left behind.
+        while let Some(slice) = canvas.take_capture_slice() {
+            editor.autosave.note_slice(slice);
+        }
         if let Some(pixels) = canvas.take_capture(&gpu.device) {
             editor.autosave.finish(pixels, Instant::now());
         } else if !canvas.capture_in_flight() {
@@ -1981,7 +2107,7 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
 // ---------------------------------------------------------------------------
 
 /// Encode one document and put it wherever it belongs.
-fn run_task(task: Task) -> Vec<Report> {
+fn run_task(task: Task, images: &Encoded) -> Vec<Report> {
     let Task {
         doc,
         internal,
@@ -1994,6 +2120,14 @@ fn run_task(task: Task) -> Vec<Report> {
     // `apply_canvas` forgets it, so this cannot happen — and a file whose
     // layers were two different sizes would be silently sheared, which is not
     // a failure to leave to "cannot happen".
+    //
+    // **It is also the only size check left on this path**, and that is worth
+    // saying: an encoded slice bypasses `docformat::resolve`, which measures a
+    // fetched buffer against the canvas at the point of use. Every slice of one
+    // capture comes back at one size — the capture's — so comparing that size
+    // against the snapshot's is the same guarantee, made once instead of per
+    // layer. What it does not cover is a *short* slice, which the capture cannot
+    // produce and `LayerImage::of` refuses anyway.
     if pixels.size != doc.size {
         return vec![Report::Failed {
             title: doc.title,
@@ -2002,6 +2136,16 @@ fn run_task(task: Task) -> Vec<Report> {
                  ({} x {} against {} x {})",
                 pixels.size.x, pixels.size.y, doc.size.x, doc.size.y,
             ),
+        }];
+    }
+
+    // A slice that would not encode refuses the whole document. A file missing
+    // a layer is not a shorter file, it is a wrong one — the rule the saved
+    // history lives by — and the next attempt is five minutes away.
+    if let Some(what) = &images.failed {
+        return vec![Report::Failed {
+            title: doc.title,
+            message: what.clone(),
         }];
     }
 
@@ -2026,7 +2170,7 @@ fn run_task(task: Task) -> Vec<Report> {
                 // `mask_index` answers that without the bytes.
                 mask: doc
                     .mask_index(i)
-                    .filter(|k| pixels.layers.get(*k).is_some())
+                    .filter(|k| images.images.get(*k).is_some_and(Option::is_some))
                     .map(|_| Canvas::Deferred),
                 // The snapshot's, not the live stack's: this runs on the
                 // writer thread, minutes after the document was described.
@@ -2059,7 +2203,8 @@ fn run_task(task: Task) -> Vec<Report> {
     };
     let mut source = CaptureSource {
         doc: &doc,
-        pixels: &pixels,
+        images,
+        merged: &pixels.merged,
     };
 
     let mut reports = Vec::new();
@@ -2205,69 +2350,144 @@ fn copy_archive(from: &Path, to: &Path) -> Result<(), docformat::SaveError> {
     })
 }
 
-/// Where an autosave's canvas-sized buffers come from: the capture that has
-/// already come home.
+/// One slice of a capture, encoded, with its canvas-sized buffer already gone.
+enum SliceImage {
+    Layer(docformat::LayerImage),
+    Mask(docformat::MaskImage),
+}
+
+/// Every slice of the capture in flight, encoded as it arrived.
+///
+/// **This is what is left of `docs/perf/formats-and-host-memory.md` §10.1, and
+/// it is what closes it.** The readback bands across frames, so the pixels come
+/// home incrementally; held until the document was complete they were 24
+/// canvases at 400 MB on the reference document. Each is encoded on the writer
+/// thread the frame it lands and the buffer dropped, so what stands is the PNG —
+/// which is what the archive was going to hold anyway.
+///
+/// It cannot simply be a `Vec` the writer walks in order, because the two orders
+/// disagree: the capture reads bottom of the stack upwards and `Canvases` is
+/// asked top first, then the masks are asked interleaved where the capture put
+/// them all at the end. Indexed by capture position, which is what
+/// `Candidate::pixel_index` and `mask_index` already answer in.
+#[derive(Default)]
+struct Encoded {
+    images: Vec<Option<SliceImage>>,
+    /// The first slice that would not encode, kept for the report.
+    ///
+    /// A document missing a layer is not a shorter document, it is a wrong one —
+    /// the rule the saved history lives by — so one failure refuses the whole
+    /// write rather than writing the rest.
+    failed: Option<String>,
+}
+
+impl Encoded {
+    /// Encode one slice and let its buffer go.
+    fn add(&mut self, index: usize, mask: bool, size: UVec2, pixels: &[u8]) {
+        let image = match mask {
+            true => docformat::MaskImage::of(pixels, size).map(SliceImage::Mask),
+            false => docformat::LayerImage::of(pixels, size).map(SliceImage::Layer),
+        };
+        match image {
+            Ok(image) => {
+                if self.images.len() <= index {
+                    self.images.resize_with(index + 1, || None);
+                }
+                self.images[index] = Some(image);
+            }
+            Err(e) => {
+                let what = format!("slice {index} could not be encoded: {e}");
+                log::warn!("{what}");
+                self.failed.get_or_insert(what);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.images.clear();
+        self.failed = None;
+    }
+
+    /// How much is being held, for the log line that says so.
+    fn bytes(&self) -> usize {
+        self.images
+            .iter()
+            .flatten()
+            .map(|i| match i {
+                SliceImage::Layer(image) => image.len(),
+                SliceImage::Mask(image) => image.len(),
+            })
+            .sum()
+    }
+}
+
+/// Where an autosave's images come from: the slices already encoded, plus the
+/// flattened preview, which is still pixels.
 ///
 /// It **borrows** rather than taking, which is deliberate and is what lets the
 /// painter's own file be encoded afresh when the internal copy could not be
-/// written. Taking would drop each buffer a little earlier and buy nothing: the
-/// capture's peak is reached the moment the last slice arrives, before the
-/// writer thread starts, and the archive is streamed so nothing accumulates
-/// beside it.
+/// written. That property survived the change to encoded slices: two passes over
+/// a `LayerImage` are two `write_all`s of the same bytes.
 ///
-/// **The N canvases the capture holds are what is left of
-/// `docs/perf/formats-and-host-memory.md` §10.1, and they are not this
-/// module's to release.** `DocumentCapture` arrives whole from
-/// `CanvasRenderer::take_capture`; encoding each slice *as it comes home* needs
-/// the renderer to hand finished slices over one at a time, which is a change to
-/// `canvas.rs`.
+/// The preview stays whole and is the one canvas this holds. It has to: the
+/// archive's thumbnail is box-averaged down from its *pixels*, so a PNG of it
+/// would have to be decoded again to make one.
 struct CaptureSource<'a> {
     doc: &'a Candidate,
-    pixels: &'a DocumentCapture,
+    images: &'a Encoded,
+    merged: &'a [u8],
 }
 
 impl CaptureSource<'_> {
-    /// The capture's buffer at `index`, or a refusal naming what was missing.
-    ///
-    /// A slice the capture did not bring back is refused rather than written
-    /// blank: an autosave that quietly replaced somebody's layer with nothing is
-    /// the worst thing on this path, and the timer's next attempt is minutes
-    /// away rather than never.
-    ///
-    /// The sentence the artist sees is not this one — `docformat::resolve`
-    /// replaces it with the layer's *name*, which this side does not have, and
-    /// the replacement is what `write_internal` then formats into the failure
-    /// report. So this string reaches **nobody** today: it is what a direct
-    /// caller would get, and there are none outside the tests. It says which
-    /// slice of the capture was missing because that is the only thing this
-    /// side knows, not because anything reads it.
-    fn at(
-        &self,
-        index: Option<usize>,
-        what: impl FnOnce() -> String,
-    ) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        index
-            .and_then(|k| self.pixels.layers.get(k))
-            .map(|bytes| Cow::Borrowed(bytes.as_slice()))
-            .ok_or_else(|| docformat::SaveError::NotSupplied { what: what() })
+    fn image(&self, index: Option<usize>) -> Option<&SliceImage> {
+        self.images.images.get(index?)?.as_ref()
     }
 }
 
 impl docformat::Canvases for CaptureSource<'_> {
+    /// **Never reached, and refusing rather than answering is the point.** Every
+    /// slice a capture brings back is encoded, so `layer_image` answers for one
+    /// that arrived and this answers for one that did not — and a slice the
+    /// capture did not bring back is refused rather than written blank, because
+    /// an autosave that quietly replaced somebody's layer with nothing is the
+    /// worst thing on this path and the timer's next attempt is minutes away
+    /// rather than never.
+    ///
+    /// The sentence the artist sees is not this one — `docformat::resolve`
+    /// replaces it with the layer's *name*, which this side does not have.
     fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        self.at(self.doc.pixel_index(index), || {
-            format!("pixels the capture did not bring back for stack entry {index}")
+        Err(docformat::SaveError::NotSupplied {
+            what: format!("pixels the capture did not bring back for stack entry {index}"),
         })
     }
 
+    fn layer_image(&mut self, index: usize) -> Option<&docformat::LayerImage> {
+        match self.image(self.doc.pixel_index(index))? {
+            SliceImage::Layer(image) => Some(image),
+            // A mask where a layer was expected. Unreachable — `pixel_index`
+            // and `mask_index` index disjoint halves of `Candidate::slots` —
+            // and refusing keeps it that way rather than writing a coverage
+            // plane as somebody's paint.
+            SliceImage::Mask(_) => None,
+        }
+    }
+
+    /// [`Self::layer`]'s twin, and unreachable for the same reason.
     fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        self.at(self.doc.mask_index(index), || {
-            format!("mask the capture did not bring back for stack entry {index}")
+        Err(docformat::SaveError::NotSupplied {
+            what: format!("mask the capture did not bring back for stack entry {index}"),
         })
+    }
+
+    fn mask_image(&mut self, index: usize) -> Option<&docformat::MaskImage> {
+        match self.image(self.doc.mask_index(index))? {
+            SliceImage::Mask(image) => Some(image),
+            SliceImage::Layer(_) => None,
+        }
     }
 
     fn merged(&mut self) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
-        Ok(Cow::Borrowed(&self.pixels.merged))
+        Ok(Cow::Borrowed(self.merged))
     }
 }
 
@@ -2711,13 +2931,43 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// A one-pixel document's worth of pixels, as the capture hands them over.
-    fn one_pixel_capture() -> DocumentCapture {
-        DocumentCapture {
-            size: UVec2::ONE,
-            layers: vec![vec![200, 40, 40, 255]],
-            merged: vec![200, 40, 40, 255],
-        }
+    /// A one-pixel document's worth of pixels, as the capture hands them over:
+    /// the preview whole, and one layer slice already encoded.
+    ///
+    /// Through `Encoded::add` rather than by building a `LayerImage` here, so
+    /// what these tests drive is the same encode the writer thread runs.
+    fn one_pixel_capture() -> (DocumentCapture, Encoded) {
+        let mut images = Encoded::default();
+        images.add(0, false, UVec2::ONE, &[200, 40, 40, 255]);
+        (
+            DocumentCapture {
+                size: UVec2::ONE,
+                merged: vec![200, 40, 40, 255],
+            },
+            images,
+        )
+    }
+
+    /// [`run_task`] with the pair [`one_pixel_capture`] hands back.
+    ///
+    /// A helper rather than three lines at each of the eleven call sites, and
+    /// it keeps the call readable where the only thing a test varies is the
+    /// document, where it goes, and how long a copy is kept.
+    fn run_one_pixel(
+        doc: Candidate,
+        internal: Option<PathBuf>,
+        expiry: Option<Duration>,
+    ) -> Vec<Report> {
+        let (pixels, images) = one_pixel_capture();
+        run_task(
+            Task {
+                doc,
+                internal,
+                pixels,
+                expiry,
+            },
+            &images,
+        )
     }
 
     #[test]
@@ -2735,12 +2985,7 @@ mod tests {
         doc.size = UVec2::ONE;
         let ours = internal.join("hands-5555555555555555.ora");
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours.clone()),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
 
         assert!(
             reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
@@ -2798,12 +3043,7 @@ mod tests {
         doc.size = UVec2::ONE;
         let ours = internal.join("both-6666666666666666.ora");
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours.clone()),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
         assert!(
             reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
             "{reports:?}"
@@ -2816,6 +3056,227 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&internal);
         let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// A capture that was given up on leaves nothing behind for the next one.
+    ///
+    /// The slices are encoded on the writer thread as they arrive, so between
+    /// captures that thread is holding state — and a capture can end two ways:
+    /// [`Autosave::finish`], which consumes it, and [`Autosave::abandon`], which
+    /// is a resize, a close or an explicit Save. Missing the second half leaves
+    /// one capture's images standing while the next fills in around them, and
+    /// the sharp end of that is `Encoded::failed`: a slice that would not encode
+    /// refuses the *whole* document, so a good document would be refused
+    /// afterwards for a reason belonging to one nobody kept.
+    ///
+    /// **What this can and cannot discriminate, said rather than implied.**
+    /// Both `abandon` and `begin` clear the writer, so it fails only when both
+    /// are taken away — it cannot single out either. That is deliberate rather
+    /// than a gap in the fixture: `begin`'s clear is what makes the invariant
+    /// *local*, so a third way of ending a capture cannot leak, and `abandon`'s
+    /// is what makes the release *prompt* — without it an abandoned capture's
+    /// PNGs stand until the next one begins, which is five minutes, or for ever
+    /// if the document was closed. **The promptness is covered by nothing**,
+    /// because the state lives in the thread and nothing here can see it.
+    ///
+    /// It drives the real writer, because the accumulator it is about is that
+    /// thread's own.
+    #[test]
+    fn a_capture_given_up_on_leaves_nothing_behind_for_the_next() {
+        let internal = scratch("abandon-internal");
+        let session = session_of(1);
+        let id = session.active_id();
+
+        let mut autosave = Autosave {
+            interval: Duration::ZERO,
+            expiry: None,
+            // Never the real one: a test must not write a marker into somebody's
+            // data folder, where their next start of Umber would find it.
+            marks_dir: Some(scratch("abandon-sessions")),
+            ..Autosave::default()
+        };
+        autosave.next_due(Instant::now(), true, &session);
+        let ours = internal.join("Untitled 1-3333333333333333.ora");
+        autosave.docs.get_mut(&id).expect("a record").internal = Some(ours.clone());
+
+        let mut doc = candidate(id, "Untitled 1");
+        doc.size = UVec2::ONE;
+
+        // A capture that comes home with a slice the encoder refuses — a
+        // wrong-sized buffer is the reachable shape of it — and is then given
+        // up on rather than finished.
+        autosave.begin(doc.clone());
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 0,
+            size: UVec2::splat(4),
+            pixels: vec![0; 7],
+        });
+        autosave.abandon();
+
+        // And a perfectly ordinary one behind it.
+        autosave.begin(doc);
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 0,
+            size: UVec2::ONE,
+            pixels: vec![200, 40, 40, 255],
+        });
+        autosave.finish(
+            DocumentCapture {
+                size: UVec2::ONE,
+                merged: vec![200, 40, 40, 255],
+            },
+            Instant::now(),
+        );
+
+        let mut reports = Vec::new();
+        for _ in 0..4000 {
+            reports.extend(autosave.poll());
+            if !reports.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "a document was refused for a reason belonging to a capture nobody kept: {reports:?}"
+        );
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "nothing was written at all: {reports:?}"
+        );
+        assert!(ours.exists(), "the internal copy was never written");
+
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
+    /// Every slice lands on the layer it came off, mask and all.
+    ///
+    /// **What a byte comparison cannot see is the *mapping*.** The slices are
+    /// encoded as they come home — bottom of the stack upwards, then every mask
+    /// — and the archive is written top first with each mask beside its own
+    /// layer, so `Candidate::pixel_index` and `mask_index` are the only thing
+    /// standing between a document and one written with its layers shifted or a
+    /// coverage plane put down as somebody's paint. An archive built with the
+    /// wrong slice in each place is still a valid archive and still byte-stable;
+    /// only reopening it and looking at the pixels can tell.
+    ///
+    /// `docformat`'s `an_archive_built_from_encoded_images_is_the_one_built_from_
+    /// pixels` is the other half, and it is where "before and after" can be
+    /// compared at all: both routes into `write_archive` exist in one build
+    /// there, and neither does here.
+    ///
+    /// Three layers, **no two alike**, with the mask on the middle one — a
+    /// fixture whose layers shared a colour would compare equal under a mix-up,
+    /// which is the failure this exists for.
+    ///
+    /// **It goes through `Autosave::note_slice` rather than `Encoded::add`**,
+    /// because that is where the capture's ordering is reconciled with the
+    /// archive's: `Candidate::slots` reads every layer and *then* every mask, so
+    /// `index >= layers` is the only thing deciding which of the two a slice is.
+    /// Handing `Encoded::add` a flag worked out in the test would be the test
+    /// restating the rule — demonstrated by mutation, since `>=` to `>` left all
+    /// 806 tests green while that line was reached by nothing.
+    #[test]
+    fn every_encoded_slice_lands_on_the_layer_it_came_off() {
+        let internal = scratch("mapping-internal");
+        let size = UVec2::new(2, 1);
+        let session = session_of(1);
+        let id = session.active_id();
+        let mut doc = candidate(id, "Untitled 1");
+        doc.size = size;
+        doc.layers = (0..3)
+            .map(|i| LayerMeta {
+                name: format!("Layer {i}"),
+                slot: Some(i as u32),
+                // The middle one, so a mask written against the wrong entry
+                // lands somewhere a test can see rather than falling off an end.
+                mask: (i == 1).then_some(9),
+                ..doc.layers[0].clone()
+            })
+            .collect();
+
+        // Opaque and distinct, so a straight-alpha round trip is exact and no
+        // two layers can be told apart by luck. The mask reveals the left pixel
+        // and hides the right, which is not symmetric either.
+        let paint = |v: u8| vec![v, 0, 255 - v, 255, 255 - v, v, 0, 255];
+        let coverage = vec![255, 255, 255, 255, 0, 0, 0, 255];
+
+        let mut autosave = Autosave {
+            interval: Duration::ZERO,
+            expiry: None,
+            // Never the real one: a marker left in somebody's data folder would
+            // be found by their next start of Umber.
+            marks_dir: Some(scratch("mapping-sessions")),
+            ..Autosave::default()
+        };
+        autosave.next_due(Instant::now(), true, &session);
+        let ours = internal.join("mapping-1212121212121212.ora");
+        autosave.docs.get_mut(&id).expect("a record").internal = Some(ours.clone());
+
+        // In the order the capture hands them over: every layer, bottom first,
+        // and then every mask. Which of the four is the mask is `note_slice`'s
+        // answer and not this test's.
+        autosave.begin(doc);
+        for i in 0..3usize {
+            autosave.note_slice(umber_render::CaptureSlice {
+                index: i,
+                size,
+                pixels: paint(40 + 60 * i as u8),
+            });
+        }
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 3,
+            size,
+            pixels: coverage.clone(),
+        });
+        autosave.finish(
+            DocumentCapture {
+                size,
+                merged: paint(200),
+            },
+            Instant::now(),
+        );
+
+        let mut reports = Vec::new();
+        for _ in 0..4000 {
+            reports.extend(autosave.poll());
+            if !reports.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}"
+        );
+
+        let back = umber_core::docimport::import(&ours).expect("reopen the copy");
+        assert_eq!(back.layers.len(), 3, "the stack changed shape");
+        for (i, layer) in back.layers.iter().enumerate() {
+            let want = paint(40 + 60 * i as u8);
+            let got: Vec<u8> = layer
+                .pixels
+                .iter()
+                .flat_map(|piece| piece.bytes.clone())
+                .collect();
+            assert_eq!(got, want, "layer {i} came back with another layer's pixels");
+            let mask = layer.mask.as_ref().map(|pieces| {
+                pieces
+                    .iter()
+                    .flat_map(|piece| piece.bytes.clone())
+                    .collect::<Vec<u8>>()
+            });
+            match i {
+                1 => assert_eq!(
+                    mask.as_deref(),
+                    Some(coverage.as_slice()),
+                    "the mask did not land on the layer it belongs to"
+                ),
+                _ => assert!(mask.is_none(), "layer {i} came back wearing a mask"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&internal);
     }
 
     /// **An autosave that wrote nothing reports nothing written.**
@@ -2849,12 +3310,7 @@ mod tests {
         // internal copy is the only one, and it cannot be created.
         doc.path = None;
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours), None);
 
         assert!(
             reports.iter().any(|r| matches!(r, Report::Failed { .. })),
@@ -2874,15 +3330,19 @@ mod tests {
         doc.path = None;
         let short = DocumentCapture {
             size: UVec2::ONE,
-            layers: Vec::new(),
             merged: vec![200, 40, 40, 255],
         };
-        let reports = run_task(Task {
-            doc,
-            internal: Some(internal.join("short-2222222222222222.ora")),
-            pixels: short,
-            expiry: None,
-        });
+        let reports = run_task(
+            Task {
+                doc,
+                internal: Some(internal.join("short-2222222222222222.ora")),
+                pixels: short,
+                expiry: None,
+            },
+            // Nothing encoded at all, which is what a capture that gave up
+            // before its first slice leaves behind.
+            &Encoded::default(),
+        );
         assert!(
             reports.iter().any(|r| matches!(r, Report::Failed { .. })),
             "a capture missing a slice was written as a blank layer: {reports:?}"
@@ -2921,12 +3381,7 @@ mod tests {
         doc.path = Some(theirs.clone());
         doc.size = UVec2::ONE;
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours), None);
 
         assert!(
             reports.iter().any(|r| matches!(r, Report::Failed { .. })),
@@ -2971,12 +3426,7 @@ mod tests {
         doc.layers[0].effects = vec![Effect::drop_shadow(), Effect::outline()];
         let ours = internal.join("Untitled 1-7777777777777777.ora");
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours.clone()),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
         assert!(
             reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
             "{reports:?}"
@@ -3077,12 +3527,7 @@ mod tests {
         doc.layers[0].text = Some(Box::new(record.clone()));
         let ours = internal.join("Untitled 1-7777777777777778.ora");
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours.clone()),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
         assert!(
             reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
             "{reports:?}"
@@ -3142,12 +3587,7 @@ mod tests {
         doc.size = UVec2::ONE;
         let ours = internal.join("Untitled 1-6666666666666666.ora");
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours.clone()),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
 
         assert!(matches!(
             reports.last(),
@@ -3178,12 +3618,11 @@ mod tests {
         doc.path = Some(theirs.clone());
         doc.size = UVec2::ONE;
 
-        let reports = run_task(Task {
+        let reports = run_one_pixel(
             doc,
-            internal: Some(internal.join("hands-8888888888888888.ora")),
-            pixels: one_pixel_capture(),
-            expiry: Some(Duration::from_secs(30 * 24 * 3600)),
-        });
+            Some(internal.join("hands-8888888888888888.ora")),
+            Some(Duration::from_secs(30 * 24 * 3600)),
+        );
 
         assert!(matches!(
             reports.last(),
@@ -3232,12 +3671,11 @@ mod tests {
         doc.size = UVec2::ONE;
         doc.path = None;
 
-        let reports = run_task(Task {
+        let reports = run_one_pixel(
             doc,
-            internal: Some(blocked),
-            pixels: one_pixel_capture(),
-            expiry: Some(Duration::from_secs(30 * 24 * 3600)),
-        });
+            Some(blocked),
+            Some(Duration::from_secs(30 * 24 * 3600)),
+        );
 
         assert!(
             reports.iter().any(|r| matches!(r, Report::Failed { .. })),
@@ -3274,12 +3712,7 @@ mod tests {
         doc.size = UVec2::ONE;
         let ours = internal.join("hands-5555555555555555.ora");
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(ours.clone()),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
 
         assert!(
             reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
@@ -3316,12 +3749,7 @@ mod tests {
         let mut doc = candidate(Session::default().active_id(), "Untitled 1");
         doc.size = UVec2::splat(4);
 
-        let reports = run_task(Task {
-            doc,
-            internal: Some(internal.join("u-9999999999999999.ora")),
-            pixels: one_pixel_capture(),
-            expiry: None,
-        });
+        let reports = run_one_pixel(doc, Some(internal.join("u-9999999999999999.ora")), None);
         assert!(
             matches!(reports.as_slice(), [Report::Failed { .. }]),
             "{reports:?}",

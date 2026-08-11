@@ -14,8 +14,8 @@ use umber_core::{
     Selection, StrokeBuilder, TileMask, TipMask, Transform,
 };
 use umber_render::{
-    BakedStack, CanvasRenderer, Choice, CompositeParams, DabStyle, DocumentCapture, EffectFrame,
-    FloatParams, FloatSource, Gpu, LayerDraw, LayerEffects, ProbeParams, StrokeStyle, Thumbnail,
+    BakedStack, CanvasRenderer, Choice, CompositeParams, DabStyle, EffectFrame, FloatParams,
+    FloatSource, Gpu, LayerDraw, LayerEffects, ProbeParams, StrokeStyle, Thumbnail,
 };
 
 const DOC: u32 = 64;
@@ -2585,6 +2585,98 @@ fn nothing_outside_a_selections_own_rectangle_is_paintable() {
     }
 }
 
+#[test]
+fn a_banded_selection_upload_clips_exactly_where_an_unbanded_one_does() {
+    // A selection's coverage is one byte per pixel of its own rectangle, so
+    // Select All on a large canvas is a canvas-sized `write_texture` — 256 MiB
+    // of staging at 16384² and 1.07 GB at 32768², on the allocation path whose
+    // failure loses the device. `upload_coverage` bands it, and what a band can
+    // get wrong is *which rows it wrote*: an offset that is band-relative where
+    // it should be absolute, or a slice taken from the head of the buffer every
+    // time, puts the whole mask back at the top of the texture.
+    //
+    // So this compares the mark, not the mechanism. The same selection is
+    // uploaded twice — once whole, once in eight bands — and the two strokes
+    // must leave byte-identical layers. Driven by `set_readback_limit`, because
+    // the real limit needs a canvas nobody should ask a CI runner for.
+    let mut h = harness_or_skip!();
+
+    // **A triangle, and a rectangle will not do.** A rectangle selection's mask
+    // is the same byte in every row of its own bounding box, so a band that
+    // wrote the wrong rows would write bytes indistinguishable from the right
+    // ones — the fixture-shape failure CLAUDE.md records for the page table,
+    // and it was demonstrated here by mutation before this line was written:
+    // slicing every band from the head of the buffer left a rectangle fixture
+    // green. Every row of this one is a different width, so a misplaced band is
+    // a differently shaped mark. The height is deliberately not a multiple of
+    // the band either.
+    let sel = || {
+        Selection::polygon(
+            &[
+                Vec2::new(10.0, 6.0),
+                Vec2::new(52.0, 6.0),
+                Vec2::new(10.0, 44.0),
+            ],
+            UVec2::splat(DOC),
+        )
+        .expect("a selection")
+    };
+    let mask = sel().bounds();
+    let wide = h.canvas.readback_limit_for_test();
+
+    h.set_selection(Some(sel()));
+    h.stamp(&[dab(32.0, 32.0, 60.0, 1.0)]);
+    h.commit_to(0, Color::WHITE, 1.0, BrushMode::Paint);
+
+    // The scratch has to go, or the second stroke's `max` would be taken
+    // against coverage the *first* one already put there — and a banded upload
+    // that clipped nothing at all would pass.
+    let mut enc = h.encoder();
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // Eight bands of five rows and a last of one, so the short final band and
+    // the reused staging are both exercised.
+    h.canvas.set_readback_limit((mask.width * 5) as u64);
+    // A fresh `Arc`, which is what makes the renderer upload again rather than
+    // recognising the selection it already holds.
+    h.set_selection(Some(sel()));
+    h.stamp(&[dab(32.0, 32.0, 60.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    // Put the limit back before reading, so the comparison is not itself banded
+    // — that is a different guard's claim and not this one's.
+    h.canvas.set_readback_limit(wide);
+    let full = PixelRect {
+        x: 0,
+        y: 0,
+        width: DOC,
+        height: DOC,
+    };
+    let whole = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, full);
+    let banded = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 1, full);
+    assert_eq!(
+        banded, whole,
+        "a banded selection upload clipped somewhere else than the whole one did"
+    );
+    // And that the fixture is not vacuous: a stroke that reached everywhere, or
+    // nowhere, would compare equal under any banding at all. The third of these
+    // is the one that matters — inside the mask's own rectangle and outside the
+    // shape, which is where a row written from the wrong band lands.
+    let alpha = |x: u32, y: u32| whole[(y * DOC + x) as usize * 4 + 3];
+    assert!(alpha(15, 10) > 0, "inside the triangle");
+    assert_eq!(alpha(2, 32), 0, "left of the mask's own rectangle");
+    assert_eq!(
+        alpha(48, 40),
+        0,
+        "inside the rectangle, past the hypotenuse"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Undo storage
 // ---------------------------------------------------------------------------
@@ -4438,7 +4530,7 @@ fn run_capture(
     canvas: &mut CanvasRenderer,
     slots: &[u32],
     draws: &[LayerDraw],
-) -> (DocumentCapture, std::time::Duration, usize) {
+) -> (Captured, std::time::Duration, usize) {
     assert!(
         canvas.begin_capture(slots, draws),
         "a capture was in flight"
@@ -4446,11 +4538,24 @@ fn run_capture(
     drive_to_completion(gpu, canvas)
 }
 
+/// A whole document, reassembled from the slices the capture handed over one
+/// at a time plus the preview it hands over at the end.
+///
+/// The renderer no longer holds the layers together — that is the ten
+/// gigabytes — so the shape every test here reads is put back together on this
+/// side, by the same draining loop `autosave::collect` runs.
+struct Captured {
+    size: UVec2,
+    layers: Vec<Vec<u8>>,
+    merged: Vec<u8>,
+}
+
 /// The frame loop of [`run_capture`], for a capture already begun.
 fn drive_to_completion(
     gpu: &Gpu,
     canvas: &mut CanvasRenderer,
-) -> (DocumentCapture, std::time::Duration, usize) {
+) -> (Captured, std::time::Duration, usize) {
+    let mut slices: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut worst = std::time::Duration::ZERO;
     let mut frames = 0usize;
     // **This loop is a wall-clock budget in disguise, and saying it was not is
@@ -4484,11 +4589,26 @@ fn drive_to_completion(
 
         let started = std::time::Instant::now();
         canvas.submit_capture();
+        // Drained *before* the collect, which is the order `autosave::collect`
+        // keeps and the order that matters: a slice still in the capture when
+        // it completes is one nothing asked for.
+        while let Some(slice) = canvas.take_capture_slice() {
+            slices.push((slice.index, slice.pixels));
+        }
         let taken = canvas.take_capture(&gpu.device);
         worst = worst.max(recording + started.elapsed());
 
         if let Some(doc) = taken {
-            return (doc, worst, frames);
+            slices.sort_by_key(|(at, _)| *at);
+            return (
+                Captured {
+                    size: doc.size,
+                    layers: slices.into_iter().map(|(_, px)| px).collect(),
+                    merged: doc.merged,
+                },
+                worst,
+                frames,
+            );
         }
         // Stand in for the frame this loop is pretending to be. `take_capture`
         // polls *without* blocking — the whole point — so a loop with nothing
@@ -7351,6 +7471,111 @@ fn an_effect_over_budget_is_dropped_from_the_bottom_and_counted() {
         assert_eq!(baked.dropped, 2, "base {base} did not say what it dropped");
         assert_eq!(h.canvas.effects_dropped(), 2);
     }
+}
+
+/// A bake that cannot be given a page draws the layer plain and says so once.
+///
+/// **The one canvas-sized allocation the artist did not ask for by name.** An
+/// open follows a command, a layer follows a command, and a bake follows a
+/// *frame* — so `promote` reaching the infallible `ensure_pages` meant an
+/// out-of-memory could take Umber down while somebody was painting. What this
+/// drives is everything a caller does about the refusal, from the far side:
+/// the picture, the draw list, the count the panel reads, and the notice.
+///
+/// The refusal is provoked with `set_page_ceiling_for_test`, because a runner
+/// has no card to put under memory pressure. Both ways of being refused arrive
+/// at the same `Err` out of `take_whole_page`, so the ceiling is the reachable
+/// one and it exercises the whole of the response.
+#[test]
+fn a_bake_refused_its_page_draws_the_layer_and_reports_once() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 3.0, OutlinePosition::Outside)];
+    let stack = [effected(draw, &ring)];
+
+    // The baseline, so the case is not vacuous: with room, this document draws
+    // its layer *and* its outline, and reports nothing.
+    let ok = h.bake(&stack, 8);
+    assert_eq!(ok.draws.len(), 2, "the fixture drew no effect at all");
+    assert_eq!(h.canvas.effects_dropped(), 0);
+    assert!(h.canvas.take_effect_refusal().is_none());
+
+    // Now take the effect's page back and fill the atlas. At this canvas a page
+    // holds exactly one tile, so painting a slot spends a page; the loop stops
+    // when nothing is free, which is when `take_whole_page` has nowhere to go.
+    let empty: [LayerEffects<'_>; 1] = [effected(draw, &[])];
+    h.bake(&empty, 8);
+    let mut slot = 1;
+    while h.canvas.free_tiles() > 0 && slot < 40 {
+        h.write_block(slot, SHAPE, [255, 255, 255, 255]);
+        slot += 1;
+    }
+    assert_eq!(h.canvas.free_tiles(), 0, "the atlas still has room");
+    h.canvas.set_page_ceiling_for_test(h.canvas.page_count());
+
+    let before = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, SHAPE);
+    let refused = h.bake(&stack, 8);
+
+    // The layer is drawn, without its effect, and the count says so.
+    assert_eq!(
+        refused.draws.len(),
+        1,
+        "a refused bake spliced an effect draw in anyway: {:?}",
+        refused.draws
+    );
+    assert_eq!(refused.draws[0].slot, 0);
+    assert_eq!(refused.dropped, 1);
+    assert_eq!(h.canvas.effects_dropped(), 1);
+
+    // And nothing moved. A refusal that damaged the layer would be far worse
+    // than a picture with no outline on it.
+    let after = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, SHAPE);
+    assert_eq!(after, before, "a refused bake changed the layer's pixels");
+    assert!(
+        h.canvas.atlas_invariant().is_ok(),
+        "{:?}",
+        h.canvas.atlas_invariant()
+    );
+
+    // **Once.** A bake runs on every frame an effect is stale, so a refusal
+    // reported per bake would be a dialog at the frame rate — which is the
+    // whole reason the renderer latches it rather than the caller.
+    assert!(
+        h.canvas.take_effect_refusal().is_some(),
+        "the refusal was never offered, so nothing could tell the artist"
+    );
+    for _ in 0..3 {
+        h.bake(&stack, 8);
+        assert!(
+            h.canvas.take_effect_refusal().is_none(),
+            "the same refusal was offered again"
+        );
+    }
+
+    // Room again re-arms it, so an artist who closed something else and carried
+    // on is told again if it happens again.
+    h.canvas
+        .set_page_ceiling_for_test(h.canvas.page_count() + 4);
+    let back = h.bake(&stack, 8);
+    assert_eq!(back.draws.len(), 2, "the effect did not come back");
+    assert!(h.canvas.take_effect_refusal().is_none());
+    h.canvas.set_page_ceiling_for_test(h.canvas.page_count());
+    h.bake(&empty, 8);
+    while h.canvas.free_tiles() > 0 && slot < 60 {
+        h.write_block(slot, SHAPE, [255, 255, 255, 255]);
+        slot += 1;
+    }
+    h.bake(&stack, 8);
+    assert!(
+        h.canvas.take_effect_refusal().is_some(),
+        "a bake that ran did not re-arm the notice"
+    );
 }
 
 /// A shadow baked mid-stroke is the shadow the commit produces.

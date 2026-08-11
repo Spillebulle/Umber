@@ -3780,6 +3780,13 @@ impl UmberApp {
                 },
             )
         };
+        // **The one refusal that arrives on a frame nobody asked for.** A bake
+        // promotes every slice it targets and a promotion asks the device for a
+        // page, so an out-of-memory reaches this path while somebody is
+        // painting — where an open and a layer both follow a command. It is
+        // taken rather than read, and the renderer only offers it once per
+        // episode, so this cannot become a dialog at the frame rate.
+        let effects_refused = canvas.take_effect_refusal();
         let layer_draws = baked.draws;
         let active_draw = baked.active_index;
 
@@ -3900,6 +3907,14 @@ impl UmberApp {
                 // and a thumbnail arriving is something happening.
                 gfx.window.request_redraw();
             }
+        }
+
+        // Said here rather than beside the bake, because the bake holds the
+        // renderer and this writes the editor. Once per episode — see
+        // `CanvasRenderer::take_effect_refusal` — and it is the *only* thing on
+        // this path that tells the artist their effects are not being drawn.
+        if let Some(refused) = effects_refused {
+            self.editor.notice = Some(vram::effect_refused(&refused));
         }
 
         // The autosave's own readback, mapped now that the frame holding its

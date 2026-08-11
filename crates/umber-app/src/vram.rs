@@ -124,6 +124,35 @@ pub fn slice_refused(what: &str, refused: &Vram) -> Notice {
     }
 }
 
+/// A layer effect that could not be given the storage it bakes into.
+///
+/// **A third sentence, because it is the third event.** Nothing failed to open
+/// and nothing failed to appear: the picture is whole, every layer is where it
+/// was, and what is missing is a shadow or an outline. So it leads with what is
+/// still true rather than with the refusal, and it says the layers are drawn
+/// *without* their effects — which is exactly what `bake_effects` returns when a
+/// bake is abandoned.
+///
+/// **It is also the only one of the three the artist did not ask for by name.**
+/// An open and a layer both follow a command; a bake follows a frame. That is
+/// why the renderer latches it — see `EffectCache::refusing` — and why this
+/// wording must not read as though something was lost. Nothing was: the
+/// parameters are still on the layers and the next bake that finds room draws
+/// them.
+pub fn effect_refused(refused: &Vram) -> Notice {
+    Notice {
+        title: "Could not draw the layer effects".to_string(),
+        lines: vec![format!(
+            "Your picture is unchanged and the layers are drawn without their effects. \
+             Baking them needs {needed} of graphics memory at {w} × {h}, and this graphics \
+             card could not provide it. {REMEDY}",
+            needed = gigabytes(refused.peak_bytes()),
+            w = refused.doc_size.x,
+            h = refused.doc_size.y,
+        )],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +218,7 @@ mod tests {
             open_refused("sketch.clip", 21, &reported(0)),
             slice_refused("a layer", &reported(21)),
             slice_refused("a mask", &reported(21)),
+            effect_refused(&reported(21)),
         ];
         for notice in &notices {
             for text in std::iter::once(&notice.title).chain(&notice.lines) {
@@ -233,6 +263,23 @@ mod tests {
             "a growth names the array it replaces as well as the one it makes: {}",
             grown.lines[0]
         );
+
+        // A bake is a growth too — the atlas it replaces is resident while the
+        // copy between them is recorded — so it names the same peak, and it
+        // names the canvas because "at 20000 x 5000" is the half an artist can
+        // act on with the third lever.
+        let bake = effect_refused(&reported(21));
+        assert!(
+            bake.lines[0].contains("17.4 GB") && bake.lines[0].contains("20000 × 5000"),
+            "a refused bake names the transient and the canvas: {}",
+            bake.lines[0]
+        );
+        // And it leads with what is still true, because nothing was lost.
+        assert!(
+            bake.lines[0].starts_with("Your picture is unchanged"),
+            "a refused bake reads as a loss: {}",
+            bake.lines[0]
+        );
     }
 
     /// Both refusals end on something to do. A sentence saying only that the
@@ -243,6 +290,7 @@ mod tests {
         for notice in [
             open_refused("sketch.clip", 21, &reported(0)),
             slice_refused("a layer", &reported(21)),
+            effect_refused(&reported(21)),
         ] {
             let line = notice.lines[0].to_lowercase();
             // All three, and the first is the one that costs nothing: what was
