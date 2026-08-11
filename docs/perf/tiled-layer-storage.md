@@ -240,6 +240,17 @@ shadows enabled and then removed held four whole pages — 1.6 GB on the
 20000×5000 document — until a resize. The three methods are `#[must_use]` now
 and answer with the slots they gave up.
 
+**And the fill that replaced `clear_buffer` then leaked into the step after
+it.** `gaps` and `empty` describe the *step*, and the step following the last
+layer is the flattened preview — which is contiguous and has none. Left alone it
+took the previous one'''s, so `copy_chunk` punched that layer'''s unbacked tiles out
+of the merged image: holes in `mergedimage.png` shaped like wherever the topmost
+layer happened not to be stored. Nothing in the suite compared
+`DocumentCapture::merged` against `export_rgba` on a canvas with more than one
+tile, which is why it took a third pass to find. `gaps` is recomputed on every
+band now rather than on the first of each step, because guarding it on `row == 0`
+is the same staleness one level down.
+
 **`atlas_invariant` is what those two argue for.** Every cell held by exactly one
 slot or free, no duplicates, none leaked, checked as a *set* after every step of
 a session that writes, fills, clears, masks, commits, lifts, flips, resizes and
