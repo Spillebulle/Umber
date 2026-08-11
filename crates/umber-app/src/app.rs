@@ -760,6 +760,20 @@ impl UmberApp {
     /// The flip is still there, reached by the next press, and re-gated then.
     ///
     /// `step` names what did not happen, for the notice: "undone" or "put back".
+    ///
+    /// **Nothing in this crate's tests reaches this function, and that was
+    /// demonstrated rather than assumed.** `UmberApp` holds a `winit::Window`
+    /// and a `wgpu::Surface`, so it cannot be built headlessly — the gap
+    /// `every_reason_a_paste_is_refused_has_a_finished_sentence` already
+    /// records for `begin_float`. Three mutations were run and all 812 tests
+    /// stayed green: deleting the call to this from `undo`, deleting the
+    /// settling arm's two lines, and handing the redo path `"undone"`. What
+    /// covers the parts that *can* be covered is named where each lives —
+    /// `Editor::undo_gate`'s guard for the rule,
+    /// `ui::tests::the_edit_menus_history_rows_go_dead_when_a_lock_refuses_the_
+    /// flip` for the panel, `flip_step_refusal`'s guard for the sentences, and
+    /// `mirror_document`'s `#[must_use]` for the one defect that used to live
+    /// in `reverse`. The ordering here is not among them.
     fn settle_step(&mut self, gate: StepGate, step: &'static str) -> bool {
         match gate {
             StepGate::Clear => true,
