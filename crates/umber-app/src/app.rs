@@ -2270,8 +2270,8 @@ impl UmberApp {
         canvas.clear_layer(&gfx.gpu.queue, slot);
     }
 
-    /// Ask the device for the storage one more slice would need, changing
-    /// nothing.
+    /// Ask the device for the storage one more *painted* layer would need,
+    /// changing nothing.
     ///
     /// One gate for [`Self::add_layer`] and [`Self::add_mask`], because they are
     /// the same question — both claim exactly one slice off the same pool — and
@@ -2280,10 +2280,19 @@ impl UmberApp {
     /// not happen, where a refusal after it would leave the stack naming a slice
     /// the array does not have.
     ///
-    /// `slot_capacity_after_one_claim` rather than `slot_capacity_needed() + 1`,
-    /// because a claim that fills a parked slice's gap needs no storage at all
-    /// and reserving for it would grow the array by 400 MB at 10000² for a slice
-    /// nobody takes. See that method.
+    /// **What is reserved is a page of headroom, not a slice**, and the
+    /// difference arrived with the tile atlas: a blank layer stores no tile and
+    /// therefore costs nothing, so there is no slice left to refuse at the
+    /// moment one is added. Refusing nothing would be worse than not asking,
+    /// because the gate would go quiet exactly when the card is full — so
+    /// `CanvasRenderer::try_ensure_slots` guarantees the pool holds enough free
+    /// cells that the first stroke on the new layer cannot be the thing that
+    /// meets the ceiling. It is idempotent, so sixty-four blank layers ask for
+    /// one page and not sixty-four.
+    ///
+    /// `slot_capacity_after_one_claim` rather than `slot_capacity_needed() + 1`
+    /// is now only what the ceiling assertion is stated against, since neither
+    /// figure decides an allocation. See that method.
     ///
     /// With no graphics yet — the Android path before `resumed` — there is
     /// nothing to ask and nothing to refuse; the caller's own `self.gfx` check
