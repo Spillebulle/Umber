@@ -9927,14 +9927,19 @@ impl CanvasRenderer {
         self.captures_given_up
     }
 
-    /// How far the capture in flight has walked, or `None` where there is none.
+    /// How far the capture in flight has walked: its linear step, and the first
+    /// row of the band it is on within that step. `None` where there is none.
     ///
     /// For the tests, and for one thing only: a guard about an edit landing
-    /// *between* two steps has to know that it did. Timing it by counting frames
-    /// would make the guard vacuous the day a step takes one frame more.
+    /// *inside* a capture has to know where it landed. Timing it by counting
+    /// frames would make the guard vacuous the day a step takes one frame more —
+    /// an edit arriving before its layer is read disturbs nothing, and the
+    /// assertion would then pass for the wrong reason. The row is what tells a
+    /// guard that a step is part-read, which on a banded capture is the case
+    /// where the layer itself comes back torn across two instants.
     #[doc(hidden)]
-    pub fn capture_step_for_test(&self) -> Option<usize> {
-        self.capture.as_ref().map(|job| job.step)
+    pub fn capture_progress_for_test(&self) -> Option<(usize, u32)> {
+        self.capture.as_ref().map(|job| (job.step, job.row))
     }
 
     pub fn settle_capture(&mut self, device: &wgpu::Device) {

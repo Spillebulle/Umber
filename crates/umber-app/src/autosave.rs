@@ -4160,17 +4160,30 @@ mod tests {
     /// agree; the layer is trimmed on the way out, so a flat opaque fill covers
     /// the canvas and the piece is the whole of it.
     fn colours_written(path: &Path) -> ([u8; 4], [u8; 4]) {
-        let doc = umber_core::docimport::import(path).expect("the archive reads back");
-        let layer = doc.layers.last().expect("a layer");
-        let piece = layer.pixels.first().expect("the layer holds pixels");
-        let first: [u8; 4] = piece.bytes[..4].try_into().expect("four bytes");
+        let bytes = layer_written(path);
+        let first: [u8; 4] = bytes[..4].try_into().expect("four bytes");
         assert!(
-            piece.bytes.chunks_exact(4).all(|p| p == first),
+            bytes.chunks_exact(4).all(|p| p == first),
             "the fill was not flat, so this comparison says nothing",
         );
         let preview = umber_core::docimport::preview::from_path(path).expect("a preview");
         let merged: [u8; 4] = preview.rgba[..4].try_into().expect("four bytes");
         (first, merged)
+    }
+
+    /// The one layer of a written archive, straight-alpha sRGB.
+    ///
+    /// One piece, because `docformat` trims to what the layer covers and every
+    /// fill here is opaque over the whole canvas.
+    fn layer_written(path: &Path) -> Vec<u8> {
+        let doc = umber_core::docimport::import(path).expect("the archive reads back");
+        let layer = doc.layers.last().expect("a layer");
+        layer
+            .pixels
+            .first()
+            .expect("the layer holds pixels")
+            .bytes
+            .clone()
     }
 
     /// An edit landing between two steps of a capture must not be written as a
@@ -4220,7 +4233,8 @@ mod tests {
             if loops
                 .canvases
                 .get(&loops.id)
-                .and_then(CanvasRenderer::capture_step_for_test)
+                .and_then(CanvasRenderer::capture_progress_for_test)
+                .map(|(step, _)| step)
                 == Some(1)
             {
                 between = true;
@@ -4246,6 +4260,82 @@ mod tests {
         assert_eq!(
             layer, AFTER,
             "the file was written from before the edit rather than after it",
+        );
+    }
+
+    /// An edit landing part-way through a *banded* step must not write the layer
+    /// torn across two instants.
+    ///
+    /// The other guard's edit lands between two steps, which `index < step`
+    /// catches on its own. This one lands while the step reading that very slice
+    /// is half done — the case `Capture::started` exists for, and the only one
+    /// where the damage is inside a single layer rather than between two of
+    /// them: the bands copied before the edit hold the old colour and the bands
+    /// after it hold the new, in one PNG.
+    ///
+    /// A canvas large enough to band for real is one no CI runner should be
+    /// asked for, so `set_readback_limit` does it the way every other banded
+    /// test here does — one row a band on an 8-square document.
+    ///
+    /// Demonstrated by mutation: with `disturb`'s test narrowed to
+    /// `index < self.step` the layer comes back holding both colours, and the
+    /// other two guards stay green.
+    #[test]
+    fn an_edit_part_way_through_a_banded_step_does_not_tear_the_layer() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "torn");
+        let slot = loops.editor.layers.layers()[0]
+            .slot()
+            .expect("the one layer holds a slice");
+
+        const BEFORE: [u8; 4] = [200, 40, 40, 255];
+        const AFTER: [u8; 4] = [40, 160, 60, 255];
+        paint_slice(gpu, &mut loops, slot, BEFORE);
+        // One padded row, so every step of this capture is eight bands.
+        loops
+            .canvases
+            .get_mut(&loops.id)
+            .expect("a renderer")
+            .set_readback_limit(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+
+        // Part-way through the layer's own step: some of its rows are out of the
+        // staging buffer and the rest have not been copied yet.
+        let mut inside = false;
+        for _ in 0..128 {
+            loops.frame(gpu, true);
+            if matches!(
+                loops
+                    .canvases
+                    .get(&loops.id)
+                    .and_then(CanvasRenderer::capture_progress_for_test),
+                Some((0, row)) if row > 0
+            ) {
+                inside = true;
+                break;
+            }
+        }
+        assert!(
+            inside,
+            "the capture never sat part-way through its layer, so this guard \
+             exercised nothing",
+        );
+
+        paint_slice(gpu, &mut loops, slot, AFTER);
+        loops.run_until_written(gpu);
+        assert!(loops.theirs.exists(), "the document was never written");
+
+        let bytes = layer_written(&loops.theirs);
+        assert!(
+            bytes.chunks_exact(4).all(|p| p == AFTER),
+            "the layer was written from the bands read before the edit and the \
+             bands read after it: {:?}",
+            bytes
+                .chunks_exact(4)
+                .map(|p| [p[0], p[1], p[2], p[3]])
+                .collect::<std::collections::BTreeSet<_>>(),
         );
     }
 
