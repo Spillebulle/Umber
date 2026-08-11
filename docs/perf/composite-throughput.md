@@ -1357,7 +1357,18 @@ that read ±2% on a quiet machine.
 cargo run --release -p umber-render --example measure-composite -- \
     --sizes 1920x1080,2048x2048,4096x4096 --layers 1,8,16,32,54 \
     --zooms fit,0.25,1 --budget 8 --repeat 2
+# and, for §11.3 and §11.3a, the same with --masks
 ```
+
+**The example was broken between the run that produced §11.1 and §11.2 and the
+one that produced §11.3.** `composite.wgsl` took binding 6 for `mask_tex` on a
+branch that landed beside the one the example was written on, colliding with the
+extra sampler the example declares in the text every variant compiles; pipeline
+creation then failed on the first line of the sweep. Nothing caught it because an
+example is not a test. §11.1 and §11.2 stand — the mask tap is the same
+`tile_bilinear` through the same texture and which view it goes through changes
+no fetch — and the re-run agrees with them to within 0.1 ms wherever they
+overlap.
 
 **The machine.** RTX 3080, Vulkan, output 1920x1080, 32 passes per submit,
 median of 25 samples after 5. The noise floor — an empty submit and fence — is
@@ -1413,46 +1424,153 @@ loop does not repeat — the checkerboard, the sRGB encode, the backdrop — dil
 it: at 1920x1080 and 1:1 it is 1.23x at one layer, 1.33x at 8, 1.77x at 16,
 1.88x at 32 and 1.98x at 54.
 
-### 11.3 It is not the page table. It is the four loads.
+### 11.3 It is not the page table. It is **not** mostly the four loads either.
 
-This is the finding that should decide what happens next, and the `table`
-variant is what isolates it: it does the page-table read and the unbacked branch
-and returns without touching the atlas. At 1920x1080, 1:1, 54 layers, dense:
+**This section said "it is the four loads" and gave a ratio of 16x, and that was
+wrong.** It is retracted here rather than edited away, because the number was
+quoted into `CLAUDE.md`, into `docs/perf/roadmap.md` and into a brief, and
+because how it went wrong is the more useful half.
+
+The page-table half stands. `table` does the page-table read and the unbacked
+branch and returns without touching the atlas, and it comes back at 1.19 ms
+against `sampled`'s 1.26 — **the dependent page-table read is nearly free**. A
+slot's table slice is `tiles.x × tiles.y × 4` bytes, which at 1920x1080 is 40
+tiles and **160 bytes**, so the whole table for 54 slots is **8.4 KB** and sits
+in cache. It stays small on a large canvas: 54 KB at 4096².
+
+What was wrong was reading the rest off `sampled` minus `table` by elimination.
+**Neither of those two controls has the real prologue.** `table` does one clamp
+and one integer divide, where `tile_bilinear` does a floor, two clamps, two
+divides, a comparison and a second branch; `sampled` does none of it at all. So
+"everything but the fetch" had never been measured, and whatever the prologue
+costs was being charged to the taps.
+
+The `prologue` variant is that control — the whole prologue, the page-table
+load, the fast-path test and both branches, and no atlas read anywhere, with a
+return that depends on the resolved atlas coordinate and on both weights so
+nothing folds away. At 1920x1080, 1:1, 54 layers, dense, output 1920x1080:
 
 | | ms | what it adds |
 |---|---|---|
-| `table` — loop, ALU, page-table read | 1.18 | — |
-| `sampled` — the above plus one hardware bilinear tap | 1.26 | **+0.08 ms** |
-| `tiled` — the above plus four `textureLoad`s and the lerp | 2.49 | **+1.31 ms** |
+| `sampled` — loop, ALU, encode, one hardware bilinear tap | 1.26 | — (the pre-atlas composite) |
+| `table` — loop, ALU, encode, page-table read, short prologue | 1.19 | — |
+| `prologue` — the **real** prologue, page table, both branches, no atlas read | 2.02 | **+0.76 ms** over `sampled` |
+| `hw-fast` — `prologue` plus one hardware bilinear tap | 2.29 | +0.27 ms over `prologue` |
+| `tiled` — `prologue` plus four `textureLoad`s and the lerp | 2.49 | +0.47 ms over `prologue` |
+| `gather` — `prologue` plus four `textureGather`s and the same lerp | 2.76 | +0.74 ms over `prologue` |
 
-**The dependent page-table read is nearly free** — a slot's table slice is
-`tiles.x × tiles.y × 4` bytes, which at 1920x1080 is 40 tiles and **160 bytes**,
-so the whole table for 54 slots is **8.4 KB** and sits in cache, and the latency
-the design worried about never materialises. It stays small on a large canvas:
-54 KB at 4096². What costs is the hand-reconstructed tap: four scalar
-`textureLoad`s and a lerp against one TMU instruction, and the ratio between
-them is about **16x**.
+Two rounds on a quiet machine, spreads of ±2% to ±5% on every figure in that
+table, and a third standalone run agrees to within 0.05 ms.
 
-That is indicative rather than exact — `table` returns a tile-uniform value and
-so is not a perfect "everything but the fetch" control — but the gap is an order
-of magnitude and no plausible correction closes it.
+**Read the deltas carefully, because the obvious subtraction is not the
+addressing.** `prologue − sampled` is 0.76 ms and it is tempting to call that the
+prologue's cost; it is not, because `sampled` contains one hardware bilinear tap
+and `prologue` contains none, so that figure is *the addressing minus one tap*.
+Taking the tap from `hw-fast − prologue = 0.27 ms`, the arithmetic is:
+
+- **the addressing** — prologue, page table, fast-path test, branch — **≈1.03 ms**
+- **one hardware bilinear tap** ≈0.27 ms
+- **four `textureLoad`s and the hand lerp** 0.47 ms
+- and the atlas's +1.23 ms is `1.03 + 0.47 − 0.27`, which checks out.
+
+So the split is **84% the addressing and 16% the hand-reconstructed tap**, not
+62/38 — the first draft of this correction made the same misnomer one level down,
+which is worth leaving visible. The 16% is `tiled − hw-fast`, **0.20 ms**, and it
+is the strongest figure in the table because it is a difference between two whole
+pipelines and needs no control at all: it is what four scalar loads and a hand
+lerp cost *over* one TMU instruction in the same shader structure, a ratio of
+**1.7:1 and not 16:1**. Four adjacent texels are close to the cost of one, which
+is what a texture cache is for; what is not free is arriving at the address.
+
+Two things that figure rests on, both stated rather than buried. The first is
+that the two taps cost the same — `sampled`'s is independent and `hw-fast`'s
+hangs off the page-table read; on the dense store the layout is the identity, so
+they touch the same texels in the same order, which is the closest this harness
+can come to holding it. The second is that `prologue` is a fair stand-in for the
+addressing, and it is a stand-in rather than a measurement of any one thing.
+
+**And "the addressing" is not the arithmetic, which is the part still open.**
+A floor, two integer conversions, two clamps, two divides by 256 and a comparison
+cannot cost 0.83 ms more than `table`'s one clamp and one divide: at 54 layers
+over a 1920x1080 frame that is 112 million invocations, so 0.83 ms is of the
+order of **two hundred fp32 operations each** on a card that does about 30
+TFLOP/s. The listed arithmetic is under twenty. Something structural is being
+paid for, and the obvious candidate is the one thing `prologue` and `tiled` have
+that `table` does not: **the straddling branch**. Straddling is 0.78% of
+*samples* and it is spatially coherent — a one-texel band along every tile
+edge — so the fraction of *warps* that contain one, and therefore execute both
+sides, is far higher. Nothing here measures that; a `fast-only` variant that
+returns the empty value on a straddle instead of taking the branch would, in one
+more column, and it is the cheapest next experiment in this section.
 
 **So `tiles.wgsl`'s refusal of the apron is what this costs**, and that refusal
-is now priced rather than argued. The apron was rejected because a *stale* one
-is "the real risk in the whole design" — a one-texel seam appearing only at some
-zooms on some layers because one writer forgot to refresh it — and because
-dropping it makes a tile's pitch equal its size, which is what lets a page be the
-canvas rounded up and never larger than a limit the canvas was already inside.
-Both arguments stand. What has changed is that the bill is a number: **+1.31 ms
-per frame at 54 layers on a fully painted 1920x1080 document, and +0.33 ms on a
-realistic one.**
+is now priced rather than argued — but the price is *not* what an apron would
+give back. The apron was rejected because a *stale* one is "the real risk in the
+whole design" — a one-texel seam appearing only at some zooms on some layers
+because one writer forgot to refresh it — and because dropping it makes a tile's
+pitch equal its size, which is what lets a page be the canvas rounded up and
+never larger than a limit the canvas was already inside. Both arguments stand.
+What has changed is that the bill is a number, and that the number is **+0.20 ms
+of it and not +1.23 ms**: an apron would let the fast path take one hardware tap,
+which the `hw-fast` column measures at 2.29 ms against 2.49 — an **8%** saving on
+the pass, not the 50% the earlier reading implied. It is not the 0.47 either,
+which is what four loads cost against *no* fetch and is not a thing an apron
+recovers.
 
-`textureGather` is the obvious cheaper middle and is **unmeasured**: it fetches
-the four texels of a bilinear footprint in one instruction per channel, and
-inside `tile_bilinear`'s existing single-tile fast path — 99.2% of samples — the
-addressing could be clamped by hand first, so no apron is needed. Whether four
-gathers beat sixteen scalar loads on this hardware is a question for the next run
-of this example, not a recommendation.
+### 11.3a `textureGather` was measured, and it loses
+
+§11.3 named it as the obvious cheaper middle. It is not cheaper. It is
+**8% to 11% slower than the four loads** on this hardware, at every layer count
+and both canvases, in both rounds, at working zoom and on a dense document; at
+fit or on a realistic document it is inside the noise of the shipped path,
+because both are dominated by tiles that issue no fetch at all.
+
+| 1920x1080, 1:1, 54 layers | tiled | gather | gather ÷ tiled |
+|---|---|---|---|
+| dense | 2.49 ms | 2.76 ms | **1.11x** |
+| realistic (blob) | 1.59 ms | 1.66 ms | 1.04x |
+| dense, a mask on every layer | 3.23 ms | 3.53 ms | 1.09x |
+
+The reason is §11.3's correction, and it was foreseeable from it: a gather
+fetches four texels of **one channel**, so RGBA needs four of them, and four
+gathers against four `textureLoad`s is the same number of texture instructions
+covering the same sixteen values. There was never an instruction to be saved —
+only an address computation, and `tile_atlas_texel` is a shift, a mask, a
+multiply and an add that the compiler already shares across the four taps. What
+the gather adds is sixteen swizzles to reassemble four `vec4`s out of four
+per-channel vectors, and on this hardware that costs more than it saves.
+
+**The mask tap does not rescue it.** A mask is read on one channel, so one gather
+would do where the layer needs four — but a mask goes through the same
+`tile_bilinear`, and a second single-channel copy of it is the "three
+hand-written copies of an unpack" `tiles.wgsl` exists to refuse. Measured with
+`--masks` anyway, in case the driver eliminated the three dead gathers: it does
+not, and the gap widens rather than closes.
+
+What *was* worth having is the exactness. `gather` returns **byte for byte** what
+the shipped path returns, on all three residencies — not "within a level", zero
+of 255 — which is what makes the timing a comparison of two costs rather than of
+two pictures. Three things had to be right for that and each is written up at
+`GATHER_BODY`: aiming the gather at `(a + 1) / dim` so the hardware's own
+`floor(uv·dim − 0.5)` lands half a texel from either boundary rather than on one;
+the component order, which is counter-clockwise from the lower left and so
+`.w .z .x .y` in a y-down texture; and reproducing the canvas-edge clamp by
+zeroing the weight on any axis where the two taps collapsed onto one texel.
+
+**Exact on a second backend and a second driver too.** `--fallback` puts the
+whole check on WARP over Dx12, and it comes back zero of 255 on all three
+residencies. That is what settles the question the sRGB view raises — a gather
+and a `textureLoad` both decode the transfer function, on both — rather than
+leaving it to a reading of two specifications. It does not settle the aim: see
+`GATHER_BODY`, where the mutation that aims at the texel corner instead of its
+centre comes back exact on this hardware and is refused on the arithmetic.
+
+**Nothing was built.** `tiles.wgsl` is untouched, and the variant lives in
+`measure-composite.rs` where re-running it is one command. Note also that
+`tile_bilinear` has exactly one caller — `composite.wgsl` — so this never
+threatened the commit: `commit.wgsl` writes at 1:1 and takes no bilinear tap at
+all, and `flip.wgsl`, `effect.wgsl` and `thumbnail.wgsl` use the point-sampling
+`tile_load`.
 
 ### 11.4 Why the zoomed-out win is a residency win, not a tiling win
 
@@ -1504,3 +1622,47 @@ documents, the ones that motivated the whole programme, that get it.
 The ranking that comes out of this is therefore **R6, then the apron or
 `textureGather` question, then R5, and not R7.** The middle one is new and is not
 in the roadmap at all, which is what a measurement is for.
+
+### 11.6 What the second run did to that ranking
+
+`textureGather` is measured and refused (§11.3a) and the four loads turn out to
+be 16% rather than substantially all of the atlas's cost (§11.3). Both move the
+middle item down rather than off, and the reasons are worth separating.
+
+- **The middle item is now "the apron", not "the apron or `textureGather`".**
+  Gather is not a cheaper way to reach the same picture; it is a dearer one.
+- **An apron is worth 8%, not 50%.** That is what `hw-fast` prices: 2.29 ms
+  against `tiled`'s 2.49 at the worst case in the whole sweep. An apron buys the
+  fast path a hardware tap and buys the straddling 0.78% nothing it does not
+  already have, so the column is the whole of what it could deliver. Against that
+  it costs a refresh rule that is stale-by-default — `docs/perf/tiled-layer-storage.md`
+  §8.3's "the real risk in the whole design" — and it costs the tile pitch, which
+  is what keeps a page inside a limit the canvas was already inside. **8% is not
+  a price worth paying for that**, and this is the first time the trade has had
+  numbers on both sides.
+- **`hw-fast` is not itself a candidate, apron or no apron**, and the reason is
+  worth stating because the column looks like one. Without an apron the fast
+  path's own guarantee does not survive handing the coordinate to the sampler: it
+  established in f32 that both taps sit in one cell, and the hardware then picks
+  its own base texel in its own rounding, so within a rounding error of a texel
+  boundary the two disagree and the tap reads across the cell edge. That is the
+  seam, arriving by another door — and a run that shows a deviation of 1 of 255,
+  as this one does, is one sample of where a rounding falls rather than evidence
+  it cannot fall the other way.
+- **What is actually left is the addressing, and nothing in the programme
+  targets it.** About **1.03 ms of the 1.23** is it — see §11.3 for why that is
+  1.03 and not the 0.76 the obvious subtraction gives, and for why it cannot all
+  be the arithmetic. Two candidates, in the order they should be tried, and both
+  are cheaper than an apron and neither can make a picture worse:
+  - **The straddling branch.** §11.3's arithmetic says the addressing costs about
+    ten times what a floor, two clamps and two divides could, and the branch is
+    the one structural thing `prologue` and `tiled` have that `table` does not.
+    Measure it first — one more column, a variant that returns the empty value on
+    a straddle instead of taking the branch — because if that is where the time
+    is then the arithmetic below is not worth touching.
+  - **The arithmetic.** Two divides by a power of two ought to be shifts, and
+    `lo / TILE` and `up / TILE` are recomputed where `t_lo` plus a comparison of
+    the *offset within the tile* would do. Whether any of that survives the
+    compiler is unknown.
+- **R6 is unaffected and is still first.** Everything above is a constant factor
+  on a pass R6 stops running at all.
