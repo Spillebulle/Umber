@@ -378,8 +378,23 @@ fn is_autosave_name(path: &Path) -> bool {
     };
     let lower = name.to_ascii_lowercase();
     let ext = format!(".{}", docformat::EXTENSION);
-    let temporary = format!("{ext}.saving");
-    lower.ends_with(&ext) || lower.contains(&temporary)
+    if lower.ends_with(&ext) {
+        return true;
+    }
+    // The temporary, in both spellings it has had. What follows `.ora.saving`
+    // has to be nothing or `write_with`'s `-<pid>-<n>`, rather than merely
+    // *containing* the phrase: this decides what `Reaper` deletes, and a
+    // `notes.ora.saving.bak` somebody dropped in the folder is not Umber's to
+    // remove. `rsplit_once` so the tail is what follows the last occurrence.
+    match lower.rsplit_once(format!("{ext}.saving").as_str()) {
+        Some((_, tail)) => {
+            tail.is_empty()
+                || (tail.starts_with('-')
+                    && tail.len() > 1
+                    && tail[1..].bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+        }
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4157,5 +4172,11 @@ mod tests {
         assert!(!is_autosave_name(Path::new("hands.png")));
         assert!(!is_autosave_name(Path::new("hands")));
         assert!(!is_autosave_name(Path::new("orafile")));
+        // Widening the temporary's spelling must not widen what the reaper
+        // will delete. Anything after `.ora.saving` that is not the writer's
+        // own `-<pid>-<n>` is a file somebody else put in Umber's folder.
+        assert!(!is_autosave_name(Path::new("hands-0.ora.saving.bak")));
+        assert!(!is_autosave_name(Path::new("hands-0.ora.savings")));
+        assert!(!is_autosave_name(Path::new("hands-0.ora.saving-notes.txt")));
     }
 }
