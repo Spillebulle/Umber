@@ -39,6 +39,7 @@ pub mod style;
 pub mod text;
 pub mod textobj;
 pub mod thumbnail;
+pub mod tile;
 pub mod time;
 pub mod tip;
 mod tip_table;
