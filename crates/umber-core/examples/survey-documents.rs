@@ -62,6 +62,20 @@ fn held_bytes(doc: &ImportedDocument) -> u64 {
     doc.layers.iter().map(|l| l.pixel_bytes()).sum()
 }
 
+/// How many pieces the whole document comes to, masks included.
+///
+/// **This is a cost as well as a saving**, which is why it is a column rather
+/// than a footnote: `app.rs`'s upload loop issues one `write_layer_rect` per
+/// piece and that function submits per call, so this number is how many
+/// submissions opening the document costs. Whoever changes the upload path
+/// wants it in front of them.
+fn pieces(doc: &ImportedDocument) -> usize {
+    doc.layers
+        .iter()
+        .map(|l| l.pixels.len() + l.mask.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
 fn main() {
     let mut only: Option<String> = None;
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -84,8 +98,8 @@ fn main() {
     files.sort();
 
     println!(
-        "{:<44} {:>11} {:>4} {:>4} {:>4} {:>8} {:>8} {:>6}  verdict",
-        "file", "canvas", "ent", "fld", "pix", "dense", "held", "held%"
+        "{:<44} {:>11} {:>4} {:>4} {:>4} {:>8} {:>8} {:>6} {:>7}  verdict",
+        "file", "canvas", "ent", "fld", "pix", "dense", "held", "held%", "pieces"
     );
     println!("{}", "-".repeat(128));
 
@@ -105,21 +119,22 @@ fn main() {
                 dense_total += dense;
                 held_total += held;
                 println!(
-                    "{:>5}x{:<5} {entries:>4} {folders:>4} {:>4} {:>8} {:>8} {:>5.1}%  opens{}",
+                    "{:>5}x{:<5} {entries:>4} {folders:>4} {:>4} {:>8} {:>8} {:>5.1}% {:>7}  opens{}",
                     doc.size.x,
                     doc.size.y,
                     entries - folders,
                     gigabytes(dense),
                     gigabytes(held),
                     100.0 * held as f64 / dense.max(1) as f64,
+                    pieces(&doc),
                     note(&doc, only.is_some()),
                 );
             }
             Err(e) => {
                 refused += 1;
                 println!(
-                    "{:>11} {:>4} {:>4} {:>4} {:>8} {:>8} {:>6}  REFUSED: {e}",
-                    "-", "-", "-", "-", "-", "-", "-"
+                    "{:>11} {:>4} {:>4} {:>4} {:>8} {:>8} {:>6} {:>7}  REFUSED: {e}",
+                    "-", "-", "-", "-", "-", "-", "-", "-"
                 );
             }
         }
