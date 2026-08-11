@@ -149,16 +149,27 @@ now false.
 
 4. **The readbacks and the capture synthesise.** `read_layer_pieces` fills its
    output with `SlotClass::empty_bytes` before any copy lands and copies only
-   backed fragments; `read_layer_rect` is one call to it. The capture clears its
-   band buffer and copies backed fragments into their own columns.
+   backed fragments; `read_layer_rect` is one call to it. The capture fills the
+   gaps in `Capture::copy_chunk`, from the slot's own empty value, as the rows
+   come out of the mapped buffer.
 
-   **The departure: the capture cannot do a sparse *mask*.** `clear_buffer`
-   writes zeroes, which is a layer's empty value and not a mask's, so a partly
-   backed mask would come back black where nothing was stored. It is unreachable
-   — every mask a save or an autosave reads is fully backed, from an import's
-   single canvas piece or from a stroke — and there is a `debug_assert` saying
-   so rather than a comment claiming it cannot happen. A mask at one byte,
-   §5's item, is where that gets closed.
+   **It was a `clear_buffer` first, and that was the worst defect in the whole
+   stage.** `clear_buffer` writes zeroes, which is a layer's empty value and not
+   a mask's — and the comment beside it asserted that a partly-backed mask could
+   not arise, "every mask a save or an autosave reads is fully backed, from an
+   import's single canvas piece or from a stroke". That stopped being true in
+   the same change that wrote it: item 5 below made `fill_layer_white` a table
+   write, so *add a mask, paint on part of it* is a Mask-class slot with tiles
+   unbacked. Zeroes on `.r` are coverage 0, so the **autosaved file hid the
+   layer everywhere the artist had not painted on its mask**, while the explicit
+   Save — which goes through `read_layer_pieces` — did not. Two writers of one
+   document disagreeing, which is the failure CLAUDE.md calls worse than losing
+   something every time.
+
+   Doing the fill on the CPU is also better for a *layer*: `clear_buffer` was
+   one lump of GPU work per band, up to `readback_limit` and so 268 MB on the
+   motivating document, where `copy_chunk` is already spread across frames by
+   `CAPTURE_CHUNK_BYTES`.
 
 5. **`clear_layer`, `fill_layer_white` and `clear_all_layers` are table writes**,
    and `fill_layer_white` is the one that is more than a tidy-up: full reveal
@@ -192,7 +203,7 @@ now false.
    `back_tiles` grows fallibly; where the device refuses, the tiles that could
    not be backed are logged and skipped and the stroke loses them.
 
-### The one hazard that is not in this document at all
+### The hazards that are not in this document at all
 
 **A growth part-way through a caller's encoder loses what was already recorded
 into it.** A growth replaces the atlas texture and copies the old one into the
@@ -215,6 +226,28 @@ it is asked afterwards.
 `a_growth_part_way_through_an_encoder_keeps_what_was_recorded_before_it` is the
 guard; put the growth back on its own encoder and it fails.
 
+**The rule was then broken at the one call site its own commit message cited**,
+and a critic found it: `run_effect_steps` still promoted into an encoder of its
+own. The guard could not see it, because it drives `commit_stroke`, which reaches
+a growth through `back_tiles` — where the fix *was* applied. A rule enforced in N
+methods still needs somebody to check that N is all of them, which is the lesson
+`slot_revision` already records.
+
+**And an effect slice's page was never handed back.** The comment beside the
+promotion said the pages came back through `EffectCache::forget_all` and
+`retain_only`; neither can, because that type holds no `LayerStore`. Four drop
+shadows enabled and then removed held four whole pages — 1.6 GB on the
+20000×5000 document — until a resize. The three methods are `#[must_use]` now
+and answer with the slots they gave up.
+
+**`atlas_invariant` is what those two argue for.** Every cell held by exactly one
+slot or free, no duplicates, none leaked, checked as a *set* after every step of
+a session that writes, fills, clears, masks, commits, lifts, flips, resizes and
+clears again. A cell issued twice is one layer's paint in another's and a cell
+leaked is storage nothing can take back; neither appears in a pixel until the two
+slots happen to be drawn together, which is exactly why the effect leak survived
+a critic-reviewed branch and two rounds of mutation testing.
+
 ### What is left, and what it is worth
 
 - **A mask at one byte** (§5). `SlotClass` is the hook and it exists; what is
@@ -231,9 +264,20 @@ guard; put the growth back on its own encoder and it fails.
   the page is not given back at commit, because demoting would need to know
   which tiles are empty and that is a readback. The preview's page *is* given
   back, by `end_float`.
-- **An effect slice's page is held until the slot is reused**, which is no worse
-  than before — the layer array never shrank either — and is worth noting because
-  `EffectCache::forget_all` reads like a release and is not one.
+- **Residency never shrinks under an undo.** A stroke's patch is captured over
+  the pieces it damaged, so the tiles that were unbacked then read back as the
+  empty value, the undo writes it, and the tile is backed to store nothing. A
+  layer ends up holding the union of everywhere it has ever been painted,
+  bounded by the grid. An emptiness scan is what would avoid it and is the thing
+  `write_layer_rect` must not have.
+- **A flip coarsens residency**, at most doubling per flip and bounded by the
+  grid. See item 7 above.
+- **The Android resume path does not carry the slot classes.** `resumed`
+  rebuilds storage with no pixels — `add_canvas` is handed a `Document` and not
+  a stack — so every slot comes back a Layer and a mask reads transparent rather
+  than white. That is exactly what a cleared slice did before, so it is not a
+  regression; it is cheap to fix and nobody can test it, because the mobile
+  build has never been run.
 
 ---
 
