@@ -3999,8 +3999,12 @@ mod tests {
 
     #[test]
     fn save_replaces_the_file_only_once_it_has_written_all_of_it() {
-        let dir = std::env::temp_dir().join("umber-docformat-save");
-        std::fs::create_dir_all(&dir).unwrap();
+        // `temp_dir`'s, which carries the process id. This asks for the
+        // *directory* to be free of leftovers now rather than for one named
+        // file to be absent, so a second `cargo test` running beside this one
+        // in the same fixed directory would have made it fail on somebody
+        // else's temporary — which is a flake that looks like a real defect.
+        let dir = temp_dir("save");
         let path = dir.join("sketch.ora");
 
         let size = UVec2::new(2, 2);
