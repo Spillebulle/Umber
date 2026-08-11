@@ -761,7 +761,16 @@ fn a_large_canvas_gives_the_colour_scratch_back_when_a_stroke_ends() {
         "a smudging stroke recorded no colour"
     );
     h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+    // The centre and a texel out at the antialiased rim. The rim is where the
+    // composite's *bilinear* tap on the colour plane can reach a texel no
+    // fragment wrote, which is the reason `ensure_stroke_color` clears what it
+    // allocates — this reading is the only thing that would notice if a
+    // reallocated plane came back holding whatever the driver left. It is not
+    // fully discriminating: an adapter that zeroes a fresh texture passes either
+    // way, which is exactly what makes the clear worth having rather than the
+    // test.
     let ordinary = h.pixel(32, 32);
+    let rim = h.pixel(32, 20);
     assert_near(ordinary, [255, 0, 0], 4, "a smudged dab under the limit");
     assert!(
         h.canvas.holds_stroke_color(),
@@ -781,8 +790,13 @@ fn a_large_canvas_gives_the_colour_scratch_back_when_a_stroke_ends() {
     );
 
     // And the next stroke paints the same mark, out of a texture that had to be
-    // allocated again.
-    h.fill(0, Color::from_srgb_u8(0, 0, 0, 0));
+    // allocated again. `clear_layer` rather than `Harness::fill`, which stamps a
+    // dab and commits it at full opacity whatever colour it is handed — the
+    // first draft of this used `fill` with a transparent colour and painted
+    // opaque black over the mark it was about to compare against.
+    let mut enc = h.encoder();
+    h.canvas.clear_layer(&mut enc, 0);
+    h.gpu.queue.submit(Some(enc.finish()));
     h.stamp_colored(&[red], true);
     assert!(h.canvas.holds_stroke_color());
     h.commit(Color::BLACK, 1.0, BrushMode::Paint);
@@ -790,6 +804,11 @@ fn a_large_canvas_gives_the_colour_scratch_back_when_a_stroke_ends() {
         h.pixel(32, 32),
         ordinary,
         "the mark moved when the colour scratch was reallocated"
+    );
+    assert_eq!(
+        h.pixel(32, 20),
+        rim,
+        "the mark's edge moved when the colour scratch was reallocated"
     );
 }
 
@@ -3521,8 +3540,13 @@ fn a_renderer_is_built_at_its_documents_slot_count_and_keeps_the_speculation() {
 ///
 /// **It measures the capacity that was allocated**, which is the output, rather
 /// than restating the rule — and it drives the *shrink*, which is the direction
-/// the bug is in. A capacity of 64 was reachable here before this test existed;
-/// two live slices at 128² is a capacity of two.
+/// the bug is in. A capacity of 64 was reachable here before this test existed.
+///
+/// Two live slices at 128² comes out at **four**, not two, and that is
+/// `built_capacity`'s speculative floor rather than slack: a resized document
+/// gets the same handful of spare slices a freshly opened one of its shape does,
+/// or the next layer added after a resize pays a whole reallocate-and-copy that
+/// the same layer added before it would not.
 #[test]
 fn a_resize_rebuilds_at_the_live_slice_count_and_carries_the_picture() {
     let mut h = harness_or_skip!();
@@ -3545,7 +3569,7 @@ fn a_resize_rebuilds_at_the_live_slice_count_and_carries_the_picture() {
 
     assert_eq!(
         h.canvas.slot_capacity(),
-        2,
+        4,
         "the new array carried the old canvas's slice count"
     );
     // And the shorter copy still carried every slice that mattered: the depth
@@ -6159,16 +6183,29 @@ fn an_effect_with_no_reach_produces_no_draw_at_all() {
 /// several full-screen passes a frame for a picture nobody sees. The predicate
 /// here is that shader's own, `!visible || opacity <= 0.0`.
 ///
-/// **Four outputs, and the pixel is the one that matters.** The bake count and
-/// the draw list say the work did not happen; the composite says the elision was
-/// safe. The clipped layer above the hidden one is there deliberately: an
+/// **Five outputs, and the last two are the ones that matter.** The bake count,
+/// the slot capacity and the draw list say the work did not happen; the
+/// composite says the elision was safe; and `active_index` says the draw list is
+/// still describable, since eliding a draw shifts every position after it and
+/// the stroke previews on whichever draw sits at the number the composite is
+/// given. The clipped layer above the hidden one is there deliberately: an
 /// unclipped invisible draw is the one shape `layer-residency.md` §2.2 warns
 /// against removing, because it writes `clip_alpha` for whatever is clipped to
 /// it — an effect draw cannot be that draw, because its own layer's draw follows
 /// immediately and writes the same zero, and this is what says so out loud.
 ///
+/// **Both halves of the predicate are driven**, hidden and at zero opacity: they
+/// are `composite.wgsl`'s own `!visible || opacity <= 0.0` and a test of only the
+/// first would leave the second free to be deleted.
+///
 /// And showing the layer again brings the effect back, so this is an elision
 /// rather than a loss.
+///
+/// `base` is **4 and not 3**, which is the harness's whole capacity: an effect
+/// slice at 3 would fit in the array already and the capacity reading would be
+/// the same number either way, which is a guard agreeing with itself. At 4 the
+/// un-elided path has to grow. It also keeps the ghost's slot 3 clear of
+/// anything a bake writes.
 #[test]
 fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
     let mut h = harness_or_skip!();
@@ -6200,7 +6237,17 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
 
     let before_bakes = h.canvas.effect_bakes();
     let before_slots = h.canvas.slot_capacity();
-    let baked = h.bake(&stack, 3);
+    // The stroke is on the hidden layer, whose own outer effect is the draw
+    // being elided — the position that shifts if `baked` counts wrongly.
+    let painting = EffectFrame {
+        active_index: 1,
+        stroke: StrokeStyle {
+            opacity: 0.0,
+            ..Default::default()
+        },
+        stroke_live: false,
+    };
+    let baked = h.bake_frame(&stack, 4, painting);
 
     assert_eq!(
         baked.draws.len(),
@@ -6218,7 +6265,34 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
         before_slots,
         "a hidden layer's effect took a canvas-sized slice"
     );
+    assert_eq!(
+        baked.active_index, 1,
+        "the stroke would preview on the wrong draw"
+    );
     assert_eq!(baked.dropped, 0);
+
+    // The other half of the predicate: visible, and at zero opacity.
+    let faded = LayerDraw {
+        opacity: 0.0,
+        ..layer(0, 1.0, BlendMode::Normal)
+    };
+    let baked_faded = h.bake_frame(
+        &[
+            effected(floor, &[]),
+            effected(faded, &cast),
+            effected(clipped, &[]),
+        ],
+        4,
+        painting,
+    );
+    assert_eq!(
+        baked_faded.draws.len(),
+        3,
+        "a layer at zero opacity still baked its effect: {:?}",
+        baked_faded.draws
+    );
+    assert_eq!(h.canvas.effect_bakes(), before_bakes);
+    assert_eq!(h.canvas.slot_capacity(), before_slots);
 
     // (45, 32) is inside where the shadow would have fallen and clear of the
     // square, so it is the pixel that would move if any of this were unsound.
@@ -6259,15 +6333,9 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
     let lit = [
         effected(floor, &[]),
         effected(shown, &cast),
-        effected(
-            LayerDraw {
-                clipped: true,
-                ..layer(1, 1.0, BlendMode::Normal)
-            },
-            &[],
-        ),
+        effected(clipped, &[]),
     ];
-    let baked = h.bake(&lit, 3);
+    let baked = h.bake_frame(&lit, 4, painting);
     assert_eq!(
         baked.draws.len(),
         4,
@@ -6276,6 +6344,19 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
     assert!(
         h.canvas.effect_bakes() > before_bakes,
         "showing the layer again drew a shadow nothing had baked"
+    );
+    assert!(
+        h.canvas.slot_capacity() > before_slots,
+        "the effect drew into a slice the array never grew to hold"
+    );
+    // A drop shadow is an *outer* effect, so its draw is spliced in before its
+    // layer's and the stroke's position moves with it. This is the reading the
+    // elided case above has to agree with, and the pair is what says
+    // `active_index` is counted off what was pushed rather than off the caller's
+    // list.
+    assert_eq!(
+        baked.active_index, 2,
+        "the stroke would preview on the shadow instead of the layer"
     );
 }
 
