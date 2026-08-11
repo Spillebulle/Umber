@@ -9591,6 +9591,16 @@ impl CanvasRenderer {
         // rectangle to transparency. A skip would leave both on the canvas. The
         // residency signal is the *piece set* the caller was given, which for a
         // `.clip` is block presence — see `docimport::residency`.
+        //
+        // **The consequence, stated rather than discovered: residency never
+        // shrinks under an undo.** A stroke's patch is captured over the pieces
+        // it damaged, and the tiles that were unbacked then read back as the
+        // empty value — so the patch holds it, the undo writes it, and the tile
+        // is backed to store nothing. A layer therefore ends up holding the
+        // union of everywhere it has ever been painted, bounded by the grid.
+        // Nothing here can tell that write apart from the text tool's, which is
+        // exactly the argument above; what would is a scan, and the scan is what
+        // the text tool makes wrong.
         let tiles = self.layers.grid.tiles_over(rect);
         {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
