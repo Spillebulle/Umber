@@ -1594,6 +1594,26 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   mode there is", true of five modes and false of twenty-three. The guard walks
   `BlendMode::ALL` through the real font and measures, rather than restating a
   number.
+- **`LayerType == 0` names two different things, and reading it alone called an
+  artist's whole document vector.** A **placed image** — an image file imported
+  into a `.clip` and left resizable — carries type 0 and a render chain whose
+  every external chunk is absent, which is exactly a vector layer's shape.
+  `ResizableOriginalMipmap` is what tells them apart, and it is asked first. The
+  pixels genuinely *are* in the file (44.4 MB of a 45.4 MB document), placed by a
+  184-byte `ResizableImageInfo` transform that is **not** the identity — four
+  images scaled by 0.4434 into four quadrants of a page. Taking them needs a
+  resampler `umber-core` deliberately does not have and a reading of that blob
+  inferred from five layers at zero rotation with six of twenty-three fields
+  unexplained. `docs/document-import.md` has the layout and names `CanvasPreview`
+  as the instrument that would turn it from a guess into a measurement.
+- **A refusal that discards its own diagnosis is the "contains no layers" bug one
+  level up.** Every reason a layer is dropped goes into
+  `ImportedDocument::warnings`, and warnings ride on the *document* — so on the
+  one path where no document is built, all of it was thrown away and the artist
+  got a sentence that reads as corruption. `ImportError::Empty` carries the
+  distinct reasons with a count. **Its heading says the file was *read* and
+  deliberately does not say it is undamaged**: the reasons under it are whatever
+  refused each layer, and several of them mean it may be damaged after all.
 - **A message about a dropped layer must name the *cause*, not the symptom.** A
   Clip Studio vector layer stores strokes and is rasterised on demand, so no
   level of its mipmap chain holds a bitmap — the document is intact and Umber
@@ -5138,6 +5158,14 @@ parts that mattered are not the obvious ones.
   Write `Transform::reseat`'s form instead: **nothing calls this yet**, and what
   goes wrong until it does. A split remit is what makes this the *normal* case
   rather than a slip, so it belongs in the brief.
+- **A critic must never restore a file in a tree its parent is still editing.**
+  One undid its own mutation with `git cat-file -p HEAD:<path> > <path>` while
+  the parent had uncommitted edits in that file, destroying them — and the
+  parent's next `git add -A` then committed half a change, leaving `main`-bound
+  work red with a test asserting a string the code no longer produced. The critic
+  reported the collision, which is what made it recoverable. Either give the
+  critic its own worktree, or tell it to mutate and revert **only** after
+  confirming the tree is clean, and to report rather than restore if it is not.
 - **Commit before mutating.** An agent undoing a mutation test with
   `git checkout -- <path>` destroyed its own uncommitted work in the same
   stroke, because the file held both. It redid it from context and nothing was
