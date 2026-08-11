@@ -1132,6 +1132,33 @@ mod tests {
         );
     }
 
+    /// A tile's position is a number out of somebody else's file, and the
+    /// arithmetic that places it must not panic on any of them.
+    ///
+    /// `-i64::MIN` panics in a debug build, which is why [`visible_rect`] is
+    /// saturating throughout. Nothing that reads a real `.kra` can reach these
+    /// values, which is exactly why they need a test rather than a reader.
+    #[test]
+    fn a_tile_placed_absurdly_far_off_the_page_lands_nowhere() {
+        let canvas = UVec2::new(64, 64);
+        for at in [
+            (i64::MIN, 0),
+            (0, i64::MIN),
+            (i64::MAX, i64::MAX),
+            (i64::MIN, i64::MAX),
+            (-64, 0),
+            (64, 0),
+        ] {
+            assert!(
+                visible_rect(canvas, (64, 64), at).is_none(),
+                "a 64-square tile at {at:?} does not reach a 64-square canvas"
+            );
+        }
+        // And one that does land, so the sweep is not passing by refusing
+        // everything.
+        assert!(visible_rect(canvas, (64, 64), (-1, -1)).is_some());
+    }
+
     #[test]
     fn an_uncompressed_tile_reads_the_same_as_a_compressed_one() {
         let compressed = fixtures::kra(

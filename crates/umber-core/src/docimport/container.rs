@@ -207,11 +207,23 @@ pub fn crop(
 ) -> Option<(PixelRect, Vec<u8>)> {
     debug_assert_eq!(src.len(), src_size.x as usize * src_size.y as usize * 4);
 
+    // **Saturating, because the offset is a number out of somebody else's
+    // file.** An ORA's `x`/`y` are parsed as `i64` and `-i64::MIN` panics in a
+    // debug build and wraps in a release one — into a rectangle that then
+    // indexes past the source. Every clamp below refuses anything that does not
+    // land, so saturating to the ends is exactly right: an offset that far out
+    // reaches no canvas. `blit` has the same expressions and is left alone
+    // because both its remaining call sites pass `(0, 0)`; if either ever takes
+    // an offset off a file, it wants this too.
     let (ox, oy) = at;
-    let y_from = (-oy).max(0);
-    let y_to = (canvas.y as i64 - oy).min(src_size.y as i64);
-    let x_from = (-ox).max(0);
-    let x_to = (canvas.x as i64 - ox).min(src_size.x as i64);
+    let y_from = oy.saturating_neg().clamp(0, src_size.y as i64);
+    let y_to = (canvas.y as i64)
+        .saturating_sub(oy)
+        .clamp(0, src_size.y as i64);
+    let x_from = ox.saturating_neg().clamp(0, src_size.x as i64);
+    let x_to = (canvas.x as i64)
+        .saturating_sub(ox)
+        .clamp(0, src_size.x as i64);
     if y_to <= y_from || x_to <= x_from {
         return None;
     }
@@ -321,11 +333,26 @@ mod tests {
     /// A layer entirely off the page yields no piece, which is the same picture
     /// the canvas of zeroes was — and is the case that makes "no piece means
     /// the empty value" load-bearing rather than decorative.
+    ///
+    /// **The two extremes are in the sweep, and they are not decoration.** An
+    /// ORA's `x`/`y` are parsed as `i64` off a file a stranger wrote, and
+    /// `-i64::MIN` panics in a debug build; the whole arithmetic here is
+    /// saturating because of it. Nothing else in this module drives that value.
     #[test]
     fn a_layer_that_misses_the_canvas_yields_nothing_at_all() {
         let size = UVec2::new(4, 4);
         let src = vec![255u8; 2 * 2 * 4];
-        for at in [(-2, 0), (4, 0), (0, -2), (0, 4), (-9, -9)] {
+        for at in [
+            (-2, 0),
+            (4, 0),
+            (0, -2),
+            (0, 4),
+            (-9, -9),
+            (i64::MIN, 0),
+            (0, i64::MIN),
+            (i64::MAX, i64::MAX),
+            (i64::MIN, i64::MAX),
+        ] {
             assert!(
                 crop(&src, UVec2::new(2, 2), at, size).is_none(),
                 "a 2×2 layer at {at:?} does not reach a 4×4 canvas"

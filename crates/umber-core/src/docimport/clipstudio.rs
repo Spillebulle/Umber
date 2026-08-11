@@ -2114,6 +2114,27 @@ mod tests {
         );
     }
 
+    /// A bitmap's origin is a number out of somebody else's file, and the
+    /// arithmetic that places its blocks must not panic on any of them.
+    ///
+    /// `-i64::MIN` panics in a debug build and `canvas - origin` overflows for
+    /// a very negative one, which is why [`block_span`] is checked and
+    /// saturating throughout. No real `.clip` reaches these values, which is
+    /// exactly why they need a test rather than a reader.
+    #[test]
+    fn a_block_placed_absurdly_far_off_the_page_lands_nowhere() {
+        for origin in [i64::MIN, i64::MAX, -256, 300, i64::MIN + 1] {
+            assert!(
+                block_span(origin, 0, BLOCK, 256).is_none(),
+                "a block at {origin} does not reach a 256-wide canvas"
+            );
+        }
+        // And one that does land, so the sweep is not passing by refusing
+        // everything: half a block hanging off the left edge.
+        let (at, within) = block_span(-128, 0, BLOCK, 256).expect("half a block lands");
+        assert_eq!((at, within), (0, 128..256));
+    }
+
     /// A block Clip Studio did not store is transparent on a layer — the state
     /// of every corner nobody painted on. The fixture omits an all-zero block,
     /// which is what a real writer does.
