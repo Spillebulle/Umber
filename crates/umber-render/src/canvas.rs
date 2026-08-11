@@ -1307,8 +1307,22 @@ struct Capture {
     /// The step in flight, or the next to be recorded. `slots.len()` is the
     /// flattened preview, which goes last.
     step: usize,
-    /// One entry per step, filled in as each comes home.
+    /// One entry per step, filled in as each comes home — and emptied again by
+    /// [`CanvasRenderer::take_capture_slice`] as each is handed over.
     results: Vec<Option<Vec<u8>>>,
+    /// How many layer slices have been handed over.
+    ///
+    /// **This is what stops the whole document being resident at once.** The
+    /// readback is already banded and already spread across frames, so the
+    /// pixels arrive incrementally; without a way out they were then *held*,
+    /// which is 10 GB on the reference document and is
+    /// `docs/perf/formats-and-host-memory.md` §10.1's whole figure. A caller
+    /// that drains each slice as it lands and encodes it leaves this holding
+    /// one.
+    ///
+    /// The flattened preview is never drained: it is the last step, it is what
+    /// the thumbnail is scaled from, and it is one canvas rather than N.
+    taken: usize,
     /// The step in flight, as far as it has been copied out of the mapped
     /// buffer. See [`Capture::copy_chunk`].
     partial: Option<Vec<u8>>,
@@ -1439,17 +1453,40 @@ impl Capture {
     }
 }
 
-/// Everything a document needs written down, read back without a stall.
+/// One layer slice, off the GPU and out of the capture's hands.
 ///
-/// `layers` are in **layer-texture form** — sRGB with alpha premultiplied in
-/// linear space — which is what `umber_core::docformat::SaveLayer::pixels`
-/// wants. `merged` is straight-alpha sRGB, as `SaveDocument::merged` wants.
-/// Both come from the same passes the screen uses, so an autosaved file cannot
-/// disagree with what was on screen.
+/// In **layer-texture form** — sRGB with alpha premultiplied in linear space —
+/// which is what `umber_core::docformat::SaveLayer::pixels` wants, and what
+/// `docformat::LayerImage::of` and `MaskImage::of` take.
+pub struct CaptureSlice {
+    /// Which of the `slots` [`CanvasRenderer::begin_capture`] was given this is.
+    pub index: usize,
+    /// The canvas this was read at.
+    ///
+    /// Carried with the slice rather than looked up, because the caller encodes
+    /// it the frame it arrives and the renderer is the only thing that knows
+    /// what shape the capture in flight was begun at — `doc_size` is the
+    /// document's *now*, and a resize between the two is exactly the state a
+    /// silently sheared file comes out of.
+    pub size: UVec2,
+    pub pixels: Vec<u8>,
+}
+
+/// What is left of a document once every layer slice has been drained: its size
+/// and its flattened preview.
+///
+/// `merged` is straight-alpha sRGB, as `SaveDocument::merged` wants, and it
+/// comes from the same composite pass the screen uses — so an autosaved file
+/// cannot disagree with what was on screen.
+///
+/// **The layers are deliberately not here.** They are handed over one at a time
+/// by [`CanvasRenderer::take_capture_slice`], because holding all of them until
+/// the document was complete is the ten gigabytes
+/// `docs/perf/formats-and-host-memory.md` §10.1 is about. The preview stays
+/// whole: it is one canvas rather than N, and the archive's thumbnail is scaled
+/// from its pixels rather than from its PNG.
 pub struct DocumentCapture {
     pub size: UVec2,
-    /// One buffer per slot asked for, in that order.
-    pub layers: Vec<Vec<u8>>,
     pub merged: Vec<u8>,
 }
 
@@ -9208,6 +9245,7 @@ impl CanvasRenderer {
             // One per layer, and one for the flattened preview the format
             // requires.
             results: (0..slots.len() + 1).map(|_| None).collect(),
+            taken: 0,
             partial: None,
             merged_target: None,
             abandoned: false,
@@ -9509,18 +9547,57 @@ impl CanvasRenderer {
             return None;
         }
 
-        let job = self.capture.take().expect("checked above");
+        // Every layer slice has to have been drained, or the caller has not
+        // been asking and the buffers are about to be dropped on the floor.
+        // Loud rather than silent: an autosave written from a document missing
+        // a layer is the worst thing on this path, and `CaptureSource` refuses
+        // a slice it was never given — so this is the diagnosis rather than the
+        // defence.
+        if job.taken < job.slots.len() {
+            log::error!(
+                "a capture was collected with {} of {} slices never taken",
+                job.slots.len() - job.taken,
+                job.slots.len(),
+            );
+        }
+        let mut job = self.capture.take().expect("checked above");
         let size = job.size;
-        let mut buffers: Vec<Vec<u8>> = job
+        let merged = job
             .results
-            .into_iter()
-            .map(|r| r.expect("a complete capture has every buffer"))
-            .collect();
-        let merged = buffers.pop().expect("the preview is the last step");
-        Some(DocumentCapture {
-            size,
-            layers: buffers,
-            merged,
+            .pop()
+            .flatten()
+            .expect("a complete capture has its preview");
+        Some(DocumentCapture { size, merged })
+    }
+
+    /// The next layer slice that has come home, taken out of the capture.
+    ///
+    /// Called every frame beside [`Self::take_capture`] and **before** it: each
+    /// slice is handed over as soon as its last band is out of the staging
+    /// buffer, so the capture holds the one it is assembling rather than the
+    /// whole document. The caller is expected to encode it and drop the buffer —
+    /// `docformat::LayerImage` is what for.
+    ///
+    /// In the order the caller asked for the slots, which is the order they are
+    /// read back, and never the flattened preview: that one is the last step and
+    /// [`Self::take_capture`] hands it over whole.
+    ///
+    /// `None` means nothing more has landed *yet*, not that nothing more is
+    /// coming. An abandoned or failed capture answers `None` too, and its
+    /// buffers are dropped rather than handed out — a caller that had already
+    /// taken some of them is told by `take_capture` never answering.
+    pub fn take_capture_slice(&mut self) -> Option<CaptureSlice> {
+        let job = self.capture.as_mut()?;
+        if job.abandoned || job.failed || job.taken >= job.slots.len() {
+            return None;
+        }
+        let index = job.taken;
+        let pixels = job.results[index].take()?;
+        job.taken += 1;
+        Some(CaptureSlice {
+            index,
+            size: job.size,
+            pixels,
         })
     }
 

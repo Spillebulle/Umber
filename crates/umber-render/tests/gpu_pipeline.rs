@@ -14,8 +14,8 @@ use umber_core::{
     Selection, StrokeBuilder, TileMask, TipMask, Transform,
 };
 use umber_render::{
-    BakedStack, CanvasRenderer, Choice, CompositeParams, DabStyle, DocumentCapture, EffectFrame,
-    FloatParams, FloatSource, Gpu, LayerDraw, LayerEffects, ProbeParams, StrokeStyle, Thumbnail,
+    BakedStack, CanvasRenderer, Choice, CompositeParams, DabStyle, EffectFrame, FloatParams,
+    FloatSource, Gpu, LayerDraw, LayerEffects, ProbeParams, StrokeStyle, Thumbnail,
 };
 
 const DOC: u32 = 64;
@@ -4530,7 +4530,7 @@ fn run_capture(
     canvas: &mut CanvasRenderer,
     slots: &[u32],
     draws: &[LayerDraw],
-) -> (DocumentCapture, std::time::Duration, usize) {
+) -> (Captured, std::time::Duration, usize) {
     assert!(
         canvas.begin_capture(slots, draws),
         "a capture was in flight"
@@ -4538,11 +4538,24 @@ fn run_capture(
     drive_to_completion(gpu, canvas)
 }
 
+/// A whole document, reassembled from the slices the capture handed over one
+/// at a time plus the preview it hands over at the end.
+///
+/// The renderer no longer holds the layers together — that is the ten
+/// gigabytes — so the shape every test here reads is put back together on this
+/// side, by the same draining loop `autosave::collect` runs.
+struct Captured {
+    size: UVec2,
+    layers: Vec<Vec<u8>>,
+    merged: Vec<u8>,
+}
+
 /// The frame loop of [`run_capture`], for a capture already begun.
 fn drive_to_completion(
     gpu: &Gpu,
     canvas: &mut CanvasRenderer,
-) -> (DocumentCapture, std::time::Duration, usize) {
+) -> (Captured, std::time::Duration, usize) {
+    let mut slices: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut worst = std::time::Duration::ZERO;
     let mut frames = 0usize;
     // **This loop is a wall-clock budget in disguise, and saying it was not is
@@ -4576,11 +4589,26 @@ fn drive_to_completion(
 
         let started = std::time::Instant::now();
         canvas.submit_capture();
+        // Drained *before* the collect, which is the order `autosave::collect`
+        // keeps and the order that matters: a slice still in the capture when
+        // it completes is one nothing asked for.
+        while let Some(slice) = canvas.take_capture_slice() {
+            slices.push((slice.index, slice.pixels));
+        }
         let taken = canvas.take_capture(&gpu.device);
         worst = worst.max(recording + started.elapsed());
 
         if let Some(doc) = taken {
-            return (doc, worst, frames);
+            slices.sort_by_key(|(at, _)| *at);
+            return (
+                Captured {
+                    size: doc.size,
+                    layers: slices.into_iter().map(|(_, px)| px).collect(),
+                    merged: doc.merged,
+                },
+                worst,
+                frames,
+            );
         }
         // Stand in for the frame this loop is pretending to be. `take_capture`
         // polls *without* blocking — the whole point — so a loop with nothing

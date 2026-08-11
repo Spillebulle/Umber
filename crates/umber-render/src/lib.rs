@@ -21,8 +21,8 @@ pub mod canvas;
 pub mod gpu;
 
 pub use canvas::{
-    BakedStack, CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, EffectFrame,
-    FloatParams, FloatSource, LayerDraw, LayerEffects, ProbeParams, StrokeStyle, Thumbnail, Vram,
-    effect_marks_nothing, text_reset_is_live,
+    BakedStack, CanvasRenderer, CaptureSlice, CompositeParams, DabStyle, DocumentCapture,
+    EffectFrame, FloatParams, FloatSource, LayerDraw, LayerEffects, ProbeParams, StrokeStyle,
+    Thumbnail, Vram, effect_marks_nothing, text_reset_is_live,
 };
 pub use gpu::{Choice, Gpu};
