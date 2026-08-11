@@ -803,7 +803,7 @@ pub enum SaveError {
     /// is that the *consequence* is identical and is the only thing the artist
     /// can act on — this document was not written, and none of it was.
     ///
-    /// `what` is filled in by [`resolve`] rather than by the source, so it
+    /// `what` is filled in by `resolve` rather than by the source, so it
     /// names the **layer** and not the index the source was asked in: a source
     /// knows which slice it failed to read and does not know what the artist
     /// called it.
