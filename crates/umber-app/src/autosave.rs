@@ -1418,7 +1418,7 @@ pub struct Autosave {
     ///
     /// A flag rather than a report pushed where it is discovered, because both
     /// discoveries happen where there is no channel left to push it down:
-    /// [`Autosave::writer_vanished`] has just dropped one, and
+    /// [`Autosave::lose_writer`] has just dropped one, and
     /// [`Autosave::writer`]'s failed spawn never made one. [`Autosave::poll`]
     /// drains it.
     lost: bool,
@@ -1885,7 +1885,7 @@ impl Autosave {
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        self.writer_vanished();
+                        self.lose_writer();
                         break;
                     }
                 }
@@ -1921,7 +1921,17 @@ impl Autosave {
         out.push(report);
     }
 
-    /// The writer thread ended without being asked to.
+    /// There is no writer: one ended without being asked to, or one could not
+    /// be started.
+    ///
+    /// **One function for both, called from both**, because the alternative is
+    /// the same two lines written twice and only one of them reachable from a
+    /// test. A failed spawn cannot be produced on demand — it wants a machine
+    /// out of handles — so the spawn arm is a *call to this*, which the
+    /// disconnect guard drives, rather than a copy of it that nothing does.
+    /// That is the "make it structural and say which" rule: what a test covers
+    /// here is the body, and what covers the second call site is that it is a
+    /// call.
     ///
     /// **`tx` is the half that matters.** [`Autosave::writer`] starts a thread
     /// only where it is `None`, so a sender whose receiver has gone is a writer
@@ -1950,7 +1960,7 @@ impl Autosave {
     /// only route `collect` has to the renderer's own job, and strand it for the
     /// life of the renderer: exactly the disowned-job bug `settle_capture`
     /// exists to undo.
-    fn writer_vanished(&mut self) {
+    fn lose_writer(&mut self) {
         self.tx = None;
         self.rx = None;
         self.lost = true;
@@ -2009,11 +2019,13 @@ impl Autosave {
     /// send, and the deflate happens here.
     ///
     /// **When this ends unexpectedly, [`Self::poll`] is what notices**, by the
-    /// `Disconnected` on `report_rx`, and [`Self::writer_vanished`] is what
-    /// makes the next call here start another. That sentence belongs beside the
-    /// spawn rather than only beside the collector: the state a thread leaves
-    /// when it dies is made here, and "who clears this" was written down long
-    /// before anybody asked "who notices if it is never reached".
+    /// `Disconnected` on `report_rx`, and [`Self::lose_writer`] is what makes
+    /// the next call here start another. That sentence belongs beside the spawn
+    /// rather than only beside the collector: the state a thread leaves when it
+    /// dies is made here, and "who clears this" was written down long before
+    /// anybody asked "who notices if it is never reached". **And when it never
+    /// starts, the same function is what says so** — the failure below is the
+    /// third way into the same state and the one no channel can report.
     fn writer(&mut self) -> Option<&mpsc::Sender<Job>> {
         if self.tx.is_none() {
             let (task_tx, task_rx) = mpsc::channel::<Job>();
@@ -2080,7 +2092,7 @@ impl Autosave {
                     // again, so the sentence promising Umber will try again is
                     // exactly the one a failure here would falsify.
                     log::warn!("could not start the autosave writer: {e}");
-                    self.lost = true;
+                    self.lose_writer();
                     return None;
                 }
             }
@@ -3442,10 +3454,14 @@ mod tests {
     /// fail. Left alone it would make `Report::NoWriter`'s own sentence, which
     /// promises Umber will try again, the thing that turns out to be false.
     ///
-    /// Driven by asking for the report the failed spawn raises rather than by
-    /// contriving a thread failure, which needs a machine out of handles: what
-    /// the spawn arm does is set the flag, and this is the whole of what the
-    /// flag then produces.
+    /// **What this covers and what it does not**, said out loud because a
+    /// thread failure cannot be produced on demand. It drives the flag's whole
+    /// consequence and it cannot see the spawn arm *setting* the flag. What
+    /// covers that is structure rather than a test: the arm calls
+    /// [`Autosave::lose_writer`], the same function the disconnect calls and
+    /// `an_autosave_whose_writer_vanished_says_so_and_starts_another` drives,
+    /// so the untested part is a call and not a second copy of the body.
+    /// Deleting the call is still a mutation nothing here fails on.
     #[test]
     fn an_autosave_that_cannot_start_a_writer_says_so_too() {
         let mut autosave = Autosave {
