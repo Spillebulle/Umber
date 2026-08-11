@@ -2029,9 +2029,24 @@ pub fn collect(
         if let Some(pixels) = canvas.take_capture(&gpu.device) {
             editor.autosave.finish(pixels, Instant::now());
         } else if !canvas.capture_in_flight() {
-            // The renderer gave up on it — a resize, or a failed map. Nothing
-            // is coming, so the scheduler must stop waiting for it or this
-            // document is never autosaved again.
+            // The renderer gave up on it — a resize, a failed map, or edits
+            // landing on slices it had already read faster than it could read
+            // them again. Nothing is coming, so the scheduler must stop waiting
+            // for it or this document is never autosaved again.
+            //
+            // **The last of those three waits and the other two do not**, and
+            // the renderer is what tells them apart. An interrupted capture
+            // should start again at once. One that gave up should not: the
+            // document is being painted faster than it can be read, so another
+            // begun on the next frame spends the same budget on the same
+            // painting — every frame, for as long as somebody is working — and
+            // only one capture runs at a time, so that is every other open
+            // document's autosave starved by this one. `defer` puts it back to
+            // the ordinary interval, which is the cadence the artist was
+            // promised anyway.
+            if canvas.take_capture_gave_up() {
+                editor.autosave.defer(id, Instant::now());
+            }
             editor.autosave.abandon();
         }
     }
