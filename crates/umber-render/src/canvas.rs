@@ -2273,7 +2273,6 @@ struct EffectCache {
     bakes: u64,
 }
 
-/// The layer texture array and the views onto it.
 /// The page table's texel format.
 ///
 /// One `u32` an entry, holding a [`umber_core::tile::Entry`]. Read only with
@@ -2350,8 +2349,23 @@ fn layer_texture(device: &wgpu::Device, size: UVec2, capacity: u32) -> wgpu::Tex
     // A page, not the canvas — see [`LayerStore`]. Rounding up cannot cross the
     // device's `max_texture_dimension_2d`, because every value that limit takes
     // is itself a multiple of the tile and the canvas is already inside it;
-    // `rounding_a_canvas_up_to_tiles_never_passes_the_device_limit` sweeps it.
+    // `rounding_a_canvas_up_to_tiles_never_passes_the_device_limit` sweeps the
+    // figures real adapters report.
+    //
+    // **The specification does not promise it**, though, and the failure is a
+    // dimension validation error, which is fatal and which `try_reserve`'s
+    // `OutOfMemory` scope does not catch. So it is asserted here rather than
+    // only reasoned about: a device reporting, say, 5000 would make a 4900
+    // canvas want a 5120 page, and the fix then is to round
+    // `CanvasLimit::of_device` *down* to a whole tile — and to route
+    // `install_import`'s own copy of that comparison through the same function.
     let page = Grid::new(size).page_size();
+    debug_assert!(
+        page.x <= device.limits().max_texture_dimension_2d
+            && page.y <= device.limits().max_texture_dimension_2d,
+        "a {size} canvas wants a {page} page against a limit of {}",
+        device.limits().max_texture_dimension_2d
+    );
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("umber-layers"),
         size: wgpu::Extent3d {
@@ -2482,8 +2496,9 @@ impl LayerStore {
     /// Push the whole table to the GPU.
     ///
     /// Whole, not per slot, and that is affordable only because of **when this
-    /// runs**: the table is written when the store is built, when it grows and
-    /// when the canvas is resized, and nowhere else. Nothing on the drawing path
+    /// runs**: the table is written when the store is built, when it grows, when
+    /// the canvas is resized, and from [`CanvasRenderer::write_entry`] — which
+    /// is reached only by the two `_for_test` hooks. Nothing on the drawing path
     /// touches it while residency is the identity.
     ///
     /// **The sparse stage may not keep this shape**, and the figure is why. The
@@ -7856,15 +7871,33 @@ impl CanvasRenderer {
         tile: (u32, u32),
         from: u32,
     ) {
-        let grid = self.layers.grid;
-        let at = from as usize * grid.tiles_per_page() as usize + grid.index(tile.0, tile.1);
+        let Some(at) = self.table_slot(from, tile) else {
+            return;
+        };
         let entry = self.layers.entries[at];
         self.write_entry(queue, slot, tile, entry);
     }
 
-    fn write_entry(&mut self, queue: &wgpu::Queue, slot: u32, tile: (u32, u32), entry: Entry) {
+    /// Where a slot's tile sits in the CPU table, or `None` where the slot or
+    /// the tile is off the end.
+    ///
+    /// Refusing rather than indexing, for the reason `read_layer_rect` logs and
+    /// returns rather than aborting: these two hooks are `pub`, so a test naming
+    /// a tile that does not exist should fail its own assertion rather than
+    /// panic inside the renderer.
+    fn table_slot(&self, slot: u32, tile: (u32, u32)) -> Option<usize> {
         let grid = self.layers.grid;
-        let at = slot as usize * grid.tiles_per_page() as usize + grid.index(tile.0, tile.1);
+        if slot >= self.layers.capacity || tile.0 >= grid.tiles.x || tile.1 >= grid.tiles.y {
+            log::error!("page table asked for slot {slot} tile {tile:?}");
+            return None;
+        }
+        Some(slot as usize * grid.tiles_per_page() as usize + grid.index(tile.0, tile.1))
+    }
+
+    fn write_entry(&mut self, queue: &wgpu::Queue, slot: u32, tile: (u32, u32), entry: Entry) {
+        let Some(at) = self.table_slot(slot, tile) else {
+            return;
+        };
         self.layers.entries[at] = entry;
         self.layers.upload_table(queue);
         self.touch_slot(slot);
@@ -9538,7 +9571,8 @@ mod tests {
     /// A text scan, for the reason the packaging scans here are. What it covers
     /// is that nobody put a direct read back into one of the three; what it
     /// cannot see is whether the routing is *right* — that is
-    /// `a_tap_across_a_tile_boundary_blends_the_logical_neighbour`'s — and it
+    /// `a_tap_across_a_tile_boundary_blends_the_logical_neighbour`'s and
+    /// `an_unbacked_layer_tile_reads_as_nothing`'s — and it
     /// **cannot see a fourth shader file**, because nothing in Rust can
     /// enumerate a directory at compile time. Adding one that binds the atlas
     /// means adding it to this list.

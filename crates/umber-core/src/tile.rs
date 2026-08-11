@@ -61,11 +61,20 @@
 //!   `flip.wgsl` goes out of its way to read through a *non*-sRGB view
 //!   precisely because the sRGB one would decode.
 //!
-//! What it costs is instruction count on the composite's loop, and what it
-//! cannot promise is the sampler's last bit at a magnified antialiased edge —
-//! the hardware's interpolation weights are fixed-point where these are `f32`.
-//! Where a bilinear tap lands on a texel centre, which is every sample at zoom
-//! 1, both are exact and the comparison may promise bytes.
+//! What it costs is instruction count on the composite's loop — **unmeasured**,
+//! and the one claim in this module that nobody has checked. What it cannot
+//! promise is the sampler's last bit where a tap falls between texels: the
+//! hardware's interpolation weights are fixed-point where these are `f32`.
+//!
+//! Where a tap lands *on* a texel centre both are exact and a comparison may
+//! promise bytes, and that is a statement about the tap rather than about the
+//! zoom: at zoom 1 the offset is `camera.center - pivot`, neither of which is
+//! constrained to be whole, so an ordinary pan is fractional. What is exact is
+//! the export, the eyedropper's two picks and the autosave's flattened preview,
+//! which composite at zoom 1 with the centre and the pivot both at the middle of
+//! their own target — so a saved file, an exported PNG and a picked colour are
+//! bit-identical to what the sampler gave. The smudge probe is the one internal
+//! reuse that is not: it composites at `8 / (radius × 2)`.
 
 use crate::geom::PixelRect;
 use glam::UVec2;
@@ -259,11 +268,13 @@ impl Grid {
     /// edge yields nothing for the part outside, because there is no tile there
     /// and a copy naming one would be a validation error.
     ///
-    /// The order matters to one caller and not the rest: a readback stitches the
-    /// fragments back into a tightly packed buffer by copying each fragment's
-    /// rows to their own offsets, so any order would do — but a *write* of a
-    /// banded upload walks these in the order it was handed them, and row-major
-    /// is what keeps that a forward scan of the caller's bytes.
+    /// **Nothing outside this module calls it yet.** The sparse stage's
+    /// readback, its banded write and its allocator are what it is for, and none
+    /// of them exists — so what is written down here is the property they will
+    /// need rather than a description of a caller: row-major, because a write of
+    /// a banded upload walks these in the order it was handed them and that is
+    /// what keeps it a forward scan of the caller's bytes. A readback stitches
+    /// by offset and would not care.
     pub fn fragments(&self, rect: PixelRect) -> Vec<Fragment> {
         let x0 = rect.x.min(self.doc_size.x);
         let y0 = rect.y.min(self.doc_size.y);
@@ -299,9 +310,11 @@ impl Grid {
 
     /// Every tile a document rectangle touches, row-major and deduplicated.
     ///
-    /// What an allocator is asked for before a commit: [`Self::fragments`]
-    /// answers the same question and carries the geometry, so this exists only
-    /// where the geometry is not wanted and building it would be waste.
+    /// What an allocator would be asked for before a commit — and **there is no
+    /// allocator yet**, so this has no caller outside the tests.
+    /// [`Self::fragments`] answers the same question and carries the geometry,
+    /// so this is for the case where the geometry is not wanted and building it
+    /// would be waste.
     pub fn tiles_over(&self, rect: PixelRect) -> Vec<(u32, u32)> {
         let x1 = rect.x.saturating_add(rect.width).min(self.doc_size.x);
         let y1 = rect.y.saturating_add(rect.height).min(self.doc_size.y);

@@ -7665,16 +7665,34 @@ fn add_glow_matches_add_over_an_opaque_backdrop_and_differs_over_a_soft_one() {
 // the only thing that runs the substitution or the cross-tile tap at all.
 // ---------------------------------------------------------------------------
 
-/// Two tiles on a side. The harness's 64 is one tile, so it has no boundary to
-/// straddle and no second tile to be pointed at.
-const TILED: u32 = 512;
+/// A canvas three tiles wide and two tall, and **a whole number of neither**.
+///
+/// The harness's 64 is one tile, so it has no boundary to straddle and no second
+/// tile to be pointed at. Two further properties are load-bearing and both were
+/// arrived at by mutation rather than by design:
+///
+/// * **Non-square.** With a square tile grid an x/y transposition anywhere in
+///   the packing — `Entry::cell`, the WGSL's `tile_atlas_texel` — resolves to a
+///   tile that exists and, on a slot filled flat, holds the same thing, so no
+///   assertion can see it. Three by two sends tile (2, 0) to (0, 2), which is
+///   off the bottom of the page and reads as zero.
+/// * **Not a multiple of the tile.** The page is the canvas rounded up, so 700 ×
+///   500 leaves a margin out to 768 × 512 that is cleared and never written. A
+///   tap that fails to clamp at the canvas edge reads *that*, and comes back
+///   short. On a canvas that filled its page exactly, the unclamped tap runs off
+///   the tile grid instead, the page table's out-of-bounds `textureLoad` answers
+///   **zero — a legitimate entry, page 0 tile (0, 0)** — and the answer is
+///   plausible content rather than nothing. Dropping the clamp passed against a
+///   768 × 512 fixture.
+const TILED_W: u32 = 700;
+const TILED_H: u32 = 500;
 
-/// A renderer over a `TILED`-square canvas with `slots` slices, cleared.
+/// A renderer over the `TILED_W` × `TILED_H` canvas with `slots` slices, cleared.
 fn tiled_canvas(gpu: &Gpu, slots: u32) -> CanvasRenderer {
     let mut canvas = CanvasRenderer::new(
         &gpu.device,
         &gpu.queue,
-        UVec2::splat(TILED),
+        UVec2::new(TILED_W, TILED_H),
         TARGET_FORMAT,
         slots,
     );
@@ -7692,7 +7710,7 @@ fn fill_tiled_slot(gpu: &Gpu, canvas: &mut CanvasRenderer, slot: u32, rgba: [u8;
         .iter()
         .copied()
         .cycle()
-        .take((TILED as usize) * (TILED as usize) * 4)
+        .take((TILED_W as usize) * (TILED_H as usize) * 4)
         .collect();
     canvas.write_layer_rect(
         &gpu.device,
@@ -7701,8 +7719,8 @@ fn fill_tiled_slot(gpu: &Gpu, canvas: &mut CanvasRenderer, slot: u32, rgba: [u8;
         PixelRect {
             x: 0,
             y: 0,
-            width: TILED,
-            height: TILED,
+            width: TILED_W,
+            height: TILED_H,
         },
         &bytes,
     );
@@ -7816,35 +7834,83 @@ fn an_unbacked_layer_tile_reads_as_nothing() {
     fill_tiled_slot(gpu, &mut canvas, 0, [255, 0, 0, 255]);
 
     let draws = [layer(0, 1.0, BlendMode::Normal)];
-    // An eighth puts the whole 512 canvas inside the 64 view, so pixel 8 is
-    // around document 64 (tile 0,0) and pixel 40 around document 320 (tile 1,0).
-    let zoom = 0.125;
-    let centre = Vec2::splat(TILED as f32 * 0.5);
-    assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 8)[3],
-        255,
-        "the layer starts opaque everywhere"
-    );
-    assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8)[3],
-        255
-    );
+    // A twelfth puts the whole 700 × 500 canvas inside the 64 view. Screen pixel
+    // `p` is document `(p + 0.5 - 32) * 12 + centre`, so:
+    //   x = 8, 32, 46  ->  doc 68, 356, 524  -> tile columns 0, 1, 2
+    //   y = 24, 40     ->  doc 160, 352      -> tile rows 0, 1
+    let zoom = 1.0 / 12.0;
+    let centre = Vec2::new(TILED_W as f32 * 0.5, TILED_H as f32 * 0.5);
+    let at =
+        |canvas: &CanvasRenderer, x, y| tiled_composite(gpu, canvas, &draws, zoom, centre, x, y);
+
+    for (x, y) in [(8, 24), (32, 24), (46, 24), (8, 40), (32, 40), (46, 40)] {
+        assert_eq!(
+            at(&canvas, x, y),
+            [255, 0, 0, 255],
+            "the layer starts opaque everywhere: {x},{y}"
+        );
+    }
 
     canvas.unback_tile_for_test(&gpu.queue, 0, (1, 0));
     assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 8),
-        [255, 0, 0, 255],
-        "the tile that is still stored is untouched"
-    );
-    assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8),
+        at(&canvas, 32, 24),
         [0, 0, 0, 0],
         "a tile nothing is stored for is transparent, not whatever was there"
     );
     assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 40),
+        at(&canvas, 8, 24),
+        [255, 0, 0, 255],
+        "the tile beside it is untouched"
+    );
+    assert_eq!(
+        at(&canvas, 32, 40),
         [255, 0, 0, 255],
         "and the tile below it is untouched"
+    );
+    // **Tile (2, 0) is what says the two axes are told apart.** The grid is
+    // three by two, so a transposed unpack — in `Entry::cell` or in the WGSL's
+    // `tile_atlas_texel` — sends it to (0, 2), which is off the bottom of the
+    // page and reads as zero. On a square grid it would land on a tile that
+    // exists and holds the same flat colour, and nothing could see it.
+    assert_eq!(
+        at(&canvas, 46, 24),
+        [255, 0, 0, 255],
+        "the far column resolves to its own tile, not to a transposed one"
+    );
+}
+
+/// A tap at the canvas's own border clamps, as the sampler it replaced did.
+///
+/// `tile_bilinear`'s two `clamp` calls are the whole of `ClampToEdge`, and
+/// nothing else reaches them: every other test composites at zoom 1, where the
+/// weights are zero and the outer taps are multiplied away, or samples well
+/// inside. Delete either clamp and the last half-texel of the right and bottom
+/// edges fades into the page's cleared padding at any magnification — which is
+/// a soft rim round every document, and exactly the smearing
+/// `nothing_outside_a_selections_own_rectangle_is_paintable` refuses on its own
+/// terms.
+#[test]
+fn a_tap_at_the_canvas_edge_clamps_rather_than_reading_the_padding() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 1);
+    fill_tiled_slot(gpu, &mut canvas, 0, [255, 0, 0, 255]);
+
+    let draws = [layer(0, 1.0, BlendMode::Normal)];
+    // Zoom 4 with the camera on the last column: screen pixel 32's centre is
+    // 32.5, so the document coordinate is 699.75 — a quarter of a texel past the
+    // centre of the last texel, 699.5. Clamped, both taps are texel 699 and the
+    // answer is exactly what is stored. Unclamped, the second tap is texel 700,
+    // which is inside the *page* (768 wide) and outside the canvas, so it is
+    // cleared — and a quarter of the answer would be nothing.
+    let zoom = 4.0;
+    let centre = Vec2::new(TILED_W as f32 - 0.25, TILED_H as f32 * 0.5);
+    let edge = tiled_composite(gpu, &canvas, &draws, zoom, centre, 32, 32);
+    assert_eq!(
+        edge,
+        [255, 0, 0, 255],
+        "a tap past the last texel centre must clamp to it, not fade into the \
+         page's margin beyond the canvas"
     );
 }
 
@@ -7872,22 +7938,23 @@ fn an_unbacked_mask_tile_reveals_the_layer_rather_than_hiding_it() {
         mask: Some(1),
         clipped: false,
     }];
-    let zoom = 0.125;
-    let centre = Vec2::splat(TILED as f32 * 0.5);
+    // The sampling grid `an_unbacked_layer_tile_reads_as_nothing` sets out.
+    let zoom = 1.0 / 12.0;
+    let centre = Vec2::new(TILED_W as f32 * 0.5, TILED_H as f32 * 0.5);
     assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8)[3],
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 32, 24)[3],
         0,
         "a black mask hides the layer"
     );
 
     canvas.unback_tile_for_test(&gpu.queue, 1, (1, 0));
     assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 40, 8),
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 32, 24),
         [255, 0, 0, 255],
         "where the mask stores nothing the layer is revealed whole"
     );
     assert_eq!(
-        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 8)[3],
+        tiled_composite(gpu, &canvas, &draws, zoom, centre, 8, 24)[3],
         0,
         "and the tile the mask does store still hides"
     );
@@ -7926,7 +7993,7 @@ fn a_tap_across_a_tile_boundary_blends_the_logical_neighbour() {
     // 256 — so the tap reaches texel 255 (red, tile 0,0) and texel 256 (blue,
     // through the borrow).
     let zoom = 2.0;
-    let centre = Vec2::new(TILED as f32 * 0.5, 64.0);
+    let centre = Vec2::new(256.0, 64.0);
 
     assert_eq!(
         tiled_composite(gpu, &canvas, &draws, zoom, centre, 16, 32),
@@ -8007,6 +8074,8 @@ fn a_thumbnail_reads_an_unbacked_tile_as_nothing_too() {
     // paint in a tile that stores none.
     canvas.unback_tile_for_test(&gpu.queue, 0, (1, 0));
     canvas.unback_tile_for_test(&gpu.queue, 0, (1, 1));
+    canvas.unback_tile_for_test(&gpu.queue, 0, (2, 0));
+    canvas.unback_tile_for_test(&gpu.queue, 0, (2, 1));
     let half = thumb_of(&mut canvas);
     assert!(!half.is_empty());
     assert_ne!(

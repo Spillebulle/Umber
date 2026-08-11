@@ -36,9 +36,16 @@ deliberate departures, and taking the design's own wording for the code is the
   so a page *is* what a slice was and §3.1's growth correction, `try_reserve`,
   `Vram`, `resize` and every `MAX_SLOTS` figure are unchanged rather than
   re-derived. The ceiling is therefore today's ceiling and not 17.18 GB. The
-  costs: the dense-layer penalty is 3.5% at 20000×5000 rather than §4.2's 5.2%
-  (there is no apron to pay for), and the page-side sweep §10 asks
-  `measure-atlas.rs` for is not a question any more.
+  costs: the page-side sweep §10 asks `measure-atlas.rs` for is not a question
+  any more, and the dense-layer penalty is **per axis** rather than §4.2's flat
+  5.2% — which makes it worst on a *small* dimension and best on the canvas this
+  programme is about. 3.5% at 20000×5000, 5.4% on an A4 page at 600 dpi, 6.7% at
+  2560×1440, **26.4% at 1920×1080** and 63.8% at 800×600. 1080 is 4.22 tiles, so
+  the most ordinary canvas anybody paints on is the worst realistic entry, and
+  `growth_quantum` reads that figure — a 1920×1080 document's quantum falls from
+  32 slices to 25. `canvas.rs`'s `slice_bytes` carries the table. Quoting the
+  3.5% alone, which a first draft of this section did, is "state the figures one
+  by one" broken in the document a later reader takes for instructions.
   **It rests on one property**: rounding a canvas up to a multiple of 256 cannot
   cross `max_texture_dimension_2d`, because every value that limit takes is
   itself a multiple of 256. That is true of every adapter anybody has measured
