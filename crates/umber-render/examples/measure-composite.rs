@@ -118,15 +118,23 @@ const TILES: &str = include_str!("../shaders/tiles.wgsl");
 const BLEND: &str = include_str!("../shaders/blend.wgsl");
 const COMPOSITE: &str = include_str!("../shaders/composite.wgsl");
 
-/// A binding both variants declare and only one reads.
+/// A binding every variant declares and only some read.
 ///
 /// The sampled path needs a sampler and `composite.wgsl` declares its own at
 /// binding 3 — after this file in the concatenation, so reading that one would
-/// be a forward reference. Declaring a second here, in the text **both**
-/// variants get, is what keeps the two pipelines on one bind group layout and
-/// the difference between them down to a single function body. An unused
-/// binding costs nothing per fragment.
-const EXTRA_BINDINGS: &str = "\n@group(0) @binding(6) var measure_samp: sampler;\n";
+/// be a forward reference. Declaring a second here, in the text **all** variants
+/// get, is what keeps the pipelines on one bind group layout and the difference
+/// between them down to a single function body. An unused binding costs nothing
+/// per fragment.
+///
+/// **Binding 7, not 6.** `composite.wgsl` took binding 6 for `mask_tex` — the
+/// raw, non-sRGB view of the same atlas a mask is read through — on a branch
+/// that landed beside the one this example was written on, and neither branch
+/// could see the other. The result was a duplicate binding that failed pipeline
+/// creation on the first line of the sweep, so this example did not run at all
+/// between those two merges. That is the "wrong in the combination" failure
+/// CLAUDE.md records, arriving through a binding number.
+const EXTRA_BINDINGS: &str = "\n@group(0) @binding(7) var measure_samp: sampler;\n";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Variant {
@@ -393,6 +401,10 @@ fn backed_tiles(grid: &Grid, slot: u32, residency: Residency) -> Vec<bool> {
 /// One atlas and one page table over it: what a bind group is built from.
 struct Store {
     atlas_view: wgpu::TextureView,
+    /// The same texture without the transfer function, which is what
+    /// `composite.wgsl` binds at 6 and reads a mask through. Same fetch, same
+    /// cost; it is here so the pipeline layout is the shipped one.
+    raw_view: wgpu::TextureView,
     table_view: wgpu::TextureView,
     pages: u32,
     backed: u64,
@@ -400,6 +412,8 @@ struct Store {
 }
 
 const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// `LAYER_FORMAT_LINEAR` in `canvas.rs`. See [`Store::raw_view`].
+const LAYER_FORMAT_LINEAR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const PAGE_TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const STROKE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// What the real surface is. The screen pipeline is compiled against the
@@ -536,7 +550,7 @@ fn build_store(
         dimension: wgpu::TextureDimension::D2,
         format: LAYER_FORMAT,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
+        view_formats: &[LAYER_FORMAT_LINEAR],
     });
     // Popped here, with no view yet built. See this function's docs. `block_on`
     // over a future wgpu builds with `ready(...)`: an extractor, not a wait.
@@ -636,6 +650,12 @@ fn build_store(
     Some(Store {
         atlas_view: atlas.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        }),
+        raw_view: atlas.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(LAYER_FORMAT_LINEAR),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
             ..Default::default()
         }),
         table_view: table.create_view(&wgpu::TextureViewDescriptor {
@@ -1053,8 +1073,10 @@ fn sweep_canvas(
                 entry_sampler(3),
                 entry_texture(4),
                 entry_page_table(5),
-                // The extra sampler both variants declare. See EXTRA_BINDINGS.
-                entry_sampler(6),
+                // `mask_tex` — the raw view of the atlas. See `Store::raw_view`.
+                entry_texture_array(6),
+                // The extra sampler every variant declares. See EXTRA_BINDINGS.
+                entry_sampler(7),
             ],
         });
     let pipeline_layout = gpu
@@ -1134,6 +1156,10 @@ fn sweep_canvas(
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&s.raw_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
                         resource: wgpu::BindingResource::Sampler(&sampler),
                     },
                 ],
