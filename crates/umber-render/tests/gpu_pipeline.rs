@@ -5060,15 +5060,36 @@ fn settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone() {
         clipped: false,
     }];
 
-    // A live capture is not this function's business: its owner drives it, and
-    // pushing it along from the side would map a step nobody had recorded.
+    // **A live capture is not this function's business**, and what is at stake
+    // is not tidiness: `take_capture` hands the finished document to whoever
+    // asks, so a settle that reached a live job would collect it and drop it on
+    // the floor — its owner would then find nothing in flight and end the
+    // autosave having written nothing. So here is a whole capture's worth of
+    // frames with the settler as the *only* thing asking after it: it must
+    // still be in flight at the end, waiting for the owner that never came.
+    //
+    // Enough frames for a real capture several times over. A settle that
+    // reached this one would have finished it long before the last of them —
+    // demonstrated by mutation, taking the abandoned-or-failed test out.
     assert!(h.canvas.begin_capture(&[0], &draws));
-    for _ in 0..8 {
+    for _ in 0..100 {
+        let mut enc = h.encoder();
+        h.canvas
+            .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
         h.canvas.settle_capture(&h.gpu.device);
+        if !h.canvas.capture_in_flight() {
+            break;
+        }
+        // As in `drive_to_completion`: the poll does not wait, so this loop has
+        // to, or a hundred iterations pass before the GPU finishes the first
+        // copy and the test proves nothing.
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(
         h.canvas.capture_in_flight(),
-        "settling threw away a capture that was still somebody's"
+        "settling collected a capture that was still somebody's, so its \
+         document went nowhere"
     );
 
     // Cancelled part-way through a step — a copy recorded, no map outstanding —
