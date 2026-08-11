@@ -8113,3 +8113,544 @@ fn a_thumbnail_reads_an_unbacked_tile_as_nothing_too() {
         "a slot storing no tile at all has nothing on it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sparse residency
+//
+// Stage 2. A tile is stored when something writes to it and not before, so the
+// tests below are about three things phase 1 could not have: that residency
+// really is sparse, that a cell arriving out of the pool cannot carry the last
+// slot's paint with it, and that everything which used to read a canvas-sized
+// slice — a readback, a flip, a resize, a capture — still answers with the
+// picture.
+//
+// The fixture keeps `tiled_canvas`'s two properties and needs a third: a slot
+// that is *partly* backed beside one that is fully backed, so a bug that
+// resolves the wrong slot's table slice has somewhere to show.
+// ---------------------------------------------------------------------------
+
+/// A rectangle wholly inside tile `(tx, ty)` of the tiled fixture.
+fn in_tile(tx: u32, ty: u32) -> PixelRect {
+    PixelRect {
+        x: tx * 256 + 8,
+        y: ty * 256 + 8,
+        width: 16,
+        height: 16,
+    }
+}
+
+fn write_flat(gpu: &Gpu, canvas: &mut CanvasRenderer, slot: u32, rect: PixelRect, rgba: [u8; 4]) {
+    let bytes: Vec<u8> = rgba
+        .iter()
+        .copied()
+        .cycle()
+        .take((rect.area() * 4) as usize)
+        .collect();
+    canvas.write_layer_rect(&gpu.device, &gpu.queue, slot, rect, &bytes);
+}
+
+/// A layer costs the tiles it covers, and two slots' residencies are their own.
+///
+/// The headline claim of the whole stage, and it is measured rather than
+/// restated: `backed_tiles` counts what the allocator actually handed out.
+/// The second slot is what makes a table slice resolved against the wrong slot
+/// visible — with one slot painted there is nothing to be confused with.
+#[test]
+fn a_layer_costs_the_tiles_it_covers_and_no_more() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+    assert_eq!(canvas.backed_tiles(0), 0, "a blank layer stores nothing");
+    assert_eq!(canvas.backed_tiles(1), 0);
+
+    write_flat(gpu, &mut canvas, 0, in_tile(0, 0), [255, 0, 0, 255]);
+    assert_eq!(
+        canvas.backed_tiles(0),
+        1,
+        "one tile written, one tile stored"
+    );
+    assert_eq!(canvas.backed_tiles(1), 0, "the other slot paid nothing");
+
+    write_flat(gpu, &mut canvas, 1, in_tile(2, 1), [0, 0, 255, 255]);
+    assert_eq!(canvas.backed_tiles(0), 1);
+    assert_eq!(canvas.backed_tiles(1), 1);
+
+    // Six tiles between them would be the dense answer. The whole point is that
+    // this is two.
+    let dense = 3 * 2;
+    assert!(
+        canvas.backed_tiles(0) + canvas.backed_tiles(1) < dense,
+        "residency is not sparse at all"
+    );
+
+    // And the pixels are where they were put, in the slot they were put in.
+    let read = |canvas: &CanvasRenderer, slot: u32, rect: PixelRect| {
+        canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, rect)
+    };
+    assert_eq!(&read(&canvas, 0, in_tile(0, 0))[..4], &[255, 0, 0, 255]);
+    assert_eq!(&read(&canvas, 1, in_tile(2, 1))[..4], &[0, 0, 255, 255]);
+    // Slot 1 stores nothing in tile (0, 0) and slot 0 nothing in (2, 1), so
+    // both read as the empty value rather than as each other's paint.
+    assert_eq!(&read(&canvas, 1, in_tile(0, 0))[..4], &[0, 0, 0, 0]);
+    assert_eq!(&read(&canvas, 0, in_tile(2, 1))[..4], &[0, 0, 0, 0]);
+}
+
+/// A cell handed back out of the pool arrives at the slot's own empty value.
+///
+/// **This is the failure that makes an allocator dangerous rather than merely
+/// wrong.** An atlas cell is recycled, so it holds whatever the last slot that
+/// held it left there; a commit loads and blends, and a partly written tile
+/// keeps whatever is around the write. Without the clear in `back_tiles` this
+/// reads back another layer's paint — which is not a wrong picture so much as
+/// somebody else's picture.
+///
+/// The fill-then-clear is what makes the cell dirty *and* free, which no
+/// ordinary sequence does.
+#[test]
+fn a_recycled_atlas_cell_carries_none_of_the_last_layers_paint() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+
+    // Slot 1 takes every cell of the canvas and fills them opaque white.
+    fill_tiled_slot(gpu, &mut canvas, 1, [255, 255, 255, 255]);
+    assert_eq!(canvas.backed_tiles(1), 6);
+    // Then gives them back, still full of white.
+    canvas.clear_layer(&gpu.queue, 1);
+    assert_eq!(canvas.backed_tiles(1), 0, "a cleared layer stores nothing");
+
+    // Slot 0 writes a small rectangle, which takes one of those cells.
+    write_flat(gpu, &mut canvas, 0, in_tile(1, 0), [255, 0, 0, 255]);
+    assert_eq!(canvas.backed_tiles(0), 1);
+
+    // Everything in that tile the write did not cover must be transparent, not
+    // the white slot 1 left in the cell.
+    let whole = PixelRect {
+        x: 256,
+        y: 0,
+        width: 256,
+        height: 256,
+    };
+    let bytes = canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, whole);
+    let painted = in_tile(1, 0);
+    let mut stray = 0;
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let doc_x = 256 + x;
+            let inside = doc_x >= painted.x
+                && doc_x < painted.x + painted.width
+                && y >= painted.y
+                && y < painted.y + painted.height;
+            if inside {
+                continue;
+            }
+            let at = ((y * 256 + x) * 4) as usize;
+            if bytes[at..at + 4] != [0, 0, 0, 0] {
+                stray += 1;
+            }
+        }
+    }
+    assert_eq!(stray, 0, "a recycled cell was handed over dirty");
+}
+
+/// A stroke crossing into a tile nobody has painted backs it before the commit
+/// reads it, and the commit lands on both sides of the boundary.
+///
+/// The dab is centred on the boundary between tiles (0, 0) and (1, 0), so the
+/// commit is two draws into two different atlas cells under two different
+/// deltas. A delta that was zero — the phase-1 identity — puts the right-hand
+/// half of the mark wherever the cell happens to be.
+#[test]
+fn a_stroke_across_a_tile_boundary_commits_on_both_sides_of_it() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+
+    // Dirty the pool first, so the cells this stroke takes are recycled ones —
+    // the commit's `LoadOp::Load` would otherwise blend over another layer's
+    // fill and the colour below would be wrong rather than absent.
+    fill_tiled_slot(gpu, &mut canvas, 1, [0, 255, 0, 255]);
+    canvas.clear_layer(&gpu.queue, 1);
+
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.begin_frame();
+    canvas.draw_dabs(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &[dab(256.0, 100.0, 20.0, 1.0)],
+        DabStyle::default(),
+    );
+    let damage = PixelRect {
+        x: 230,
+        y: 74,
+        width: 52,
+        height: 52,
+    };
+    canvas.commit_stroke(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        0,
+        damage,
+        &[damage],
+        StrokeStyle {
+            color: Color::from_srgb_u8(200, 40, 40, 255),
+            opacity: 1.0,
+            ..StrokeStyle::default()
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+
+    assert_eq!(
+        canvas.backed_tiles(0),
+        2,
+        "a stroke over one boundary reaches two tiles"
+    );
+
+    let at = |x: u32, y: u32| {
+        let px = canvas.read_layer_rect(
+            &gpu.device,
+            &gpu.queue,
+            0,
+            PixelRect {
+                x,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+        [px[0], px[1], px[2], px[3]]
+    };
+    // Either side of the boundary, well inside the dab.
+    assert!(
+        at(246, 100)[3] > 200,
+        "the left half of the mark is missing"
+    );
+    assert!(
+        at(266, 100)[3] > 200,
+        "the right half of the mark is missing"
+    );
+    assert_near(at(246, 100), [200, 40, 40], 3, "left of the boundary");
+    assert_near(at(266, 100), [200, 40, 40], 3, "right of the boundary");
+    // And nothing landed where the dab does not reach — which is what a wrong
+    // delta produces.
+    assert_eq!(
+        at(600, 400)[3],
+        0,
+        "the mark reached a tile it never touched"
+    );
+}
+
+/// A new mask costs no storage and still reveals everything.
+///
+/// `fill_layer_white` is a table write since stage 2: full reveal *is* a mask
+/// slot's empty value. What makes this a test of the *store* rather than of the
+/// shader is the readback, whose synthesis has to answer white for a mask and
+/// transparent for a layer out of the same code.
+#[test]
+fn a_new_mask_stores_nothing_and_reveals_everything() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+    fill_tiled_slot(gpu, &mut canvas, 0, [255, 0, 0, 255]);
+
+    canvas.fill_layer_white(&gpu.queue, 1);
+    assert_eq!(canvas.backed_tiles(1), 0, "an untouched mask costs nothing");
+
+    let read = canvas.read_layer_rect(&gpu.device, &gpu.queue, 1, in_tile(2, 1));
+    assert!(
+        read.chunks(4).all(|p| p == [255, 255, 255, 255]),
+        "a mask nobody has painted on must read as full reveal, not as black"
+    );
+
+    // The layer under it is undimmed, which is the whole reason a new mask is
+    // white rather than clear.
+    let mut masked = layer(0, 1.0, BlendMode::Normal);
+    masked.mask = Some(1);
+    let centre = Vec2::new(TILED_W as f32 * 0.5, TILED_H as f32 * 0.5);
+    let px = tiled_composite(gpu, &canvas, &[masked], 1.0 / 12.0, centre, 32, 32);
+    assert_eq!(px[3], 255, "a full-reveal mask hid its layer");
+
+    // Painting on it backs exactly the tiles the stroke reached, and the rest
+    // still reveals.
+    write_flat(gpu, &mut canvas, 1, in_tile(0, 0), [0, 0, 0, 255]);
+    assert_eq!(canvas.backed_tiles(1), 1);
+    let still = canvas.read_layer_rect(&gpu.device, &gpu.queue, 1, in_tile(2, 1));
+    assert!(
+        still.chunks(4).all(|p| p == [255, 255, 255, 255]),
+        "painting one tile of a mask changed what the others reveal"
+    );
+}
+
+/// An undo patch restores a rectangle whose tiles have been given back since.
+///
+/// The sequence an artist reaches by painting, clearing the layer and undoing:
+/// the pieces were captured while the tiles were backed, the clear freed them,
+/// and the write-back has to allocate them again rather than write into nothing.
+#[test]
+fn an_undo_restores_into_a_tile_that_has_been_unbacked_since() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 1);
+    let piece = in_tile(1, 1);
+    write_flat(gpu, &mut canvas, 0, piece, [10, 200, 30, 255]);
+
+    let before = canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, piece);
+    canvas.clear_layer(&gpu.queue, 0);
+    assert_eq!(canvas.backed_tiles(0), 0);
+    assert!(
+        canvas
+            .read_layer_rect(&gpu.device, &gpu.queue, 0, piece)
+            .chunks(4)
+            .all(|p| p == [0, 0, 0, 0]),
+        "a cleared layer still had pixels"
+    );
+
+    canvas.write_layer_rect(&gpu.device, &gpu.queue, 0, piece, &before);
+    let after = canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, piece);
+    assert_eq!(after, before, "the undo did not put the pixels back");
+    assert_eq!(canvas.backed_tiles(0), 1, "the write backed its own tile");
+}
+
+/// A flip mirrors a *sparse* layer exactly, and flipping twice restores it.
+///
+/// The dense guard runs on the harness's single-tile canvas, where a flip is one
+/// pass and one whole-page copy. This is the case that pass exists for: the
+/// destination tile at the left edge is made of the right edge's texels, which
+/// on a canvas that is not a whole number of tiles straddles two source tiles —
+/// so a flip is the one storage move that cannot be a translation.
+#[test]
+fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+
+    // Two marks, in tiles that mirror onto different tiles. 700 wide is 2.73
+    // tiles, so the mirror of tile 0 lands across tiles 1 and 2.
+    let left = in_tile(0, 0);
+    let right = in_tile(2, 1);
+    write_flat(gpu, &mut canvas, 0, left, [200, 40, 40, 255]);
+    write_flat(gpu, &mut canvas, 0, right, [40, 40, 200, 255]);
+    let backed = canvas.backed_tiles(0);
+    assert_eq!(backed, 2);
+
+    let read_all = |canvas: &CanvasRenderer| {
+        canvas.read_layer_rect(
+            &gpu.device,
+            &gpu.queue,
+            0,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: TILED_W,
+                height: TILED_H,
+            },
+        )
+    };
+    let before = read_all(&canvas);
+
+    canvas.flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal);
+    let once = read_all(&canvas);
+    assert_ne!(once, before, "the flip did nothing");
+
+    // The left mark is now on the right, exactly mirrored.
+    let px = |bytes: &[u8], x: u32, y: u32| {
+        let at = ((y * TILED_W + x) * 4) as usize;
+        [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+    };
+    let mirror_x = TILED_W - 1 - (left.x + 4);
+    assert_eq!(
+        px(&once, mirror_x, left.y + 4),
+        [200, 40, 40, 255],
+        "the mark did not arrive at its mirror position"
+    );
+    assert_eq!(
+        px(&once, left.x + 4, left.y + 4),
+        [0, 0, 0, 0],
+        "the mark is still where it was as well"
+    );
+
+    canvas.flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal);
+    assert_eq!(
+        read_all(&canvas),
+        before,
+        "flipping twice is not the identity, so undoing a flip loses a level"
+    );
+    // **A flip coarsens residency and this is where that is said out loud.**
+    // Which destination tiles a flip has to store is derived from which *source
+    // tiles* hold something, and a 256-wide source tile mirrored onto a canvas
+    // that is not a whole number of tiles lands across two destination tiles —
+    // so a tile that held one mark becomes two that hold half of one each. The
+    // picture is exact, which is what the assertion above says; the storage is
+    // an over-approximation that grows towards dense under repeated flips and
+    // is bounded by the grid. Nothing short of knowing where the paint is
+    // *inside* a tile can do better, and that is a readback.
+    assert!(canvas.backed_tiles(0) >= backed);
+    assert!(
+        canvas.backed_tiles(0) <= 3 * 2,
+        "residency ran past the whole grid"
+    );
+}
+
+/// A resize carries a sparse layer, and a destination tile it only partly fills
+/// is the slot's empty value everywhere else.
+///
+/// Every move a resize makes is a translation, so this is copies alone — no
+/// scratch and no pass. The trap a scratch would have carried is exactly the
+/// second assertion: a shifted destination tile reaches outside what any source
+/// tile covers.
+#[test]
+fn a_resize_carries_a_sparse_layer_and_leaves_no_stale_texels() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+    // Dirty the pool, so a destination cell that is not cleared shows it.
+    fill_tiled_slot(gpu, &mut canvas, 1, [0, 255, 0, 255]);
+    canvas.clear_layer(&gpu.queue, 1);
+
+    let mark = in_tile(1, 0);
+    write_flat(gpu, &mut canvas, 0, mark, [200, 40, 40, 255]);
+
+    // Grow, anchored top-left, so the picture does not move and the arithmetic
+    // is checkable by hand.
+    canvas.resize(
+        &gpu.device,
+        &gpu.queue,
+        UVec2::new(900, 700),
+        Anchor::TopLeft,
+        2,
+    );
+
+    let bytes = canvas.read_layer_rect(
+        &gpu.device,
+        &gpu.queue,
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: 900,
+            height: 700,
+        },
+    );
+    let px = |x: u32, y: u32| {
+        let at = ((y * 900 + x) * 4) as usize;
+        [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+    };
+    assert_eq!(
+        px(mark.x + 4, mark.y + 4),
+        [200, 40, 40, 255],
+        "the mark did not survive the resize"
+    );
+    // Everything else, including the region the new canvas added and the rest of
+    // the destination tile, is the empty value rather than the green the pool
+    // was dirtied with.
+    let mut stray = 0;
+    for y in 0..700u32 {
+        for x in 0..900u32 {
+            let inside =
+                x >= mark.x && x < mark.x + mark.width && y >= mark.y && y < mark.y + mark.height;
+            if inside {
+                continue;
+            }
+            if px(x, y) != [0, 0, 0, 0] {
+                stray += 1;
+            }
+        }
+    }
+    assert_eq!(
+        stray, 0,
+        "a resized layer came back with texels nobody wrote"
+    );
+}
+
+/// A blended commit on a tiled layer reads its backdrop out of the right cell.
+///
+/// Multiply against white is the identity and against black is black, which are
+/// exact whatever the rounding — so this says the backdrop copy found the
+/// layer's own texels rather than another cell's. The two tiles carry different
+/// backdrops on purpose: one answer that happened to be right for both would say
+/// nothing.
+#[test]
+fn a_blended_commit_finds_its_backdrop_in_the_right_tile() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 1);
+    write_flat(gpu, &mut canvas, 0, in_tile(0, 0), [255, 255, 255, 255]);
+    write_flat(gpu, &mut canvas, 0, in_tile(1, 0), [0, 0, 0, 255]);
+
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.begin_frame();
+    canvas.draw_dabs(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &[
+            dab(
+                in_tile(0, 0).x as f32 + 8.0,
+                in_tile(0, 0).y as f32 + 8.0,
+                6.0,
+                1.0,
+            ),
+            dab(
+                in_tile(1, 0).x as f32 + 8.0,
+                in_tile(1, 0).y as f32 + 8.0,
+                6.0,
+                1.0,
+            ),
+        ],
+        DabStyle::default(),
+    );
+    let pieces = [in_tile(0, 0), in_tile(1, 0)];
+    let span = PixelRect {
+        x: pieces[0].x,
+        y: pieces[0].y,
+        width: pieces[1].x + pieces[1].width - pieces[0].x,
+        height: 16,
+    };
+    canvas.commit_stroke(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        0,
+        span,
+        &pieces,
+        StrokeStyle {
+            color: Color::from_srgb_u8(255, 255, 255, 255),
+            opacity: 1.0,
+            blend: BlendMode::Multiply,
+            ..StrokeStyle::default()
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let at = |x: u32, y: u32| {
+        let px = canvas.read_layer_rect(
+            &gpu.device,
+            &gpu.queue,
+            0,
+            PixelRect {
+                x,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+        [px[0], px[1], px[2], px[3]]
+    };
+    // White multiplied by white is white; black multiplied by white is black.
+    let (a, b) = (in_tile(0, 0), in_tile(1, 0));
+    assert_near(
+        at(a.x + 8, a.y + 8),
+        [255, 255, 255],
+        2,
+        "multiply over white",
+    );
+    assert_near(at(b.x + 8, b.y + 8), [0, 0, 0], 2, "multiply over black");
+}

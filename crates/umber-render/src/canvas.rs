@@ -1888,6 +1888,18 @@ struct TransformUniforms {
     _pad2: f32,
 }
 
+/// What one slot's table slice becomes after a flip, held until the passes that
+/// read the old one have been submitted.
+///
+///  is where each destination tile ended up and  is the cells the
+/// slot held before, which go back to the pool except where a destination reused
+/// one.
+struct FlipInstall {
+    slot: u32,
+    placed: Vec<((u32, u32), Entry)>,
+    freed: Vec<Entry>,
+}
+
 /// One drawn piece of a commit: which page of the atlas it writes, what takes a
 /// document pixel there, and the document rectangle it covers.
 ///
@@ -4342,7 +4354,11 @@ impl CanvasRenderer {
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.layers.texture,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: dx, y: dy, z: page },
+                    origin: wgpu::Origin3d {
+                        x: dx,
+                        y: dy,
+                        z: page,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::Extent3d {
@@ -4361,7 +4377,8 @@ impl CanvasRenderer {
         let base = self.layers.slot_at(slot);
         for ty in 0..self.layers.grid.tiles.y {
             for tx in 0..self.layers.grid.tiles.x {
-                self.layers.entries[base + self.layers.grid.index(tx, ty)] = Entry::at(page, tx, ty);
+                self.layers.entries[base + self.layers.grid.index(tx, ty)] =
+                    Entry::at(page, tx, ty);
             }
         }
         self.layers.use_of[page as usize] = PageUse::Owned(slot);
@@ -5526,13 +5543,16 @@ impl CanvasRenderer {
     fn commit_aims(&self, slot: u32, pieces: &[PixelRect]) -> Vec<CommitAim> {
         let mut out = Vec::new();
         if let Some(page) = self.layers.owned_page(slot) {
-            out.extend(pieces.iter().filter(|p| p.width > 0 && p.height > 0).map(
-                |p| CommitAim {
-                    page,
-                    delta: (0, 0),
-                    doc: *p,
-                },
-            ));
+            out.extend(
+                pieces
+                    .iter()
+                    .filter(|p| p.width > 0 && p.height > 0)
+                    .map(|p| CommitAim {
+                        page,
+                        delta: (0, 0),
+                        doc: *p,
+                    }),
+            );
             return out;
         }
         for piece in pieces {
@@ -6069,7 +6089,7 @@ impl CanvasRenderer {
 
         // What each slot's table slice will become, held until the encoder has
         // been submitted. See the note on ordering above.
-        let mut installs: Vec<(u32, Vec<((u32, u32), Entry)>, Vec<Entry>)> = Vec::new();
+        let mut installs: Vec<FlipInstall> = Vec::new();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("flip-canvas"),
         });
@@ -6187,13 +6207,22 @@ impl CanvasRenderer {
                 );
                 placed.push((tile, cell));
             }
-            installs.push((slot, placed, freed));
+            installs.push(FlipInstall {
+                slot,
+                placed,
+                freed,
+            });
         }
         queue.submit(Some(enc.finish()));
 
         // Only now. Every pass above resolved through the residency it was
         // reading; these are the residencies it produced.
-        for (slot, placed, freed) in installs {
+        for FlipInstall {
+            slot,
+            placed,
+            freed,
+        } in installs
+        {
             let kept: Vec<Entry> = placed.iter().map(|(_, e)| *e).collect();
             let base = self.layers.slot_at(slot);
             for i in 0..self.layers.grid.tiles_per_page() as usize {
@@ -6214,10 +6243,21 @@ impl CanvasRenderer {
     /// Which tiles a slot needs once the canvas is mirrored.
     ///
     /// A destination tile has to be stored wherever the source rectangle it is
-    /// made of touches a tile that is. The count is within one column or row of
-    /// the source's — a mirror is a bijection — so this neither grows nor
-    /// shrinks a layer's residency by more than the edge tile the canvas's own
-    /// size cuts short.
+    /// made of touches a tile that is.
+    ///
+    /// **This is an over-approximation and a flip therefore coarsens
+    /// residency**, which is worth stating rather than discovering. All that is
+    /// known about a backed tile is that it is backed, not where inside it the
+    /// paint is; a 256-wide source tile mirrored onto a canvas that is not a
+    /// whole number of tiles lands across *two* destination tiles, so a tile
+    /// holding one mark becomes two holding half of one each. The picture is
+    /// exact either way — `a_flip_mirrors_a_sparse_layer_and_flipping_twice_
+    /// restores_it_exactly` compares every byte — and it is the storage that
+    /// grows, at most doubling per flip and bounded by the grid. Nothing short
+    /// of knowing where the paint is inside a tile can do better, and that is a
+    /// readback of the whole layer at pointer-up on a command that is already
+    /// the rarest thing here. A canvas that *is* a whole number of tiles is
+    /// exact.
     fn mirrored_residency(&self, slot: u32, axis: FlipAxis) -> Vec<(u32, u32)> {
         let grid = self.layers.grid;
         let mut out = Vec::new();
@@ -6415,11 +6455,7 @@ impl CanvasRenderer {
         // The layer's own page, which `promote` above guaranteed exists and is
         // identity-mapped — so a document texel is at the atlas texel
         // `fs_mask`'s `textureLoad` asks for.
-        let layer_page = self
-            .layers
-            .owned_page(source.slot)
-            .expect("promoted above")
-            as usize;
+        let layer_page = self.layers.owned_page(source.slot).expect("promoted above") as usize;
         let mask_bind_group =
             make_bind_group(&self.layers.page_views[layer_page], "transform-mask-bg");
 

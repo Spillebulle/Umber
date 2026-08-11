@@ -211,17 +211,25 @@ impl Graphics {
     /// The background is the caller's to set, because this does not take a
     /// `Document`: [`Graphics::add_canvas`] is what pairs the two, and a
     /// renderer cloned from another document's does not inherit it.
-    fn make_canvas(&self, size: UVec2, slots: u32) -> Result<CanvasRenderer, Vram> {
+    /// Reserve a document's tile atlas, or report what the device refused.
+    ///
+    /// **`pages`, not slots.** Since the atlas has an allocator, a slot costs a
+    /// slice of the page table and no storage at all, so there is nothing to
+    /// reserve per layer; what has to exist up front is enough *pages* to hold
+    /// the tiles about to be uploaded. `install_import` computes that from the
+    /// piece set the reader handed it — which is exactly the residency signal,
+    /// and for a `.clip` is block presence.
+    fn make_canvas(&self, size: UVec2, pages: u32) -> Result<CanvasRenderer, Vram> {
         match self.canvases.values().next() {
             Some(existing) => {
-                existing.try_for_document(&self.gpu.device, &self.gpu.queue, size, slots)
+                existing.try_for_document(&self.gpu.device, &self.gpu.queue, size, pages)
             }
             None => CanvasRenderer::try_new(
                 &self.gpu.device,
                 &self.gpu.queue,
                 size,
                 self.config.format,
-                slots,
+                pages,
             ),
         }
     }
@@ -4540,7 +4548,31 @@ impl UmberApp {
             history,
         } = imported.open();
         let size = doc.size;
-        let slots = layers.slot_capacity_needed();
+        // **The reservation is stated in pages, computed from the residency
+        // about to be uploaded.** It used to be `slot_capacity_needed()` — one
+        // canvas-sized slice a layer — and that figure is what refused the
+        // artist's 20000×5000 document at 21.2 GB while it held 1.42 GB of
+        // paint. A slot costs no storage now, so what has to exist is enough
+        // pages for the tiles the pieces reach; `Opened::uploads` already *is*
+        // the piece set, which for a `.clip` is block presence.
+        //
+        // Presence over-reports residency — measured at 1.13× across the
+        // corpus and 1.58× on the worst document — so this is an upper bound on
+        // what will actually be backed rather than an estimate, which is the
+        // right direction for a reservation.
+        let grid = umber_core::tile::Grid::new(UVec2::new(size.x, size.y));
+        let mut tiles = 0usize;
+        for upload in &uploads {
+            let mut seen: Vec<(u32, u32)> = upload
+                .pieces
+                .iter()
+                .flat_map(|p| grid.tiles_over(p.rect))
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            tiles += seen.len();
+        }
+        let pages = (tiles as u32).div_ceil(grid.tiles_per_page().max(1));
 
         // **The layer array is asked for before `open_document`**, which is the
         // whole of how a card that cannot hold it produces a sentence rather
@@ -4551,11 +4583,11 @@ impl UmberApp {
         // editor. Here nothing has touched the *session*, so a refusal leaves it
         // exactly as it was, exactly as the device-limit check above does.
         //
-        // Not before `imported.open()`, which has already run three lines up:
-        // the slice count is not the layer count — a mask is a slice too — so
-        // there is nothing to ask the device for until the stack exists. That
-        // call has therefore already built this document's host-side buffers,
-        // and a refusal here frees them rather than never allocating them.
+        // Not before `imported.open()`, which has already run: the page count
+        // is derived from the pieces that call produced, so there is nothing to
+        // ask the device for until they exist. That call has therefore already
+        // built this document's host-side buffers, and a refusal here frees
+        // them rather than never allocating them.
         //
         // **It does not cover the uploads below.** Those go through
         // `Queue::write_texture`, whose staging buffer is allocated by wgpu's
@@ -4564,7 +4596,7 @@ impl UmberApp {
         // and the submit in the loop bound how much staging can stand at once;
         // they do not make it reportable. See `vram`'s module docs.
         let reserved = match self.gfx.as_ref() {
-            Some(gfx) => match gfx.make_canvas(UVec2::new(size.x, size.y), slots) {
+            Some(gfx) => match gfx.make_canvas(UVec2::new(size.x, size.y), pages) {
                 Ok(canvas) => Some(canvas),
                 Err(refused) => {
                     // The artist's own count, not the slice count: a masked
