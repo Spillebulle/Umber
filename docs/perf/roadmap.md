@@ -288,6 +288,14 @@ because this is the paragraph the next person reads.
   `a_mask_multiplier_reaches_every_level_the_composite_can_show` are the counts,
   and `every_level_a_mask_can_hold_moves_the_picture` is the same claim measured
   on the GPU.
+  **But "the one live loss" is a trade, and both this paragraph and
+  `formats-and-host-memory.md` §5.2 stated only the favourable half.** A mask
+  scales premultiplied RGBA, so there are two destinations and the counts
+  mirror: linear storage reaches 256 alphas and 183 colours, sRGB storage 183
+  and 256. Linear is right because alpha is the channel a mask multiplies, and
+  it costs the hide end over an *opaque* backdrop — the first non-zero mask
+  level now moves the output by 13 sRGB levels rather than 1. Both docs now
+  carry the table.
 - **There is no dedicated linear array.** The mask stayed in the layer array and
   took a second *view* of it — `LAYER_FORMAT_LINEAR`, the raw view `flip.wgsl`
   already used. The composite and the effect extract bind it for their mask tap;

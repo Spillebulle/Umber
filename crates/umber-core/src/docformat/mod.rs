@@ -2740,24 +2740,33 @@ mod tests {
         );
     }
 
-    /// **A mask patch written by this build comes back byte for byte.**
+    /// **A mask patch answers to the document's revision, in both directions.**
     ///
-    /// The bytes go in raw at both ends, so this is the mask's half of
-    /// `saving_and_reopening_does_not_move_a_pixel` — and it is a real claim
-    /// rather than a tautology now, because the reader has a branch that
-    /// *would* convert them. A document this build writes declares 4, so that
-    /// branch must not fire; one written before it declares 3 and it must. The
-    /// coverage is a partial for the reason it is everywhere else here: 0 and
-    /// 255 are the transfer function's fixed points and survive either way.
+    /// A mask slice used to hold sRGB-encoded coverage and now holds the linear
+    /// multiplier, so a patch of one means something different either side of
+    /// [`VERSION`] 4 — and the bytes go in raw at both ends, which is what makes
+    /// this a real claim rather than a tautology: the reader has a branch that
+    /// converts, and it must fire for a revision-3 file and not for this one.
     ///
-    /// **What this does not drive is the conversion itself**, only its absence.
-    /// Building a revision-3 archive carrying a manifest is more fixture than
-    /// the claim is worth, and the conversion is the same
-    /// `srgb::decode_v3_mask_buffer` `openraster::load_mask` calls, which
-    /// `a_mask_written_before_the_bump_is_converted_and_a_current_one_is_not`
-    /// does drive. Said out loud rather than left for somebody to assume.
+    /// **The v3 half was missing and the gap was proved by mutation.** Turning
+    /// `docimport::history`'s condition off left all 1,122 tests green, because
+    /// the only guard was this one's first half — which drives the *absence* of
+    /// the conversion — and
+    /// `a_mask_written_before_the_bump_is_converted_and_a_current_one_is_not`,
+    /// which drives `openraster::load_mask`: a different function, at a
+    /// different call site, keyed off a different flag, that never enters
+    /// `history.rs` at all. A doc comment here claimed the second covered the
+    /// first. It did not. That is "a guard on a model is not a guard on the
+    /// panel" one module over, and the cost of it is a *document damaged by an
+    /// undo*: open a pre-4 file whose history holds a mask stroke, press Ctrl+Z,
+    /// and the mask goes back a full gamma curve out.
+    ///
+    /// One archive is built and read twice, with nothing between the two but the
+    /// version attribute, so neither reading can be explained by the fixture.
+    /// The coverage is a partial for the reason it is everywhere else here: 0
+    /// and 255 are the transfer function's fixed points and survive either way.
     #[test]
-    fn a_mask_patch_survives_a_round_trip_unconverted() {
+    fn a_mask_patch_is_converted_or_not_by_the_revision_the_document_declares() {
         use crate::history::{Edit, EditBody, EditKind, History, PixelPatch};
 
         let size = UVec2::new(4, 4);
@@ -2770,6 +2779,7 @@ mod tests {
         // The patch names the *mask's* slice, which is what makes the entry
         // record `mask: true` and reach the branch under test.
         let mask_slot = stack.add_mask(0).expect("a mask slice");
+        assert_ne!(slot, mask_slot, "the fixture is not testing anything");
 
         let rect = crate::geom::PixelRect {
             x: 0,
@@ -2777,20 +2787,35 @@ mod tests {
             width: 2,
             height: 2,
         };
+        // 188 is what the old form stored for a half, so the conversion has
+        // somewhere unambiguous to land and the direction is legible in the
+        // assertion: 128 is right and 229 is the mirrored bug.
+        //
+        // **An ordinary patch rides beside it, carrying the same byte**, and it
+        // is what makes `entry.mask` load-bearing rather than decorative. With a
+        // mask patch alone, dropping that half of the condition converts the one
+        // patch that wanted converting and nothing objects — so the guard would
+        // hold the *version* test and not the *which slice* test. A layer's
+        // pixels are premultiplied sRGB colour and the mask table means nothing
+        // to them; put them through it and every pre-4 document's history comes
+        // back darker.
         let mut history = History::default();
         history.record(Edit::new(
             EditKind::Paint,
-            EditBody::Pixels(PixelPatch::new(rect, mask_slot, vec![77; 2 * 2 * 4])),
+            EditBody::Pixels(PixelPatch::new(rect, mask_slot, vec![188; 2 * 2 * 4])),
+        ));
+        history.record(Edit::new(
+            EditKind::Paint,
+            EditBody::Pixels(PixelPatch::new(rect, slot, vec![188; 2 * 2 * 4])),
         ));
         let saved = super::history::SaveHistory::new(&history, &stack)
             .expect("every patch names a live slice");
-        assert_ne!(slot, mask_slot, "the fixture is not testing anything");
 
         let layers = vec![SaveLayer {
             mask: Some(Canvas::Held(&mask)),
             ..layer("Ink", &px)
         }];
-        let doc = round_trip(&SaveDocument {
+        let (bytes, warnings) = encode(&SaveDocument {
             size,
             layers: &layers,
             active: 0,
@@ -2798,20 +2823,46 @@ mod tests {
             dpi: Document::DEFAULT_DPI,
             merged: Canvas::Held(&px),
             history: Some(saved),
-        });
-        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        })
+        .expect("encode");
+        assert!(warnings.is_empty(), "{warnings:?}");
 
-        let opened = doc.open();
-        assert_eq!(opened.history.len(), 1, "the history came back");
-        let patch = &opened.history.entry_at(0).unwrap().patches()[0];
+        // `(the mask patch's byte, the ordinary patch's byte)`, in the order
+        // they were recorded.
+        let patch_bytes = |bytes: &[u8]| {
+            let doc = docimport::read_openraster(bytes).expect("read back");
+            assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+            let opened = doc.open();
+            assert_eq!(opened.history.len(), 2, "both entries came back");
+            let at =
+                |i: usize| opened.history.entry_at(i).unwrap().patches()[0].pieces()[0].bytes()[0];
+            (at(0), at(1))
+        };
+
         assert_eq!(
-            patch.pieces()[0].bytes()[0],
-            77,
-            "a mask patch this build wrote must come back unconverted"
+            patch_bytes(&bytes),
+            (188, 188),
+            "nothing this build wrote may be converted on the way back in"
         );
-        // And the layer's own mask entry beside it, which travels the same file
-        // and has to answer to the same revision.
-        assert_eq!(opened.stack.get(0).unwrap().mask(), Some(mask_slot));
+
+        // The same archive, saying it was written before the bump. Everything
+        // else about it — the manifest, the PNGs, the rectangles — is identical.
+        let older = with_stack_xml(&bytes, |xml| {
+            let from = format!("{VERSION_ATTR}=\"4\"");
+            assert!(xml.contains(&from), "the fixture did not declare 4: {xml}");
+            xml.replace(&from, &format!("{VERSION_ATTR}=\"3\""))
+        });
+        let (converted, untouched) = patch_bytes(&older);
+        assert!(
+            (i32::from(converted) - 128).abs() <= 1,
+            "a revision-3 mask patch must be converted; 188 meant a half, got \
+             {converted}, and 229 would be the mirrored direction"
+        );
+        assert_eq!(
+            untouched, 188,
+            "a patch of a layer's own pixels is colour, and the mask table means \
+             nothing to it"
+        );
     }
 
     /// Write a document and read it straight back through the importer, which

@@ -3035,14 +3035,25 @@ fn every_level_a_mask_can_hold_moves_the_picture() {
     // **Measured on the alpha, and that is not a convenience.** A mask
     // multiplies the layer's alpha, which is linear 8-bit; the *colour* the
     // composite hands the screen has been through the sRGB encode, whose slope
-    // at the reveal end is about a sixth, so 56 near-white greys are 7 pixels
+    // at the reveal end is about a sixth, so 56 near-white greys are 27 pixels
     // there whatever the mask holds. Reading the colour would measure the
     // display encode and call it a mask defect. `export_rgba` is the one path
     // that hands back straight alpha, and it reuses this very composite pass.
     //
-    // The reveal range is what is swept, because that is where a mask is visible
-    // and where the sRGB storage this replaced was worst: over 200..=255 it
-    // could express 22 of the 56.
+    // **The *hide* end is what is swept, and the first draft swept the reveal
+    // end on a figure that was made up.** It said the old storage "could express
+    // 22 of the 56" over 200..=255; measured, it expresses all 56 there, because
+    // `srgb_to_linear` is *steep* at the top — high stored bytes spread out and
+    // collide nowhere. Its toe is where alpha states collapse: over stored
+    // 0..=55 linear reaches 56 distinct alphas and sRGB reaches **11**. So the
+    // count below only means something down here, and up there it would have
+    // been a tautology dressed as a measurement — which is this file's own rule
+    // about a figure in a comment being what the next change gets argued
+    // against, with the figure invented.
+    //
+    // See `umber_core::docimport::srgb` for the half of this that goes the other
+    // way: at the hide end over an *opaque* backdrop the colour granularity gets
+    // worse, and the change is a trade rather than a free win.
     let mut h = harness_or_skip!();
     h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
     fill_slot(&mut h, 0, [255, 255, 255, 255]);
@@ -3053,7 +3064,7 @@ fn every_level_a_mask_can_hold_moves_the_picture() {
     masked.mask = Some(1);
 
     let mut seen = std::collections::BTreeSet::new();
-    for level in 200..=255u8 {
+    for level in 0..=55u8 {
         h.canvas.write_layer_rect(
             &h.gpu.device,
             &h.gpu.queue,
@@ -3076,13 +3087,15 @@ fn every_level_a_mask_can_hold_moves_the_picture() {
         );
         seen.insert(px[at + 3]);
     }
-    // Every one of the 56 lands somewhere of its own. A regression here is a
-    // *shortfall* rather than a wrong pixel, which is exactly why counting is
-    // what catches it and why the spot check this file already had could not.
+    // Every one of the 56 lands somewhere of its own, against 11 for the storage
+    // this replaced. A regression here is a *shortfall* rather than a wrong
+    // pixel, which is exactly why counting is what catches it and why the spot
+    // check this file already had could not.
     assert_eq!(
         seen.len(),
         56,
-        "levels 200..=255 collapsed into {} distinct alphas",
+        "levels 0..=55 collapsed into {} distinct alphas; the sRGB storage this \
+         replaced reaches 11 here",
         seen.len()
     );
 }

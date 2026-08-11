@@ -48,9 +48,24 @@
 //! input 75 upward, so 73 of 256 inputs collide with their neighbour. Measured
 //! both ways and it is the same figure from either end — an sRGB-stored mask can
 //! express only **183** of the 256 multipliers the composite's own 8-bit alpha
-//! can show, all 73 of the missing ones in the upper *reveal* range where a mask
-//! is actually visible. Adjacent stored bytes differ by 0.0089 in the multiplier
-//! at the reveal end, against a uniform 0.0039 for linear.
+//! can show. Adjacent stored bytes differ by 0.0089 in the multiplier at the
+//! reveal end, against a uniform 0.0039 for linear.
+//!
+//! **It is a trade and not a free win, and saying so is the honest half.** A
+//! mask scales premultiplied RGBA, and the two halves land in channels of
+//! different kinds: alpha is linear 8-bit, colour is sRGB 8-bit. The counts are
+//! exactly mirrored — linear storage reaches 256 alphas and 183 colours, sRGB
+//! storage 183 and 256 — and they have to be, because the two storages differ by
+//! the transfer function and so do the two destinations. What decides it is that
+//! a mask is a multiplier on **alpha**: that is the channel it scales, it is
+//! what a transparent-background document exports, and it is the form every
+//! source format already states. What it costs is the hide end over an *opaque*
+//! backdrop, where the first non-zero mask level now takes the output from
+//! sRGB 0 to sRGB 13 where it used to step 0, 1, 2 — so a light layer masked
+//! down over dark artwork bands there where it did not before.
+//! `a_mask_multiplier_reaches_every_level_the_composite_can_show` measures all
+//! four cells, because a guard that took one column would have read as proof of
+//! something that is only half true.
 //!
 //! So a mask slice now holds **linear coverage**, read through the array's
 //! `LAYER_FORMAT_LINEAR` view — the same raw view `flip.wgsl` has always used,
@@ -370,25 +385,39 @@ mod tests {
     #[test]
     fn a_mask_multiplier_reaches_every_level_the_composite_can_show() {
         // Stated at the far end rather than at this function, because that is
-        // where it is spent: a mask multiplies an opaque layer's alpha and the
-        // result lands in an 8-bit linear channel, so what the picture can show
-        // is `round(m · 255)` over every byte a slice can hold. Linear reaches
-        // all 256. The sRGB form this replaced reached 183, and the second half
-        // measures that rather than asserting it, so the figure in the module
-        // docs is one a test prints.
-        let reach = |m: fn(u8) -> f32| {
+        // where it is spent — and stated for **both** destinations, because a
+        // mask scales premultiplied RGBA and the two halves of that land in
+        // channels of different kinds. This is the measurement the first draft
+        // took only one side of, and one side of it reads as a free win.
+        //
+        //   destination            linear   sRGB
+        //   8-bit linear alpha        256    183
+        //   8-bit sRGB colour         183    256
+        //
+        // Exactly mirrored, and it has to be: the two storages differ by the
+        // transfer function and so do the two destinations. What decides it is
+        // that a mask is a multiplier on **alpha** — that is the channel it
+        // scales, it is what a transparent-background document exports, and it
+        // is what every source format's byte already means. The colour column is
+        // the cost and is not nothing: a light layer masked down over an opaque
+        // dark backdrop bands at the hide end where it did not before, because
+        // the first non-zero mask level now takes the output from sRGB 0 to
+        // sRGB 13 where it used to step 0, 1, 2.
+        let reach = |m: fn(u8) -> f32, out: fn(f32) -> f32| {
             let mut seen = [false; 256];
             for s in 0..=255u8 {
-                seen[(m(s) * 255.0 + 0.5) as usize] = true;
+                seen[(out(m(s)) * 255.0 + 0.5) as usize] = true;
             }
             seen.iter().filter(|s| **s).count()
         };
-        assert_eq!(reach(|s| s as f32 / 255.0), 256, "linear coverage");
-        assert_eq!(
-            reach(|s| srgb_to_linear(s as f32 / 255.0)),
-            183,
-            "the sRGB form this replaced, for the record"
-        );
+        let linear = |s: u8| s as f32 / 255.0;
+        let srgb = |s: u8| srgb_to_linear(s as f32 / 255.0);
+        let alpha = |m: f32| m;
+
+        assert_eq!(reach(linear, alpha), 256, "linear storage, alpha");
+        assert_eq!(reach(srgb, alpha), 183, "sRGB storage, alpha");
+        assert_eq!(reach(linear, linear_to_srgb), 183, "linear storage, colour");
+        assert_eq!(reach(srgb, linear_to_srgb), 256, "sRGB storage, colour");
     }
 
     #[test]
