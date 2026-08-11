@@ -2544,15 +2544,25 @@ struct EffectCache {
 /// it, close other applications" — to somebody whose card was never asked, which
 /// is the refusal naming the wrong bound that `check_bounds` was split apart to
 /// stop.
-/// **No test reaches `Ceiling`, and that is a property of the arithmetic rather
-/// than a gap somebody could close.** A page holds exactly one canvas's worth of
-/// tiles, so `MAX_SLOTS` pages need `MAX_SLOTS` slots' worth of paint — at which
-/// point `bake_effects`' `capacity == 0` has already refused the bake, because
-/// there is no slice left above the stack for an effect to use. `begin_float`
-/// refuses at `reserved >= MAX_SLOTS` for the same reason. It is written because
-/// the alternative is a synthesised `Vram`, which is wrong whether or not
-/// anything can produce it.
-enum PageRefusal {
+/// **No test reaches `Ceiling`, and for the effect bake that is a property of
+/// the arithmetic rather than a gap somebody could close.** A page holds exactly
+/// one canvas's worth of tiles, so `MAX_SLOTS` pages need `MAX_SLOTS` slots'
+/// worth of paint — at which point `bake_effects`' `capacity == 0` has already
+/// refused the bake, because there is no slice left above the stack for an
+/// effect to use. `begin_float` refuses at `reserved >= MAX_SLOTS` for the same
+/// reason. It is written because the alternative is a synthesised [`Vram`],
+/// which is wrong whether or not anything can produce it.
+///
+/// **[`CanvasRenderer::flip_layers`] is a second producer and its `Ceiling` is
+/// not that unreachable**, which is why this is `pub`. A flip holds a slot's old
+/// residency *and* the tiles the mirror lands on at the same instant, so its
+/// peak is up to twice the document's — sixty-four layers each with a mask, each
+/// half covered on a canvas that is not a whole number of tiles, is the shape
+/// that reaches it. Nothing here can produce that on a runner, and the flip is
+/// written so that it does not matter: it refuses whole rather than dropping
+/// tiles, and the tiles a flip drops are paint no undo can reach.
+#[derive(Debug)]
+pub enum PageRefusal {
     /// The device would not allocate the grown atlas.
     Device(Vram),
     /// [`MAX_SLOTS`] pages already, and none of them whole and free.
@@ -6581,30 +6591,67 @@ impl CanvasRenderer {
     /// unmirrored over the flipped picture and a preview would put its pixels
     /// down in the place they were dragged to before the flip.
     ///
-    /// # Both of its allocations are refusals rather than deaths, and neither was
+    /// # A flip happens whole or not at all, and the refusal is the whole of how
     ///
-    /// A flip asks the device for two things: the atlas grows, because a
-    /// mirrored tile straddles two destination tiles wherever the canvas is not
-    /// a whole number of them, and then a page-sized scratch. Both went through
-    /// the infallible path — `ensure_pages` and a bare `create_texture` — so on a
-    /// card with room for the document and not for one more page beside it,
-    /// Image ▸ Flip was the crash box. `try_reserve`'s enumeration of what is
-    /// still fatal named neither, which is worse than the hole: a reader
-    /// trusting that list would have looked elsewhere.
+    /// A flip asks for three things: room in the atlas for the tiles a mirror
+    /// lands on, the growth that makes that room, and a page-sized scratch. All
+    /// three used to fail open. The growth went through the infallible
+    /// `ensure_pages` and the scratch was a bare `create_texture`, so on a card
+    /// with room for the document and not for one more page beside it,
+    /// Image ▸ Flip was the crash box — and `try_reserve`'s enumeration of what
+    /// is still fatal named neither, which is worse than the hole, because a
+    /// reader trusting that list would have looked elsewhere.
     ///
-    /// **A refusal changes nothing at all.** Both reservations happen before the
-    /// probes are reset, before the capture is cancelled and before a slot is
-    /// touched, so an `Err` means the document is exactly as it was and the
-    /// caller must not record an entry saying otherwise. That is the rule
-    /// `try_ensure_pages` and `plan_set_effect` already keep, and here it decides
-    /// whether an undo would put back a picture that was never flipped.
+    /// **Making those two fallible without this paragraph would have been a
+    /// far worse bug than the crash.** The tile loop used to meet a cell it
+    /// could not back with a `log::error!` and a `continue` — reachable already,
+    /// because `growth_for` caps at [`MAX_SLOTS`] and returns as though it had
+    /// done what it was asked, and reachable on *every* refusal the moment the
+    /// growth could refuse. What a dropped tile costs here is not what it costs
+    /// a stroke: a flip's undo entry is another flip and carries **no pixels**,
+    /// so tiles dropped by one are in no patch, no parked slice and no gesture.
+    /// The artist flips the canvas, part of their painting evaporates, and
+    /// Ctrl+Z cannot bring it back because undoing a flip is flipping again.
+    /// Trading a visible crash box for permanent silent loss is not a fix.
+    ///
+    /// So the flip is atomic, which is the rule it already lives by one level
+    /// up: `mirror_document` refuses *whole* when any layer is locked, because
+    /// "a picture with some layers mirrored and some not is one that was never
+    /// on screen". The same argument reaches every tile.
+    ///
+    /// Three things make it so, and the third is what makes the other two more
+    /// than discipline:
+    ///
+    /// 1. **Every reservation happens before anything is mutated** — before the
+    ///    probes are reset, before the capture is cancelled, before a slot is
+    ///    touched — so a refusal there leaves the document exactly as it was.
+    /// 2. **The pool is checked against `wanted` after the growth**, because
+    ///    `growth_for` fails open at the ceiling: an `Ok` from
+    ///    [`Self::try_ensure_pages`] is not a promise that the cells arrived.
+    /// 3. **A shortfall inside the loop abandons the whole flip.** The encoder
+    ///    is dropped without being submitted, every cell taken goes back on the
+    ///    free list, and `entries` was never touched — so there is no state to
+    ///    unwind and nothing reaches the GPU. That is what lets 1 and 2 be a
+    ///    guard rather than a claim about reachability.
+    ///
+    /// **Three things done before the loop do survive an abandonment there**, and
+    /// naming them is the honest form of "changes nothing": the probes are reset,
+    /// a capture in flight is cancelled, and every slot's revision is bumped. None
+    /// touches a texel — a reset probe is a colour sample taken again, a cancelled
+    /// capture is restarted by `collect`'s settle, and a bumped revision costs a
+    /// thumbnail. What matters is that no *pixel* and no page-table entry moves,
+    /// because that is what the history entry would be lying about.
+    ///
+    /// The caller must not record a history entry on an `Err`: it would put a
+    /// mirror in the timeline that never happened, and stepping over it would
+    /// flip a picture that was never flipped.
     pub fn flip_layers(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         slots: &[u32],
         axis: FlipAxis,
-    ) -> Result<(), Vram> {
+    ) -> Result<(), PageRefusal> {
         if slots.is_empty() {
             return Ok(());
         }
@@ -6613,9 +6660,8 @@ impl CanvasRenderer {
         // reallocates the texture and cannot happen part-way through an encoder
         // that names it.
         //
-        // **Every read, and that is what makes a refusal free.** Nothing below
-        // this point up to the second reservation mutates the renderer, so an
-        // `Err` out of either leaves the document untouched.
+        // **Every read, and that is what makes a refusal free.** Nothing from
+        // here to the last reservation mutates the renderer.
         let plans: Vec<(u32, Vec<(u32, u32)>)> = slots
             .iter()
             .filter(|s| (**s as usize) < MAX_SLOTS && self.layers.owned_page(**s).is_none())
@@ -6635,7 +6681,8 @@ impl CanvasRenderer {
         // size whether or not the atlas grows, and the atlas is what a growth
         // would then be holding twice.
         let page = self.layers.grid.page_size();
-        let scratch = try_reserve_flip_scratch(device, self.doc_size, page, self.layers.pages)?;
+        let scratch = try_reserve_flip_scratch(device, self.doc_size, page, self.layers.pages)
+            .map_err(PageRefusal::Device)?;
 
         if self.layers.free.len() < wanted {
             let per = self.layers.grid.tiles_per_page() as usize;
@@ -6644,10 +6691,20 @@ impl CanvasRenderer {
             // No encoder yet, and deliberately: the flip's own is created below,
             // so there is nothing recorded for a separately submitted copy to
             // lose. See `ensure_pages`.
-            self.try_ensure_pages(device, queue, None, pages)?;
+            self.try_ensure_pages(device, queue, None, pages)
+                .map_err(PageRefusal::Device)?;
+        }
+        // **An `Ok` above is not a promise the cells arrived.** `growth_for`
+        // caps at `MAX_SLOTS` and returns the capped capacity as though it were
+        // what was asked for, so a document already at the ceiling grows by
+        // nothing and reports success. Asked here rather than discovered in the
+        // loop, because the loop is where a tile would be lost.
+        if self.layers.free.len() < wanted {
+            return Err(PageRefusal::Ceiling);
         }
 
-        // Past both refusals, so from here the flip happens.
+        // Past every refusal, so from here the flip happens — or is abandoned
+        // whole below, which is the same thing to the document.
         //
         // A sample recorded against the picture as it was would be read back as
         // though it belonged to the picture as it is.
@@ -6716,6 +6773,12 @@ impl CanvasRenderer {
         // What each slot's table slice will become, held until the encoder has
         // been submitted. See the note on ordering above.
         let mut installs: Vec<FlipInstall> = Vec::new();
+        // Every cell taken off the free list, so abandoning can put them all
+        // back. `placed` is not that list: it also holds cells the slot already
+        // owned, and pushing one of those onto `free` would issue a live cell
+        // twice — `atlas_invariant`'s worst failure, one layer's paint appearing
+        // inside another's.
+        let mut taken: Vec<Entry> = Vec::new();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("flip-canvas"),
         });
@@ -6796,10 +6859,31 @@ impl CanvasRenderer {
                     existing
                 } else {
                     match self.layers.free.pop() {
-                        Some(cell) => cell,
+                        Some(cell) => {
+                            taken.push(cell);
+                            cell
+                        }
+                        // **The whole flip is abandoned rather than this tile
+                        // dropped**, and the difference is the artist's
+                        // painting. A dropped tile here is paint that no undo
+                        // can reach: a flip's entry carries no pixels, so it is
+                        // in no patch, and undoing a flip is flipping again.
+                        // This used to be a `log::error!` and a `continue`.
+                        //
+                        // Nothing has to be unwound. The encoder is dropped
+                        // without `finish()`, so not one command reaches the
+                        // GPU; `entries` is written only after the submit, so
+                        // the page table still describes the picture as it is;
+                        // and every cell taken goes back. The reservation above
+                        // is what should have made this unreachable, so it is a
+                        // `log::error!` as well as a refusal.
                         None => {
-                            log::error!("the atlas is full: slot {slot} loses a tile to the flip");
-                            continue;
+                            log::error!(
+                                "the atlas ran out mid-flip after reserving {wanted} cell(s); \
+                                 the flip is abandoned whole and the picture is unchanged"
+                            );
+                            self.layers.free.append(&mut taken);
+                            return Err(PageRefusal::Ceiling);
                         }
                     }
                 };

@@ -189,6 +189,33 @@ pub fn flip_refused(refused: &Vram) -> Notice {
     }
 }
 
+/// A canvas flip that met Umber's own ceiling rather than the card's.
+///
+/// **The one notice in this module that is not about graphics memory**, and it
+/// is here rather than in a module of its own because it is the other half of
+/// one command's refusal — `PageRefusal`'s two arms, which exist because only
+/// one of them is the artist's to act on. A flip holds a slot's old tiles and
+/// the tiles the mirror lands on at the same instant, so an extreme document can
+/// want more pages than `MAX_SLOTS` however much memory the card has. Sending
+/// [`flip_refused`] there would blame a card that was never asked and offer
+/// closing other applications, which does nothing.
+///
+/// So it states **no figure and no remedy about the machine**. The lever is the
+/// document: fewer layers, or one fewer mask, is fewer pages. What it shares
+/// with the other four is the opening, and here that is the whole point — the
+/// flip is atomic, so a refusal really does mean the picture is untouched.
+pub fn flip_at_ceiling() -> Notice {
+    Notice {
+        title: "Could not flip the canvas".to_string(),
+        lines: vec![
+            "Your picture is unchanged and nothing was mirrored. This document has more \
+             layers and masks than Umber can mirror in one step. Flattening or removing \
+             some layers, or removing a layer mask, will bring it within reach."
+                .to_string(),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +283,7 @@ mod tests {
             slice_refused("a mask", &reported(21)),
             effect_refused(&reported(21)),
             flip_refused(&reported(21)),
+            flip_at_ceiling(),
         ];
         for notice in &notices {
             for text in std::iter::once(&notice.title).chain(&notice.lines) {
@@ -332,6 +360,35 @@ mod tests {
             flip.lines[0].contains("nothing was mirrored"),
             "a refused flip has to say the picture did not move: {}",
             flip.lines[0]
+        );
+
+        // **The ceiling's twin names no figure and blames no card**, because
+        // `MAX_SLOTS` is Umber's own and closing a browser does not move it.
+        // Measured against the string rather than restated: swapping
+        // `flip_at_ceiling` for `flip_refused` in `mirror_document` compiles and
+        // reads plausibly, and the words are what tell them apart.
+        let ceiling = flip_at_ceiling();
+        assert!(
+            ceiling.lines[0].contains("nothing was mirrored"),
+            "a refused flip has to say the picture did not move: {}",
+            ceiling.lines[0]
+        );
+        for absent in [
+            "graphics card",
+            "graphics memory",
+            "other applications",
+            "GB",
+        ] {
+            assert!(
+                !ceiling.lines[0].contains(absent),
+                "the ceiling refusal claims “{absent}”, which was never asked: {}",
+                ceiling.lines[0]
+            );
+        }
+        assert!(
+            ceiling.lines[0].contains("Flattening"),
+            "the ceiling refusal offers nothing to do: {}",
+            ceiling.lines[0]
         );
     }
 

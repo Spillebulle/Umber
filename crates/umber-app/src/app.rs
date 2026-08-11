@@ -860,7 +860,15 @@ impl UmberApp {
         // refusal while stepping back leaves the history where it is rather than
         // half applied.
         if let Err(refused) = canvas.flip_layers(&gfx.gpu.device, &gfx.gpu.queue, &slots, axis) {
-            self.editor.notice = Some(vram::flip_refused(&refused));
+            // **Two refusals, because only one of them is the card's.**
+            // Collapsing them would tell somebody whose card was never asked to
+            // close other applications, which is the wrong-bound refusal
+            // `check_bounds` was split apart to stop. `PageRefusal` already
+            // makes the distinction for the effect bake.
+            self.editor.notice = Some(match refused {
+                umber_render::PageRefusal::Device(refused) => vram::flip_refused(&refused),
+                umber_render::PageRefusal::Ceiling => vram::flip_at_ceiling(),
+            });
             return false;
         }
         self.editor.flip_canvas(axis);
