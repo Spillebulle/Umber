@@ -31,11 +31,11 @@
 //! Everything else is held equal on purpose. The substitution is textual and
 //! **self-checking**: it takes `tiles.wgsl` up to `fn tile_bilinear(` and
 //! refuses to run if that is not the last item in the file, so a function added
-//! after it cannot be silently dropped from the variant. Both variants declare
-//! the same extra sampler at the same binding whether or not they read it, so
-//! the two pipelines share one layout and differ in nothing else.
+//! after it cannot be silently dropped from the variant. Every variant declares
+//! the same extra sampler at the same binding whether or not it reads it, so
+//! the pipelines share one layout and differ in nothing else.
 //!
-//! Three variants are compiled, not two:
+//! Four variants are compiled, not two:
 //!
 //! - **tiled** — the shipped `tile_bilinear`, byte for byte.
 //! - **sampled** — one hardware bilinear tap. This is the pre-atlas composite.
@@ -44,6 +44,9 @@
 //!   is: it splits the atlas's cost into the dependent table read and the taps
 //!   that hang off it, which is the split the design's argument turns on. It
 //!   cannot be optimised away because it really does read a texture.
+//! - **gather** — `textureGather` inside the existing single-tile fast path.
+//!   §11.3 named this as the unmeasured middle between the shipped four loads
+//!   and an apron; [`GATHER_BODY`] is what it is and why it is exact.
 //!
 //! # Residency is the axis that can reverse the sign
 //!
@@ -93,12 +96,30 @@
 //!
 //! # What is checked rather than assumed
 //!
-//! The dense cell renders once through each of the two real variants and the
-//! frames are compared. They are two renderings of one picture — a hardware
+//! Two comparisons, and they are held to **different** bars on purpose.
+//!
+//! `tiled` against `sampled` is two *renderings* of one picture — a hardware
 //! bilinear tap and a hand lerp of four `textureLoad`s — so they agree to
 //! within the last bit rather than exactly, and the largest deviation is
 //! printed. A large one would mean the A/B is comparing two different pictures
 //! and the whole table is void.
+//!
+//! `gather` against `tiled` must be **exactly zero**, on every residency. It
+//! reads the same stored texels and runs the same f32 lerp, so it is one
+//! rendering computed twice; anything else means it is fetching different
+//! texels. Every residency, because the packed atlas and the unbacked branch
+//! are paths the dense store never takes.
+//!
+//! **What that check catches, demonstrated by mutation rather than claimed.**
+//! Dropping the canvas-edge weight collapse is 15 of 255; permuting the gather's
+//! component order is 22; aiming the gather one texel over is 23. What it does
+//! **not** catch is aiming at the texel corner (`+ 0.5`) instead of its centre
+//! (`+ 1.0`) — that came back exact. That is the honest reading and it is the
+//! reason the aim is written the way it is: at the corner the hardware's own
+//! `floor(uv * dim - 0.5)` sits exactly on a boundary and which side it falls is
+//! this driver's rounding, so a variant that happens to agree here could step
+//! into the neighbouring tile on another. [`GATHER_BODY`] argues that from the
+//! arithmetic, because no check available from this machine can.
 //!
 //! It is an example rather than a test because it asserts wall-clock time,
 //! which CLAUDE.md forbids on CI, and because it wants gigabytes of a real card.
@@ -192,6 +213,10 @@ impl Variant {
 /// hardware's precision. `dim` is derived from `doc_size` rather than asked of
 /// the texture, because a page *is* the canvas rounded up to whole tiles —
 /// `Grid::page_size` — so it is three integer operations and no query.
+/// **The check cannot see this one**: aiming at the corner instead came back
+/// exact on this adapter, because its rounding at an exact boundary happens to
+/// agree. That is an argument from arithmetic with a mutation saying the guard
+/// is silent about it, which is the honest shape rather than a claim of cover.
 ///
 /// **The component order.** WGSL follows D3D and Vulkan: the returned vector is
 /// the four texels counter-clockwise from the lower left, which in a y-down
