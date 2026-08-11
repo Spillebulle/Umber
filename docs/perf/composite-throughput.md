@@ -1426,9 +1426,10 @@ and returns without touching the atlas. At 1920x1080, 1:1, 54 layers, dense:
 | `tiled` — the above plus four `textureLoad`s and the lerp | 2.49 | **+1.31 ms** |
 
 **The dependent page-table read is nearly free** — a slot's table slice is
-`tiles.x × tiles.y × 4` bytes, 6.4 KB for this canvas, so the whole table for 54
-slots is cache-resident and the latency the design worried about never
-materialises. What costs is the hand-reconstructed tap: four scalar
+`tiles.x × tiles.y × 4` bytes, which at 1920x1080 is 40 tiles and **160 bytes**,
+so the whole table for 54 slots is **8.4 KB** and sits in cache, and the latency
+the design worried about never materialises. It stays small on a large canvas:
+54 KB at 4096². What costs is the hand-reconstructed tap: four scalar
 `textureLoad`s and a lerp against one TMU instruction, and the ratio between
 them is about **16x**.
 
