@@ -67,6 +67,13 @@ What stage 2 still has to do, in the order the risk runs:
    and the flip on today's code, and it is not in this document at all: §7 and
    §9.4 assume every slot is tiled and then have to invent a residency rule for
    the float's preview that changes every frame of a drag.
+   **`LayerStore::capacity` has to become two numbers with it.** It is the page
+   table's depth *and* the atlas's today, because under the identity they are
+   the same; once they are not, `growth_for`, `built_capacity`, `ensure_slots`,
+   `Vram::slices` and `MAX_SLOTS`'s derivation each have to be told which of the
+   two they meant. The slot count is what `MAX_SLOTS` bounds and it is free —
+   a slot costs `tiles.x × tiles.y × 4` bytes of table; the page count is what
+   costs money and what a refusal is stated against.
 2. **`write_layer_rect` backing the tiles it writes.** §3.6's floor — the
    emptiness scan — is **not needed and must not be built**, and the roadmap's
    §2.1 is why. Stage 2 of the programme already made `ImportedLayer::pixels` a
