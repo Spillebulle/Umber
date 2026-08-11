@@ -1299,6 +1299,71 @@ pub enum Report {
     /// logged: a broken autosave must never become a dialog that keeps
     /// appearing while somebody is trying to paint.
     Failed { title: String, message: String },
+    /// The writer thread ended without being asked to, which can only be a
+    /// panic in it. See [`Autosave::poll`].
+    ///
+    /// **Not a [`Self::Failed`] naming a document**, and the difference is what
+    /// the artist has to act on: one document refused is one document, where a
+    /// writer that has gone is *every* autosave from then until it is started
+    /// again. Naming a document would understate it, and by the time this is
+    /// noticed the document that was being written has usually been handed over
+    /// and forgotten, so there is often no honest name to give.
+    WriterVanished,
+}
+
+impl Report {
+    /// What the artist is told, where there is anything to tell them.
+    ///
+    /// Exhaustive, deliberately: a fourth report cannot be added without
+    /// deciding whether it interrupts somebody who is painting. It is here
+    /// rather than inlined at [`collect`] so a test can read the sentence
+    /// without a device — that call site takes a `Gpu` and a canvas map.
+    pub fn notice(&self) -> Option<Notice> {
+        match self {
+            // Nothing to say: the good case is the tab's dot coming off.
+            Self::Written { .. } => None,
+            Self::Failed { title, message } => Some(Notice {
+                title: format!("Could not autosave “{title}”"),
+                lines: vec![
+                    message.clone(),
+                    "Autosave will keep trying. Your work is not lost. Use \
+                     File, Save to write it where you want it."
+                        .to_string(),
+                ],
+            }),
+            // "Will start it again" is true because `poll` drops the sender:
+            // `writer` respawns only when it is `None`, so without that half
+            // this sentence would be a promise nothing keeps.
+            Self::WriterVanished => Some(Notice {
+                title: "Autosave has stopped".to_string(),
+                lines: vec![
+                    "The part of Umber that writes autosave copies stopped \
+                     unexpectedly, so the last one was not written."
+                        .to_string(),
+                    "Umber will start it again at the next attempt. Your work is \
+                     not lost. Use File, Save to write it where you want it."
+                        .to_string(),
+                ],
+            }),
+        }
+    }
+
+    /// The line the log gets, where this report is a failure.
+    ///
+    /// One reading for both failures, because [`Autosave::complained`] is about
+    /// how often somebody painting is interrupted rather than about which of
+    /// the two went wrong. Exhaustive for [`Self::notice`]'s reason.
+    fn complaint(&self) -> Option<String> {
+        match self {
+            Self::Written { .. } => None,
+            Self::Failed { title, message } => {
+                Some(format!("could not autosave “{title}”: {message}"))
+            }
+            Self::WriterVanished => {
+                Some("the autosave writer stopped; nothing was written".to_string())
+            }
+        }
+    }
 }
 
 /// The autosave's whole state: the schedule, what is in flight, and the thread
@@ -1503,6 +1568,15 @@ impl Autosave {
     }
 
     /// Put one job on the writer's queue, starting it if this is the first.
+    ///
+    /// **A failed send is logged here and recovered from in [`Self::poll`]**,
+    /// which is one owner rather than two. It is tempting to clear the channel
+    /// on the spot so the very next job respawns, and that is the trap: the
+    /// disconnect on `rx` is the *only* evidence the artist is ever told from,
+    /// so a `send` that quietly replaced the pair would take the detection away
+    /// from the one place that reports it. `poll` runs once a frame, so the
+    /// recovery is at most a frame behind, and the jobs lost in between belong
+    /// to a capture that was already going to fail.
     fn send(&mut self, job: Job) {
         match self.writer() {
             Some(tx) => {
@@ -1737,25 +1811,86 @@ impl Autosave {
     ///
     /// Returns at most one message worth showing the user: a failure, once per
     /// run. Everything else goes to the caller as state to apply.
+    ///
+    /// **A disconnect is a report of its own, and reading it as "nothing today"
+    /// was a defect.** This drained with `while let Ok(..)`, which stops on
+    /// `Empty` and on `Disconnected` alike — and for this channel the second can
+    /// only be the writer thread having panicked, since it ends normally only
+    /// when `tx` is dropped and that happens when the whole [`Autosave`] does.
+    /// Meanwhile [`Autosave::writer`] respawns only where `self.tx` is `None`,
+    /// so a panicked thread left a live-looking but disconnected sender that was
+    /// **never replaced**: every later capture ran in full, paid its GPU
+    /// readback, and had its jobs dropped on the floor by a `send` that met the
+    /// failure with a log line. Nothing was ever written again, and
+    /// [`Report::Failed`] — the one route to telling the artist — travelled down
+    /// the same dead channel.
+    ///
+    /// So the waiter notices, which is [`update::Updates::poll`]'s shape and
+    /// `textpanel::Fonts::poll`'s. The receiver is taken out for the loop, for
+    /// the reason that one takes its `inbox`: answering the disconnect needs
+    /// `&mut self`.
+    ///
+    /// [`update::Updates::poll`]: crate::update::Updates::poll
     pub fn poll(&mut self) -> Vec<Report> {
-        let Some(rx) = self.rx.as_ref() else {
+        let Some(rx) = self.rx.take() else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        while let Ok(report) = rx.try_recv() {
-            if let Report::Failed { title, message } = &report {
-                log::warn!("could not autosave “{title}”: {message}");
-                if self.complained {
-                    continue;
+        loop {
+            match rx.try_recv() {
+                Ok(report) => self.note(report, &mut out),
+                // The writer is still there with nothing to say, which is
+                // almost every frame.
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.rx = Some(rx);
+                    break;
                 }
-                self.complained = true;
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.writer_vanished();
+                    self.note(Report::WriterVanished, &mut out);
+                    break;
+                }
             }
-            out.push(report);
         }
         if out.iter().any(|r| matches!(r, Report::Written { .. })) {
             self.last_written = Some(Instant::now());
         }
         out
+    }
+
+    /// Log a report, and pass it on unless the artist has been interrupted by a
+    /// failure already.
+    fn note(&mut self, report: Report, out: &mut Vec<Report>) {
+        if let Some(line) = report.complaint() {
+            log::warn!("{line}");
+            if self.complained {
+                return;
+            }
+            self.complained = true;
+        }
+        out.push(report);
+    }
+
+    /// The writer thread ended without being asked to.
+    ///
+    /// **`tx` is the half that matters.** [`Autosave::writer`] starts a thread
+    /// only where it is `None`, so a sender whose receiver has gone is a writer
+    /// that is never started again — and every job after it silently dropped,
+    /// for the rest of the run. Dropping it here is the whole of the respawn:
+    /// the next `send` finds `None` and stands a fresh thread up. `rx` goes with
+    /// it because it can only ever answer `Disconnected` again.
+    ///
+    /// The capture in flight is deliberately **left alone**. It will finish into
+    /// a fresh writer holding none of the slices the dead one ate, and
+    /// `CaptureSource` refuses a slice it was not given rather than writing a
+    /// layer blank — so that capture fails loudly and the next one is whole.
+    /// Clearing `flight` here instead would empty `capturing_id`, which is the
+    /// only route `collect` has to the renderer's own job, and strand it for the
+    /// life of the renderer: exactly the disowned-job bug `settle_capture`
+    /// exists to undo.
+    fn writer_vanished(&mut self) {
+        self.tx = None;
+        self.rx = None;
     }
 
     /// Where this document's internal copy has been put, if one has been.
@@ -2068,6 +2203,12 @@ pub fn collect(
 
     let mut notice = None;
     for report in editor.autosave.poll() {
+        // What the artist is told is `Report::notice`'s, in one exhaustive
+        // place, so a report that is added cannot be one nobody decided whether
+        // to interrupt somebody about.
+        if let Some(said) = report.notice() {
+            notice = Some(said);
+        }
         match report {
             Report::Written {
                 id,
@@ -2098,17 +2239,8 @@ pub fn collect(
                     crate::crash::note_autosave(id, path, revision);
                 }
             }
-            Report::Failed { title, message } => {
-                notice = Some(Notice {
-                    title: format!("Could not autosave “{title}”"),
-                    lines: vec![
-                        message,
-                        "Autosave will keep trying. Your work is not lost. Use \
-                         File, Save to write it where you want it."
-                            .to_string(),
-                    ],
-                });
-            }
+            // Nothing to apply. What these two say is the notice above.
+            Report::Failed { .. } | Report::WriterVanished => {}
         }
     }
     notice
@@ -3088,6 +3220,111 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&internal);
         let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// A writer that panicked leaves the artist told and another one started.
+    ///
+    /// **Every capture went on running and nothing was ever written.**
+    /// [`Autosave::writer`] respawns only where `self.tx` is `None`, so a
+    /// panicked thread left a live-looking but disconnected sender that was
+    /// never replaced: `next_due` nominated, `begin_capture` succeeded, the
+    /// readback banded across frames at its full cost, and `finish` posted the
+    /// task into a dead channel. `poll` read the same dead channel, so
+    /// [`Report::Failed`] — the one route to the artist — could not arrive
+    /// either. For the rest of the run the painter was paying for an autosave
+    /// they were not getting, with nothing on screen saying so.
+    ///
+    /// Both halves are needed and only the second catches the whole bug: a
+    /// respawn that stayed silent would leave somebody in exactly that position
+    /// until the next attempt, and a notice with no respawn would be a sentence
+    /// promising something nothing does. So this reads the **notice** rather
+    /// than the flag, and then drives a real capture all the way to a file on
+    /// disk — which is the only claim that means the writer is genuinely back.
+    #[test]
+    fn an_autosave_whose_writer_vanished_says_so_and_starts_another() {
+        let internal = scratch("vanished-internal");
+        let session = session_of(1);
+        let id = session.active_id();
+
+        let mut autosave = Autosave {
+            interval: Duration::ZERO,
+            expiry: None,
+            marks_dir: Some(scratch("vanished-sessions")),
+            ..Autosave::default()
+        };
+        autosave.next_due(Instant::now(), true, &session);
+        let ours = internal.join("Untitled 1-4444444444444444.ora");
+        autosave.docs.get_mut(&id).expect("a record").internal = Some(ours.clone());
+
+        // A writer that has panicked. A real thread rather than two dropped
+        // channel ends, because the claim is about a panic and that the two
+        // leave the same state is the thing to check rather than assume: the
+        // unwind is what drops both, having sent nothing. Joined first, so
+        // nothing below races it. Its message goes to stderr through the
+        // default hook, which the harness captures.
+        let (task_tx, task_rx) = mpsc::channel::<Job>();
+        let (report_tx, report_rx) = mpsc::channel::<Report>();
+        let dead = std::thread::Builder::new()
+            .name("umber-autosave-test".to_owned())
+            .spawn(move || {
+                let _ends = (task_rx, report_tx);
+                panic!("the autosave writer panicked part way through a document");
+            })
+            .expect("a writer thread");
+        assert!(dead.join().is_err(), "the writer was supposed to panic");
+        autosave.tx = Some(task_tx);
+        autosave.rx = Some(report_rx);
+
+        // What the artist is told. Read as the notice rather than the variant,
+        // because a report nothing turns into a sentence is a failure nobody
+        // hears about — which is the defect, one level along.
+        let reports = autosave.poll();
+        let said: Vec<Notice> = reports.iter().filter_map(Report::notice).collect();
+        assert_eq!(said.len(), 1, "the artist was not told once: {reports:?}");
+        assert!(
+            said[0].title.contains("Autosave"),
+            "the notice does not say what stopped: {:?}",
+            said[0],
+        );
+        assert!(
+            said[0].lines.iter().any(|l| l.contains("not written")),
+            "the notice does not say nothing was written: {:?}",
+            said[0],
+        );
+
+        // And the promise that notice makes, kept: an ordinary capture behind
+        // it is written by a writer that had to be started again.
+        let mut doc = candidate(id, "Untitled 1");
+        doc.size = UVec2::ONE;
+        autosave.begin(doc);
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 0,
+            size: UVec2::ONE,
+            pixels: vec![200, 40, 40, 255],
+        });
+        autosave.finish(
+            DocumentCapture {
+                size: UVec2::ONE,
+                merged: vec![200, 40, 40, 255],
+            },
+            Instant::now(),
+        );
+
+        let mut reports = Vec::new();
+        for _ in 0..4000 {
+            reports.extend(autosave.poll());
+            if !reports.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "no second writer was ever started: {reports:?}",
+        );
+        assert!(ours.exists(), "the internal copy was never written");
+
+        let _ = std::fs::remove_dir_all(&internal);
     }
 
     /// **One archive still reaches two places, and this is what now says so.**
