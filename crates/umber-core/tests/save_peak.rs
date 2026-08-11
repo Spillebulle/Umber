@@ -175,8 +175,12 @@ fn held_peak(path: &std::path::Path, layers: usize) -> usize {
 ///
 /// It does grow a little, and by what is worth naming: a `<layer>` element and
 /// a ZIP central-directory record per entry, both of which the writer has to
-/// hold until it knows where every entry landed. Measured at 400², that is
-/// about 27 KB a layer against a 640 KB slice.
+/// hold until it knows where every entry landed. Nothing canvas-sized survives
+/// a layer.
+///
+/// **The figures are printed and are deliberately not written here.** Quoting
+/// one in a comment beside the code that measures it is how the last version of
+/// this ended up stating two margins that disagreed; run the test to see them.
 #[test]
 fn a_deferred_save_costs_the_same_whatever_the_stack_is() {
     let dir = scratch();
@@ -187,12 +191,10 @@ fn a_deferred_save_costs_the_same_whatever_the_stack_is() {
     let many = deferred_peak(&path, 24);
 
     // Twenty-two more layers, for less than two slices in total, where the path
-    // this replaced cost twenty-two. The honest margin is about 2.2x — the
-    // measured growth is a little over half a slice — and it is a bound on the
-    // *shape* rather than a tight one: a per-layer cost that had crept up to a
-    // tenth of a canvas would still trip it. No figure is quoted here on
-    // purpose; the `println!` below prints the ones somebody would want, which
-    // is the only way a comment cannot go stale against the code beside it.
+    // this replaced cost twenty-two. A bound on the *shape* rather than a tight
+    // one — a per-layer cost that had crept up to a tenth of a canvas would
+    // still trip it — and stated in slices rather than in bytes so it says the
+    // same thing if `SIDE` moves.
     assert!(
         many >= few,
         "the peak fell as layers were added, which means the reading is noise \
