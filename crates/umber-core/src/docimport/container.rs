@@ -80,17 +80,44 @@ pub fn read_entry_bounded(
     })
 }
 
+/// Largest single *image* entry either ZIP reader will decompress.
+///
+/// **Derived from the canvas ceiling rather than picked, and it is the same
+/// figure [`super::check_image_size`] enforces one layer down.** A layer's PNG,
+/// a mask's PNG, a saved history patch and `mergedimage.png` are all pictures,
+/// and a picture Umber will decode is at most
+/// [`ImportedDocument::MAX_DIMENSION`] on each edge — so its raw RGBA is
+/// `32768² × 4`, which is 4 GiB. A PNG of incompressible data is a shade larger
+/// than raw: deflate's stored blocks add about 0.03%, plus a filter byte per row
+/// and the chunk framing. A sixteenth on top covers that with room to spare.
+///
+/// **What it replaces is [`ImportedDocument::MAX_TOTAL_BYTES`]**, the *whole
+/// document's* figure, which is four times this and was what every image entry
+/// was read at. That is the same shape [`MAX_STRUCTURE_BYTES`] was introduced
+/// for, in the entries somebody would think of last: a 16 MiB archive entry of
+/// deflated zeroes is a `read_to_end` growing a `Vec` to sixteen gigabytes
+/// before a single PNG chunk is parsed, and `preview::from_bytes` takes that
+/// route inside Explorer's surrogate process.
+///
+/// It is deliberately **not tighter than a canvas**. A thumbnail of a document
+/// Umber can open has to work, and the figure that would make this small is a
+/// preview-specific one nobody has measured — see `preview::psd_composite`.
+pub const MAX_IMAGE_BYTES: u64 =
+    (ImportedDocument::MAX_DIMENSION as u64) * (ImportedDocument::MAX_DIMENSION as u64) * 4 * 17
+        / 16;
+
 /// Read one entry whole if it is present.
 ///
-/// Bounded at [`ImportedDocument::MAX_TOTAL_BYTES`], which is a sanity bound
-/// for a *canvas*. Anything whose own size is bounded by something much smaller
-/// should say so — see [`read_optional_entry_bounded`].
+/// Bounded at [`MAX_IMAGE_BYTES`], because every remaining caller is a
+/// *picture*: a layer's PNG, a mask's, a history patch, `mergedimage.png`, a
+/// Krita tile file and a `.defaultpixel`. Anything whose own size is bounded by
+/// something else should say so — see [`read_optional_entry_bounded`].
 pub fn read_optional_entry(
     zip: &mut Zip<'_>,
     name: &str,
     format: SourceFormat,
 ) -> Result<Option<Vec<u8>>, ImportError> {
-    read_optional_entry_bounded(zip, name, format, ImportedDocument::MAX_TOTAL_BYTES)
+    read_optional_entry_bounded(zip, name, format, MAX_IMAGE_BYTES)
 }
 
 /// The same, for an entry whose content has a bound of its own.
@@ -498,9 +525,15 @@ mod tests {
             let mut zip = open(&bytes, format).expect("an archive");
             let err = read_entry_bounded(&mut zip, name, format, MAX_STRUCTURE_BYTES)
                 .expect_err("an entry past the bound");
+            // **Which of the two refusals fired, not merely that one did.**
+            // Both name the entry — the declared-size check before anything is
+            // decompressed, and the `take` check after — so asserting on the
+            // name alone leaves deleting the first one green, which is the
+            // whole point of having it. `openraster`'s history guard makes the
+            // same distinction and this one did not.
             assert!(
-                format!("{err}").contains(name),
-                "the refusal does not name the entry that met the bound: {err}"
+                format!("{err}").contains(&format!("`{name}` claims to be")),
+                "the entry was decompressed before anything objected: {err}"
             );
         }
 

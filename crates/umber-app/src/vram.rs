@@ -202,8 +202,10 @@ pub fn flip_refused(refused: &Vram) -> Notice {
 ///
 /// So it states **no figure and no remedy about the machine**. The lever is the
 /// document: fewer layers, or one fewer mask, is fewer pages. What it shares
-/// with the other four is the opening, and here that is the whole point — the
-/// flip is atomic, so a refusal really does mean the picture is untouched.
+/// with [`effect_refused`] and [`flip_refused`] — and *not* with the other two,
+/// which announce a failure rather than reassure — is the opening, and here that
+/// is the whole point: the flip is atomic, so a refusal really does mean the
+/// picture is untouched.
 pub fn flip_at_ceiling() -> Notice {
     Notice {
         title: "Could not flip the canvas".to_string(),
@@ -402,6 +404,14 @@ mod tests {
     /// Both refusals end on something to do. A sentence saying only that the
     /// card said no leaves the artist with a dialog and no next step, which is
     /// the failure `StackTooLarge`'s own wording was rewritten for.
+    ///
+    /// **`flip_at_ceiling` is deliberately not in this sweep and that is said
+    /// here rather than left to be inferred.** It offers a lever — flattening or
+    /// removing layers — and not `REMEDY`'s three, because closing other
+    /// applications does nothing about `MAX_SLOTS`. Its own assertions are in
+    /// `each_refusal_names_the_figure_the_device_declined`. Somebody adding a
+    /// sixth notice will copy this list; without this paragraph they would
+    /// either add theirs and break it, or leave theirs out in silence.
     #[test]
     fn every_refusal_offers_a_lever() {
         for notice in [

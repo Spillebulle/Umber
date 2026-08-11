@@ -817,12 +817,22 @@ impl Vram {
 /// direction that reads as reassurance; `no_shipped_code_grows_the_atlas_
 /// infallibly` is the half of it a test can hold.
 ///
+/// **It was still stale on both counts after the first rewrite**, which is the
+/// lesson rather than the anecdote: the entry it named for `begin_float` was a
+/// call that allocates nothing, and it went on omitting the one canvas-sized
+/// texture an ordinary Save makes. A list of what is unguarded cannot be
+/// maintained by the person guarding something; it has to be re-derived from the
+/// `create_texture` calls each time.
+///
 /// What is still fatal:
 ///
-/// * `begin_float`'s preview slice — `ensure_slots(preview_slot + 1)`. One slice
-///   off this same array, which is exactly the question `add_layer` and
-///   `add_mask` now ask, so it is the third of a set of three with two guarded.
 /// * `resize` — rebuilds the whole array from the Canvas settings dialog.
+/// * **`export_target`**, a whole canvas-sized texture with no error scope
+///   round it — 400 MB on the 20000×5000 document Stage 1 was written for. It
+///   is not only the Export command: `mergedimage.png` goes through it on
+///   **every Save**, and so do `pick_colour`, `probe_canvas` and the autosave's
+///   flattened preview. That makes it the most frequently reached entry on this
+///   list by a wide margin.
 /// * A blank document — `Graphics::add_canvas`, reached by File → New, which
 ///   offers up to `max_texture_dimension_2d`; one slice at 32768² is 4.3 GB.
 ///   Note the tab is created *before* the allocation in `create_document`, so
@@ -835,9 +845,11 @@ impl Vram {
 ///   `Queue::write_texture` stages through wgpu's **fatal** error path, so an
 ///   out-of-memory there loses the device with nothing able to catch it, one
 ///   line after an array allocation that was accepted.
-/// * Every canvas-sized texture that is not a slice at all: the stroke scratch,
-///   the per-dab colour plane, a float's two copies, an effect working set,
-///   `upload_coverage`'s selection mask.
+/// * Every other canvas-sized texture that is not a slice at all: the stroke
+///   scratch, the per-dab colour plane, a float's two copies, an effect working
+///   set, `upload_coverage`'s selection mask, and `commit_blended`'s backdrop —
+///   which is the one of them bounded well below a canvas, at
+///   `canvas width × 64` per damaged piece.
 /// * **A device lost between two of Umber's own calls.** `Device::lose` is also
 ///   reached from wgpu's `lose_if_oom`, which runs after *every* `Queue::submit`
 ///   and every `Device::poll` — so a driver reset or another process exhausting
@@ -849,6 +861,13 @@ impl Vram {
 /// Each of those is still an uncaptured device error and therefore still the
 /// crash box. Stage 1 covers opening a document, adding a layer or a mask, an
 /// effect bake and a canvas flip.
+///
+/// **One path is guarded and still says nothing**, which is a different gap and
+/// belongs here so it is not mistaken for one of the above: `begin_float`'s
+/// `promote` answers a [`PageRefusal`] and the caller turns it into a
+/// `log::error!` and a `None`. The float simply does not start. That is the
+/// right *outcome* — nothing is damaged — and the artist is told nothing at all,
+/// where an open, a layer, a bake and a flip all reach `umber-app::vram`.
 ///
 /// **The device survives this**, which is what makes reporting it worth
 /// anything: `create_texture` maps its hal error through
@@ -6625,9 +6644,13 @@ impl CanvasRenderer {
     /// 1. **Every reservation happens before anything is mutated** — before the
     ///    probes are reset, before the capture is cancelled, before a slot is
     ///    touched — so a refusal there leaves the document exactly as it was.
-    /// 2. **The pool is checked against `wanted` after the growth**, because
+    /// 2. **The pool is checked against `wanted` *before* the growth**, because
     ///    `growth_for` fails open at the ceiling: an `Ok` from
     ///    [`Self::try_ensure_pages`] is not a promise that the cells arrived.
+    ///    Asking first is what keeps a `Ceiling` refusal free — checking
+    ///    afterwards left the atlas reallocated and copied at up to `MAX_SLOTS`
+    ///    pages for a flip that then did not happen, which is the one mutation
+    ///    of "a refusal changes nothing at all" this method could still make.
     /// 3. **A shortfall inside the loop abandons the whole flip.** The encoder
     ///    is dropped without being submitted, every cell taken goes back on the
     ///    free list, and `entries` was never touched — so there is no state to
@@ -6702,17 +6725,28 @@ impl CanvasRenderer {
             let per = self.layers.grid.tiles_per_page() as usize;
             let short = (wanted - self.layers.free.len()).div_ceil(per.max(1)) as u32;
             let pages = self.layers.pages.saturating_add(short);
+            // **The ceiling is asked about *before* the growth, not after.**
+            // `growth_for` caps at `MAX_SLOTS` and hands the capped capacity
+            // back as though it were what was asked for, so a document near the
+            // ceiling grows — reallocating and copying the whole atlas, which is
+            // where the money is — and only then turns out to be short. Its
+            // answer is the capacity a growth *would* reach, and a page carries
+            // `tiles_per_page` cells, so the count is derivable without
+            // performing it and a `Ceiling` refusal costs nothing at all.
+            let capacity = self.growth_for(pages).unwrap_or(self.layers.pages);
+            let gained = capacity.saturating_sub(self.layers.pages) as usize * per;
+            if self.layers.free.len() + gained < wanted {
+                return Err(PageRefusal::Ceiling);
+            }
             // No encoder yet, and deliberately: the flip's own is created below,
             // so there is nothing recorded for a separately submitted copy to
             // lose. See `ensure_pages`.
             self.try_ensure_pages(device, queue, None, pages)
                 .map_err(PageRefusal::Device)?;
         }
-        // **An `Ok` above is not a promise the cells arrived.** `growth_for`
-        // caps at `MAX_SLOTS` and returns the capped capacity as though it were
-        // what was asked for, so a document already at the ceiling grows by
-        // nothing and reports success. Asked here rather than discovered in the
-        // loop, because the loop is where a tile would be lost.
+        // The backstop. Nothing reachable should meet it now that the arithmetic
+        // above answers first; it stays because the loop below is where a tile
+        // would otherwise be lost, and a second reading costs one comparison.
         if self.layers.free.len() < wanted {
             return Err(PageRefusal::Ceiling);
         }
@@ -11736,38 +11770,86 @@ mod tests {
     /// something is guarded; this cannot.
     ///
     /// [`CanvasRenderer::ensure_pages`] survives for the GPU tests, which want
-    /// an atlas grown without a refusal to unwrap. It is the *shipped* callers
-    /// that are the property, so the scan stops at this module — which is also
-    /// what keeps it from matching its own source, the failure
-    /// `a_reservation_builds_no_view_before_it_has_checked` records.
+    /// an atlas grown without a refusal to unwrap. It is `pub`, so **the scan
+    /// covers `umber-app` as well as this module** — the name of this test says
+    /// "shipped" and `umber-app` is shipped, and a guard whose name claims more
+    /// than its domain is the failure this file records everywhere else. What
+    /// keeps it from matching its own source is the `concat!` split and the
+    /// `#[cfg(test)]` truncation, and **not** the module scope; an earlier
+    /// version of this comment credited the scope, which would have been a
+    /// reason to widen the scan and lose the protection at the same time.
+    ///
+    /// Both call forms are matched: a method call and a `Self::` path. Comments
+    /// are stripped, and the strip takes a `//` inside a string literal with it
+    /// — over-stripping can only make the scan miss a call in such a line, which
+    /// nothing here writes, where under-stripping would fail on this file's own
+    /// prose.
     ///
     /// Demonstrated by mutation: put `self.ensure_pages` back in `flip_layers`
     /// and this fails.
     #[test]
     fn no_shipped_code_grows_the_atlas_infallibly() {
-        const SRC: &str = include_str!("canvas.rs");
         const DEFINITION: &str = concat!("fn ", "ensure_pages(");
-        const CALL: &str = concat!(".", "ensure_pages(");
+        const CALLS: [&str; 2] = [
+            concat!(".", "ensure_pages("),
+            concat!("Self::", "ensure_pages("),
+        ];
 
-        let shipped: String = SRC
-            .lines()
-            .take_while(|l| !l.starts_with("#[cfg(test)]"))
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Comments out, the test module off the end, and the fallible sibling
+        // taken out of the text — `try_ensure_pages` contains the shorter name,
+        // so the infallible calls cannot be counted until it is gone.
+        let shipped = |src: &str| -> String {
+            src.lines()
+                .take_while(|l| !l.starts_with("#[cfg(test)]"))
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace(concat!(".try_", "ensure_pages("), "")
+                .replace(concat!("Self::try_", "ensure_pages("), "")
+        };
+
+        let here = shipped(include_str!("canvas.rs"));
         assert!(
-            shipped.contains(DEFINITION),
+            here.contains(DEFINITION),
             "`ensure_pages` was renamed or moved; this guard has to follow it"
         );
-        // `try_ensure_pages` contains the shorter name, so the fallible calls
-        // have to be taken out before the infallible ones can be counted.
-        let infallible = shipped.replace(concat!(".try_", "ensure_pages("), "");
+
+        // Every shipped source that can see it. `umber-app` is the only other
+        // crate holding a `CanvasRenderer`, and the whole reason to scan it is
+        // that nothing in this file could tell you if it grew a caller.
+        let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../umber-app/src");
+        let mut sources = vec![("umber-render/src/canvas.rs".to_string(), here)];
+        let mut stack = vec![app];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                panic!("`umber-app/src` is not where this guard expects it: {dir:?}");
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("a source file");
+                    sources.push((path.display().to_string(), shipped(&text)));
+                }
+            }
+        }
         assert!(
-            !infallible.contains(CALL),
-            "something outside the tests calls the infallible `ensure_pages`; a growth that \
-             cannot be refused is an out-of-memory that reaches `crash::device_error`, and \
-             `try_ensure_pages` exists so that it does not"
+            sources.len() > 10,
+            "the sweep found {} files, which is not a crate",
+            sources.len()
         );
+
+        for (name, text) in sources {
+            for call in CALLS {
+                assert!(
+                    !text.contains(call),
+                    "{name} calls the infallible `ensure_pages`; a growth that cannot be \
+                     refused is an out-of-memory that reaches `crash::device_error`, and \
+                     `try_ensure_pages` exists so that it does not"
+                );
+            }
+        }
     }
 
     /// The two figures a refusal may state are the two the device actually

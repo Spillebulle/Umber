@@ -44,13 +44,29 @@ use crate::time::Timestamp;
 /// `manifest.entries.len()` is looked at. Nothing in the format bounds the entry
 /// count.
 ///
-/// **Where it stops is a flip.** A canvas flip writes no PNG — that is what
-/// makes it free of the budget above — so a session of nothing but flips is a
-/// manifest with no patches beside it, and about a hundred bytes an entry puts
-/// three hundred thousand consecutive flips at this figure. That is not a
-/// session anybody has, and it is the one case where this is stricter than the
-/// writer; saying so is better than a derivation that pretends otherwise.
-const MAX_MANIFEST_BYTES: u64 = fmt::BUDGET_BYTES as u64;
+/// **Where `BUDGET_BYTES` alone would be stricter than the writer is three
+/// places, not one**, which is why the figure is a multiple of it rather than
+/// equal to it. The first draft said "one case" and was wrong twice over:
+///
+/// * **A flip writes no PNG.** That is what makes it free of the budget above,
+///   so a session of nothing but flips is a manifest with no patches beside it.
+/// * **A manifest entry is *larger* than the PNG it indexes, at the small end.**
+///   A minimal `ManifestEdit` with one piece is on the order of 135 bytes of
+///   JSON — kind, layer, four rectangle fields, a piece with its `src` path, a
+///   timestamp — against about 70 to 90 for a 1×1 RGBA PNG at
+///   `Compression::Fast`. So a session of very many very small edits reaches
+///   this before the patches reach `BUDGET_BYTES`, at a ratio near 1.6:1.
+/// * **`Manifest::layers` is unbounded.** It is every layer's *name*, and a name
+///   comes out of whatever wrote the file the layers were imported from. That is
+///   the identical argument `container::MAX_STRUCTURE_BYTES` makes for
+///   `stack.xml`, and it applies here because the same names are in both.
+///
+/// So: twice the patch budget for the entries, plus one structure entry's worth
+/// for the names. Both terms are existing constants rather than figures picked
+/// here, and neither is tight — what the bound has to do is refuse sixteen
+/// gigabytes of JSON, not sit close to what a real file holds.
+pub(super) const MAX_MANIFEST_BYTES: u64 =
+    2 * fmt::BUDGET_BYTES as u64 + super::container::MAX_STRUCTURE_BYTES;
 
 /// One recorded edit as it came out of a file.
 #[derive(Clone, Debug)]

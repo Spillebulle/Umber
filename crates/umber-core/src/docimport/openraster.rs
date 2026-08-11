@@ -1473,7 +1473,7 @@ mod tests {
     /// sentence has to say the size stopped it. Demonstrated by mutation.
     #[test]
     fn a_saved_history_past_its_own_bound_is_dropped_and_the_picture_opens() {
-        let bytes = fixtures::ora_with_padded_history(32 * 1024 * 1024 + 1);
+        let bytes = fixtures::ora_with_padded_history(history::MAX_MANIFEST_BYTES as usize + 1);
         let doc = read(&bytes).expect("the document opens regardless");
         assert_eq!(doc.layers.len(), 1, "the picture is untouched");
         assert!(doc.history.is_none(), "the history should not have loaded");

@@ -99,7 +99,21 @@ fn widen(src: &[u8], stride: usize, f: impl Fn(&[u8]) -> [u8; 4]) -> Vec<u8> {
 /// never lose anything.
 pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let format = SourceFormat::Png;
-    let image = decode_png(bytes, format)?;
+    // **Here the picture *is* the canvas, so the canvas refusal is the accurate
+    // one.** `ImageTooLarge` exists because an ORA layer is stored at its own
+    // bounding box and may be larger than the page it sits on, which makes
+    // "the canvas is 60000×60000" a sentence sending the artist to shrink
+    // something that is nowhere near the bound. A flat PNG has no such gap: its
+    // image and its canvas are one rectangle, and `check_bounds` two lines
+    // below would have said `CanvasTooLarge` if the decode had got that far.
+    // Same figure, same remedy, and the sentence that names what the file
+    // actually has.
+    let image = decode_png(bytes, format).map_err(|e| match e {
+        ImportError::ImageTooLarge { width, height } => {
+            ImportError::CanvasTooLarge { width, height }
+        }
+        other => other,
+    })?;
     // A flat picture is one layer and no folders.
     let mut budget = check_bounds(
         format,
@@ -237,6 +251,31 @@ mod tests {
         assert!(
             matches!(err, ImportError::Malformed { .. }),
             "a picture at exactly the ceiling was refused for its size: {err:?}"
+        );
+    }
+
+    /// **A flat PNG's picture *is* its canvas, so it is refused as one.**
+    ///
+    /// `read_png` maps the decoder's `ImageTooLarge` back to `CanvasTooLarge`,
+    /// because the variant that distinguishes the two exists for the ORA layer
+    /// case — a layer stored at its own bounding box, larger than the page it
+    /// sits on — and there is no such gap here. Both sentences name the same
+    /// figure and the same remedy; only one of them is true about this file.
+    ///
+    /// Demonstrated by mutation: drop the `map_err` and this reads
+    /// `ImageTooLarge`, which is a document being told a picture inside it is
+    /// too large when the picture is the whole of it.
+    #[test]
+    fn a_flat_png_too_large_is_refused_as_a_canvas() {
+        let edge = ImportedDocument::MAX_DIMENSION + 1;
+        let err = read_png(&fixtures::png_header_only(edge, 1)).expect_err("past the ceiling");
+        assert!(
+            matches!(err, ImportError::CanvasTooLarge { width, height } if width == edge && height == 1),
+            "{err:?}"
+        );
+        assert!(
+            format!("{err}").starts_with("The canvas is"),
+            "the sentence names the wrong thing: {err}"
         );
     }
 }
