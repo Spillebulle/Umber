@@ -3426,6 +3426,15 @@ impl CanvasRenderer {
         queue.submit(Some(enc.finish()));
         self.layers = resized;
 
+        // Everything above this line answers to the canvas being left behind —
+        // `CanvasCopy::plan` and the copy extent. Everything below it is being
+        // built for the new one, and `clear_stroke` in particular asks whether
+        // a slice of *this* canvas is small enough to hold an allocation in
+        // case. It used to be written after that call, so a document grown past
+        // the speculation limit went on holding its colour scratch for one more
+        // stroke.
+        self.doc_size = new_size;
+
         // The scratch is the stroke in progress, and there is not one — see the
         // contract above. Reallocated rather than copied, and it starts clear
         // like any freshly allocated target.
@@ -3452,7 +3461,6 @@ impl CanvasRenderer {
         // into a file with layers of two different sizes in it.
         self.cancel_capture();
 
-        self.doc_size = new_size;
         self.dab_state.doc_size = [new_size.x as f32, new_size.y as f32];
         // The mask names pixels of a canvas that no longer exists. Dropped
         // rather than rescaled: a selection is the artist's statement about
