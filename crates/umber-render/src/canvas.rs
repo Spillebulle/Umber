@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use umber_core::tile::{Entry, Grid};
+use umber_core::tile::{Entry, Fragment, Grid, TILE};
 use umber_core::{
     Affine, Anchor, Background, BlendMode, BrushMode, Camera, CanvasCopy, Color, Dab, Effect,
     EffectKind, FlipAxis, OutlinePosition, PixelRect, Selection, TipMask, transform,
@@ -849,7 +849,7 @@ fn try_reserve(
         log::warn!("refused a {capacity}-slice layer array at {doc_size}: {error}");
         return Err(Vram {
             slices: capacity,
-            held: replacing.map_or(0, |old| old.capacity),
+            held: replacing.map_or(0, |old| old.pages),
             slice_bytes: slice_bytes(doc_size),
             doc_size,
         });
@@ -900,6 +900,14 @@ const TILE_PRELUDE_EFFECT: &str = concat!(
 const TILE_PRELUDE_THUMBNAIL: &str = concat!(
     include_str!("../shaders/tiles.wgsl"),
     include_str!("../shaders/thumbnail.wgsl"),
+);
+
+/// See [`TILE_PRELUDE_EFFECT`]. The flip is the **fourth** reader of the layer
+/// array and the only one that needs a raw, non-sRGB view of it — see
+/// `flip.wgsl` for why a mirror is the one storage move that cannot be a copy.
+const TILE_PRELUDE_FLIP: &str = concat!(
+    include_str!("../shaders/tiles.wgsl"),
+    include_str!("../shaders/flip.wgsl"),
 );
 
 /// The commit pass, with the same blend modes in front of it.
@@ -1880,6 +1888,20 @@ struct TransformUniforms {
     _pad2: f32,
 }
 
+/// One drawn piece of a commit: which page of the atlas it writes, what takes a
+/// document pixel there, and the document rectangle it covers.
+///
+/// The unit both commit paths are cut into, because a layer's texels are tiled
+/// and a render pass has exactly one attachment. For a page-backed slot there is
+/// one of these per damaged piece with a zero delta, which is what a commit was
+/// before there were tiles.
+#[derive(Clone, Copy, Debug)]
+struct CommitAim {
+    page: u32,
+    delta: (i32, i32),
+    doc: PixelRect,
+}
+
 /// Mirrors `Commit` in `commit.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1887,13 +1909,32 @@ struct CommitUniforms {
     rect_min: [f32; 2],
     rect_max: [f32; 2],
     doc_size: [f32; 2],
-    _pad0: [f32; 2],
+    /// What to add to a document pixel to reach the atlas texel this pass is
+    /// writing, and how large the target is.
+    ///
+    /// **This is the whole of what a per-tile commit needed**, and it took the
+    /// place of the two padding words that used to sit here. A commit's target
+    /// is one page of the atlas and the piece being drawn is one tile's share of
+    /// the damage, so the quad has to be mapped through the *page* rather than
+    /// through the canvas. `vs` adds this and divides by `target_size`;
+    /// `out.doc` stays in **document** space, so `fs` and `fs_blend` are
+    /// untouched — which is also what keeps `fs_blend`'s `rect_min` backdrop
+    /// lookup right by construction rather than by a second correction.
+    ///
+    /// Zero and `doc_size` reproduce exactly what the pass did before, which is
+    /// what a page-backed slot still gets.
+    atlas_delta: [f32; 2],
+    target_size: [f32; 2],
+    /// `color` is a `vec4<f32>`, which WGSL aligns to 16, so it must start at
+    /// offset 48. Scalars for the padding: see the uniform-layout note in
+    /// CLAUDE.md.
+    _pad0: f32,
+    _pad1: f32,
     color: [f32; 4],
     mode: u32,
     per_dab_color: u32,
-    /// [`BlendMode::index`]. Took one of the two padding words already here, so
-    /// the block is the size it always was. Scalars rather than a `vec3`: see
-    /// the uniform-layout note in CLAUDE.md.
+    /// [`BlendMode::index`]. Scalars rather than a `vec3`: see the
+    /// uniform-layout note in CLAUDE.md.
     blend: u32,
     _pad2: u32,
 }
@@ -1908,7 +1949,12 @@ struct CommitUniforms {
 struct FlipUniforms {
     doc_size: [u32; 2],
     axis: u32,
-    _pad: u32,
+    /// Which slot of the page table to resolve through.
+    slot: u32,
+    /// [`SlotClass::clear_colour`] as the shader wants it: what an unbacked tile
+    /// of `slot` reads as. A `vec4<f32>` and therefore 16-aligned, which the two
+    /// scalars above pack into.
+    empty: [f32; 4],
 }
 
 /// Mirrors `Thumb` in `thumbnail.wgsl`.
@@ -2283,7 +2329,84 @@ struct EffectCache {
 /// `the_seed_format_is_a_render_target_on_every_device` exists.
 const PAGE_TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
-/// The layer array, which is now a **tile atlas plus a page table**.
+/// What a slot's *absent* tiles read as, and therefore what one has to be
+/// initialised to when it is first backed.
+///
+/// **A layer's is transparent black and a mask's is white**, because a mask
+/// multiplies the layer's alpha and a mask nobody has painted on reveals
+/// everything. Taking a mask's absent tile for zero hides its layer everywhere
+/// nobody painted — the bug `clipstudio.rs` records fixing on the import side,
+/// in the same format, at the same block size.
+///
+/// The shaders already carry this per call site — `composite.wgsl` passes
+/// `vec4<f32>(0.0)` for a layer and `vec4<f32>(1.0)` for a mask, and
+/// `effect.wgsl` the same pair. What this adds is the **Rust** side of the same
+/// fact, which three things need and none of them could ask a shader: a newly
+/// allocated cell has to be *initialised* to it (an atlas cell is recycled and
+/// holds whatever the last slot left there), a readback of an unbacked tile has
+/// to *synthesise* it, and the flip has to hand it to `tile_load`.
+///
+/// It is also what makes a mask sparse at all. [`CanvasRenderer::fill_layer_white`]
+/// backs nothing and simply says "this slot is a mask": full reveal is the empty
+/// value, so a new mask costs no storage until somebody paints on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotClass {
+    Layer,
+    Mask,
+}
+
+impl SlotClass {
+    /// The RGBA8 an absent tile of this class reads as, on the CPU side.
+    ///
+    /// White for a mask is `[255; 4]` and not `srgb::encode_coverage(0)`'s
+    /// `[0, 0, 0, 255]`: the composite reads a mask on `.r` and full reveal is
+    /// `.r == 1.0`, which is what [`Self::clear_colour`] writes and therefore
+    /// what a readback of a *backed* full-reveal tile would hand back.
+    fn empty_bytes(self) -> [u8; 4] {
+        match self {
+            Self::Layer => [0, 0, 0, 0],
+            Self::Mask => [255, 255, 255, 255],
+        }
+    }
+
+    /// The clear value a freshly allocated cell of this class takes.
+    ///
+    /// Linear, and the target is sRGB-typed — but 0.0 and 1.0 encode to 0 and
+    /// 255 either way, which is the same argument [`CanvasRenderer::fill_layer_white`]
+    /// used to make about filling a whole slice.
+    fn clear_colour(self) -> wgpu::Color {
+        match self {
+            Self::Layer => wgpu::Color::TRANSPARENT,
+            Self::Mask => wgpu::Color::WHITE,
+        }
+    }
+}
+
+/// What one page of the atlas is being used for.
+///
+/// **`Owned` is the concept that is not in `docs/perf/tiled-layer-storage.md`
+/// at all**, and it is what keeps the float and the effects on exactly the code
+/// they had. A page-backed slot owns a whole page, identity-mapped — page `p`
+/// holding slot `s`'s tiles at their own coordinates — which is byte for byte
+/// the layout there was before there was a page table, so every document-space
+/// origin those paths already used is still the right atlas-space origin. §7 and
+/// §9.4 assume every slot is tiled and then have to invent a residency rule for
+/// the float's preview that changes every frame of a drag.
+///
+/// It is deliberately **not** what a stroke does. Letting a commit promote its
+/// layer is one line and would open the artist's document — an imported layer
+/// nobody has painted on stays sparse — and it puts an ordinary 1920×1080
+/// session back on a dense array *plus* the 26.4% page padding, which is a
+/// regression for everybody who is not opening a 20 GB file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PageUse {
+    /// Cells are handed out individually, to any slot.
+    Pool,
+    /// The whole page is one slot's, identity-mapped.
+    Owned(u32),
+}
+
+/// The layer array, which is a **tile atlas plus a page table**.
 ///
 /// A slice of `texture` is a *page* rather than a layer. Where a slot's texels
 /// live is `table`'s to say, one [`Entry`] per (tile, slot): a page and a tile
@@ -2291,14 +2414,26 @@ const PAGE_TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 /// and therefore reads as the slot's own empty value. `umber_core::tile` is the
 /// arithmetic and `docs/perf/tiled-layer-storage.md` is the design.
 ///
-/// **A page is the canvas rounded up to whole tiles**, so it holds exactly one
-/// layer's worth of tiles, and the *identity* table — page `n` holding slot `n`'s
-/// tiles at their own coordinates — is byte for byte the layout there was before
-/// there was a table at all. That is why nothing about growth, reservation,
-/// [`Vram`]'s refusal, `resize` or [`MAX_SLOTS`] changed shape when this
-/// arrived: a page *is* what a slice was, and every document-space origin a copy
-/// or a scissor already used is still the right atlas-space origin under the
-/// identity.
+/// **A page is the canvas rounded up to whole tiles**, so a page holds exactly
+/// one layer's worth of tiles. That is what makes [`PageUse::Owned`] free — an
+/// owned page *is* what a slice was — and it is why nothing about growth,
+/// reservation or [`Vram`]'s refusal changed shape.
+///
+/// # The two capacities, which used to be one number
+///
+/// `pages` is how deep the **atlas** is and it grows on demand. The **page
+/// table** is [`MAX_SLOTS`] deep from the moment the store exists and is never
+/// grown, which retires the question rather than answering it in five places: a
+/// slot's table slice is `tiles.x × tiles.y × 4` bytes — 65 KB for a whole stack
+/// at 2048², 1.6 MB on the 20000×5000 document that prompted this, and 16.8 MB
+/// at the largest canvas Umber makes, against a single *page* there of 4.3 GB.
+/// At that price there is no reason to grow it, so `growth_for`, `built_capacity`
+/// and `ensure_slots` are all page questions alone and the two cannot be
+/// confused, because only one of them is ever grown.
+///
+/// The consequence to expect: **a blank layer costs nothing**, so
+/// [`CanvasRenderer::try_ensure_slots`] has no slice to refuse. It reserves a
+/// page of *headroom* instead — see there.
 struct LayerStore {
     /// The canvas's tile grid. Carried because every question this type answers
     /// is a function of the canvas size, and re-deriving it per call would be a
@@ -2308,24 +2443,38 @@ struct LayerStore {
     /// Loaded by the composite, the effect extract and the thumbnail — all
     /// three through the page table, none of them with a sampler.
     array_view: wgpu::TextureView,
-    /// One per page, used as render targets by commit and clear.
-    slot_views: Vec<wgpu::TextureView>,
-    /// The same pages seen as [`LAYER_FORMAT_LINEAR`], for the flip pass and
-    /// nothing else. Built here rather than per flip because a view is cheap to
-    /// hold and the alternative is allocating one per slice per command.
-    raw_slot_views: Vec<wgpu::TextureView>,
-    capacity: u32,
-    /// `(tiles.x, tiles.y, capacity)` of [`PAGE_TABLE_FORMAT`].
+    /// The same, as [`LAYER_FORMAT_LINEAR`], for the flip and nothing else. Its
+    /// exactness rests on reading the stored bytes without the transfer
+    /// function; see `flip.wgsl`.
+    raw_array_view: wgpu::TextureView,
+    /// One per **page**, used as a render target by the commit, the clear and
+    /// every path that has promoted its slot.
+    page_views: Vec<wgpu::TextureView>,
+    /// How deep the atlas is. **Not** how many slots there are.
+    pages: u32,
+    /// `(tiles.x, tiles.y, MAX_SLOTS)` of [`PAGE_TABLE_FORMAT`].
     table: wgpu::Texture,
     table_view: wgpu::TextureView,
-    /// The same table on the CPU, `capacity` slices of `grid.tiles_per_page()`
-    /// entries, row-major within a slice.
+    /// The same table on the CPU, [`MAX_SLOTS`] slices of
+    /// `grid.tiles_per_page()` entries, row-major within a slice.
     ///
     /// The authority: the texture is an upload of this. Every question about
     /// where a texel is — a copy's origin, a commit's attachment, whether a
     /// readback has anything to read — is answered here, so the renderer never
     /// has to read a texture back to find out where a tile went.
     entries: Vec<Entry>,
+    /// What each slot's absent tiles read as. Indexed by slot, [`MAX_SLOTS`]
+    /// long.
+    class: Vec<SlotClass>,
+    /// What each page is for. Indexed by page, `pages` long.
+    use_of: Vec<PageUse>,
+    /// Cells of [`PageUse::Pool`] pages that no slot holds, as the [`Entry`]
+    /// each would become.
+    ///
+    /// Popped from the back, so a cell freed by a clear is the next one handed
+    /// out — which keeps a delete-then-paint cycle inside the pages it already
+    /// has rather than walking the atlas.
+    free: Vec<Entry>,
 }
 
 /// The layer array's texture, and nothing else.
@@ -2390,13 +2539,13 @@ fn layer_texture(device: &wgpu::Device, size: UVec2, capacity: u32) -> wgpu::Tex
 }
 
 impl LayerStore {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, size: UVec2, capacity: u32) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, size: UVec2, pages: u32) -> Self {
         Self::from_texture(
             device,
             queue,
-            layer_texture(device, size, capacity),
+            layer_texture(device, size, pages),
             size,
-            capacity,
+            pages,
         )
     }
 
@@ -2410,31 +2559,24 @@ impl LayerStore {
         queue: &wgpu::Queue,
         texture: wgpu::Texture,
         size: UVec2,
-        capacity: u32,
+        pages: u32,
     ) -> Self {
         let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("umber-layers-array"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
+        let raw_array_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("umber-layers-array-raw"),
+            format: Some(LAYER_FORMAT_LINEAR),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
 
-        let slot_views = (0..capacity)
+        let page_views = (0..pages)
             .map(|i| {
                 texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some("umber-layer-slot"),
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: i,
-                    array_layer_count: Some(1),
-                    ..Default::default()
-                })
-            })
-            .collect();
-
-        let raw_slot_views = (0..capacity)
-            .map(|i| {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some("umber-layer-slot-raw"),
-                    format: Some(LAYER_FORMAT_LINEAR),
+                    label: Some("umber-layer-page"),
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     base_array_layer: i,
                     array_layer_count: Some(1),
@@ -2444,12 +2586,14 @@ impl LayerStore {
             .collect();
 
         let grid = Grid::new(size);
+        // **[`MAX_SLOTS`] deep and never grown** — see [`LayerStore`] for the
+        // arithmetic that makes that the cheap answer rather than a lazy one.
         let table = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("umber-page-table"),
             size: wgpu::Extent3d {
                 width: grid.tiles.x,
                 height: grid.tiles.y,
-                depth_or_array_layers: capacity,
+                depth_or_array_layers: MAX_SLOTS as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -2464,50 +2608,106 @@ impl LayerStore {
             ..Default::default()
         });
 
-        // **The identity table**: page `n` holds slot `n`'s tiles at their own
-        // coordinates, so a document texel is at the atlas texel it was at when
-        // a slice was a canvas. That is what makes every copy origin, every
-        // scissor and every render target in this file still correct while the
-        // indirection is proved against a known-good answer — see [`LayerStore`].
-        let mut entries = Vec::with_capacity((capacity as usize) * grid.tiles_per_page() as usize);
-        for page in 0..capacity {
-            for ty in 0..grid.tiles.y {
-                for tx in 0..grid.tiles.x {
-                    entries.push(Entry::at(page, tx, ty));
-                }
-            }
-        }
+        // **Nothing is backed.** A slot costs storage when something writes to
+        // it and not before, which is the whole of stage 2: a blank layer is a
+        // table slice of `UNBACKED` and no atlas cell at all.
+        let entries = vec![Entry::UNBACKED; MAX_SLOTS * grid.tiles_per_page() as usize];
 
-        let store = Self {
+        let mut store = Self {
             grid,
             texture,
             array_view,
-            slot_views,
-            raw_slot_views,
-            capacity,
+            raw_array_view,
+            page_views,
+            pages,
             table,
             table_view,
             entries,
+            class: vec![SlotClass::Layer; MAX_SLOTS],
+            use_of: vec![PageUse::Pool; pages as usize],
+            free: Vec::new(),
         };
+        store.stock(0..pages);
         store.upload_table(queue);
         store
     }
 
+    /// Put every cell of a range of fresh pool pages on the free list.
+    ///
+    /// Back to front within a page, so popping walks a page forwards — which
+    /// keeps a layer's tiles clustered in one page and makes the copies a
+    /// promotion or a resize issues sequential rather than scattered.
+    fn stock(&mut self, pages: std::ops::Range<u32>) {
+        for page in pages.rev() {
+            for ty in (0..self.grid.tiles.y).rev() {
+                for tx in (0..self.grid.tiles.x).rev() {
+                    self.free.push(Entry::at(page, tx, ty));
+                }
+            }
+        }
+    }
+
+    /// Where one slot's table slice starts.
+    fn slot_at(&self, slot: u32) -> usize {
+        slot as usize * self.grid.tiles_per_page() as usize
+    }
+
+    fn entry(&self, slot: u32, tile: (u32, u32)) -> Entry {
+        self.entries[self.slot_at(slot) + self.grid.index(tile.0, tile.1)]
+    }
+
+    /// Every tile of a slot that is stored somewhere, with where.
+    fn backed(&self, slot: u32) -> impl Iterator<Item = ((u32, u32), Entry)> + '_ {
+        let base = self.slot_at(slot);
+        let tiles = self.grid.tiles;
+        (0..self.grid.tiles_per_page()).filter_map(move |i| {
+            let e = self.entries[base + i as usize];
+            e.is_backed().then(|| ((i % tiles.x, i / tiles.x), e))
+        })
+    }
+
+    /// Push one slot's table slice to the GPU.
+    ///
+    /// **Per slot, not whole**, and the figure is why: the table is
+    /// `tiles.x × tiles.y × slots × 4` bytes — 1.6 MB on the 20000×5000 document
+    /// and **16.8 MB** for a full stack at the largest canvas Umber makes. A
+    /// commit backs tiles, so a whole-table upload would land at every
+    /// pointer-up, which is worse than the readback beside it. One slice is
+    /// 6.3 KB there.
+    fn upload_slot(&self, queue: &wgpu::Queue, slot: u32) {
+        let at = self.slot_at(slot);
+        let count = self.grid.tiles_per_page() as usize;
+        let raw: &[u8] = bytemuck::cast_slice(&self.entries[at..at + count]);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.table,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: slot,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            raw,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.grid.tiles.x * 4),
+                rows_per_image: Some(self.grid.tiles.y),
+            },
+            wgpu::Extent3d {
+                width: self.grid.tiles.x,
+                height: self.grid.tiles.y,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Push the whole table to the GPU.
     ///
-    /// Whole, not per slot, and that is affordable only because of **when this
-    /// runs**: the table is written when the store is built, when it grows, when
-    /// the canvas is resized, and from [`CanvasRenderer::write_entry`] — which
-    /// is reached only by the two `_for_test` hooks. Nothing on the drawing path
-    /// touches it while residency is the identity.
-    ///
-    /// **The sparse stage may not keep this shape**, and the figure is why. The
-    /// table is `tiles.x × tiles.y × slots × 4` bytes: 6.3 KB per slot on the
-    /// 20000×5000 document, and **16.8 MB** for a full stack at the largest
-    /// canvas Umber makes. Once a commit backs tiles, that is a 16.8 MB upload
-    /// at every pointer-up, which is worse than the readback beside it. The
-    /// upload has to become per slot — one slice, `tiles.x × tiles.y × 4` — and
-    /// this is where the layout it would have to agree with is stated.
+    /// Only where every slot moved at once: when the store is built, when the
+    /// atlas grows and when the canvas is resized. Everything on the drawing
+    /// path goes through [`Self::upload_slot`].
     fn upload_table(&self, queue: &wgpu::Queue) {
         if self.entries.is_empty() {
             return;
@@ -2529,9 +2729,40 @@ impl LayerStore {
             wgpu::Extent3d {
                 width: self.grid.tiles.x,
                 height: self.grid.tiles.y,
-                depth_or_array_layers: self.capacity,
+                depth_or_array_layers: MAX_SLOTS as u32,
             },
         );
+    }
+
+    /// Give every cell a slot holds back to the pool, and unback its table
+    /// slice. Its own page, where it had one, goes back to the pool whole.
+    ///
+    /// The caller uploads the slice.
+    fn release(&mut self, slot: u32) {
+        if let Some(page) = self.owned_page(slot) {
+            self.use_of[page as usize] = PageUse::Pool;
+            self.stock(page..page + 1);
+        } else {
+            let base = self.slot_at(slot);
+            for i in 0..self.grid.tiles_per_page() as usize {
+                let e = self.entries[base + i];
+                if e.is_backed() {
+                    self.free.push(e);
+                }
+            }
+        }
+        let base = self.slot_at(slot);
+        for i in 0..self.grid.tiles_per_page() as usize {
+            self.entries[base + i] = Entry::UNBACKED;
+        }
+    }
+
+    /// The page this slot owns whole, if it has one.
+    fn owned_page(&self, slot: u32) -> Option<u32> {
+        self.use_of
+            .iter()
+            .position(|u| *u == PageUse::Owned(slot))
+            .map(|p| p as u32)
     }
 }
 
@@ -2549,6 +2780,16 @@ struct Shared {
     /// Repeats where [`Shared::sampler`] clamps. A paper tile has to wrap — it
     /// covers the whole document — and a tip stretched over its dab must not.
     grain_sampler: wgpu::Sampler,
+
+    /// One tile of transparent black, and one of white, as bytes.
+    ///
+    /// What [`CanvasRenderer::clear_cells`] copies into a freshly allocated
+    /// atlas cell. A cell is recycled, so it arrives holding whatever the last
+    /// slot that held it left there; these are the two [`SlotClass`] empty
+    /// values, 256 KB each and independent of the canvas, which is why they live
+    /// here rather than on the renderer.
+    blank_tile: wgpu::Buffer,
+    white_tile: wgpu::Buffer,
 
     /// The four dab pipelines, indexed by [`DabStyle::index`].
     ///
@@ -2800,6 +3041,19 @@ impl Shared {
             ..Default::default()
         });
 
+        // One tile of each empty value, for a freshly allocated atlas cell. See
+        // the fields.
+        let blank_tile = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("umber-blank-tile"),
+            contents: &[0u8; (TILE * TILE * 4) as usize],
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        let white_tile = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("umber-white-tile"),
+            contents: &[0xffu8; (TILE * TILE * 4) as usize],
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+
         // ---- dab pass -------------------------------------------------------
         let dab_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dab"),
@@ -2945,10 +3199,25 @@ impl Shared {
             label: Some("commit"),
             source: wgpu::ShaderSource::Wgsl(BLEND_PRELUDE_COMMIT.into()),
         });
+        // **The uniform takes a dynamic offset, exactly as the blended commit's
+        // already did.** A commit is drawn once per (piece ∩ tile) since a
+        // layer's texels are tiled, and each of those carries its own
+        // `atlas_delta` — so the block varies per draw, and `write_buffer`
+        // between passes of one encoder would not work: every write is staged
+        // before the whole submission, so all the draws would see the last one.
         let commit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("commit-bgl"),
             entries: &[
-                uniform_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
                 texture_entry(1),
                 sampler_entry(2),
                 texture_entry(3),
@@ -3092,11 +3361,28 @@ impl Shared {
         // `None`, which together are what make the pass an exact permutation.
         let flip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("flip"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/flip.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(TILE_PRELUDE_FLIP.into()),
         });
         let flip_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("flip-bgl"),
-            entries: &[uniform_entry(0), texture_entry(1)],
+            entries: &[
+                // A dynamic offset, so one bind group serves every slot of one
+                // flip: the block carries the slot and its empty value, and a
+                // `write_buffer` between the passes would be staged before the
+                // whole submission and seen by all of them.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                texture_array_entry(1),
+                page_table_entry(2),
+            ],
         });
         let flip_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("flip-pl"),
@@ -3351,6 +3637,8 @@ impl Shared {
         Self {
             sampler,
             grain_sampler,
+            blank_tile,
+            white_tile,
             dab_pipelines,
             dab_layout,
             composite_pipeline,
@@ -3703,11 +3991,58 @@ impl CanvasRenderer {
         self.background = background.premultiplied();
     }
 
+    /// How many slots the page table holds. [`MAX_SLOTS`], always: the table is
+    /// built at the ceiling and never grown — see [`LayerStore`].
     pub fn slot_capacity(&self) -> u32 {
-        self.layers.capacity
+        MAX_SLOTS as u32
     }
 
-    /// Guarantee at least `needed` texture-array slices exist.
+    /// How deep the atlas is, in pages. Observation, and what the VRAM readout
+    /// reports.
+    pub fn page_count(&self) -> u32 {
+        self.layers.pages
+    }
+
+    /// How many atlas cells no slot holds.
+    pub fn free_tiles(&self) -> usize {
+        self.layers.free.len()
+    }
+
+    /// How many cells a slot holds. What a test asks to say a layer got sparser.
+    pub fn backed_tiles(&self, slot: u32) -> usize {
+        if slot as usize >= MAX_SLOTS {
+            return 0;
+        }
+        self.layers.backed(slot).count()
+    }
+
+    /// What a slot's absent tiles read as.
+    fn class_of(&self, slot: u32) -> SlotClass {
+        self.layers
+            .class
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(SlotClass::Layer)
+    }
+
+    /// Say what a slot's absent tiles read as.
+    ///
+    /// Set by [`Self::fill_layer_white`] and reset by [`Self::clear_layer`], so
+    /// a slot recycled from a mask into a layer stops reading white. Both are
+    /// the *only* two places a slot changes what it is for, which is why this is
+    /// private: a third caller would be a slot whose class and whose pixels
+    /// disagreed.
+    fn set_class(&mut self, slot: u32, class: SlotClass) {
+        if let Some(c) = self.layers.class.get_mut(slot as usize) {
+            *c = class;
+        }
+    }
+
+    /// Guarantee the atlas holds at least `pages` pages.
+    ///
+    /// The same [`grown_capacity`] policy the layer array always grew by, asked
+    /// about pages instead of slices — which is the same question, because a
+    /// page is what a slice was.
     ///
     /// Growth reallocates the array and copies every existing slice, so it
     /// doubles rather than growing by one — a document that reaches eight
@@ -3720,46 +4055,38 @@ impl CanvasRenderer {
     /// **The `.min` below fails open and the assertion is what stops it.**
     /// Asked for more than [`MAX_SLOTS`], this allocates the ceiling, logs a
     /// growth line naming it, and returns as though it had done what it was
-    /// asked — after which every slot at or above the ceiling indexes off the
-    /// end of the array. It is unreachable today, because `SlotPool` hands out
-    /// at most slot 255 and `begin_float` refuses at the ceiling; but this
-    /// clamp is the *only* thing standing between those two guarantees and
-    /// silently wrong pixels, and `LayerStack::MAX_SLOTS` lives in a different
-    /// crate, where it can be raised on its own with only one test in this one
-    /// to notice. A named failure is worth the debug build's comparison.
-    pub fn ensure_slots(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: u32) {
-        let Some(capacity) = self.growth_for(needed) else {
+    /// asked. It is unreachable today: a page is what a slice was, and no
+    /// document can hold more painted pages than it has slots.
+    pub fn ensure_pages(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pages: u32) {
+        let Some(capacity) = self.growth_for(pages) else {
             return;
         };
         let grown = LayerStore::new(device, queue, self.doc_size, capacity);
         self.adopt(device, queue, grown);
     }
 
-    /// [`CanvasRenderer::ensure_slots`], refusing rather than dying where the
-    /// device will not hold the grown array.
+    /// [`CanvasRenderer::ensure_pages`], refusing rather than dying where the
+    /// device will not hold the grown atlas.
     ///
-    /// The refusal is stated against `c + n` slices, and that is what a caller
-    /// should say out loud: a growth holds the array it is replacing *and* the
+    /// The refusal is stated against `c + n` pages, and that is what a caller
+    /// should say out loud: a growth holds the atlas it is replacing *and* the
     /// one it is making, because the copy between them is recorded against both
     /// and wgpu keeps a texture alive for any submission naming it. See
     /// [`Vram::peak_bytes`].
     ///
-    /// **A refusal changes nothing at all** — not the capacity, not the bind
+    /// **A refusal changes nothing at all** — not the page count, not the bind
     /// group, not one texel — so a caller may ask before it changes its own
-    /// model and treat an `Err` as "this did not happen". It must ask *first*,
-    /// though: a stack that has already claimed a slice the array does not have
-    /// is a stack the renderer will index off the end of, and there is no
-    /// undoing that from here.
-    pub fn try_ensure_slots(
+    /// model and treat an `Err` as "this did not happen".
+    pub fn try_ensure_pages(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        needed: u32,
+        pages: u32,
     ) -> Result<(), Vram> {
-        let Some(capacity) = self.growth_for(needed) else {
+        let Some(capacity) = self.growth_for(pages) else {
             return Ok(());
         };
-        // The array this one replaces is still resident while it is made — the
+        // The atlas this one replaces is still resident while it is made — the
         // copy is recorded against both — so it is what `Vram::peak_bytes` adds.
         //
         // **Untested, and structural instead**, which is the honest reading:
@@ -3778,31 +4105,299 @@ impl CanvasRenderer {
         Ok(())
     }
 
-    /// The capacity a growth to `needed` would allocate, or `None` where there
+    /// Guarantee a slot **exists**, which since stage 2 costs nothing at all.
+    ///
+    /// A slot is a slice of the page table, the table is [`MAX_SLOTS`] deep from
+    /// the moment the store is built, and an unpainted slot backs no atlas cell.
+    /// So there is no allocation left here and the method survives only as the
+    /// place that says so — and as the assertion, which is the one thing it
+    /// still does: `LayerStack::MAX_SLOTS` lives in a different crate where it
+    /// can be raised on its own, and a slot past this ceiling would index off
+    /// the end of `entries` rather than merely being unbacked.
+    pub fn ensure_slots(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue, needed: u32) {
+        debug_assert!(
+            needed <= MAX_SLOTS as u32,
+            "asked for {needed} slots against a ceiling of {MAX_SLOTS}"
+        );
+    }
+
+    /// Reserve room for one more *painted* layer, refusing rather than dying.
+    ///
+    /// **This is where the refusal moved to and why it is not vacuous.** Before
+    /// stage 2 a new layer allocated a canvas-sized slice, so `add_layer` could
+    /// ask the device for it and report a sentence. A blank layer now costs
+    /// nothing, so there is nothing to refuse at that moment — and refusing
+    /// nothing is worse than not asking, because the gate goes quiet exactly
+    /// when the card is full. What is reserved instead is a page of **headroom**
+    /// in the pool: enough free cells that the first stroke on the new layer
+    /// cannot be the thing that meets the ceiling.
+    ///
+    /// It is a headroom check rather than a per-layer allocation, so adding
+    /// sixty-four blank layers grows the atlas once and not sixty-four times.
+    ///
+    /// `needed` is the slot count the caller is about to claim, kept so the
+    /// ceiling assertion still runs where it always did.
+    pub fn try_ensure_slots(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        needed: u32,
+    ) -> Result<(), Vram> {
+        self.ensure_slots(device, queue, needed);
+        let want = self.layers.grid.tiles_per_page() as usize;
+        if self.layers.free.len() >= want {
+            return Ok(());
+        }
+        self.try_ensure_pages(device, queue, self.layers.pages + 1)
+    }
+
+    /// The page count a growth to `pages` would allocate, or `None` where there
     /// is nothing to grow.
     ///
-    /// The decision half of [`CanvasRenderer::ensure_slots`], shared with its
+    /// The decision half of [`CanvasRenderer::ensure_pages`], shared with its
     /// fallible sibling so the two cannot grow to different sizes — which would
     /// make a refusal the only observable difference between them and a silent
     /// one the day they drifted.
-    fn growth_for(&self, needed: u32) -> Option<u32> {
-        debug_assert!(
-            needed <= MAX_SLOTS as u32,
-            "asked for {needed} slices against a ceiling of {MAX_SLOTS}"
-        );
-        if needed <= self.layers.capacity {
+    fn growth_for(&self, pages: u32) -> Option<u32> {
+        if pages <= self.layers.pages {
             return None;
         }
         let capacity = grown_capacity(
-            self.layers.capacity,
-            needed,
+            self.layers.pages,
+            pages,
             // `self.doc_size`, which `resize` rewrites before anything can ask
-            // again, so the budget is always against the canvas the array is
+            // again, so the budget is always against the canvas the atlas is
             // actually being built for.
             slice_bytes(self.doc_size),
         )
         .min(MAX_SLOTS as u32);
         Some(capacity)
+    }
+
+    /// Make sure every tile in `tiles` of `slot` is stored somewhere, growing
+    /// the atlas if the pool has run out, and initialise anything newly
+    /// allocated to the slot's own empty value.
+    ///
+    /// **The initialisation is the half that is easy to forget and impossible to
+    /// see.** An atlas cell is recycled: it holds whatever the last slot that
+    /// held it left behind. A commit loads and blends, so a stroke crossing into
+    /// a tile nobody has painted would blend over another layer's paint — and a
+    /// partly written tile of a *mask* would read black where nothing had been
+    /// written rather than white. So a cell arrives cleared to
+    /// [`SlotClass::clear_colour`], in the caller's own encoder, before anything
+    /// reads it.
+    ///
+    /// **What happens when the atlas is full is `docs/perf/tiled-layer-storage.md`
+    /// §9.5's open problem, and it is not solved here.** Growth is fallible and
+    /// happens at pointer-up; where the device refuses, the tiles that could not
+    /// be backed are logged and skipped, and the stroke loses them. The
+    /// alternative — refusing the whole stroke — loses more.
+    fn back_tiles(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: u32,
+        tiles: &[(u32, u32)],
+    ) {
+        if slot as usize >= MAX_SLOTS {
+            return;
+        }
+        let wanted = tiles
+            .iter()
+            .filter(|t| !self.layers.entry(slot, **t).is_backed())
+            .count();
+        if wanted == 0 {
+            return;
+        }
+        if self.layers.free.len() < wanted {
+            let short = wanted - self.layers.free.len();
+            let per = self.layers.grid.tiles_per_page() as usize;
+            let more = short.div_ceil(per.max(1)) as u32;
+            if let Err(refused) =
+                self.try_ensure_pages(device, queue, self.layers.pages.saturating_add(more))
+            {
+                log::error!(
+                    "the atlas is full: {} tile(s) of slot {slot} cannot be stored ({} pages of {} bytes)",
+                    wanted - self.layers.free.len(),
+                    refused.slices,
+                    refused.slice_bytes,
+                );
+            }
+        }
+
+        let class = self.class_of(slot);
+        let base = self.layers.slot_at(slot);
+        let mut fresh: Vec<Entry> = Vec::new();
+        for &(tx, ty) in tiles {
+            let at = base + self.layers.grid.index(tx, ty);
+            if self.layers.entries[at].is_backed() {
+                continue;
+            }
+            let Some(cell) = self.layers.free.pop() else {
+                break;
+            };
+            self.layers.entries[at] = cell;
+            fresh.push(cell);
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        self.clear_cells(encoder, &fresh, class);
+        self.layers.upload_slot(queue, slot);
+    }
+
+    /// Wipe a set of atlas cells to one class's empty value.
+    ///
+    /// A **buffer copy**, not a render pass, and that is what makes it usable
+    /// where it is needed. A `LoadOp::Clear` clears the whole attachment rather
+    /// than a scissored region, so a scissored clear would need a pipeline of
+    /// its own — and a pass cannot be recorded between the copies `promote`
+    /// issues. One 256 KB buffer per class, held for the life of the renderer,
+    /// copied once per cell.
+    fn clear_cells(&self, encoder: &mut wgpu::CommandEncoder, cells: &[Entry], class: SlotClass) {
+        let blank = match class {
+            SlotClass::Layer => &self.shared.blank_tile,
+            SlotClass::Mask => &self.shared.white_tile,
+        };
+        for cell in cells {
+            let (x, y) = cell.origin();
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: blank,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(TILE * 4),
+                        rows_per_image: Some(TILE),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.layers.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x,
+                        y,
+                        z: cell.page(),
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: TILE,
+                    height: TILE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    /// Give a slot a whole page of its own, identity-mapped, carrying whatever
+    /// it already holds.
+    ///
+    /// What it buys is that every document-space origin is an atlas-space
+    /// origin again, which is what keeps the float, the effect slices and
+    /// `transform.wgsl` on exactly the code they had. See [`PageUse`] for why
+    /// this is right for those three and wrong for a stroke.
+    ///
+    /// The page is cleared to the slot's empty value first, because the cells it
+    /// is made of are recycled; then the slot's backed tiles are copied into
+    /// their identity positions and their old cells go back to the pool.
+    fn promote(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: u32,
+    ) {
+        if slot as usize >= MAX_SLOTS || self.layers.owned_page(slot).is_some() {
+            return;
+        }
+        // A whole free page, or one more. Asked for *before* anything moves, so
+        // a refusal leaves the slot exactly as it was.
+        let Some(page) = self.take_whole_page(device, queue) else {
+            log::error!("no page for slot {slot}");
+            return;
+        };
+        let class = self.class_of(slot);
+        let cells: Vec<Entry> = (0..self.layers.grid.tiles.y)
+            .flat_map(|ty| (0..self.layers.grid.tiles.x).map(move |tx| (tx, ty)))
+            .map(|(tx, ty)| Entry::at(page, tx, ty))
+            .collect();
+        self.clear_cells(encoder, &cells, class);
+
+        let moves: Vec<((u32, u32), Entry)> = self.layers.backed(slot).collect();
+        for (tile, from) in &moves {
+            let (sx, sy) = from.origin();
+            let (dx, dy) = (tile.0 * TILE, tile.1 * TILE);
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.layers.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: sx,
+                        y: sy,
+                        z: from.page(),
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.layers.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: dx, y: dy, z: page },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: TILE,
+                    height: TILE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        // Freed *after* the copies are recorded, so nothing that is still being
+        // read can be handed out — the encoder runs in order, but a second
+        // promotion in the same encoder would otherwise be able to claim one.
+        for (_, from) in moves {
+            self.layers.free.push(from);
+        }
+        let base = self.layers.slot_at(slot);
+        for ty in 0..self.layers.grid.tiles.y {
+            for tx in 0..self.layers.grid.tiles.x {
+                self.layers.entries[base + self.layers.grid.index(tx, ty)] = Entry::at(page, tx, ty);
+            }
+        }
+        self.layers.use_of[page as usize] = PageUse::Owned(slot);
+        self.layers.upload_slot(queue, slot);
+    }
+
+    /// A page no slot holds any cell of, growing the atlas if there is none.
+    fn take_whole_page(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<u32> {
+        let per = self.layers.grid.tiles_per_page() as usize;
+        let whole = |store: &LayerStore| -> Option<u32> {
+            (0..store.pages).find(|p| {
+                store.use_of[*p as usize] == PageUse::Pool
+                    && store.free.iter().filter(|c| c.page() == *p).count() == per
+            })
+        };
+        if let Some(page) = whole(&self.layers) {
+            self.layers.free.retain(|c| c.page() != page);
+            return Some(page);
+        }
+        let pages = self.layers.pages;
+        self.ensure_pages(device, queue, pages + 1);
+        if self.layers.pages == pages {
+            return None;
+        }
+        let page = whole(&self.layers)?;
+        self.layers.free.retain(|c| c.page() != page);
+        Some(page)
+    }
+
+    /// Give every cell a slot holds back, and push the emptied table slice.
+    fn release_slot(&mut self, queue: &wgpu::Queue, slot: u32) {
+        if slot as usize >= MAX_SLOTS {
+            return;
+        }
+        self.layers.release(slot);
+        self.layers.upload_slot(queue, slot);
     }
 
     /// Copy the old array into `grown`, clear what is new, and swap it in.
@@ -3816,10 +4411,10 @@ impl CanvasRenderer {
     /// there, a refused growth announced a growth that did not happen and was
     /// then immediately contradicted by `try_reserve`'s own refusal line.
     fn adopt(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut grown: LayerStore) {
-        let capacity = grown.capacity;
+        let capacity = grown.pages;
         log::info!(
-            "growing layer storage {} -> {} slots",
-            self.layers.capacity,
+            "growing the tile atlas {} -> {} pages",
+            self.layers.pages,
             capacity
         );
         let page = self.layers.grid.page_size();
@@ -3850,25 +4445,30 @@ impl CanvasRenderer {
             wgpu::Extent3d {
                 width: page.x,
                 height: page.y,
-                depth_or_array_layers: self.layers.capacity,
+                depth_or_array_layers: self.layers.pages,
             },
         );
-        // **And carry the table the copy above is for.** `grown` was built with
-        // a fresh identity table, which agrees with the old one entry for entry
-        // while residency *is* the identity — so this is a no-op today and is
-        // the difference between the copy meaning something and not the day it
-        // stops being one. A page index does not move across a growth: page `n`
-        // of the old array is page `n` of the new, which is exactly what the
-        // whole-page copy above establishes.
-        let carried = self.layers.entries.len().min(grown.entries.len());
-        grown.entries[..carried].copy_from_slice(&self.layers.entries[..carried]);
+        // **And carry the table the copy above is for**, along with everything
+        // else that says where a texel is. A page index does not move across a
+        // growth: page `n` of the old atlas is page `n` of the new, which is
+        // exactly what the whole-page copy above establishes — so the entries,
+        // the per-page use and the free list are all still true of the larger
+        // atlas, and only the cells of the pages that did not exist before are
+        // new. `grown` was built with every page pooled and every cell free, so
+        // taking the old free list and stocking the tail is the whole of it.
+        grown.entries.copy_from_slice(&self.layers.entries);
+        grown.class.copy_from_slice(&self.layers.class);
+        grown.use_of[..self.layers.pages as usize].copy_from_slice(&self.layers.use_of);
+        grown.free.clear();
+        grown.stock(self.layers.pages..capacity);
+        grown.free.extend_from_slice(&self.layers.free);
         grown.upload_table(queue);
 
-        // Slices beyond the old capacity are freshly allocated and hold
-        // whatever the driver left behind.
-        for slot in self.layers.capacity..capacity {
-            clear_view(&mut enc, &grown.slot_views[slot as usize], "clear-new-slot");
-        }
+        // Nothing is cleared here. A cell of a page that did not exist before is
+        // on the free list and holds whatever the driver left behind; it is
+        // `back_tiles` that wipes one to the slot's own empty value on the way
+        // out of the pool, which is the only place that knows what value that
+        // is.
         queue.submit(Some(enc.finish()));
 
         self.composite_bind_group = make_composite_bind_group(
@@ -3999,7 +4599,7 @@ impl CanvasRenderer {
         // `live` an honest description of the new array — see the note on that
         // parameter. Moved up from below the copy for exactly that reason;
         // nothing else about the float depends on where this runs.
-        self.end_float();
+        self.end_float(queue);
         let plan = CanvasCopy::plan(self.doc_size, new_size, anchor);
         log::info!(
             "resizing canvas {} x {} -> {} x {}, {anchor:?}",
@@ -4010,47 +4610,161 @@ impl CanvasRenderer {
         );
 
         // The same rule `with_shared` builds by, asked afresh against what a
-        // slice costs at the *new* size — including the speculative floor, so a
+        // page costs at the *new* size — including the speculative floor, so a
         // resized document does not start reallocating on its second layer where
         // a freshly opened one of the same shape would not.
+        //
+        // # A resize needs no scratch, and that is what tiling bought here
+        //
+        // The old atlas and the new one are two textures that are both live, and
+        // **every move a resize makes is a translation** — the anchor shifts the
+        // whole picture by one offset. So for each backed source tile, clip its
+        // document rectangle to the surviving region, shift it, and
+        // `copy_texture_to_texture` it into whichever destination tiles it lands
+        // in. No shader, no scratch, and nothing reads a region that was never
+        // written: a shifted destination tile reaches outside what any source
+        // tile covers, and what is not copied is simply left unbacked, which is
+        // the slot's own empty value. A scratch would have needed a per-slot
+        // clear to make that safe. The flip is the one that genuinely cannot do
+        // this — see `flip_layers`.
         let capacity = built_capacity(live, slice_bytes(new_size));
-        let resized = LayerStore::new(device, queue, new_size, capacity);
+        let mut resized = LayerStore::new(device, queue, new_size, capacity);
+        resized.class.copy_from_slice(&self.layers.class);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("resize-canvas"),
         });
-        for view in &resized.slot_views {
-            clear_view(&mut enc, view, "clear-resized-slot");
-        }
-        let carried = self.layers.capacity.min(capacity);
-        enc.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.layers.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: plan.from.x,
-                    y: plan.from.y,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &resized.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: plan.to.x,
-                    y: plan.to.y,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: plan.size.x,
-                height: plan.size.y,
-                depth_or_array_layers: carried,
-            },
+        let survivor = PixelRect {
+            x: plan.from.x,
+            y: plan.from.y,
+            width: plan.size.x,
+            height: plan.size.y,
+        };
+        let shift = (
+            plan.to.x as i64 - plan.from.x as i64,
+            plan.to.y as i64 - plan.from.y as i64,
         );
+        let mut owned: Vec<u32> = Vec::new();
+        for slot in 0..MAX_SLOTS as u32 {
+            if self.layers.owned_page(slot).is_some() {
+                owned.push(slot);
+            }
+            for (tile, from) in self.layers.backed(slot) {
+                // What of this tile survives, where it lands, and which
+                // destination tiles that reaches.
+                let src = self.layers.grid.tile_rect(tile.0, tile.1);
+                let Some(kept) = intersect(src, survivor) else {
+                    continue;
+                };
+                let dest = PixelRect {
+                    x: (kept.x as i64 + shift.0) as u32,
+                    y: (kept.y as i64 + shift.1) as u32,
+                    ..kept
+                };
+                for Fragment {
+                    doc,
+                    tile: dt,
+                    within,
+                } in resized.grid.fragments(dest)
+                {
+                    let cell = match resized.entry(slot, dt) {
+                        e if e.is_backed() => e,
+                        _ => {
+                            let Some(cell) = resized.free.pop() else {
+                                continue;
+                            };
+                            // Fresh, so it holds whatever the driver left there
+                            // and only part of it is about to be written.
+                            let class = resized.class[slot as usize];
+                            let blank = match class {
+                                SlotClass::Layer => &self.shared.blank_tile,
+                                SlotClass::Mask => &self.shared.white_tile,
+                            };
+                            let (cx, cy) = cell.origin();
+                            enc.copy_buffer_to_texture(
+                                wgpu::TexelCopyBufferInfo {
+                                    buffer: blank,
+                                    layout: wgpu::TexelCopyBufferLayout {
+                                        offset: 0,
+                                        bytes_per_row: Some(TILE * 4),
+                                        rows_per_image: Some(TILE),
+                                    },
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &resized.texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d {
+                                        x: cx,
+                                        y: cy,
+                                        z: cell.page(),
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d {
+                                    width: TILE,
+                                    height: TILE,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            let at = resized.slot_at(slot) + resized.grid.index(dt.0, dt.1);
+                            resized.entries[at] = cell;
+                            cell
+                        }
+                    };
+                    // Back through the shift to find the source texels: the
+                    // destination fragment is a rectangle of the *new* document
+                    // and the source tile holds the old one.
+                    let sx = (doc.x as i64 - shift.0) as u32;
+                    let sy = (doc.y as i64 - shift.1) as u32;
+                    let (fx, fy) = from.origin();
+                    let (dx, dy) = cell.origin();
+                    enc.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.layers.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: fx + sx % TILE,
+                                y: fy + sy % TILE,
+                                z: from.page(),
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &resized.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: dx + within.0,
+                                y: dy + within.1,
+                                z: cell.page(),
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: doc.width,
+                            height: doc.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+            }
+        }
+        resized.upload_table(queue);
         queue.submit(Some(enc.finish()));
         self.layers = resized;
+
+        // A page-backed slot stays one. `apply_canvas` has already put the float
+        // down, so the only ones left are effect slices — and their cache is
+        // emptied above, which means nothing is promoted here in practice and
+        // this exists so that "an owned page survives a resize" is a property of
+        // the method rather than of who happens to call it.
+        if !owned.is_empty() {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resize-promote"),
+            });
+            for slot in owned {
+                self.promote(device, queue, &mut enc, slot);
+            }
+            queue.submit(Some(enc.finish()));
+        }
 
         // Everything above this line answers to the canvas being left behind —
         // `CanvasCopy::plan` and the copy extent. Everything below it is being
@@ -4656,10 +5370,17 @@ impl CanvasRenderer {
         pieces: &[PixelRect],
         style: StrokeStyle,
     ) {
-        let Some(view) = self.layers.slot_views.get(slot as usize) else {
-            log::error!("commit to slot {slot} beyond capacity");
+        if slot as usize >= MAX_SLOTS {
+            log::error!("commit to slot {slot} beyond the ceiling");
             return;
-        };
+        }
+        // **Before anything reads the layer.** A stroke that crossed into a tile
+        // nobody had painted has nowhere to be committed until this runs, and a
+        // cell arrives cleared to the slot's own empty value — which is what
+        // stops the commit's `LoadOp::Load` blending over whatever the last slot
+        // to hold that cell left in it.
+        let touched = self.tiles_over(pieces);
+        self.back_tiles(device, queue, encoder, slot, &touched);
 
         // Two strokes carry no blend, and both are *ignored* rather than
         // refused — the same reading `umber_core::Brush::blend_applies` gives,
@@ -4679,24 +5400,64 @@ impl CanvasRenderer {
             return;
         }
 
+        let aims = self.commit_aims(slot, pieces);
+        if aims.is_empty() {
+            self.clear_stroke(device, encoder);
+            self.touch_slot(slot);
+            return;
+        }
+
         let color = style.color;
-        queue.write_buffer(
-            &self.commit_uniforms,
-            0,
-            bytemuck::bytes_of(&CommitUniforms {
+        let target = self.layers.grid.page_size();
+        let stride = std::mem::size_of::<CommitUniforms>()
+            .next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as usize);
+        let mut blocks = vec![0u8; stride * aims.len()];
+        for (i, aim) in aims.iter().enumerate() {
+            // `rect` and not the aim's own rectangle: the quad spans the whole
+            // damaged rectangle and the scissor is what decides which of it
+            // survives, exactly as it always did. What the aim carries is where
+            // the *target* is, which is the only thing tiling changed.
+            let block = CommitUniforms {
                 rect_min: [rect.x as f32, rect.y as f32],
                 rect_max: [(rect.x + rect.width) as f32, (rect.y + rect.height) as f32],
                 doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
-                _pad0: [0.0; 2],
+                atlas_delta: [aim.delta.0 as f32, aim.delta.1 as f32],
+                target_size: [target.x as f32, target.y as f32],
+                _pad0: 0.0,
+                _pad1: 0.0,
                 color: [color.r, color.g, color.b, style.opacity.clamp(0.0, 1.0)],
                 mode: mode_index(style.mode),
                 per_dab_color: u32::from(style.per_dab_color),
                 blend: BlendMode::Normal.index(),
                 _pad2: 0,
-            }),
+            };
+            let at = i * stride;
+            blocks[at..at + std::mem::size_of::<CommitUniforms>()]
+                .copy_from_slice(bytemuck::bytes_of(&block));
+        }
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("umber-commit-uniforms"),
+            contents: &blocks,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = make_commit_bind_group(
+            device,
+            &self.shared.commit_layout,
+            &uniforms,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
         );
 
-        {
+        // One pass per page. A page-backed slot is one page and one aim, which
+        // is byte for byte the single pass this always was.
+        let mut i = 0;
+        while i < aims.len() {
+            let page = aims[i].page;
+            let Some(view) = self.layers.page_views.get(page as usize) else {
+                i += 1;
+                continue;
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("commit-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4713,24 +5474,86 @@ impl CanvasRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            aim_at_document(&mut pass, self.doc_size);
             pass.set_pipeline(match style.mode {
                 BrushMode::Paint => &self.shared.commit_pipeline,
                 BrushMode::Erase => &self.shared.commit_erase_pipeline,
             });
-            pass.set_bind_group(0, &self.commit_bind_group, &[]);
-            // One quad, drawn once per piece under a different scissor. The
-            // vertex shader spans `rect` every time — the scissor is what
-            // decides which of it survives — so nothing per piece has to reach
-            // the uniform buffer.
-            for piece in pieces {
-                pass.set_scissor_rect(piece.x, piece.y, piece.width, piece.height);
+            while i < aims.len() && aims[i].page == page {
+                let aim = &aims[i];
+                pass.set_bind_group(0, &bind_group, &[(i * stride) as u32]);
+                // In the *attachment's* coordinates, which is the page. The
+                // delta is what takes the document rectangle there, and it is
+                // never negative in the result: a fragment lies inside its own
+                // tile and a tile's cell origin is non-negative.
+                pass.set_scissor_rect(
+                    (aim.doc.x as i32 + aim.delta.0) as u32,
+                    (aim.doc.y as i32 + aim.delta.1) as u32,
+                    aim.doc.width,
+                    aim.doc.height,
+                );
                 pass.draw(0..4, 0..1);
+                i += 1;
             }
         }
 
         self.clear_stroke(device, encoder);
         self.touch_slot(slot);
+    }
+
+    /// Every storage tile a set of damaged pieces reaches.
+    fn tiles_over(&self, pieces: &[PixelRect]) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = pieces
+            .iter()
+            .flat_map(|p| self.layers.grid.tiles_over(*p))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Cut a commit's pieces into what one render pass can draw at a time.
+    ///
+    /// **Grouped by page and in page order**, so the caller opens one pass per
+    /// page rather than one per piece. A page-backed slot answers with the
+    /// caller's own pieces and a zero delta, which is exactly the single pass
+    /// spanning the whole damaged rectangle that a commit was before there were
+    /// tiles.
+    ///
+    /// A tile that is not backed yields nothing. It cannot happen after
+    /// `back_tiles` unless the atlas refused to grow, which is
+    /// `docs/perf/tiled-layer-storage.md` §9.5's open problem: what is lost is
+    /// then that tile of the stroke rather than the whole commit.
+    fn commit_aims(&self, slot: u32, pieces: &[PixelRect]) -> Vec<CommitAim> {
+        let mut out = Vec::new();
+        if let Some(page) = self.layers.owned_page(slot) {
+            out.extend(pieces.iter().filter(|p| p.width > 0 && p.height > 0).map(
+                |p| CommitAim {
+                    page,
+                    delta: (0, 0),
+                    doc: *p,
+                },
+            ));
+            return out;
+        }
+        for piece in pieces {
+            for Fragment { doc, tile, .. } in self.layers.grid.fragments(*piece) {
+                let entry = self.layers.entry(slot, tile);
+                if !entry.is_backed() {
+                    continue;
+                }
+                let (cx, cy) = entry.origin();
+                out.push(CommitAim {
+                    page: entry.page(),
+                    delta: (
+                        cx as i32 - (tile.0 * TILE) as i32,
+                        cy as i32 - (tile.1 * TILE) as i32,
+                    ),
+                    doc,
+                });
+            }
+        }
+        out.sort_by_key(|a| a.page);
+        out
     }
 
     /// The commit for a brush whose blend mode is not Normal.
@@ -4796,23 +5619,25 @@ impl CanvasRenderer {
         pieces: &[PixelRect],
         style: StrokeStyle,
     ) {
-        let Some(view) = self.layers.slot_views.get(slot as usize) else {
-            return;
-        };
         // A zero-sized piece would be an illegal copy extent and draws nothing
         // anyway. `pieces` never holds one today; skipping is cheaper than
         // depending on that.
-        let live: Vec<PixelRect> = pieces
-            .iter()
-            .copied()
-            .filter(|p| p.width > 0 && p.height > 0)
+        //
+        // **Cut per (piece ∩ tile) like the Normal commit**, which is what
+        // bounds the backdrop below: a tile is 256 square, so a blended commit's
+        // copy is now never larger than one tile even where the caller handed
+        // over a bounding rectangle as one piece.
+        let live: Vec<CommitAim> = self
+            .commit_aims(slot, pieces)
+            .into_iter()
+            .filter(|a| a.doc.width > 0 && a.doc.height > 0)
             .collect();
         if live.is_empty() {
             return;
         }
 
-        let widest = live.iter().map(|p| p.width).max().unwrap_or(1);
-        let tallest = live.iter().map(|p| p.height).max().unwrap_or(1);
+        let widest = live.iter().map(|p| p.doc.width).max().unwrap_or(1);
+        let tallest = live.iter().map(|p| p.doc.height).max().unwrap_or(1);
         let backdrop = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("umber-commit-backdrop"),
             size: wgpu::Extent3d {
@@ -4841,8 +5666,10 @@ impl CanvasRenderer {
         let stride = std::mem::size_of::<CommitUniforms>()
             .next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as usize);
         let color = style.color;
+        let target = self.layers.grid.page_size();
         let mut blocks = vec![0u8; stride * live.len()];
-        for (i, piece) in live.iter().enumerate() {
+        for (i, aim) in live.iter().enumerate() {
+            let piece = aim.doc;
             let block = CommitUniforms {
                 rect_min: [piece.x as f32, piece.y as f32],
                 rect_max: [
@@ -4850,7 +5677,10 @@ impl CanvasRenderer {
                     (piece.y + piece.height) as f32,
                 ],
                 doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
-                _pad0: [0.0; 2],
+                atlas_delta: [aim.delta.0 as f32, aim.delta.1 as f32],
+                target_size: [target.x as f32, target.y as f32],
+                _pad0: 0.0,
+                _pad1: 0.0,
                 color: [color.r, color.g, color.b, style.opacity.clamp(0.0, 1.0)],
                 mode: mode_index(style.mode),
                 per_dab_color: u32::from(style.per_dab_color),
@@ -4901,7 +5731,19 @@ impl CanvasRenderer {
             ],
         });
 
-        for (i, piece) in live.iter().enumerate() {
+        for (i, aim) in live.iter().enumerate() {
+            let piece = aim.doc;
+            let Some(view) = self.layers.page_views.get(aim.page as usize) else {
+                continue;
+            };
+            // Where this piece sits in the atlas. The copy source and the
+            // scissor are both in the *page*'s coordinates; `rect_min` above is
+            // in the document's, because that is what maps a fragment into the
+            // backdrop copy.
+            let at = (
+                (piece.x as i32 + aim.delta.0) as u32,
+                (piece.y as i32 + aim.delta.1) as u32,
+            );
             // The copy has to precede the pass that reads it, and a copy cannot
             // be recorded inside one. Pieces never overlap, so piece *i* reads
             // pixels no earlier piece wrote.
@@ -4910,9 +5752,9 @@ impl CanvasRenderer {
                     texture: &self.layers.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: piece.x,
-                        y: piece.y,
-                        z: slot,
+                        x: at.0,
+                        y: at.1,
+                        z: aim.page,
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -4945,14 +5787,13 @@ impl CanvasRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            aim_at_document(&mut pass, self.doc_size);
             pass.set_pipeline(&self.shared.commit_blend_pipeline);
             pass.set_bind_group(0, &bind_group, &[(i * stride) as u32]);
             // The quad already covers exactly this piece, so the scissor is
             // belt and braces — and it is what keeps "no pixel outside the
             // pieces the undo patch was captured from is written" a property of
             // the pass rather than of the rasteriser's rounding.
-            pass.set_scissor_rect(piece.x, piece.y, piece.width, piece.height);
+            pass.set_scissor_rect(at.0, at.1, piece.width, piece.height);
             pass.draw(0..4, 0..1);
         }
     }
@@ -5021,52 +5862,53 @@ impl CanvasRenderer {
     }
 
     /// Wipe one layer.
-    pub fn clear_layer(&mut self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
-        if let Some(view) = self.layers.slot_views.get(slot as usize) {
-            clear_view(encoder, view, "clear-layer");
-        }
+    ///
+    /// **A table write, and it gives the storage back.** An empty layer's tiles
+    /// are stored nowhere and read as [`SlotClass::Layer`]'s transparent black,
+    /// so wiping one is exactly freeing its cells — no pass, no clear, and the
+    /// pixels are given back rather than merely overwritten. It also resets the
+    /// slot's class, which is what stops a slice recycled from a mask into a
+    /// layer going on reading white.
+    ///
+    /// The encoder is kept because every caller has one and because a future
+    /// class could need a pass; nothing here records into it.
+    pub fn clear_layer(&mut self, queue: &wgpu::Queue, slot: u32) {
+        self.set_class(slot, SlotClass::Layer);
+        self.release_slot(queue, slot);
         self.touch_slot(slot);
     }
 
-    /// Fill one slice with opaque white — what a **new mask** starts as.
+    /// Make one slot a **mask**, revealing everything — what a new mask starts
+    /// as.
     ///
     /// White is "reveal everything", so a layer that has just gained a mask
     /// looks exactly as it did a moment before; that is what makes adding one
     /// something a painter can try rather than commit to.
     ///
-    /// A clear rather than a draw. The clear value is linear and the target is
-    /// sRGB-typed, but 1.0 encodes to 255 either way, so the slice really does
-    /// come back as `0xff` in every channel — which matters, because the
-    /// composite reads the red one and a mask that arrived at 0xfe would dim
-    /// its layer by a level the painter never asked for.
-    pub fn fill_layer_white(&mut self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
+    /// **It used to fill a canvas-sized slice with opaque white and it now
+    /// writes a table**, which is the sparse-mask win falling straight out of
+    /// the allocator: full reveal *is* [`SlotClass::Mask`]'s empty value, so a
+    /// new mask costs no storage at all until somebody paints on it, and the
+    /// tiles a stroke does reach arrive cleared to white by `back_tiles`. What
+    /// the old clear relied on — that 1.0 linear encodes to `0xff` through an
+    /// sRGB-typed target, so a mask never arrived at `0xfe` and dimmed its layer
+    /// by a level nobody asked for — is now [`SlotClass::empty_bytes`]'s literal
+    /// `[255; 4]` on the readback side and `wgpu::Color::WHITE` on the clear
+    /// side, which is the same pair of claims with the arithmetic taken out of
+    /// one of them.
+    pub fn fill_layer_white(&mut self, queue: &wgpu::Queue, slot: u32) {
         self.touch_slot(slot);
-        let Some(view) = self.layers.slot_views.get(slot as usize) else {
-            return;
-        };
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("fill-mask-white"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        self.set_class(slot, SlotClass::Mask);
+        self.release_slot(queue, slot);
     }
 
-    /// Wipe every allocated slot. Used at startup.
-    pub fn clear_all_layers(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        for view in &self.layers.slot_views {
-            clear_view(encoder, view, "clear-layer");
+    /// Wipe every slot. Used at startup.
+    pub fn clear_all_layers(&mut self, queue: &wgpu::Queue) {
+        for slot in 0..MAX_SLOTS as u32 {
+            self.layers.class[slot as usize] = SlotClass::Layer;
+            self.layers.release(slot);
         }
+        self.layers.upload_table(queue);
         self.touch_all_slots();
     }
 
@@ -5082,15 +5924,31 @@ impl CanvasRenderer {
     /// `textureLoad`, non-sRGB views on both sides, and no blending.
     ///
     /// A texture cannot be its own render attachment and
-    /// `copy_texture_to_texture` cannot mirror, so each slice is drawn into one
-    /// scratch texture and copied straight back. The scratch is canvas-sized
-    /// and lives only for the call: a flip is an explicit command, not
-    /// something the drawing path does, and holding a spare canvas for the rest
-    /// of the session in case somebody presses the key would cost every
-    /// document that never does.
+    /// `copy_texture_to_texture` cannot mirror, so each slot is drawn into one
+    /// scratch **page** and the tiles that end up holding something are copied
+    /// straight back. The scratch is page-sized and lives only for the call: a
+    /// flip is an explicit command, not something the drawing path does, and
+    /// holding a spare canvas for the rest of the session in case somebody
+    /// presses the key would cost every document that never does.
+    ///
+    /// # A mirror is not a translation, which is the whole reason this is a pass
+    ///
+    /// `resize` moves a slot's tiles with `copy_texture_to_texture` alone,
+    /// because every move a resize makes is a translation. A mirror is not one:
+    /// the destination tile at the left edge is made of the *right* edge's
+    /// texels, and a canvas that is not a whole number of tiles has that
+    /// straddling two source tiles. So the destination residency is derived from
+    /// the source's through the mirror, the pass reads the page table, and the
+    /// only thing copied is whole tiles out of the scratch.
+    ///
+    /// **The table is not written until the pass has run.** `write_texture` is
+    /// staged before the command buffers of the submission it precedes, so
+    /// installing the new entries before submitting would have every pass
+    /// resolve through the residency it is producing rather than the one it is
+    /// reading. Two submissions, and the second is table writes only.
     ///
     /// The canvas size does not change, which is the whole reason a flip can
-    /// keep the undo history where a resize cannot. Nothing here reallocates.
+    /// keep the undo history where a resize cannot.
     ///
     /// The caller owes this **no stroke and no float in flight** — the scratch
     /// surface and the floating copy are not mirrored, so a stroke would commit
@@ -5117,11 +5975,36 @@ impl CanvasRenderer {
             self.touch_slot(slot);
         }
 
+        // What each slot's residency becomes, worked out before anything moves —
+        // and the atlas grown for all of it at once, because a growth
+        // reallocates the texture and cannot happen part-way through an encoder
+        // that names it.
+        let plans: Vec<(u32, Vec<(u32, u32)>)> = slots
+            .iter()
+            .filter(|s| (**s as usize) < MAX_SLOTS && self.layers.owned_page(**s).is_none())
+            .map(|&slot| (slot, self.mirrored_residency(slot, axis)))
+            .collect();
+        let wanted: usize = plans
+            .iter()
+            .map(|(slot, tiles)| {
+                tiles
+                    .iter()
+                    .filter(|t| !self.layers.entry(*slot, **t).is_backed())
+                    .count()
+            })
+            .sum();
+        if self.layers.free.len() < wanted {
+            let per = self.layers.grid.tiles_per_page() as usize;
+            let short = (wanted - self.layers.free.len()).div_ceil(per.max(1)) as u32;
+            self.ensure_pages(device, queue, self.layers.pages.saturating_add(short));
+        }
+
+        let page = self.layers.grid.page_size();
         let scratch = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("umber-flip"),
             size: wgpu::Extent3d {
-                width: self.doc_size.x,
-                height: self.doc_size.y,
+                width: page.x,
+                height: page.y,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -5137,47 +6020,70 @@ impl CanvasRenderer {
             ..Default::default()
         });
 
-        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("flip-uniforms"),
-            contents: bytemuck::bytes_of(&FlipUniforms {
+        let stride = std::mem::size_of::<FlipUniforms>()
+            .next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as usize);
+        let mut blocks = vec![0u8; stride * slots.len()];
+        for (i, &slot) in slots.iter().enumerate() {
+            let e = self.class_of(slot).clear_colour();
+            let block = FlipUniforms {
                 doc_size: [self.doc_size.x, self.doc_size.y],
                 axis: match axis {
                     FlipAxis::Horizontal => 0,
                     FlipAxis::Vertical => 1,
                 },
-                _pad: 0,
-            }),
+                slot,
+                empty: [e.r as f32, e.g as f32, e.b as f32, e.a as f32],
+            };
+            let at = i * stride;
+            blocks[at..at + std::mem::size_of::<FlipUniforms>()]
+                .copy_from_slice(bytemuck::bytes_of(&block));
+        }
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flip-uniforms"),
+            contents: &blocks,
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flip-bg"),
+            layout: &self.shared.flip_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &uniforms,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(std::mem::size_of::<FlipUniforms>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    // The **raw** array, for the exactness argument above.
+                    resource: wgpu::BindingResource::TextureView(&self.layers.raw_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.layers.table_view),
+                },
+            ],
+        });
 
+        // What each slot's table slice will become, held until the encoder has
+        // been submitted. See the note on ordering above.
+        let mut installs: Vec<(u32, Vec<((u32, u32), Entry)>, Vec<Entry>)> = Vec::new();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("flip-canvas"),
         });
-        for &slot in slots {
-            let Some(source) = self.layers.raw_slot_views.get(slot as usize) else {
-                log::error!("flip of slot {slot} beyond capacity");
+        for (i, &slot) in slots.iter().enumerate() {
+            if slot as usize >= MAX_SLOTS {
+                log::error!("flip of slot {slot} beyond the ceiling");
                 continue;
-            };
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("flip-bg"),
-                layout: &self.shared.flip_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniforms.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(source),
-                    },
-                ],
-            });
+            }
             {
                 // `Clear` rather than `Load`: every texel of the scratch is
-                // written by the pass, so loading whatever the last slice left
+                // written by the pass, so loading whatever the last slot left
                 // there would only be a dependency the driver has to honour.
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("flip-slice"),
+                    label: Some("flip-slot"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &scratch_view,
                         resolve_target: None,
@@ -5193,38 +6099,151 @@ impl CanvasRenderer {
                     multiview_mask: None,
                 });
                 pass.set_pipeline(&self.shared.flip_pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_bind_group(0, &bind_group, &[(i * stride) as u32]);
                 pass.draw(0..3, 0..1);
             }
-            // A raw byte copy, so the trip back through the array costs the
-            // picture nothing. Commands within one encoder run in order, so
-            // this reads what the pass above wrote and the next slice's pass
-            // may reuse the scratch.
-            enc.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &scratch,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.layers.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: slot,
+
+            // A raw byte copy, so the trip back through the atlas costs the
+            // picture nothing. Commands within one encoder run in order, so this
+            // reads what the pass above wrote and the next slot's pass may reuse
+            // the scratch.
+            if let Some(page) = self.layers.owned_page(slot) {
+                // A page-backed slot keeps its page: the whole thing goes back,
+                // which is what this method always did.
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &scratch,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
                     },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: self.doc_size.x,
-                    height: self.doc_size.y,
-                    depth_or_array_layers: 1,
-                },
-            );
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.layers.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: page,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: self.doc_size.x,
+                        height: self.doc_size.y,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                continue;
+            }
+
+            let Some((_, tiles)) = plans.iter().find(|(s, _)| *s == slot) else {
+                continue;
+            };
+            let freed: Vec<Entry> = self.layers.backed(slot).map(|(_, e)| e).collect();
+            let mut placed: Vec<((u32, u32), Entry)> = Vec::with_capacity(tiles.len());
+            for &tile in tiles {
+                // Reuse where the tile is already backed — the destination cell
+                // is written whole out of the scratch, so no clear is needed and
+                // nothing stale can survive.
+                let existing = self.layers.entry(slot, tile);
+                let cell = if existing.is_backed() {
+                    existing
+                } else {
+                    match self.layers.free.pop() {
+                        Some(cell) => cell,
+                        None => {
+                            log::error!("the atlas is full: slot {slot} loses a tile to the flip");
+                            continue;
+                        }
+                    }
+                };
+                let (dx, dy) = cell.origin();
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &scratch,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: tile.0 * TILE,
+                            y: tile.1 * TILE,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.layers.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: dx,
+                            y: dy,
+                            z: cell.page(),
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: TILE,
+                        height: TILE,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                placed.push((tile, cell));
+            }
+            installs.push((slot, placed, freed));
         }
         queue.submit(Some(enc.finish()));
+
+        // Only now. Every pass above resolved through the residency it was
+        // reading; these are the residencies it produced.
+        for (slot, placed, freed) in installs {
+            let kept: Vec<Entry> = placed.iter().map(|(_, e)| *e).collect();
+            let base = self.layers.slot_at(slot);
+            for i in 0..self.layers.grid.tiles_per_page() as usize {
+                self.layers.entries[base + i] = Entry::UNBACKED;
+            }
+            for (tile, cell) in placed {
+                self.layers.entries[base + self.layers.grid.index(tile.0, tile.1)] = cell;
+            }
+            for cell in freed {
+                if !kept.contains(&cell) {
+                    self.layers.free.push(cell);
+                }
+            }
+            self.layers.upload_slot(queue, slot);
+        }
+    }
+
+    /// Which tiles a slot needs once the canvas is mirrored.
+    ///
+    /// A destination tile has to be stored wherever the source rectangle it is
+    /// made of touches a tile that is. The count is within one column or row of
+    /// the source's — a mirror is a bijection — so this neither grows nor
+    /// shrinks a layer's residency by more than the edge tile the canvas's own
+    /// size cuts short.
+    fn mirrored_residency(&self, slot: u32, axis: FlipAxis) -> Vec<(u32, u32)> {
+        let grid = self.layers.grid;
+        let mut out = Vec::new();
+        for ty in 0..grid.tiles.y {
+            for tx in 0..grid.tiles.x {
+                let r = grid.tile_rect(tx, ty);
+                let source = match axis {
+                    FlipAxis::Horizontal => PixelRect {
+                        x: self.doc_size.x - (r.x + r.width),
+                        ..r
+                    },
+                    FlipAxis::Vertical => PixelRect {
+                        y: self.doc_size.y - (r.y + r.height),
+                        ..r
+                    },
+                };
+                if grid
+                    .tiles_over(source)
+                    .into_iter()
+                    .any(|t| self.layers.entry(slot, t).is_backed())
+                {
+                    out.push((tx, ty));
+                }
+            }
+        }
+        out
     }
 
     // --- floating transforms ------------------------------------------------
@@ -5269,7 +6288,7 @@ impl CanvasRenderer {
         reserved: u32,
         source: &FloatSource<'_>,
     ) -> Option<u32> {
-        self.end_float();
+        self.end_float(queue);
         // Against [`MAX_SLOTS`], not [`MAX_LAYERS`]: `reserved` counts *slices*
         // — a layer, a layer's mask — and the array holds twice the stack's
         // entries, plus one, plus the effect-draw headroom. That `+ 1` is this
@@ -5293,9 +6312,29 @@ impl CanvasRenderer {
         }
         let preview_slot = reserved;
         self.ensure_slots(device, queue, preview_slot + 1);
-        if source.slot >= self.layers.capacity {
-            log::error!("transform of slot {} beyond capacity", source.slot);
+        if source.slot as usize >= MAX_SLOTS {
+            log::error!("transform of slot {} beyond the ceiling", source.slot);
             return None;
+        }
+        // **Both slots become page-backed for the duration**, which is what
+        // keeps every line below and every line of `transform.wgsl` exactly as
+        // it was: an owned page is identity-mapped, so a document origin is an
+        // atlas origin and the whole-canvas copies, the `fs_mask` sampling and
+        // `render_float`'s restore are all still right. See [`PageUse`] for why
+        // that is the correct trade here and the wrong one for a stroke: a float
+        // is one gesture on one layer and its preview slice was a whole canvas
+        // before there were tiles.
+        //
+        // The layer's own page stays after the commit. That is a real cost — a
+        // transformed layer stops being sparse — and it is bounded by how many
+        // layers the artist actually transforms.
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("float-promote"),
+            });
+            self.promote(device, queue, &mut enc, source.slot);
+            self.promote(device, queue, &mut enc, preview_slot);
+            queue.submit(Some(enc.finish()));
         }
 
         let base = self.make_float_texture(device, "umber-float-base");
@@ -5373,10 +6412,16 @@ impl CanvasRenderer {
         // here, an exclusive usage, and wgpu refuses a pass that also samples
         // one. The layer is untouched until the commit, so it is the one
         // pristine copy both passes can share.
-        let mask_bind_group = make_bind_group(
-            &self.layers.slot_views[source.slot as usize],
-            "transform-mask-bg",
-        );
+        // The layer's own page, which `promote` above guaranteed exists and is
+        // identity-mapped — so a document texel is at the atlas texel
+        // `fs_mask`'s `textureLoad` asks for.
+        let layer_page = self
+            .layers
+            .owned_page(source.slot)
+            .expect("promoted above")
+            as usize;
+        let mask_bind_group =
+            make_bind_group(&self.layers.page_views[layer_page], "transform-mask-bg");
 
         // First submission: the floating copy starts empty, whatever the
         // allocation held. See the note on this function.
@@ -5414,7 +6459,9 @@ impl CanvasRenderer {
                 origin: wgpu::Origin3d {
                     x: 0,
                     y: 0,
-                    z: source.slot,
+                    // The *page*, which under `promote` above holds the slot's
+                    // texels at their own coordinates.
+                    z: layer_page as u32,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -5438,7 +6485,7 @@ impl CanvasRenderer {
                     origin: wgpu::Origin3d {
                         x: source.rect.x,
                         y: source.rect.y,
-                        z: source.slot,
+                        z: layer_page as u32,
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -5522,7 +6569,10 @@ impl CanvasRenderer {
                 origin: wgpu::Origin3d {
                     x: 0,
                     y: 0,
-                    z: preview_slot,
+                    z: self
+                        .layers
+                        .owned_page(preview_slot)
+                        .expect("promoted above"),
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -5597,10 +6647,18 @@ impl CanvasRenderer {
         self.touch_slot(slot);
     }
 
-    /// Give the floating transform's storage back. Nothing is written: the
+    /// Give the floating transform's storage back. No *layer* is written: the
     /// layer was never touched, so abandoning a transform is exactly this.
-    pub fn end_float(&mut self) {
-        self.float = None;
+    ///
+    /// **The preview's page goes back to the pool**, which is what stops a
+    /// document that has been transformed once holding a spare canvas for the
+    /// rest of the session. The layer's own page does not — its pixels are the
+    /// picture — so a transformed layer stops being sparse until something
+    /// clears it.
+    pub fn end_float(&mut self, queue: &wgpu::Queue) {
+        if let Some(float) = self.float.take() {
+            self.release_slot(queue, float.preview_slot);
+        }
     }
 
     /// Restore `restore` from the base and draw the floating pixels over it,
@@ -5616,8 +6674,15 @@ impl CanvasRenderer {
         let Some(float) = self.float.as_ref() else {
             return;
         };
-        let Some(view) = self.layers.slot_views.get(slot as usize) else {
-            log::error!("transform into slot {slot} beyond capacity");
+        // A float's two slots are page-backed, so the page is identity-mapped
+        // and every origin below is the one it always was. `begin_float` is what
+        // guarantees it; this fails closed rather than trusting that, because a
+        // resize between the two would be a write into the wrong page.
+        let Some(page) = self.layers.owned_page(slot) else {
+            log::error!("transform into slot {slot}, which owns no page");
+            return;
+        };
+        let Some(view) = self.layers.page_views.get(page as usize) else {
             return;
         };
         encoder.copy_texture_to_texture(
@@ -5637,7 +6702,7 @@ impl CanvasRenderer {
                 origin: wgpu::Origin3d {
                     x: restore.x,
                     y: restore.y,
-                    z: slot,
+                    z: page,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -6282,7 +7347,7 @@ impl CanvasRenderer {
     /// here: [`Self::drive_thumb`] records a pass, [`Self::submit_thumb`] maps
     /// it, and [`Self::take_thumb`] collects it and lets the next pass go.
     pub fn begin_thumb(&mut self, slot: u32) -> bool {
-        if self.thumb.is_some() || slot >= self.layers.capacity {
+        if self.thumb.is_some() || slot as usize >= MAX_SLOTS {
             return false;
         }
         self.thumb = Some(ThumbJob {
@@ -7345,6 +8410,29 @@ impl CanvasRenderer {
             .any(|s| matches!(s.pass, EffectPass::Seed | EffectPass::Flood));
         let needs_band = steps.iter().any(|s| matches!(s.target, EffectTarget::Band));
         self.ensure_effect_scratch(device, needs_seeds, needs_band);
+        // **Every effect slice is page-backed.** A bake writes the whole
+        // viewport of its target every time, so an effect's pixels are a whole
+        // canvas by construction and there is nothing sparse to save; and an
+        // owned page is identity-mapped, so the pass targets it with the
+        // viewport and the origins it always used. See [`PageUse`]. The pages
+        // come back through `EffectCache::forget_all` and `retain_only`, which
+        // is where an effect slice was always released.
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("effect-promote"),
+            });
+            let slices: Vec<u32> = steps
+                .iter()
+                .filter_map(|s| match s.target {
+                    EffectTarget::Slice(slot) => Some(slot),
+                    _ => None,
+                })
+                .collect();
+            for slot in slices {
+                self.promote(device, queue, &mut enc, slot);
+            }
+            queue.submit(Some(enc.finish()));
+        }
         let Some(scratch) = self.effects.scratch.as_ref() else {
             return Err("no working set".into());
         };
@@ -7376,9 +8464,13 @@ impl CanvasRenderer {
                     Some(pair) => &pair[n],
                     None => return Err("a flood with no seed pair".into()),
                 },
-                EffectTarget::Slice(slot) => match self.layers.slot_views.get(slot as usize) {
+                EffectTarget::Slice(slot) => match self
+                    .layers
+                    .owned_page(slot)
+                    .and_then(|p| self.layers.page_views.get(p as usize))
+                {
                     Some(view) => view,
-                    None => return Err(format!("effect slice {slot} beyond capacity")),
+                    None => return Err(format!("effect slice {slot} owns no page")),
                 },
             };
             let pipeline = match step.pass {
@@ -7510,7 +8602,7 @@ impl CanvasRenderer {
             None => true,
             Some(s) => {
                 s.size != self.doc_size
-                    || s.bound_capacity != self.layers.capacity
+                    || s.bound_capacity != self.layers.pages
                     || (seeds && s.seeds.is_none())
                     || (band && s.band.is_none())
             }
@@ -7624,30 +8716,90 @@ impl CanvasRenderer {
             })
         });
 
-        let source = if index < job.slots.len() {
+        if index < job.slots.len() {
             let slot = job.slots[index];
-            if slot >= self.layers.capacity {
-                // Cannot happen — `ensure_slots` runs before a layer is ever
-                // painted — but a copy naming a slice the array does not have
-                // is a validation error, and a validation error aborts the
-                // process. An autosave is not worth taking the app down for.
-                log::error!("capture named slot {slot} beyond capacity");
+            if slot as usize >= MAX_SLOTS {
+                // Cannot happen — a slot past the ceiling would index off the
+                // end of the page table — but an autosave is not worth taking
+                // the app down for.
+                log::error!("capture named slot {slot} beyond the ceiling");
                 job.failed = true;
                 job.buffer = Some(buffer);
                 self.capture = Some(job);
                 return;
             }
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.layers.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: band_first as u32,
-                    z: slot,
-                },
-                aspect: wgpu::TextureAspect::All,
+            // **The band is filled with the slot's empty value first, then the
+            // fragments that are stored land on top.** A layer's texels are
+            // tiled, so a canvas-wide band is not one contiguous copy; what is
+            // not backed has to read as the slot's own empty value rather than
+            // as whatever the atlas cell holds, which would be another layer's
+            // paint in this one's autosaved file.
+            //
+            // `clear_buffer` writes zeroes, which is [`SlotClass::Layer`]'s
+            // empty value and not a mask's — and that is why a **mask** is the
+            // one class this cannot yet capture sparsely. It is not reachable:
+            // `Thumbs`, the save and the autosave read mask slices that arrive
+            // fully backed, from an import's single canvas piece or from a
+            // stroke. The assertion is what says so out loud rather than
+            // leaving it to be discovered.
+            debug_assert!(
+                self.class_of(slot) == SlotClass::Layer
+                    || self.layers.backed(slot).count()
+                        == self.layers.grid.tiles_per_page() as usize,
+                "a partly-backed mask cannot be captured: slot {slot}"
+            );
+            encoder.clear_buffer(&buffer, 0, None);
+            let band = PixelRect {
+                x: 0,
+                y: band_first as u32,
+                width: job.size.x,
+                height,
+            };
+            for fragment in self.layers.grid.fragments(band) {
+                let entry = self.layers.entry(slot, fragment.tile);
+                if !entry.is_backed() {
+                    continue;
+                }
+                let (cx, cy) = entry.origin();
+                let doc = fragment.doc;
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.layers.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: cx + fragment.within.0,
+                            y: cy + fragment.within.1,
+                            z: entry.page(),
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            // Into the band's own rows: the stride is the whole
+                            // canvas's padded row, so a fragment lands at its
+                            // own column of its own rows. A row stride is a
+                            // multiple of 256 and a column offset a multiple of
+                            // four, which is what both alignments ask for.
+                            offset: (doc.y - band.y) as u64 * u64::from(job.padded)
+                                + u64::from(doc.x) * 4,
+                            bytes_per_row: Some(job.padded),
+                            rows_per_image: Some(doc.height),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: doc.width,
+                        height: doc.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
             }
-        } else {
+            job.buffer = Some(buffer);
+            job.state = StepState::Rendering;
+            self.capture = Some(job);
+            return;
+        }
+        let source = {
             // The flattened preview, from the *same* composite pass the screen
             // uses — the reason `export_rgba` and `pick_colour` reuse it too.
             // A second copy of the blend maths here would be a second thing to
@@ -7887,7 +9039,7 @@ impl CanvasRenderer {
     /// panic inside the renderer.
     fn table_slot(&self, slot: u32, tile: (u32, u32)) -> Option<usize> {
         let grid = self.layers.grid;
-        if slot >= self.layers.capacity || tile.0 >= grid.tiles.x || tile.1 >= grid.tiles.y {
+        if slot as usize >= MAX_SLOTS || tile.0 >= grid.tiles.x || tile.1 >= grid.tiles.y {
             log::error!("page table asked for slot {slot} tile {tile:?}");
             return None;
         }
@@ -7977,50 +9129,39 @@ impl CanvasRenderer {
         slot: u32,
         rect: PixelRect,
     ) -> Vec<u8> {
-        // A copy naming a slice the array does not have is a validation error,
-        // and a validation error aborts the process. It should not happen —
-        // `ensure_slots` runs before a layer is ever painted — but "should not"
-        // is not a reason to make it fatal, and the resume path rebuilds
-        // storage from scratch with the stack already deep. An all-zero patch
-        // is the same thing an untouched layer would have read back.
-        if slot >= self.layers.capacity {
-            log::error!(
-                "read from slot {slot} beyond capacity {}",
-                self.layers.capacity
-            );
-            return vec![0; (rect.width as u64 * 4 * rect.height as u64) as usize];
-        }
-        self.read_texture_rows(
-            device,
-            queue,
-            "undo",
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.layers.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: rect.x,
-                    y: rect.y,
-                    z: slot,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            (rect.width, rect.height),
-        )
+        self.read_layer_pieces(device, queue, slot, &[rect])
+            .pop()
+            .unwrap_or_default()
     }
 
     /// Read several rectangles of one layer back to the CPU, for the undo
-    /// stack, in **one** submission and one wait.
+    /// stack, in as few submissions and waits as the device's buffer limit
+    /// allows.
     ///
     /// This is what a stroke's patch is captured with. The pieces are the cells
     /// of the canvas the stroke actually reached
     /// ([`umber_core::damage::TileMask`]), which for a diagonal across a large
     /// document is a hundred and fifty separate rectangles — and a hundred and
-    /// fifty calls to [`Self::read_layer_rect`] would be a hundred and fifty
-    /// submissions each blocking on its own fence, at pointer-up, in front of
-    /// the artist. Recorded together they cost one.
+    /// fifty separate readbacks would be a hundred and fifty submissions each
+    /// blocking on its own fence, at pointer-up, in front of the artist.
+    /// Recorded together they cost one.
     ///
-    /// Blocking, like [`Self::read_layer_rect`] and for the same reason: once
-    /// per stroke is acceptable, the drawing loop is not.
+    /// # A tile that is stored nowhere is **synthesised**, not copied
+    ///
+    /// The stroke that produced these pieces backed every tile it reached, so a
+    /// patch is normally whole — but a save reads a layer's whole canvas, and
+    /// most of most layers is not stored at all. What an unbacked tile reads as
+    /// is [`SlotClass::empty_bytes`], which the output is filled with before any
+    /// copy lands. Copying whatever the atlas cell happens to hold would be
+    /// another layer's paint appearing in this one's file, and it is exactly the
+    /// failure that makes an allocator dangerous rather than merely wrong.
+    ///
+    /// Nothing is banded here and nothing needs to be: a copy is one fragment of
+    /// one tile, so the largest is 256 KB, and the batching below is what keeps
+    /// a staging buffer inside the limit [`band_rows`] exists for.
+    ///
+    /// Blocking, and for the reason it always was: once per stroke is
+    /// acceptable, the drawing loop is not.
     pub fn read_layer_pieces(
         &self,
         device: &wgpu::Device,
@@ -8028,75 +9169,84 @@ impl CanvasRenderer {
         slot: u32,
         pieces: &[PixelRect],
     ) -> Vec<Vec<u8>> {
-        // As in `read_layer_rect`: refuse rather than abort. See there.
-        if slot >= self.layers.capacity {
-            log::error!(
-                "read from slot {slot} beyond capacity {}",
-                self.layers.capacity
-            );
-            return pieces
-                .iter()
-                .map(|r| vec![0; (r.area() * 4) as usize])
-                .collect();
+        let empty = self.class_of(slot).empty_bytes();
+        let mut out: Vec<Vec<u8>> = pieces
+            .iter()
+            .map(|r| {
+                empty
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take((r.area() * 4) as usize)
+                    .collect()
+            })
+            .collect();
+        // A slot past the ceiling would index off the end of the table rather
+        // than merely being unbacked. It should not happen; the empty answer is
+        // the same thing an untouched layer reads back as.
+        if slot as usize >= MAX_SLOTS {
+            log::error!("read from slot {slot} beyond the ceiling {MAX_SLOTS}");
+            return out;
         }
 
         let align = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        // Every block is a whole number of padded rows, so laying them end to
-        // end keeps each one's offset aligned without any arithmetic of its
-        // own.
         let block =
             |r: &PixelRect| (u64::from(r.width) * 4).div_ceil(align) * align * u64::from(r.height);
 
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(pieces.len());
-        let mut batch: Vec<&PixelRect> = Vec::new();
-        let mut used = 0u64;
-        let flush = |batch: &mut Vec<&PixelRect>, out: &mut Vec<Vec<u8>>| {
-            if !batch.is_empty() {
-                self.read_batch(device, queue, slot, batch, out);
-                batch.clear();
+        // Every backed fragment of every piece, remembering which piece it came
+        // from so the bytes can be put back in the right place.
+        let mut jobs: Vec<(usize, Fragment, Entry)> = Vec::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            for fragment in self.layers.grid.fragments(*piece) {
+                let entry = self.layers.entry(slot, fragment.tile);
+                if entry.is_backed() {
+                    jobs.push((i, fragment, entry));
+                }
             }
-        };
+        }
 
-        for piece in pieces {
-            let size = block(piece);
-            // One piece larger than the whole limit cannot be batched at all.
-            // Cell runs are at most one cell tall, so this needs a patch that
-            // did not come from a damage mask — but the banded path exists and
-            // costs nothing to fall back to.
-            if size > self.readback_limit {
-                flush(&mut batch, &mut out);
-                out.push(self.read_layer_rect(device, queue, slot, *piece));
-                continue;
-            }
-            if used + size > self.readback_limit {
-                flush(&mut batch, &mut out);
+        let mut batch: Vec<&(usize, Fragment, Entry)> = Vec::new();
+        let mut used = 0u64;
+        for job in &jobs {
+            let size = block(&job.1.doc);
+            if used > 0 && used + size > self.readback_limit {
+                self.read_batch(device, queue, pieces, &batch, &mut out);
+                batch.clear();
                 used = 0;
             }
             used += size;
-            batch.push(piece);
+            batch.push(job);
         }
-        flush(&mut batch, &mut out);
+        if !batch.is_empty() {
+            self.read_batch(device, queue, pieces, &batch, &mut out);
+        }
         out
     }
 
-    /// One submission's worth of [`Self::read_layer_pieces`]: every piece
-    /// copied into one staging buffer, then mapped once.
+    /// One submission's worth of [`Self::read_layer_pieces`]: every fragment
+    /// copied into one staging buffer, then mapped once and blitted into the
+    /// piece it belongs to.
     fn read_batch(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        slot: u32,
-        pieces: &[&PixelRect],
-        out: &mut Vec<Vec<u8>>,
+        pieces: &[PixelRect],
+        jobs: &[&(usize, Fragment, Entry)],
+        out: &mut [Vec<u8>],
     ) {
         let align = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let padded = |r: &PixelRect| (u64::from(r.width) * 4).div_ceil(align) * align;
 
-        let mut offsets = Vec::with_capacity(pieces.len());
+        // Every block is a whole number of padded rows, so laying them end to
+        // end keeps each one's offset aligned without any arithmetic of its own.
+        let mut offsets = Vec::with_capacity(jobs.len());
         let mut size = 0u64;
-        for piece in pieces {
+        for (_, fragment, _) in jobs {
             offsets.push(size);
-            size += padded(piece) * u64::from(piece.height);
+            size += padded(&fragment.doc) * u64::from(fragment.doc.height);
+        }
+        if size == 0 {
+            return;
         }
 
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -8109,15 +9259,16 @@ impl CanvasRenderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("undo-pieces"),
         });
-        for (piece, offset) in pieces.iter().zip(&offsets) {
+        for ((_, fragment, entry), offset) in jobs.iter().zip(&offsets) {
+            let (cx, cy) = entry.origin();
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.layers.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: piece.x,
-                        y: piece.y,
-                        z: slot,
+                        x: cx + fragment.within.0,
+                        y: cy + fragment.within.1,
+                        z: entry.page(),
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -8125,13 +9276,13 @@ impl CanvasRenderer {
                     buffer: &staging,
                     layout: wgpu::TexelCopyBufferLayout {
                         offset: *offset,
-                        bytes_per_row: Some(padded(piece) as u32),
-                        rows_per_image: Some(piece.height),
+                        bytes_per_row: Some(padded(&fragment.doc) as u32),
+                        rows_per_image: Some(fragment.doc.height),
                     },
                 },
                 wgpu::Extent3d {
-                    width: piece.width,
-                    height: piece.height,
+                    width: fragment.doc.width,
+                    height: fragment.doc.height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -8142,15 +9293,19 @@ impl CanvasRenderer {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let mapped = slice.get_mapped_range();
-        for (piece, offset) in pieces.iter().zip(&offsets) {
-            let unpadded = (piece.width * 4) as usize;
-            let padded = padded(piece) as usize;
-            let mut bytes = Vec::with_capacity(unpadded * piece.height as usize);
-            for row in 0..piece.height as usize {
-                let start = *offset as usize + row * padded;
-                bytes.extend_from_slice(&mapped[start..start + unpadded]);
+        for ((piece, fragment, _), offset) in jobs.iter().zip(&offsets) {
+            let target = &pieces[*piece];
+            let dest = &mut out[*piece];
+            let row = (target.width * 4) as usize;
+            let unpadded = (fragment.doc.width * 4) as usize;
+            let stride = padded(&fragment.doc) as usize;
+            let left = ((fragment.doc.x - target.x) * 4) as usize;
+            let top = (fragment.doc.y - target.y) as usize;
+            for y in 0..fragment.doc.height as usize {
+                let from = *offset as usize + y * stride;
+                let at = (top + y) * row + left;
+                dest[at..at + unpadded].copy_from_slice(&mapped[from..from + unpadded]);
             }
-            out.push(bytes);
         }
         drop(mapped);
         staging.unmap();
@@ -8300,12 +9455,9 @@ impl CanvasRenderer {
     ) {
         debug_assert_eq!(bytes.len() as u64, rect.area() * 4);
         self.touch_slot(slot);
-        // As in `read_layer_rect`: refuse rather than abort. See there.
-        if slot >= self.layers.capacity {
-            log::error!(
-                "write to slot {slot} beyond capacity {}",
-                self.layers.capacity
-            );
+        // As in `read_layer_pieces`: refuse rather than abort. See there.
+        if slot as usize >= MAX_SLOTS {
+            log::error!("write to slot {slot} beyond the ceiling {MAX_SLOTS}");
             return;
         }
         // The importers promise canvas-sized pixels and the undo stack promises
@@ -8321,50 +9473,81 @@ impl CanvasRenderer {
             return;
         }
 
+        // **Every tile this rectangle touches is backed, and there is no
+        // emptiness scan.** `docs/perf/tiled-layer-storage.md` §3.6's floor was
+        // a scan here that skipped a tile that was entirely the slot's empty
+        // value, and it is separately and silently wrong: `app.rs`'s text tool
+        // writes a union rectangle full of zeroes *deliberately*, to take the
+        // old text off before the new goes down, and an undo restores a
+        // rectangle to transparency. A skip would leave both on the canvas. The
+        // residency signal is the *piece set* the caller was given, which for a
+        // `.clip` is block presence — see `docimport::residency`.
+        let tiles = self.layers.grid.tiles_over(rect);
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("back-write"),
+            });
+            self.back_tiles(device, queue, &mut enc, slot, &tiles);
+            queue.submit(Some(enc.finish()));
+        }
+
         // The staging cost is the *padded* row, because wgpu repacks the
         // caller's tightly packed rows to the copy alignment on the way in.
         // `bytes` itself is tight, which is what `stride` below steps by.
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded = (rect.width * 4).div_ceil(align) * align;
-        let band = band_rows(self.readback_limit, padded, rect.height);
-        let banded = band < rect.height;
-
+        //
+        // **A fragment is at most one tile, so it is never banded**, which
+        // retires `band_rows` on this side: 256 KB of staging is inside every
+        // limit there has ever been, and the per-fragment submit below bounds a
+        // whole-canvas write to one tile of staging at a time.
         let stride = (rect.width as usize) * 4;
-        let mut first = 0;
-        while first < rect.height {
-            let rows = band.min(rect.height - first);
-            let start = (first as usize) * stride;
-            let at = wgpu::Origin3d {
-                x: rect.x,
-                y: rect.y + first,
-                z: slot,
-            };
+        for fragment in self.layers.grid.fragments(rect) {
+            let entry = self.layers.entry(slot, fragment.tile);
+            if !entry.is_backed() {
+                continue;
+            }
+            let (cx, cy) = entry.origin();
+            let doc = fragment.doc;
+            let left = ((doc.x - rect.x) as usize) * 4;
+            let top = (doc.y - rect.y) as usize;
+            let width = (doc.width as usize) * 4;
+            let mut tight = Vec::with_capacity(width * doc.height as usize);
+            for y in 0..doc.height as usize {
+                let from = (top + y) * stride + left;
+                tight.extend_from_slice(&bytes[from..from + width]);
+            }
             write_rect(
                 queue,
                 &self.layers.texture,
-                at,
-                // `write_rect` reads only the width and the height off this —
-                // where the band lands is `at`'s. Bound to one name and stated,
-                // because two expressions for the same row would be one edit
-                // away from disagreeing about it.
-                PixelRect {
-                    x: at.x,
-                    y: at.y,
-                    width: rect.width,
-                    height: rows,
+                wgpu::Origin3d {
+                    x: cx + fragment.within.0,
+                    y: cy + fragment.within.1,
+                    z: entry.page(),
                 },
-                &bytes[start..start + (rows as usize) * stride],
+                doc,
+                &tight,
             );
-            // Flushes this band's staging into a submission of its own. On the
-            // unbanded path this is the one call, and it is what stops a loop
-            // of writes holding every layer's staging at once.
+            // Flushes this fragment's staging into a submission of its own,
+            // which is what stops a loop of writes holding every layer's
+            // staging at once. `write_rect` reads only the width and the height
+            // off `doc`; where it lands is the origin's.
             queue.submit([]);
-            if banded {
-                let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            }
-            first += rows;
         }
+        let _ = device;
     }
+}
+
+/// The overlap of two rectangles, or `None` where they do not meet.
+fn intersect(a: PixelRect, b: PixelRect) -> Option<PixelRect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    (x1 > x0 && y1 > y0).then_some(PixelRect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
 }
 
 /// The smallest rectangle covering both, where either may be absent.
@@ -8729,7 +9912,14 @@ fn make_commit_bind_group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: uniforms.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: uniforms,
+                    offset: 0,
+                    // One block, not the whole buffer: with a dynamic offset the
+                    // bound range is `offset .. offset + size`, and binding the
+                    // lot would run off the end.
+                    size: wgpu::BufferSize::new(std::mem::size_of::<CommitUniforms>() as u64),
+                }),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -9085,7 +10275,7 @@ impl EffectScratch {
             textures,
             uniforms,
             binds,
-            bound_capacity: layers.capacity,
+            bound_capacity: layers.pages,
         }
     }
 }

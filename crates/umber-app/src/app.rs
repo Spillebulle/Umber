@@ -237,7 +237,7 @@ impl Graphics {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("init-document"),
             });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&self.gpu.queue);
         canvas.clear_stroke(&self.gpu.device, &mut enc);
         self.gpu.queue.submit(Some(enc.finish()));
 
@@ -1186,7 +1186,7 @@ impl UmberApp {
             return;
         };
         let Some(damage) = damage else {
-            canvas.end_float();
+            canvas.end_float(&gfx.gpu.queue);
             return;
         };
 
@@ -1300,7 +1300,7 @@ impl UmberApp {
             });
         canvas.commit_float(&gfx.gpu.queue, &mut enc, damage, &params);
         gfx.gpu.queue.submit(Some(enc.finish()));
-        canvas.end_float();
+        canvas.end_float(&gfx.gpu.queue);
 
         // The marquee follows the picture it described. Only for a lift: a
         // paste did not come out of the selection, so moving it would be a
@@ -1382,7 +1382,7 @@ impl UmberApp {
         if let Some(gfx) = self.gfx.as_mut()
             && let Some(canvas) = gfx.canvases.get_mut(&id)
         {
-            canvas.end_float();
+            canvas.end_float(&gfx.gpu.queue);
         }
         self.request_redraw();
         true
@@ -2094,7 +2094,7 @@ impl UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("clear"),
             });
-        canvas.clear_layer(&mut enc, slot);
+        canvas.clear_layer(&gfx.gpu.queue, slot);
         canvas.clear_stroke(&gfx.gpu.device, &mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
         // Undo entries reference pixels that no longer exist in any meaningful
@@ -2259,14 +2259,7 @@ impl UmberApp {
         canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
 
         // A recycled slot still holds the deleted layer's pixels.
-        let mut enc = gfx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("init-layer"),
-            });
-        canvas.clear_layer(&mut enc, slot);
-        gfx.gpu.queue.submit(Some(enc.finish()));
+        canvas.clear_layer(&gfx.gpu.queue, slot);
     }
 
     /// Ask the device for the storage one more slice would need, changing
@@ -2476,16 +2469,12 @@ impl UmberApp {
             return;
         };
         canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
-        let mut enc = gfx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("init-mask"),
-            });
         // White, not cleared: a recycled slice holds the last layer's pixels,
-        // and an empty mask would hide the layer outright.
-        canvas.fill_layer_white(&mut enc, slot);
-        gfx.gpu.queue.submit(Some(enc.finish()));
+        // and an empty mask would hide the layer outright. Since the tile atlas
+        // this is a table write rather than a canvas-sized clear — full reveal
+        // *is* a mask slot's empty value — so a new mask costs no storage at
+        // all until somebody paints on it.
+        canvas.fill_layer_white(&gfx.gpu.queue, slot);
     }
 
     /// Take the selected layer's mask off.
@@ -5107,7 +5096,7 @@ impl ApplicationHandler<Wake> for UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("init"),
             });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&gpu.queue);
         canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
@@ -6190,7 +6179,7 @@ mod tests {
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        canvas.clear_all_layers(&mut encoder);
+        canvas.clear_all_layers(&gpu.queue);
         gpu.queue.submit(Some(encoder.finish()));
 
         // One flat opaque colour per layer, keyed to its stack position rather

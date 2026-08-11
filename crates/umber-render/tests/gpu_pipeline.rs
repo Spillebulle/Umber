@@ -94,7 +94,7 @@ impl Harness {
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&gpu.queue);
         canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
@@ -801,7 +801,7 @@ fn a_large_canvas_gives_the_colour_scratch_back_when_a_stroke_ends() {
     // first draft of this used `fill` with a transparent colour and painted
     // opaque black over the mark it was about to compare against.
     let mut enc = h.encoder();
-    h.canvas.clear_layer(&mut enc, 0);
+    h.canvas.clear_layer(&h.gpu.queue, 0);
     h.gpu.queue.submit(Some(enc.finish()));
     h.stamp_colored(&[red], true);
     assert!(h.canvas.holds_stroke_color());
@@ -945,7 +945,7 @@ fn a_jittered_angle_spreads_a_stroke_the_way_a_fixed_one_cannot() {
     );
 
     let mut enc = h.encoder();
-    h.canvas.clear_all_layers(&mut enc);
+    h.canvas.clear_all_layers(&h.gpu.queue);
     h.gpu.queue.submit(Some(enc.finish()));
 
     let grain = Brush {
@@ -1056,7 +1056,7 @@ fn whole(h: &Harness) -> PixelRect {
 /// Back to an empty canvas and an empty scratch, between one mode and the next.
 fn reset(h: &mut Harness) {
     let mut enc = h.encoder();
-    h.canvas.clear_all_layers(&mut enc);
+    h.canvas.clear_all_layers(&h.gpu.queue);
     h.canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
 }
@@ -2608,7 +2608,7 @@ fn layer_readback_and_writeback_round_trip() {
     assert_eq!(saved.len(), (rect.width * rect.height * 4) as usize);
 
     let mut enc = h.encoder();
-    h.canvas.clear_layer(&mut enc, 0);
+    h.canvas.clear_layer(&h.gpu.queue, 0);
     h.gpu.queue.submit(Some(enc.finish()));
     assert_eq!(h.pixel(32, 32)[3], 0);
 
@@ -2727,21 +2727,25 @@ fn layers_do_not_bleed_into_each_other() {
 
 #[test]
 fn growing_the_layer_array_preserves_existing_pixels() {
-    // Growth reallocates the texture array and copies every slice. Losing
+    // Growth reallocates the texture array and copies every page. Losing
     // artwork when the user adds a fifth layer would be unforgivable.
+    //
+    // The **atlas** is what grows; the page table is `MAX_SLOTS` deep from the
+    // moment the store exists and is never grown, which is why the reading is
+    // `page_count` and why `slot_capacity` is now a constant.
     let mut h = harness_or_skip!();
 
     h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
-    assert!(h.canvas.slot_capacity() < 8);
+    assert!(h.canvas.page_count() < 8);
 
-    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 8);
-    assert!(h.canvas.slot_capacity() >= 8);
+    h.canvas.ensure_pages(&h.gpu.device, &h.gpu.queue, 8);
+    assert!(h.canvas.page_count() >= 8);
 
     assert_near(h.pixel_in(0, 32, 32), [200, 40, 40], 2, "after growth");
     assert_eq!(
         h.pixel_in(7, 32, 32)[3],
         0,
-        "newly allocated slots must start transparent"
+        "a slot nothing has painted on reads as transparent"
     );
 }
 
@@ -3583,7 +3587,7 @@ fn a_reservation_that_fits_builds_what_the_infallible_path_builds() {
         .try_for_document(&h.gpu.device, &h.gpu.queue, UVec2::new(DOC, DOC), 4)
         .expect("the harness canvas, reserved rather than assumed");
     let mut enc = h.encoder();
-    h.canvas.clear_all_layers(&mut enc);
+    h.canvas.clear_all_layers(&h.gpu.queue);
     h.canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
 
@@ -3615,27 +3619,44 @@ fn growing_through_the_fallible_door_preserves_existing_pixels() {
     let mut h = harness_or_skip!();
 
     h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
-    assert!(h.canvas.slot_capacity() < 8);
+    assert!(h.canvas.page_count() < 8);
 
     h.canvas
-        .try_ensure_slots(&h.gpu.device, &h.gpu.queue, 8)
-        .expect("eight slices of a 64-square canvas is 128 KB");
-    assert!(h.canvas.slot_capacity() >= 8);
+        .try_ensure_pages(&h.gpu.device, &h.gpu.queue, 8)
+        .expect("eight pages of a 64-square canvas is 512 KB");
+    assert!(h.canvas.page_count() >= 8);
 
     assert_near(h.pixel_in(0, 32, 32), [200, 40, 40], 2, "after growth");
     assert_eq!(
         h.pixel_in(7, 32, 32)[3],
         0,
-        "newly allocated slots must start transparent"
+        "a slot nothing has painted on reads as transparent"
     );
 
     // Asked again for what it already holds, it must allocate nothing at all —
     // the early return is what makes a reservation free on every add that fits.
-    let held = h.canvas.slot_capacity();
+    let held = h.canvas.page_count();
     h.canvas
-        .try_ensure_slots(&h.gpu.device, &h.gpu.queue, 8)
+        .try_ensure_pages(&h.gpu.device, &h.gpu.queue, 8)
         .expect("nothing to do cannot fail");
-    assert_eq!(h.canvas.slot_capacity(), held);
+    assert_eq!(h.canvas.page_count(), held);
+
+    // And `try_ensure_slots` is a *headroom* reservation rather than a slice: a
+    // blank layer costs nothing, so there is no slice left to refuse. It must
+    // still be idempotent — sixty-four blank layers grow the atlas once, not
+    // sixty-four times, which is the whole difference between a headroom check
+    // and a per-layer allocation.
+    let held = h.canvas.page_count();
+    for slot in 0..64 {
+        h.canvas
+            .try_ensure_slots(&h.gpu.device, &h.gpu.queue, slot + 1)
+            .expect("a blank layer asks for nothing");
+    }
+    assert_eq!(
+        h.canvas.page_count(),
+        held,
+        "adding blank layers must not grow the atlas"
+    );
 }
 
 /// A resize rebuilds the array at the *live* slice count, not the one the old
@@ -3660,8 +3681,8 @@ fn a_resize_rebuilds_at_the_live_slice_count_and_carries_the_picture() {
     let mut h = harness_or_skip!();
     // Deliberately far more than the document holds. `ensure_slots` never
     // shrinks, so this is exactly the state a delete-then-add session leaves.
-    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 64);
-    assert_eq!(h.canvas.slot_capacity(), 64, "the array should have grown");
+    h.canvas.ensure_pages(&h.gpu.device, &h.gpu.queue, 64);
+    assert_eq!(h.canvas.page_count(), 64, "the atlas should have grown");
 
     h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
     h.stamp(&[dab(20.0, 20.0, 5.0, 1.0)]);
@@ -3676,9 +3697,9 @@ fn a_resize_rebuilds_at_the_live_slice_count_and_carries_the_picture() {
     );
 
     assert_eq!(
-        h.canvas.slot_capacity(),
+        h.canvas.page_count(),
         4,
-        "the new array carried the old canvas's slice count"
+        "the new atlas carried the old canvas's page count"
     );
     // And the shorter copy still carried every slice that mattered: the depth
     // is `min(old, new)`, so trimming the capacity must not trim the picture.
@@ -4060,7 +4081,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    canvas.clear_all_layers(&mut enc);
+    canvas.clear_all_layers(&gpu.queue);
     canvas.clear_stroke(&gpu.device, &mut enc);
     canvas.draw_dabs(
         &gpu.device,
@@ -4627,7 +4648,7 @@ fn a_capture_of_a_large_document_never_costs_a_frame() {
     );
     h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, LAYERS);
     let mut enc = h.encoder();
-    h.canvas.clear_all_layers(&mut enc);
+    h.canvas.clear_all_layers(&h.gpu.queue);
     h.gpu.queue.submit(Some(enc.finish()));
 
     let slots: Vec<u32> = (0..LAYERS).collect();
@@ -4854,7 +4875,7 @@ fn a_transform_lands_where_the_maths_says_and_undo_restores_both_ends() {
     h.canvas
         .commit_float(&h.gpu.queue, &mut enc, damage, &params);
     h.gpu.queue.submit(Some(enc.finish()));
-    h.canvas.end_float();
+    h.canvas.end_float(&h.gpu.queue);
     assert_eq!(h.canvas.float_preview(), None);
 
     assert_eq!(h.pixel(32, 32), red, "the commit did not land");
@@ -4953,7 +4974,7 @@ fn lift_and_move(h: &mut Harness, sel: &Selection, by: Vec2) -> PixelRect {
     h.canvas
         .commit_float(&h.gpu.queue, &mut enc, damage, &params);
     h.gpu.queue.submit(Some(enc.finish()));
-    h.canvas.end_float();
+    h.canvas.end_float(&h.gpu.queue);
 
     PixelRect {
         x: (source.x as f32 + by.x) as u32,
@@ -5236,7 +5257,7 @@ fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&gpu.queue);
         canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
@@ -5338,7 +5359,7 @@ fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         canvas.commit_float(&gpu.queue, &mut enc, rect, &params);
         gpu.queue.submit(Some(enc.finish()));
-        canvas.end_float();
+        canvas.end_float(&gpu.queue);
         assert_eq!(
             canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, rect),
             pixels,
@@ -5510,7 +5531,7 @@ fn a_pasted_float_leaves_the_layer_beneath_it_alone() {
     h.canvas
         .commit_float(&h.gpu.queue, &mut enc, damage, &params);
     h.gpu.queue.submit(Some(enc.finish()));
-    h.canvas.end_float();
+    h.canvas.end_float(&h.gpu.queue);
     assert_eq!(h.pixel(24, 24), green, "the paste did not commit");
     assert_eq!(h.pixel(5, 5), blue, "the commit reached past its damage");
 }
@@ -5586,7 +5607,7 @@ fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    canvas.clear_all_layers(&mut enc);
+    canvas.clear_all_layers(&gpu.queue);
     canvas.clear_stroke(&gpu.device, &mut enc);
     gpu.queue.submit(Some(enc.finish()));
 
@@ -5974,7 +5995,7 @@ fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
         h.canvas
             .for_document(&h.gpu.device, &h.gpu.queue, UVec2::new(width, HEIGHT), 1);
     let mut enc = h.encoder();
-    canvas.clear_all_layers(&mut enc);
+    canvas.clear_all_layers(&h.gpu.queue);
     canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
 
@@ -5983,7 +6004,7 @@ fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
         // A fresh slice each time, so the second reading cannot be the first
         // one's ink still standing.
         let mut enc = h.encoder();
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&h.gpu.queue);
         h.gpu.queue.submit(Some(enc.finish()));
 
         canvas.write_layer_rect(
@@ -6111,7 +6132,7 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
 
     let after_write = h.canvas.slot_revision(0);
     let mut enc = h.encoder();
-    h.canvas.clear_layer(&mut enc, 0);
+    h.canvas.clear_layer(&h.gpu.queue, 0);
     h.gpu.queue.submit(Some(enc.finish()));
     assert!(h.canvas.slot_revision(0) > after_write);
 }
@@ -6357,7 +6378,7 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
     ];
 
     let before_bakes = h.canvas.effect_bakes();
-    let before_slots = h.canvas.slot_capacity();
+    let before_slots = h.canvas.page_count();
     // The stroke is on the hidden layer, whose own outer effect is the draw
     // being elided — the position that shifts if `baked` counts wrongly.
     let painting = EffectFrame {
@@ -6416,7 +6437,7 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
         baked_faded.draws
     );
     assert_eq!(h.canvas.effect_bakes(), before_bakes);
-    assert_eq!(h.canvas.slot_capacity(), before_slots);
+    assert_eq!(h.canvas.page_count(), before_slots);
 
     // (45, 32) is inside where the shadow would have fallen and clear of the
     // square, so it is the pixel that would move if any of this were unsound.
@@ -6470,8 +6491,8 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
         "showing the layer again drew a shadow nothing had baked"
     );
     assert!(
-        h.canvas.slot_capacity() > before_slots,
-        "the effect drew into a slice the array never grew to hold"
+        h.canvas.page_count() > before_slots,
+        "the effect drew into a page the atlas never grew to hold"
     );
     // A drop shadow is an *outer* effect, so its draw is spliced in before its
     // layer's and the stroke's position moves with it. This is the reading the
@@ -7327,7 +7348,7 @@ fn a_dragged_float_carries_the_effect_derived_from_it() {
     h.canvas
         .commit_float(&h.gpu.queue, &mut enc, damage, &params);
     h.gpu.queue.submit(Some(enc.finish()));
-    h.canvas.end_float();
+    h.canvas.end_float(&h.gpu.queue);
 
     let settled = layer(0, 1.0, BlendMode::Normal);
     let after = h.bake(&[effected(settled, &ring)], preview + 1);
@@ -7699,7 +7720,7 @@ fn tiled_canvas(gpu: &Gpu, slots: u32) -> CanvasRenderer {
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    canvas.clear_all_layers(&mut enc);
+    canvas.clear_all_layers(&gpu.queue);
     canvas.clear_stroke(&gpu.device, &mut enc);
     gpu.queue.submit(Some(enc.finish()));
     canvas

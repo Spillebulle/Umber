@@ -28,7 +28,19 @@ struct Commit {
     rect_min: vec2<f32>,
     rect_max: vec2<f32>,
     doc_size: vec2<f32>,
-    _pad0: vec2<f32>,
+    // Where this pass's target sits. A layer's texels live in 256-square tiles
+    // scattered through an atlas of pages (see `tiles.wgsl`), so a commit
+    // targets one *page* and draws one tile's share of the damage: `atlas_delta`
+    // is what takes a document pixel to the atlas texel, and `target_size` is
+    // the page. Zero and the canvas reproduce exactly what this did when a slice
+    // was a layer, which is what a page-backed slot still gets.
+    //
+    // `out.doc` stays in **document** space, which is what keeps `fs` and
+    // `fs_blend` untouched by any of this.
+    atlas_delta: vec2<f32>,
+    target_size: vec2<f32>,
+    _pad0: f32,
+    _pad1: f32,
     color: vec4<f32>,   // linear RGB, .a = stroke opacity
     mode: u32,          // 0 = paint, 1 = erase
     // Non-zero when the stroke carries a colour per dab — a smudging brush —
@@ -69,9 +81,14 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     );
     let c = corners[vi];
     let doc = mix(u.rect_min, u.rect_max, c);
+    // Into the *target*, which is a page of the atlas rather than the canvas.
+    // The delta can be negative — a tile's atlas origin is often left of the
+    // document position it holds — which is exactly why this is a uniform and
+    // not the viewport `aim_at_document` used to set.
+    let at = doc + u.atlas_delta;
     let ndc = vec2<f32>(
-        doc.x / u.doc_size.x * 2.0 - 1.0,
-        1.0 - doc.y / u.doc_size.y * 2.0,
+        at.x / u.target_size.x * 2.0 - 1.0,
+        1.0 - at.y / u.target_size.y * 2.0,
     );
 
     var out: VsOut;

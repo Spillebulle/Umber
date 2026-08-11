@@ -311,7 +311,7 @@ mod tests {
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&gpu.queue);
         gpu.queue.submit(Some(enc.finish()));
 
         let ctx = Context::default();
