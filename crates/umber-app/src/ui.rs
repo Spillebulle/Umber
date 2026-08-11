@@ -1574,7 +1574,9 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // that half happened cannot be undone by flipping again. Said
     // here rather than only refused in `mirror_document`, so the
     // menu does not offer what it will not do.
-    let flip_locked = ed.layers.any_locked();
+    // The same reading the Edit menu's Undo and Redo rows take, and the same
+    // one `App::mirror_document` gates on. See `Editor::flip_refused_by_lock`.
+    let flip_locked = ed.flip_refused_by_lock();
     for (axis, hint) in [
         (
             umber_core::FlipAxis::Horizontal,
@@ -1591,10 +1593,15 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         };
         if menu_item(ui, action, !flip_locked)
             .on_hover_text(hint)
-            .on_disabled_hover_text(
-                "A layer is locked. A flip mirrors every layer at once, so it \
-                 cannot skip one. Unlock it first.",
-            )
+            // The reason is `editor::FLIP_LOCKED_REASON`, shared with the Edit
+            // menu's two history rows and with the notice a refused keystroke
+            // raises. Three hand-written near-copies of one sentence is the
+            // drift `flip_refused_by_lock` was introduced to stop for the
+            // *reading*, left standing for the wording.
+            .on_disabled_hover_text(format!(
+                "A layer is locked. {} first.",
+                editor::FLIP_LOCKED_REASON
+            ))
             .clicked()
         {
             actions.flip_canvas = Some(axis);
@@ -1673,15 +1680,55 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // deep can reach this line, and a sentence claiming nothing had been done
     // to it would be flatly false in exactly the case the paragraph above
     // names.
-    if menu_item(ui, Action::Undo, ed.history.can_undo())
-        .on_disabled_hover_text("Nothing in the history to undo.")
+    // **A step over a canvas flip is refused while any layer is locked**, in
+    // both directions, and these two rows are disabled to match — exactly as
+    // the Image menu's flip rows already are, from the same reading. Without
+    // this the menu offers a command that raises a box instead of doing
+    // anything, which is the control-that-lies failure; with it, the notice
+    // `App::settle_step` raises is left catching the keystroke alone. Each
+    // reason gets its own sentence, because "nothing to undo" over a document
+    // twenty strokes deep sends somebody looking for the wrong problem.
+    // `StepGate::refuses` and never `== StepGate::FlipLocked`: a control asks
+    // whether it may offer the command, which is a question about the *set* of
+    // refusing answers, and an equality test answers it only while that set has
+    // one member. An equality test is what stood here first, and it is
+    // `matches!` wearing an operator — a fourth variant would have been a
+    // compile error in `App::settle_step` and a silent `false` here.
+    //
+    // **The gate is read before `App::undo` runs `finish_transform`**, so with
+    // a float standing this can disable a row a click would have made live: the
+    // float goes down as an `EditKind::Transform`, which is then the entry on
+    // top and is not a flip. The row is dead and its sentence names a flip that
+    // would no longer have been next. Left as it is deliberately — the error is
+    // always towards refusing, never towards offering what the model declines,
+    // which is the direction that costs a document nothing — and drawing the
+    // menu from a speculative `finish_transform` would mean predicting an edit
+    // in order to describe it.
+    let undo_locked = ed.undo_gate().refuses();
+    if menu_item(ui, Action::Undo, ed.history.can_undo() && !undo_locked)
+        .on_disabled_hover_text(if undo_locked {
+            format!(
+                "The next step back is a canvas flip, and a layer is locked. {} first.",
+                editor::FLIP_LOCKED_REASON
+            )
+        } else {
+            "Nothing in the history to undo.".to_owned()
+        })
         .clicked()
     {
         actions.undo = true;
         ui.close();
     }
-    if menu_item(ui, Action::Redo, ed.history.can_redo())
-        .on_disabled_hover_text("Nothing undone to put back.")
+    let redo_locked = ed.redo_gate().refuses();
+    if menu_item(ui, Action::Redo, ed.history.can_redo() && !redo_locked)
+        .on_disabled_hover_text(if redo_locked {
+            format!(
+                "The next step forward is a canvas flip, and a layer is locked. {} first.",
+                editor::FLIP_LOCKED_REASON
+            )
+        } else {
+            "Nothing undone to put back.".to_owned()
+        })
         .clicked()
     {
         actions.redo = true;
@@ -4448,6 +4495,83 @@ mod tests {
         assert!(
             actions.cut_selection,
             "Cut was dead on an unlocked layer, so the row answers to nothing"
+        );
+    }
+
+    /// The Edit menu's Undo and Redo rows go dead when a locked layer refuses
+    /// the canvas flip they would step over, and stay live for anything else.
+    ///
+    /// **This is the panel half, and it is the half a model test cannot
+    /// reach.** `Editor::undo_gate`'s own guard measures the rule and cannot
+    /// see whether `edit_menu` calls it — reverting that one call site leaves
+    /// it green, which is the failure CLAUDE.md records for
+    /// `is_bold_anchor`. So this clicks the row `click_menu_row` finds, and a
+    /// disabled row swallows the click.
+    ///
+    /// **Three states, not two**, and the third is what makes it a test of the
+    /// rule rather than of the lock. A locked layer over a *paint* entry must
+    /// leave Undo live: a gate that refused every kind while anything was
+    /// locked would make Ctrl+Z inert for a painter who had locked a reference
+    /// layer, and asserting only the flip case would pass under that rule too.
+    /// The unlocked flip case is what says the aim is good, exactly as
+    /// `cut_answers_to_the_lock_and_copy_does_not` argues.
+    ///
+    /// The redo side is driven by pushing the entry across, which is what
+    /// `App::undo` does to it.
+    #[test]
+    fn the_edit_menus_history_rows_go_dead_when_a_lock_refuses_the_flip() {
+        use umber_core::{Edit, EditBody, EditKind};
+
+        /// An editor holding one entry of `kind`, with the layer locked or not.
+        fn ready(kind: EditKind, locked: bool, redo: bool) -> Editor {
+            let mut ed = Editor::default();
+            ed.history.record(Edit::new(kind, EditBody::Flip));
+            if redo {
+                let edit = ed.history.take_undo().expect("the entry just recorded");
+                ed.history.push_redo(edit);
+            }
+            ed.layers.active_mut().locked = locked;
+            ed
+        }
+
+        // A flip with nothing locked: both rows live, so the aim is good and
+        // the fixture reaches the rows at all.
+        let mut ed = ready(EditKind::FlipHorizontal, false, false);
+        assert!(
+            click_menu_row(Menu::Edit, &mut ed, Action::Undo.label()).undo,
+            "Undo was dead over an unlocked flip"
+        );
+        let mut ed = ready(EditKind::FlipHorizontal, false, true);
+        assert!(
+            click_menu_row(Menu::Edit, &mut ed, Action::Redo.label()).redo,
+            "Redo was dead over an unlocked flip"
+        );
+
+        // The same flip with a layer locked: both rows dead.
+        let mut ed = ready(EditKind::FlipHorizontal, true, false);
+        assert!(
+            !click_menu_row(Menu::Edit, &mut ed, Action::Undo.label()).undo,
+            "Undo was live over a flip a lock refuses, so the menu offers what \
+             `App::settle_step` will then decline"
+        );
+        let mut ed = ready(EditKind::FlipVertical, true, true);
+        assert!(
+            !click_menu_row(Menu::Edit, &mut ed, Action::Redo.label()).redo,
+            "Redo was live over a flip a lock refuses"
+        );
+
+        // And a *paint* entry with the same lock: still live, both ways. This
+        // is the assertion that fails if the gate is widened into "a lock
+        // refuses the history".
+        let mut ed = ready(EditKind::Paint, true, false);
+        assert!(
+            click_menu_row(Menu::Edit, &mut ed, Action::Undo.label()).undo,
+            "a locked layer killed Undo over a stroke, which nothing refuses"
+        );
+        let mut ed = ready(EditKind::Paint, true, true);
+        assert!(
+            click_menu_row(Menu::Edit, &mut ed, Action::Redo.label()).redo,
+            "a locked layer killed Redo over a stroke, which nothing refuses"
         );
     }
 

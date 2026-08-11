@@ -311,6 +311,83 @@ pub enum BrushTab {
     Blending,
 }
 
+/// What one step of the history needs of the document before it can be carried
+/// out, or why it cannot be.
+///
+/// The answer to [`Editor::undo_gate`] and [`Editor::redo_gate`], and the reason
+/// this is an enum rather than a `bool` is that the two non-`Clear` answers ask
+/// for opposite things: one says *settle the document and go on*, the other says
+/// *leave the entry where it is*. A caller that collapsed them would either
+/// refuse every flip or quiet the document for a refusal it is about to make.
+///
+/// **Every reader today matches exhaustively, and a test is what keeps it that
+/// way.** The two menu rows read `gate == StepGate::FlipLocked`, which is
+/// `matches!` wearing an operator: a fourth answer would have been a compile
+/// error in `App::settle_step` and a silent `false` in both rows — the menu
+/// going on offering a command the model had just learned to decline, in a
+/// change whose whole purpose is stopping exactly that. They go through
+/// [`StepGate::refuses`] now. See CLAUDE.md's "Partial exhaustiveness is worse
+/// than none"; this is the shape it describes, found by a critic in the diff
+/// that cited that section.
+///
+/// The first phrasing of this paragraph claimed exhaustiveness outright, which
+/// is a claim about the whole program that nothing enforces — `PartialEq` is
+/// still derived (three tests want `assert_eq!`), so a fifth reader can write
+/// the equality test again, which is precisely how this arrived. What holds the
+/// line is `ui::tests::the_edit_menus_history_rows_go_dead_when_a_lock_refuses_
+/// the_flip`, a guard at the call site. Structure narrows the mistake; only a
+/// test at the call site catches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepGate {
+    /// Nothing in the way. Every entry that swaps pixels or stack shape, and
+    /// the empty stack.
+    Clear,
+    /// A canvas flip. The mirror is a GPU permutation of every layer slice, so
+    /// the live stroke has to be committed and any autosave capture cancelled
+    /// first — `flip_canvas` does both before it mirrors and stepping over one
+    /// has to do the same.
+    SettleForFlip,
+    /// A canvas flip a locked layer refuses. The entry stays where it is, and
+    /// the artist is told: a flip that half happened cannot be undone by
+    /// flipping again.
+    FlipLocked,
+}
+
+impl StepGate {
+    /// Does this answer refuse the step outright?
+    ///
+    /// **Exhaustive, and that is the whole reason it exists** rather than the
+    /// two call sites comparing against [`StepGate::FlipLocked`]. A control asks
+    /// "may I offer this", which is a question about the *set* of refusing
+    /// answers, and an equality test answers it only for as long as that set has
+    /// one member. See the type's own docs.
+    pub fn refuses(self) -> bool {
+        match self {
+            Self::Clear | Self::SettleForFlip => false,
+            Self::FlipLocked => true,
+        }
+    }
+}
+
+/// Why a locked layer refuses a canvas flip, in one clause.
+///
+/// **Three controls have to say this**: the Image menu's two flip rows, the Edit
+/// menu's Undo and Redo rows, and the notice a refused keystroke raises. They
+/// were three hand-written near-copies, which is the drift
+/// [`Editor::flip_refused_by_lock`] was introduced two commits earlier to stop
+/// for the *reading* — the sentence deserves the same treatment and a critic
+/// pointed out that it had not had it.
+///
+/// Written so it is true whether one layer is locked or twenty: `any_locked` is
+/// an `iter().any()`, so the "Unlock **it** first" it replaces is wrong for a
+/// stack with three locked in it, and a plural-agreement dance is not worth the
+/// alternative. Only that half needed fixing — "cannot skip one" has *every
+/// layer* for its antecedent and was always right, and saying "a locked one"
+/// instead put a third "lock" into one tooltip for nothing. No em-dash, like
+/// everything else the interface draws.
+pub const FLIP_LOCKED_REASON: &str = "A flip mirrors every layer at once, so it cannot skip one. Unlock every \
+     locked layer in the Layers panel";
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
@@ -1291,6 +1368,70 @@ impl Editor {
             self.camera.center = self.camera.center.clamp(Vec2::ZERO, doc.size_vec2());
         }
         resized
+    }
+
+    /// **The one reading of "may this document be mirrored".**
+    ///
+    /// A canvas flip is refused *whole* when any layer is locked — see
+    /// `App::mirror_document` for why half a flip is not a state the history's
+    /// pixel-less entry can describe — and three separate controls have to
+    /// agree about it: the Image menu's two flip rows, the Edit menu's Undo and
+    /// Redo rows, and the keystroke behind each. One statement here rather than
+    /// three `layers.any_locked()` calls that happen to be spelled the same, so
+    /// a change to what refuses a flip cannot leave one control offering it.
+    pub fn flip_refused_by_lock(&self) -> bool {
+        self.layers.any_locked()
+    }
+
+    /// What carrying the entry at the top of the undo stack backwards needs of
+    /// this document first, or why it cannot be carried out at all.
+    ///
+    /// The **plan half** of `App::reverse`, in `LayerStack::plan_reorder`'s
+    /// shape: the answer is available without spending the entry, so a control
+    /// can be disabled to match and the entry can be left alone where it cannot
+    /// be carried out. See [`StepGate`] for what the three answers cost.
+    pub fn undo_gate(&self) -> StepGate {
+        self.gate_for(self.history.next_undo().map(|edit| edit.kind))
+    }
+
+    /// [`Editor::undo_gate`]'s twin for the redo stack.
+    ///
+    /// A flip is refused in both directions, so this is not a courtesy: a redo
+    /// that spent an entry it could not carry out would damage the document in
+    /// exactly the way an undo does.
+    pub fn redo_gate(&self) -> StepGate {
+        self.gate_for(self.history.next_redo().map(|edit| edit.kind))
+    }
+
+    /// The rule both gates share, over the kind of whichever entry is next.
+    ///
+    /// `None` — nothing on that stack — answers [`StepGate::Clear`] rather than
+    /// a fourth variant: the caller's `take_undo` already returns `None` a line
+    /// later, and "there is nothing to step over" is not a refusal anybody has
+    /// to be told about. `History::can_undo` is what a control asks about that.
+    ///
+    /// **This predicts on the `kind` where `App::reverse` decides on the
+    /// `body`, and the asymmetry is deliberate.** `reverse` mirrors only for an
+    /// `EditBody::Flip` whose kind also names an axis; this refuses for the kind
+    /// alone. The kind's predicate is therefore a strict *superset* of the
+    /// body's, so this can never answer `Clear` over a step that will go on to
+    /// mirror — it fails closed, which is the direction that matters. Reading
+    /// the body would be exact and is one line away, since `next_undo` hands
+    /// back the whole `&Edit`; it is not taken, because the exact reading buys
+    /// nothing over a safe over-approximation and would make the two functions
+    /// agree by construction *only* while both are read the same way. The guard
+    /// builds the disagreeing state on purpose — a `Flip` body under every kind
+    /// — which pins this reading rather than the other.
+    fn gate_for(&self, next: Option<umber_core::EditKind>) -> StepGate {
+        // Read off `flip_axis` rather than `matches!` on the two flip variants,
+        // so a third axis would arrive here already handled. The axis itself is
+        // `reverse`'s to read back off the kind — carrying it in the gate would
+        // be a second copy of a number that has exactly one source.
+        match next.and_then(umber_core::EditKind::flip_axis) {
+            None => StepGate::Clear,
+            Some(_) if self.flip_refused_by_lock() => StepGate::FlipLocked,
+            Some(_) => StepGate::SettleForFlip,
+        }
     }
 
     /// Mirror the live document, in everything but its pixels.
@@ -2499,6 +2640,151 @@ mod tests {
 
     fn point() -> InputPoint {
         InputPoint::new(Vec2::splat(10.0), 1.0, 0.0)
+    }
+
+    /// A lock refuses a step over a canvas flip, in **both** directions, and
+    /// refuses nothing else.
+    ///
+    /// Driven over the whole of [`umber_core::EditKind::ALL`] rather than over
+    /// the two flips, because the interesting failure is the *other* half: a
+    /// gate that refused every kind while a layer was locked would make Ctrl+Z
+    /// inert for a painter who had locked a reference layer, which is an
+    /// ordinary thing to have done, and no test that only drove the flips could
+    /// tell the two rules apart. Every non-flip kind is asserted `Clear` with a
+    /// layer locked.
+    ///
+    /// Both stacks, because a flip is its own inverse and a redo that spent an
+    /// entry it could not carry out damages the document exactly as an undo
+    /// does. The redo half is set up by recording and then taking the entry, so
+    /// the fixture reaches that stack the way the application does.
+    ///
+    /// **What this does not cover**: whether `App::undo` consults the gate at
+    /// all. `App` holds a `winit::Window` and a `wgpu::Surface`, so it cannot be
+    /// built headlessly and there is no test in this crate that drives it. What
+    /// stands in for one is structural rather than a guard —
+    /// `App::mirror_document` is `#[must_use]`, so the defect this gate exists
+    /// for (a discarded refusal) is a compile error under CI's `-D warnings` —
+    /// and the panel half is
+    /// `crate::ui::tests::the_edit_menus_history_rows_go_dead_when_a_lock_
+    /// refuses_the_flip`, which clicks the real row.
+    #[test]
+    fn a_lock_refuses_a_step_over_a_flip_and_over_nothing_else() {
+        for kind in umber_core::EditKind::ALL {
+            let flip = kind.flip_axis().is_some();
+            // The body is `Flip` for every kind, which is not a state the
+            // history produces and is deliberate here: the gate is supposed to
+            // read the **kind**, so a fixture whose body agreed with the kind
+            // could not tell a gate that read the body from one that read the
+            // kind. `App::reverse` reads the body and the kind separately, and
+            // only the kind decides whether a mirror is about to happen.
+            let mut ed = Editor::default();
+            ed.history
+                .record(umber_core::Edit::new(kind, umber_core::EditBody::Flip));
+
+            assert_eq!(
+                ed.undo_gate(),
+                if flip {
+                    StepGate::SettleForFlip
+                } else {
+                    StepGate::Clear
+                },
+                "unlocked, undo over {kind:?}"
+            );
+
+            ed.layers.active_mut().locked = true;
+            assert_eq!(
+                ed.undo_gate(),
+                if flip {
+                    StepGate::FlipLocked
+                } else {
+                    StepGate::Clear
+                },
+                "locked, undo over {kind:?}"
+            );
+
+            // Onto the redo stack the way the application puts it there.
+            ed.layers.active_mut().locked = false;
+            let edit = ed.history.take_undo().expect("the entry just recorded");
+            ed.history.push_redo(edit);
+            assert_eq!(
+                ed.redo_gate(),
+                if flip {
+                    StepGate::SettleForFlip
+                } else {
+                    StepGate::Clear
+                },
+                "unlocked, redo over {kind:?}"
+            );
+
+            ed.layers.active_mut().locked = true;
+            assert_eq!(
+                ed.redo_gate(),
+                if flip {
+                    StepGate::FlipLocked
+                } else {
+                    StepGate::Clear
+                },
+                "locked, redo over {kind:?}"
+            );
+        }
+
+        // An empty stack is `Clear` and not a fourth answer: `take_undo` says
+        // "nothing" a line later, and there is nothing to tell anybody about.
+        let mut ed = Editor::default();
+        ed.layers.active_mut().locked = true;
+        assert_eq!(ed.undo_gate(), StepGate::Clear, "nothing to undo");
+        assert_eq!(ed.redo_gate(), StepGate::Clear, "nothing to redo");
+
+        // **Which end of the stack the gate reads**, which every case above is
+        // blind to because none of them holds more than one entry. A critic
+        // pointed this out and the mutation was run: turning
+        // `History::next_undo` into `self.undo.first()` left every assertion
+        // above green, and reproduces the original bug exactly — the gate would
+        // read the Paint at the bottom, answer `Clear`, and let the flip through
+        // unmirrored.
+        //
+        // **The two stacks are loaded with opposite contents on purpose.** Made
+        // symmetric they were, and a `redo_gate` that read the undo stack passed
+        // every assertion in this test and in the menu's. Here each direction
+        // is asked over a stack whose top disagrees with the other's, so the two
+        // cannot be swapped without one of the four answers moving.
+        let mut ed = Editor::default();
+        ed.layers.active_mut().locked = true;
+        // Undo: [Paint, Flip] with the flip on top. Redo: [Flip, Paint], paint
+        // on top. So undo must refuse and redo must not.
+        for kind in [
+            umber_core::EditKind::Paint,
+            umber_core::EditKind::FlipVertical,
+        ] {
+            ed.history
+                .record(umber_core::Edit::new(kind, umber_core::EditBody::Flip));
+        }
+        for kind in [
+            umber_core::EditKind::FlipVertical,
+            umber_core::EditKind::Paint,
+        ] {
+            ed.history
+                .push_redo(umber_core::Edit::new(kind, umber_core::EditBody::Flip));
+        }
+        // **The fixture is checked before it is used**, because its own
+        // ordering is load-bearing and silently so: `History::record` drains
+        // the redo stack, so putting the two loops the other way round leaves
+        // redo *empty*, and both assertions below then pass on `None => Clear`
+        // having tested nothing. A second critic asked for that mutation and it
+        // was green. Two entries applied and four held is the shape the four
+        // answers below mean anything over.
+        assert_eq!(ed.history.position(), 2, "the undo stack is not as loaded");
+        assert_eq!(ed.history.len(), 4, "the redo stack was drained");
+        assert_eq!(
+            ed.undo_gate(),
+            StepGate::FlipLocked,
+            "the gate read past the flip on top of the undo stack"
+        );
+        assert_eq!(
+            ed.redo_gate(),
+            StepGate::Clear,
+            "the gate read past the paint on top of the redo stack"
+        );
     }
 
     /// The gate every route to a stroke passes through. Checked here rather
