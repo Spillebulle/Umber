@@ -2580,6 +2580,100 @@ mod tests {
         InputPoint::new(Vec2::splat(10.0), 1.0, 0.0)
     }
 
+    /// A lock refuses a step over a canvas flip, in **both** directions, and
+    /// refuses nothing else.
+    ///
+    /// Driven over the whole of [`umber_core::EditKind::ALL`] rather than over
+    /// the two flips, because the interesting failure is the *other* half: a
+    /// gate that refused every kind while a layer was locked would make Ctrl+Z
+    /// inert for a painter who had locked a reference layer, which is an
+    /// ordinary thing to have done, and no test that only drove the flips could
+    /// tell the two rules apart. Every non-flip kind is asserted `Clear` with a
+    /// layer locked.
+    ///
+    /// Both stacks, because a flip is its own inverse and a redo that spent an
+    /// entry it could not carry out damages the document exactly as an undo
+    /// does. The redo half is set up by recording and then taking the entry, so
+    /// the fixture reaches that stack the way the application does.
+    ///
+    /// **What this does not cover**: whether `App::undo` consults the gate at
+    /// all. `App` holds a `winit::Window` and a `wgpu::Surface`, so it cannot be
+    /// built headlessly and there is no test in this crate that drives it. What
+    /// stands in for one is structural rather than a guard —
+    /// `App::mirror_document` is `#[must_use]`, so the defect this gate exists
+    /// for (a discarded refusal) is a compile error under CI's `-D warnings` —
+    /// and the panel half is
+    /// `crate::ui::tests::the_edit_menus_history_rows_go_dead_when_a_lock_
+    /// refuses_the_flip`, which clicks the real row.
+    #[test]
+    fn a_lock_refuses_a_step_over_a_flip_and_over_nothing_else() {
+        for kind in umber_core::EditKind::ALL {
+            let flip = kind.flip_axis().is_some();
+            // The body is `Flip` for every kind, which is not a state the
+            // history produces and is deliberate here: the gate is supposed to
+            // read the **kind**, so a fixture whose body agreed with the kind
+            // could not tell a gate that read the body from one that read the
+            // kind. `App::reverse` reads the body and the kind separately, and
+            // only the kind decides whether a mirror is about to happen.
+            let mut ed = Editor::default();
+            ed.history
+                .record(umber_core::Edit::new(kind, umber_core::EditBody::Flip));
+
+            assert_eq!(
+                ed.undo_gate(),
+                if flip {
+                    StepGate::SettleForFlip
+                } else {
+                    StepGate::Clear
+                },
+                "unlocked, undo over {kind:?}"
+            );
+
+            ed.layers.active_mut().locked = true;
+            assert_eq!(
+                ed.undo_gate(),
+                if flip {
+                    StepGate::FlipLocked
+                } else {
+                    StepGate::Clear
+                },
+                "locked, undo over {kind:?}"
+            );
+
+            // Onto the redo stack the way the application puts it there.
+            ed.layers.active_mut().locked = false;
+            let edit = ed.history.take_undo().expect("the entry just recorded");
+            ed.history.push_redo(edit);
+            assert_eq!(
+                ed.redo_gate(),
+                if flip {
+                    StepGate::SettleForFlip
+                } else {
+                    StepGate::Clear
+                },
+                "unlocked, redo over {kind:?}"
+            );
+
+            ed.layers.active_mut().locked = true;
+            assert_eq!(
+                ed.redo_gate(),
+                if flip {
+                    StepGate::FlipLocked
+                } else {
+                    StepGate::Clear
+                },
+                "locked, redo over {kind:?}"
+            );
+        }
+
+        // An empty stack is `Clear` and not a fourth answer: `take_undo` says
+        // "nothing" a line later, and there is nothing to tell anybody about.
+        let mut ed = Editor::default();
+        ed.layers.active_mut().locked = true;
+        assert_eq!(ed.undo_gate(), StepGate::Clear, "nothing to undo");
+        assert_eq!(ed.redo_gate(), StepGate::Clear, "nothing to redo");
+    }
+
     /// The gate every route to a stroke passes through. Checked here rather
     /// than at the four call sites in `app.rs` that reach it, which is the
     /// whole of how a lock cannot be forgotten by a fifth.

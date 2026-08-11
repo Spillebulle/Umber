@@ -6332,6 +6332,189 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 mod tests {
     use super::*;
 
+    /// **What spending a flip entry on a mirror that did not happen costs the
+    /// picture**, measured rather than argued.
+    ///
+    /// This is the justification for `Editor::undo_gate` existing at all, and
+    /// it is deliberately not a restatement of that gate: it drives the
+    /// primitives `App::undo` drives — `CanvasRenderer::flip_layers` and
+    /// `swap_patch` — over a real `History`, and reads the pixels back. What it
+    /// shows is that the two orders are *not* interchangeable, which is the
+    /// thing a guard on the gate alone can only assert.
+    ///
+    /// The sequence is the artist's. Paint an asymmetric picture, paint over a
+    /// corner of it and record the patch that undoes that, flip the canvas and
+    /// record the flip. Then step back twice, two ways:
+    ///
+    /// * **The right way** — mirror, then apply the patch — restores the
+    ///   original picture byte for byte.
+    /// * **The way the defect took** — spend the flip entry without mirroring,
+    ///   then apply the patch — writes the pre-flip rectangle into a canvas
+    ///   still in the post-flip orientation, and the picture that comes back is
+    ///   neither the original nor anything the artist ever saw.
+    ///
+    /// **Byte-exact assertions are legitimate here**, against CLAUDE.md's rule
+    /// that a pixel through a shader may not promise a byte: nothing here is
+    /// antialiased or blended. `flip.wgsl` is an integer `textureLoad`
+    /// permutation through non-sRGB views with `blend: None`, and `swap_patch`
+    /// is a readback and a `write_layer_rect`. Both hold on hardware and on the
+    /// software rasteriser.
+    ///
+    /// **The history is asserted beside the pixels**, because the damage is a
+    /// disagreement between the two and the first press looks like a no-op:
+    /// after the refused step the position must not have moved. That half is
+    /// what a pixel-only guard would miss entirely.
+    ///
+    /// Skips rather than fails with no adapter, and holds `gputest::lock` for
+    /// its whole length — see `crate::gputest`.
+    #[test]
+    fn a_flip_entry_spent_without_its_mirror_writes_the_next_patch_back_wrong() {
+        use umber_core::{Edit, EditBody, EditKind, FlipAxis};
+        use umber_render::CanvasRenderer;
+
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+
+        // Wide rather than square, so a horizontal mirror is a permutation the
+        // fixture can actually tell apart, and so a transposed one could not
+        // pass by symmetry. Four rows, so the patched corner is a quarter of it.
+        let size = UVec2::new(8, 4);
+        let whole = PixelRect {
+            x: 0,
+            y: 0,
+            width: size.x,
+            height: size.y,
+        };
+        // The corner the second edit covers. Off the origin on both axes, so a
+        // patch replayed at a transposed or mirrored rectangle lands somewhere
+        // the assertion can see.
+        let corner = PixelRect {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 2,
+        };
+
+        let stack = umber_core::LayerStack::new();
+        let slot = stack.layers()[0]
+            .slot()
+            .expect("a fresh layer holds a slot");
+
+        let build = |gpu: &umber_render::Gpu| {
+            let mut canvas = CanvasRenderer::new(
+                &gpu.device,
+                &gpu.queue,
+                size,
+                wgpu::TextureFormat::Rgba8Unorm,
+                stack.slot_capacity_needed(),
+            );
+            canvas.clear_all_layers(&gpu.queue);
+            canvas
+        };
+
+        // An opaque picture whose every column is a different red, so a
+        // left-to-right mirror moves every pixel and a wrong rectangle is
+        // visible in one byte.
+        let original: Vec<u8> = (0..whole.area())
+            .flat_map(|i| {
+                let x = (i % u64::from(size.x)) as u8;
+                let y = (i / u64::from(size.x)) as u8;
+                [20 + x * 25, 60 + y * 40, 200, 255]
+            })
+            .collect();
+        // What the second edit paints over the corner: flat, and unlike
+        // anything in `original`.
+        let over: Vec<u8> = std::iter::repeat_n([9u8, 9, 9, 255], corner.area() as usize)
+            .flatten()
+            .collect();
+
+        // --- the artist's session, up to the flip -------------------------
+        let mut canvas = build(gpu);
+        canvas.write_layer_rect(&gpu.device, &gpu.queue, slot, whole, &original);
+
+        // The patch a commit captures: the pixels the corner edit replaces.
+        let before_corner = canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, corner);
+        canvas.write_layer_rect(&gpu.device, &gpu.queue, slot, corner, &over);
+
+        canvas.flip_layers(&gpu.device, &gpu.queue, &[slot], FlipAxis::Horizontal);
+        let flipped = canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole);
+        assert_ne!(flipped, original, "the fixture's flip moved nothing");
+
+        // `History` is deliberately not `Clone` — it owns the slot claims of
+        // parked layers — so the session's two entries are built afresh for
+        // each of the three things below that spends them.
+        let session = || {
+            let mut history = umber_core::History::default();
+            history.record(Edit::new(
+                EditKind::Paint,
+                umber_core::PixelPatch::new(corner, slot, before_corner.clone()),
+            ));
+            history.record(Edit::new(EditKind::FlipHorizontal, EditBody::Flip));
+            history
+        };
+        let position_after_flip = session().position();
+
+        // --- the right way: mirror, then apply the patch -------------------
+        let mut right = session();
+        let flip_entry = right.take_undo().expect("the flip");
+        assert!(flip_entry.kind.flip_axis().is_some());
+        canvas.flip_layers(&gpu.device, &gpu.queue, &[slot], FlipAxis::Horizontal);
+        let paint_entry = right.take_undo().expect("the paint");
+        let EditBody::Pixels(patch) = paint_entry.body else {
+            panic!("the paint entry lost its patch");
+        };
+        let _ = swap_patch(&mut canvas, gpu, &patch);
+        let restored = canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole);
+        assert_eq!(
+            restored, original,
+            "stepping back over the flip and then the stroke did not restore the picture"
+        );
+
+        // --- the way the defect took: spend the flip, mirror nothing -------
+        let mut canvas = build(gpu);
+        canvas.write_layer_rect(&gpu.device, &gpu.queue, slot, whole, &flipped);
+        let mut wrong = session();
+        let _flip_entry = wrong.take_undo().expect("the flip");
+        // No `flip_layers` here: that is exactly the discarded refusal.
+        let paint_entry = wrong.take_undo().expect("the paint");
+        let EditBody::Pixels(patch) = paint_entry.body else {
+            panic!("the paint entry lost its patch");
+        };
+        let _ = swap_patch(&mut canvas, gpu, &patch);
+        let damaged = canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole);
+        assert_ne!(
+            damaged, original,
+            "spending the flip entry without mirroring happened to restore the \
+             picture, so this fixture cannot see the defect at all"
+        );
+        assert_ne!(
+            damaged, flipped,
+            "the bad patch wrote nothing; the fixture's rectangle is not being reached"
+        );
+
+        // --- and the history half, which the pixels cannot show ------------
+        //
+        // The first press looks like a no-op either way. What tells the two
+        // apart is whether the entry is still there to be reached: with a layer
+        // locked the gate refuses and the position must not move, where the
+        // defect moved it and left the picture behind.
+        let mut ed = crate::editor::Editor::default();
+        ed.history = session();
+        ed.layers.active_mut().locked = true;
+        assert_eq!(
+            ed.undo_gate(),
+            crate::editor::StepGate::FlipLocked,
+            "a locked layer must refuse the step over the flip"
+        );
+        assert_eq!(
+            ed.history.position(),
+            position_after_flip,
+            "asking the gate spent an entry"
+        );
+    }
+
     /// **A Save reads each layer out of its own slice, one at a time.**
     ///
     /// `SaveSource` is the only part of the save path with no other cover at
@@ -6731,6 +6914,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The box a refused Ctrl+Z or Ctrl+Y raises says what did not happen, in
+    /// the right direction, and names the way out.
+    ///
+    /// The remedy clause is the load-bearing one. A control disabled with a
+    /// tooltip can leave the reason implicit because the artist is already
+    /// pointing at it; a box raised by a keystroke arrives with no context at
+    /// all, and "a layer is locked" alone leaves somebody hunting a stack for
+    /// which one and never learning that unlocking it is what would let the
+    /// undo through. The Layers panel is named because that is where the
+    /// control is.
+    ///
+    /// The two directions must not say the same thing: "Nothing was undone"
+    /// over a redo is the kind of wrong that makes an artist doubt what they
+    /// just pressed.
+    #[test]
+    fn a_refused_history_step_says_what_did_not_happen_and_how_to_let_it() {
+        let undone = flip_step_refusal("undone");
+        let put_back = flip_step_refusal("put back");
+        for (at, notice) in [("undo", &undone), ("redo", &put_back)] {
+            assert_eq!(notice.lines.len(), 1, "{at}");
+            let line = &notice.lines[0];
+            assert!(!notice.title.is_empty(), "{at} has no title");
+            assert!(line.ends_with('.'), "{at} is not a sentence: {line:?}");
+            // No em-dash in anything the interface draws.
+            assert!(!line.contains('—'), "{at} carries an em-dash: {line:?}");
+            assert!(
+                line.contains("canvas flip"),
+                "{at} does not name what refused: {line:?}"
+            );
+            assert!(
+                line.contains("Layers panel"),
+                "{at} names no way out: {line:?}"
+            );
+        }
+        assert!(
+            undone.lines[0].contains("Nothing was undone"),
+            "{:?}",
+            undone.lines
+        );
+        assert!(
+            put_back.lines[0].contains("Nothing was put back"),
+            "{:?}",
+            put_back.lines
+        );
+        assert_ne!(
+            undone.lines[0], put_back.lines[0],
+            "the two directions say the same thing"
+        );
     }
 
     /// **Every reason a paste can be refused has a finished sentence**, and the
