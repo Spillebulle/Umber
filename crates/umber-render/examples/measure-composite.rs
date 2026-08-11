@@ -407,6 +407,10 @@ const STROKE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// `OFFSCREEN_FORMAT`, which only the export path uses.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
+/// How much staging one `write_texture` of the atlas may ask for. See the
+/// banding in `build_store` for why a whole page is too much.
+const UPLOAD_BAND_BYTES: u64 = 16 << 20;
+
 /// One page's worth of premultiplied paint, the same for every page.
 ///
 /// The content is deliberately the same on every page and every slot: nothing
@@ -456,8 +460,28 @@ fn page_bytes(page: UVec2, doc: UVec2) -> Vec<u8> {
     out
 }
 
+/// `None` where the card would not hold the atlas.
+///
+/// The `--budget` flag is a *self-imposed* bound and the card's is the real one,
+/// so the two disagree and this is the half that matters: 4096² at 54 slots is
+/// 3.62 GB, comfortably inside a 4 GB budget and refused by a 10 GB card that is
+/// also running the artist's own Umber and this example's other stores. Without
+/// this the run dies in wgpu's uncaptured-error handler and every cell is lost,
+/// where the one that could not be built is all that had to be skipped.
+///
+/// `CanvasRenderer::try_reserve`'s shape, including the part that is easy to get
+/// wrong: the scope is popped **before any view is built**, because a view of a
+/// failed texture is `CreateTextureViewError::InvalidResource`, which classifies
+/// as *Validation* — a filter an `OutOfMemory` scope does not catch, so it would
+/// reach the uncaptured handler one line after the check.
 #[allow(clippy::too_many_arguments)]
-fn build_store(gpu: &Gpu, grid: &Grid, slots: u32, residency: Residency, label: &str) -> Store {
+fn build_store(
+    gpu: &Gpu,
+    grid: &Grid,
+    slots: u32,
+    residency: Residency,
+    label: &str,
+) -> Option<Store> {
     let page = grid.page_size();
     let per_page = grid.tiles_per_page();
 
@@ -499,6 +523,7 @@ fn build_store(gpu: &Gpu, grid: &Grid, slots: u32, residency: Residency, label: 
         _ => cursor.div_ceil(per_page).max(1),
     };
 
+    let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let atlas = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -513,31 +538,58 @@ fn build_store(gpu: &Gpu, grid: &Grid, slots: u32, residency: Residency, label: 
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let fill = page_bytes(page, grid.doc_size);
-    for slice in 0..pages {
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: slice,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &fill,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(page.x * 4),
-                rows_per_image: Some(page.y),
-            },
-            wgpu::Extent3d {
-                width: page.x,
-                height: page.y,
-                depth_or_array_layers: 1,
-            },
+    // Popped here, with no view yet built. See this function's docs. `block_on`
+    // over a future wgpu builds with `ready(...)`: an extractor, not a wait.
+    if let Some(error) = pollster::block_on(scope.pop()) {
+        // Dropped, never used: every view of it would be a validation error.
+        drop(atlas);
+        println!(
+            "  {:<8} REFUSED by the card at {} page(s) = {}: {error}",
+            residency.label(),
+            pages,
+            gigabytes(u64::from(pages) * u64::from(page.x) * u64::from(page.y) * 4),
         );
+        return None;
+    }
+    // **The upload bands and waits, and that is not tidiness.** A whole page of
+    // 4096² is 67 MB of staging, `write_texture` asks the HAL for it with no
+    // `max_buffer_size` check, and a submit does not release staging — it hands
+    // it to that submission's fence. So fifty-four pages accumulate 3.6 GB, and
+    // when that fails `handle_hal_error` calls `lose`: **no error scope catches
+    // it and the device is gone.** The scope above covers the allocation and
+    // nothing else, which is exactly the split CLAUDE.md records for
+    // `write_layer_rect`. Waiting per band is what makes the staging alive at
+    // any instant one band, and this is setup rather than a frame.
+    let fill = page_bytes(page, grid.doc_size);
+    let row_bytes = u64::from(page.x) * 4;
+    let band = (UPLOAD_BAND_BYTES / row_bytes.max(1)).clamp(1, u64::from(page.y)) as u32;
+    for slice in 0..pages {
+        let mut y = 0;
+        while y < page.y {
+            let rows = band.min(page.y - y);
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &atlas,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y, z: slice },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &fill[(u64::from(y) * row_bytes) as usize..],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(page.x * 4),
+                    rows_per_image: Some(rows),
+                },
+                wgpu::Extent3d {
+                    width: page.x,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+            gpu.queue.submit([]);
+            let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            y += rows;
+        }
     }
 
     let table = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -581,7 +633,7 @@ fn build_store(gpu: &Gpu, grid: &Grid, slots: u32, residency: Residency, label: 
         );
     }
 
-    Store {
+    Some(Store {
         atlas_view: atlas.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -593,7 +645,7 @@ fn build_store(gpu: &Gpu, grid: &Grid, slots: u32, residency: Residency, label: 
         pages,
         backed,
         bytes: u64::from(pages) * u64::from(page.x) * u64::from(page.y) * 4,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -915,10 +967,21 @@ fn sweep_canvas(
     }
 
     // ---- the stores ----------------------------------------------------
+    //
+    // A refused store takes the whole canvas out rather than only its own rows:
+    // the sampled baseline always reads the dense one, so without it there is
+    // nothing for the other two to be compared against.
     let stores: Vec<(Residency, Store)> = Residency::ALL
         .iter()
-        .map(|&r| (r, build_store(gpu, &grid, slots, r, "atlas")))
+        .filter_map(|&r| build_store(gpu, &grid, slots, r, "atlas").map(|s| (r, s)))
         .collect();
+    if stores.len() != Residency::ALL.len() {
+        println!(
+            "SKIPPED: the card would not hold every store this canvas needs. \
+             Ask for fewer layers with --layers, or a smaller canvas."
+        );
+        return;
+    }
     for (r, s) in &stores {
         println!(
             "  {:<8} {} page(s) = {:>8}, {} tile(s) backed of {} ({:.1}%)",
