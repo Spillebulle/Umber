@@ -185,6 +185,12 @@ fn unpack(word: u32) -> (u32, u32) {
 
 impl Loading {
     /// Start reading `path`, and hand back the handle to watch it by.
+    ///
+    /// **When this worker ends unexpectedly, [`collect`] is what notices**, by
+    /// the `Disconnected` [`Self::take`] reads off `outcome`, and it takes the
+    /// modal down. Said beside the spawn rather than only at the collector: the
+    /// state a dead worker leaves is made here, and until somebody asked "who
+    /// notices if the answer never comes" the answer was nobody.
     pub fn start(
         path: PathBuf,
         name: String,

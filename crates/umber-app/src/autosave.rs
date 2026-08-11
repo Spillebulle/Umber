@@ -1944,6 +1944,13 @@ impl Autosave {
     /// [`Job::Slice`] is encode it and let the buffer go. That is the frame-path
     /// cost of the change being zero: the drain is a pointer move and a channel
     /// send, and the deflate happens here.
+    ///
+    /// **When this ends unexpectedly, [`Self::poll`] is what notices**, by the
+    /// `Disconnected` on `report_rx`, and [`Self::writer_vanished`] is what
+    /// makes the next call here start another. That sentence belongs beside the
+    /// spawn rather than only beside the collector: the state a thread leaves
+    /// when it dies is made here, and "who clears this" was written down long
+    /// before anybody asked "who notices if it is never reached".
     fn writer(&mut self) -> Option<&mpsc::Sender<Job>> {
         if self.tx.is_none() {
             let (task_tx, task_rx) = mpsc::channel::<Job>();
