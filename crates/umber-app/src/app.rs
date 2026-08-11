@@ -169,10 +169,12 @@ impl Graphics {
     /// shaders are shared, so this is a few textures rather than three shader
     /// compilations on the frame the user opened a document.
     /// `slots` is the document's slot high-water mark, not its layer count —
-    /// see [`umber_core::LayerStack::slot_capacity_needed`]. A renderer starts
-    /// with room for a handful of slices, and a document that already has more
-    /// layers than that would otherwise hand the commit and undo paths a slice
-    /// index the texture array does not have.
+    /// see [`umber_core::LayerStack::slot_capacity_needed`]. It is what the
+    /// array is *built* at: a renderer whose speculative floor was all it had
+    /// would hand the commit and undo paths a slice index the texture array does
+    /// not have, and one grown into the count afterwards would pay a growth's
+    /// old-plus-new peak once per slice on the way. The clear below is therefore
+    /// the only one — nothing grows here, so nothing clears a slice twice.
     fn add_canvas(&mut self, id: DocId, doc: &Document, slots: u32) {
         let size = doc.size;
         // Built at the count rather than grown to it. A growth holds the old
