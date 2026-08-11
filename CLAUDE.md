@@ -1971,6 +1971,49 @@ when nobody asked for it.
   one no id names — and that function acts only on an abandoned or failed job,
   because `take_capture` hands the finished document to whoever asks and a settle
   reaching a live capture would collect it and drop it.
+- **A write to a slice a capture has already read is *re-read*, not ignored and
+  not a restart.** `touch_slot` told the thumbnail of that slice and told the
+  capture nothing, so an undo, a "Clear layer", a mask fill, a text placement, a
+  float commit or an ordinary stroke commit landing inside a capture left the
+  file holding that layer as it was and `mergedimage.png` as it now is — a
+  document that never existed, written silently, five minutes at a time. `quiet`
+  gates only the *start*, so a stroke is in that list. A capture spans about
+  ninety seconds on the reference 20000×5000 document, which makes an edit inside
+  one ordinary rather than exotic. `Capture::stale` marks the step; once the
+  linear pass is over the marked steps are read again, and the preview after
+  them, to a fixed point.
+  - **A write to a step the pass has not reached marks nothing**, because what is
+    read afterwards is the new content and every step already read is untouched —
+    the file is then the document as it stands. That is what keeps this rare: a
+    stroke on a layer high in the stack disturbs a capture only once the capture
+    has walked past it.
+  - **Re-reading rather than restarting is what makes "retry" affordable at
+    all.** A restart throws away the other fifty-two layers, so on the reference
+    document it would need a ninety-second pause to ever complete and would in
+    practice mean *never autosaved* — silently, which is worse than the mixed
+    file it was fixing. One layer and the preview is a couple of seconds, so the
+    fixed point settles at the first ordinary pause.
+  - **It is bounded, and what it protects is the other tabs.** Somebody painting
+    without pause on a layer low in the stack can hold a capture away from its
+    fixed point for ever, and only one capture runs at a time — so an unbounded
+    one starves *every other open document's* autosave as well as its own.
+    `Capture::rereads` is the capture's own step count with a floor: worst case
+    twice the work. Exhausting it gives the capture up and latches
+    `take_capture_gave_up`, which `collect` reads to `defer` — another capture
+    begun on the next frame would spend the same budget on the same painting,
+    every frame, for as long as somebody is working.
+  - **A *wipe* is not a write and gives the capture up instead**, because a wipe
+    may be the slice **changing hands**: a `Candidate` is snapshotted when the
+    capture begins, deleting a layer parks its slice, the undo budget can evict
+    the parked entry, and the next layer added claims that slice and is handed it
+    through `clear_layer`. Re-reading would then file the new layer's pixels under
+    the old layer's name — a hole the mark would have *opened*, since before it
+    such a capture wrote the old layer's real pixels. `wipe_slot` is
+    `clear_layer`'s and `fill_layer_white`'s door, and only where the capture
+    named the slice, so a brand new layer's fresh slice costs a capture nothing.
+  - **`touch_all_slots` cancels the capture as well as the thumbnail.** `resize`
+    cancelled by hand and `clear_all_layers` did not; the rule belongs inside the
+    method for the reason `slot_revision` is bumped there.
 - **The generalisable shape is: when something is cancelled, ask who drives it
   afterwards.** `take_thumb` already fixed the identical failure by dropping an
   abandoned job at the top of the function, and its comment spells the mechanism
@@ -2029,7 +2072,34 @@ when nobody asked for it.
   it.**
 - **A failure says so once and carries on.** A broken autosave must never
   become a dialog that reappears over somebody's canvas every five minutes, and
-  it must never stop somebody painting.
+  it must never stop somebody painting. **Two latches, not one**, and at most one
+  failure leaves any drain: that sentence was written for one *document* failing
+  repeatedly, and folding a dead writer into the same latch made the two kinds
+  compete for the run's single interruption. `collect` shows the last notice it
+  is handed and drops the rest, so two failures in one batch spent two latches to
+  show one dialog.
+- **A dead writer is respawned by dropping its sender, and told about once.**
+  `Autosave::writer` starts a thread only where `tx` is `None`, so `lose_writer`
+  clearing it *is* the respawn — and `Report::NoWriter` is what makes the
+  sentence honest, because a notice promising Umber will try again is a promise
+  only that clearing keeps. One variant covers a thread that died and one that
+  could not be started: they differ only in a detail the artist cannot act on,
+  and they are reachable one from the other, since a death clears `tx` precisely
+  so the next `send` starts a thread and *that* spawn can fail. The sentence says
+  "may not have been written", because "stopped" is false of a thread that never
+  ran and "was not written" is false when the writer died between jobs.
+- **The capture in flight is marked, not abandoned, and then thrown away.**
+  `flight` is what `capturing_id` answers with and `collect` reaches the
+  renderer's readback only through it, so clearing it strands the job for the
+  life of the renderer — the disowned-job bug `settle_capture` exists to undo. So
+  it is marked `doomed` and `finish` drops it. Sent on, it would reach a fresh
+  writer holding none of the slices the dead one ate, be refused as
+  `NotSupplied`, and come back as a `Report::Failed` naming the *document* — a
+  second interruption, blaming a painting for a thread's death.
+- **`send` logs and `poll` recovers, which is one owner rather than two.** The
+  disconnect on `rx` is the only evidence the artist is ever told from, so a
+  `send` that quietly replaced the pair would take the detection away from the
+  one place that reports it.
 - **The window's close is refused until every unsaved document is accounted
   for.** `WindowEvent::CloseRequested` used to exit on the spot. The prompt
   names each document rather than counting them, and recomputes the list every
@@ -3113,6 +3183,41 @@ The rules, and they are cheap:
   assumed, and the comment names the hole instead of claiming the array cannot
   be forgotten. The only complete fix is a macro deriving the enum and `ALL`
   from one list, judged against this codebase's taste for per-variant rustdoc.
+- **`try_recv` has three readings, and dropping one is how a dead worker becomes
+  silence.** `Empty` is "not yet"; `Disconnected` is "every sender is gone",
+  which for a worker channel can only be a panic in it. Two spellings collapse
+  them: `try_recv().ok()`, and `while let Ok(x) = rx.try_recv()`, which exits
+  identically on both. Both shipped. `Loading::take` was the first and left an
+  **uncancellable modal over every open tab for the life of the process** —
+  `editor.loading` is cleared from one place and only on a `Some`,
+  `tabs::loading` deliberately draws no Cancel, and no further wake ever arrives.
+  `Autosave::poll` was the second and was worse for being quiet: `writer`
+  respawns only where `tx.is_none()`, so a panicked thread left a live-looking
+  disconnected sender that was never replaced, every later capture ran in full
+  and paid its GPU readback, nothing was written for the rest of the run, and
+  `Report::Failed` — the one route to the artist — travelled down the same dead
+  channel. **The rule is `match`, not the spelling**: a grep for
+  `try_recv().ok()` finds one of those two and reads as complete. Six sites in
+  `umber-app`; `update::Updates::poll` and `textpanel::Fonts::poll` were right
+  all along and are the shape to copy.
+- **A worker's panic is not reported by the panicker, so the waiter must
+  notice.** `crash::report_panic` returns early for any thread that is not
+  `main`, correctly — a box saying Umber stopped would be false. What follows is
+  that a worker's channel is the *only* detector of its own worker's death.
+- **Noticing is half of it; something has to be looking.** The loop is
+  `ControlFlow::Wait`, so a reading nobody asks for is a reading nobody takes —
+  and a panic reaches none of a worker's own wakes. The wake therefore has to be
+  a **destructor**, which unwinding runs. And it has to fire **after** the sender
+  is dropped, or the woken frame reads `Empty` and sleeps again: a body local
+  declared first does *not* drop last, because a captured upvar is a field of the
+  closure environment and the environment goes after every body local. That was
+  asserted in a comment, was false, and was measured on both paths. Own the
+  sender in the guard and drop it inside `drop`, so the order is a property of
+  the type rather than of where a `let` sits.
+- **A flat array indexed by `enum as usize` is `Effect::rank`'s hazard in its
+  other form.** `complained: [bool; 2]` compiles for a third variant and panics
+  out of bounds on the frame path. Named fields plus an exhaustive accessor make
+  it a compile error asking where the new flag goes.
 - **A rule enforced by threading a parameter is enforced at the call sites that
   thread it, and the compiler will not tell you which those are.** A growth
   replaces the atlas texture, so its old-to-new copy has to be recorded into
@@ -4157,6 +4262,20 @@ method rather than as an anecdote:
   frame later and the file appears anyway. "Measure the output, never restate the
   rule" is the right default and is not always available; where it is not, the
   honest move is to name the half that is doing the work.
+- **A one-layer fixture cannot test which layer anything landed on**, because
+  every index is zero and every wrong index is the right one. `disturb` writing
+  `stale[0]` whatever slot it was handed passed four guards until the autosave's
+  `FrameLoop` was given a second layer and the edit was aimed at the *upper* one.
+  Same shape as the square-tile-grid trap: ask what the fixture's values have in
+  common before believing the assertion.
+- **A guard about an edit landing inside a capture has to time the edit off the
+  capture's own cursor, not off a count of frames.** `capture_progress_for_test`
+  answers the step and the band. An edit arriving *before* its layer is read
+  disturbs nothing, so a frame-counting guard would go quiet the day a step took
+  one frame more and would then pass for the wrong reason. The two halves of the
+  predicate also need different fixtures: an edit between two steps is caught by
+  `index < step` alone, while one part way through a *banded* step needs
+  `set_readback_limit` and shows up as a single layer torn across two instants.
 - **A fixture carrying only what a real file produces is a test of the fixture.**
   The same shape recurred twice in one branch and both times the fixture was
   doing no work: a save fixture whose every layer covers its canvas trims to
@@ -5311,6 +5430,13 @@ parts that mattered are not the obvious ones.
   the same turn the commitment is made. That one is easy to get wrong because
   the promise *feels* discharged when the coordinator has been told, and the
   coordinator is the one who asked.
+- **A second critic earns its place on the *remedies*.** The first critic's six
+  findings on one branch were all real; its fix for one of them introduced a
+  **blocking defect of its own** — a `Drop` guard whose comment asserted a drop
+  order Rust does not have, which restored the very uncancellable modal the
+  branch existed to remove. Ask the second critic explicitly to check the
+  remedies as well as to look afresh, and settle a language-semantics claim with
+  a ten-line program rather than with confidence.
 - **A lead that says "no critic reviewed this" is worth more than one that says
   a review happened.** Several critics returned nothing at all this session,
   twice on one branch. The right response is to say so and run an independent

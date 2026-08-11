@@ -53,6 +53,10 @@ mod logo;
 pub mod loupe;
 mod palettelib;
 mod panels;
+/// Reading back what a panel drew. See its own docs: the walk was written
+/// twice before it was written once.
+#[cfg(test)]
+mod paneltest;
 mod prefs;
 mod recoverdlg;
 mod session;

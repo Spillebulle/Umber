@@ -422,20 +422,6 @@ mod tests {
         let wide = Preview::new(1920, 1080, vec![0; 1920 * 1080 * 4]).expect("a preview");
         assert_eq!(wide.fit_within(256).size, UVec2::new(256, 144));
 
-        // **And the same document stood on its end**, which nothing here drove
-        // until it was asked for. `fit_within` scales by `w.max(h)`, so every
-        // assertion in a landscape-only sweep passes with the `max` replaced by
-        // `w` — and an A4 page is the commonest shape a painting application
-        // opens. Demonstrated by mutation: `w.max(h)` → `w` gives 256 × 362 here
-        // and leaves every other case in this test green.
-        let tall = Preview::new(1080, 1920, vec![0; 1080 * 1920 * 4]).expect("a preview");
-        assert_eq!(tall.fit_within(256).size, UVec2::new(144, 256));
-
-        // A4 at 300 dpi, the real proportion rather than a round one: 2480×3508
-        // into 256 is 181×256.
-        let page = Preview::new(2480, 3508, vec![0; 2480 * 3508 * 4]).expect("a preview");
-        assert_eq!(page.fit_within(256).size, UVec2::new(181, 256));
-
         // A long thin canvas must not lose an axis entirely. 2500x625 is the
         // real proportion of one of the documents this was measured against.
         let thin = Preview::new(2500, 625, vec![0; 2500 * 625 * 4]).expect("a preview");
@@ -542,6 +528,63 @@ mod tests {
             matches!(err, ImportError::Malformed { .. }),
             "an unreadable Photoshop file should be refused, not guessed at: {err:?}"
         );
+    }
+
+    /// **A page is taller than it is wide, and every case above is not.**
+    ///
+    /// "Neither edge is past `max_edge`" is a claim about both edges, and every
+    /// preview the test above drives is landscape — so the scale could have
+    /// been divided by the *width* rather than by the longer edge and nothing
+    /// would have said so. Mutating `w.max(h)` to `w` left all 1,127 tests in
+    /// this crate green, and would have given every A4-shaped document a
+    /// thumbnail overflowing the box Explorer asked for: 181x256 into a 256
+    /// box becomes 256x362.
+    ///
+    /// So this is portrait, and it asserts the bound rather than only the
+    /// arithmetic — the same rule read the way a caller reads it. The square
+    /// case is here for the same reason: it is the one shape under which the
+    /// two readings agree, so its presence beside the others is what shows the
+    /// others are doing work.
+    #[test]
+    fn a_page_taller_than_it_is_wide_still_fits_the_box() {
+        // A4 at 181x256 is the proportion of the documents this is most often
+        // asked for, and 256 is what a file manager asks for.
+        let page = Preview::new(1810, 2560, vec![0; 1810 * 2560 * 4]).expect("a preview");
+        assert_eq!(page.fit_within(256).size, UVec2::new(181, 256));
+
+        // The mirror of the panorama above: a column, whose *width* would round
+        // away to nothing.
+        let column = Preview::new(5, 10000, vec![0; 5 * 10000 * 4]).expect("a preview");
+        assert_eq!(column.fit_within(64).size, UVec2::new(1, 64));
+
+        // Square is where dividing by the width and dividing by the longer edge
+        // cannot be told apart, which is exactly why it is not on its own.
+        let square = Preview::new(1000, 1000, vec![0; 1000 * 1000 * 4]).expect("a preview");
+        assert_eq!(square.fit_within(64).size, UVec2::new(64, 64));
+
+        // The property the caller actually depends on, over both orientations
+        // and a box each side of the awkward ratios. The preview is built once
+        // per shape and cloned per box rather than rebuilt: `fit_within`
+        // consumes `self`, and two of these are 18.5 MB, so constructing inside
+        // the inner loop is 150 MB of churn for a test whose subject is
+        // arithmetic.
+        for (w, h) in [(1810, 2560), (2560, 1810), (5, 10000), (10000, 5), (7, 9)] {
+            let shape = Preview::new(w, h, vec![0; (w * h * 4) as usize]).expect("a preview");
+            for box_edge in [1, 16, 64, 256] {
+                let fitted = shape.clone().fit_within(box_edge);
+                assert!(
+                    fitted.size.x <= box_edge && fitted.size.y <= box_edge,
+                    "{w}x{h} into {box_edge} came back {}x{}, which is past the \
+                     box a thumbnail host asked it to fit inside",
+                    fitted.size.x,
+                    fitted.size.y
+                );
+                assert!(
+                    fitted.size.x >= 1 && fitted.size.y >= 1,
+                    "{w}x{h} into {box_edge} lost an axis"
+                );
+            }
+        }
     }
 
     /// A buffer that does not match the size it claims is refused rather than

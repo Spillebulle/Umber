@@ -794,6 +794,33 @@ impl History {
         self.evict_to_budget();
     }
 
+    /// The entry [`History::take_undo`] would hand over, without taking it.
+    ///
+    /// **What a caller that may *refuse* to carry an entry out needs.** A
+    /// refusal has to be settled before the entry leaves the stack, because an
+    /// entry spent on a step that did not happen is a history that disagrees
+    /// with the picture — and for a flip, which stores no pixels, the *next*
+    /// step back then writes a patch recorded in an orientation the canvas is
+    /// no longer in, at its own rectangle, mirrored. That damage is not
+    /// undoable: the redo entry beside it was captured from the pixels the bad
+    /// write produced.
+    ///
+    /// Deliberately a borrow rather than a copy of the kind. A caller wanting
+    /// the kind can take it; one wanting to look at the body can, and neither
+    /// has to be anticipated here.
+    pub fn next_undo(&self) -> Option<&Edit> {
+        self.undo.last()
+    }
+
+    /// The entry [`History::take_redo`] would hand over, without taking it.
+    ///
+    /// [`History::next_undo`]'s twin, and needed for the same reason: a flip
+    /// is refused in *both* directions, so a redo that spends an entry it could
+    /// not carry out damages the document exactly as an undo does.
+    pub fn next_redo(&self) -> Option<&Edit> {
+        self.redo.last()
+    }
+
     /// Pop the state to restore. The caller must capture the *current* contents
     /// of the same rect first and hand it to [`History::push_redo`].
     pub fn take_undo(&mut self) -> Option<Edit> {
@@ -987,6 +1014,55 @@ mod tests {
 
         let redone = h.take_redo().unwrap();
         assert_eq!(redone.patches()[0].pieces()[0].bytes()[0], 2);
+    }
+
+    /// A peek names the entry the matching `take_*` will hand over, and does
+    /// not spend it.
+    ///
+    /// **The rule is this module's, so the guard is too.** It was guarded only
+    /// from `umber-app`, where the gate that reads it lives — and CLAUDE.md's
+    /// "enumerate the call sites of the rule, not the rule" cuts the other way
+    /// here, because which *end* of a stack these read is an engine fact rather
+    /// than a panel's. A second critic asked for it and was right.
+    ///
+    /// Both stacks carry **two** entries, which is the whole point: with one,
+    /// `first()` and `last()` are the same function. `first()` for either peek
+    /// reproduces the caller's original defect exactly — a gate reading the
+    /// bottom of the stack answers about an edit nobody is about to step over.
+    #[test]
+    fn a_peek_names_the_entry_the_take_would_hand_over() {
+        let fill = |edit: &Edit| edit.patches()[0].pieces()[0].bytes()[0];
+
+        let mut h = History::default();
+        h.record(edit(4, 4, 1));
+        h.record(edit(4, 4, 2));
+
+        let peeked = fill(h.next_undo().expect("two entries recorded"));
+        assert_eq!(peeked, 2, "the peek read the bottom of the undo stack");
+        assert_eq!(h.position(), 2, "the peek spent an entry");
+        let taken = h.take_undo().expect("two entries recorded");
+        assert_eq!(
+            fill(&taken),
+            peeked,
+            "the peek and the take disagree about which entry is next"
+        );
+
+        // The redo stack, whose own peek was covered by nothing at all. Its two
+        // entries carry different fills for the reason the undo pair does.
+        h.push_redo(taken);
+        h.push_redo(edit(4, 4, 3));
+        let peeked = fill(h.next_redo().expect("two entries pushed"));
+        assert_eq!(peeked, 3, "the peek read the bottom of the redo stack");
+        assert_eq!(
+            fill(&h.take_redo().expect("two entries pushed")),
+            peeked,
+            "the peek and the take disagree about which entry is next"
+        );
+
+        // And an empty stack peeks at nothing rather than panicking.
+        let empty = History::default();
+        assert!(empty.next_undo().is_none());
+        assert!(empty.next_redo().is_none());
     }
 
     #[test]
