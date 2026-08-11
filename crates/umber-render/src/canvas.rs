@@ -9673,11 +9673,49 @@ impl CanvasRenderer {
     /// Note what this does *not* do: free the buffer. A `map_async` that is
     /// still outstanding makes its buffer untouchable, and dropping the job
     /// here is the same class of mistake [`Self::reset_probes`] documents. The
-    /// job stays until [`Self::take_capture`] finds it settled.
+    /// job stays until [`Self::take_capture`] finds it settled — **so somebody
+    /// has to go on asking**, which is [`Self::settle_capture`]'s whole reason
+    /// for existing: the caller that cancels usually forgets the capture in the
+    /// same breath and then has nothing left to drive it with.
     pub fn cancel_capture(&mut self) {
         if let Some(job) = self.capture.as_mut() {
             job.abandoned = true;
         }
+    }
+
+    /// Push a **disowned** capture along until it settles, so its staging
+    /// buffer is given back and the next one may begin.
+    ///
+    /// [`Self::cancel_capture`] marks the job and deliberately does not free
+    /// it, and the caller that cancelled has by then stopped tracking the
+    /// document — `umber-app`'s `autosave::interrupt` cancels the renderer's
+    /// half and forgets the scheduler's half together, which is right, and left
+    /// nobody to call [`Self::take_capture`] afterwards. The job then sat in
+    /// flight for the life of the renderer, [`Self::capture_in_flight`] stayed
+    /// true, and [`Self::begin_capture`] refused every later capture of that
+    /// document. Nothing said so: the artist believes their work is being
+    /// autosaved every five minutes and it is not.
+    ///
+    /// **A live capture is left strictly alone.** Its owner drives it, and a
+    /// second `submit_capture` from the side is not what that owner is
+    /// expecting — so this acts only on a job that has been abandoned or has
+    /// failed, which is exactly the set nobody else will come back for.
+    /// Idempotent, and free on a canvas with no capture at all: one `Option`
+    /// test, no device poll.
+    pub fn settle_capture(&mut self, device: &wgpu::Device) {
+        if !self
+            .capture
+            .as_ref()
+            .is_some_and(|job| job.abandoned || job.failed)
+        {
+            return;
+        }
+        // A job cancelled mid-step has a copy recorded and no map outstanding;
+        // this is what maps it, and `take_capture` is what unmaps it and drops
+        // the job once nothing is outstanding. One of each per frame, so a
+        // cancelled capture settles in a frame or two.
+        self.submit_capture();
+        let _ = self.take_capture(device);
     }
 
     /// Take one tile of one slot out of the page table, so it reads as the

@@ -5042,6 +5042,63 @@ fn a_cancelled_capture_hands_its_buffers_back_rather_than_being_dropped() {
     );
 }
 
+#[test]
+fn settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone() {
+    // `cancel_capture` marks the job and does not free it, so *something* has
+    // to keep asking — and the caller that cancels has usually stopped tracking
+    // the document in the same breath. `settle_capture` is that something, and
+    // it is the whole of what stops a cancelled capture holding
+    // `capture_in_flight` true for the life of the renderer, refusing every
+    // later autosave of that document.
+    let mut h = harness_or_skip!();
+    let draws = vec![LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+        mask: None,
+        clipped: false,
+    }];
+
+    // A live capture is not this function's business: its owner drives it, and
+    // pushing it along from the side would map a step nobody had recorded.
+    assert!(h.canvas.begin_capture(&[0], &draws));
+    for _ in 0..8 {
+        h.canvas.settle_capture(&h.gpu.device);
+    }
+    assert!(
+        h.canvas.capture_in_flight(),
+        "settling threw away a capture that was still somebody's"
+    );
+
+    // Cancelled part-way through a step — a copy recorded, no map outstanding —
+    // which is the state a Save mid-capture leaves behind and the one that
+    // needs both halves of `settle_capture` to move.
+    let mut enc = h.encoder();
+    h.canvas
+        .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.cancel_capture();
+
+    for _ in 0..2000 {
+        h.canvas.settle_capture(&h.gpu.device);
+        if !h.canvas.capture_in_flight() {
+            break;
+        }
+        // As in `drive_to_completion`: the poll does not wait, so this loop has
+        // to.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !h.canvas.capture_in_flight(),
+        "settling never cleared a cancelled capture"
+    );
+    assert!(
+        h.canvas.begin_capture(&[0], &draws),
+        "the next capture was still refused"
+    );
+}
+
 // --- floating transforms ----------------------------------------------------
 
 /// Everything the transform tool asks of the GPU, in the order it asks it.
