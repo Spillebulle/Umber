@@ -5980,6 +5980,152 @@ mod tests {
     /// `..SaveLayer::new(…)` defaults to. Verified by mutation in both
     /// directions: neutering the value fails *this* test and passes that one;
     /// deleting the line fails that one and passes this.
+    /// **A Save reads each layer out of its own slice, one at a time.**
+    ///
+    /// `SaveSource` is the only part of the save path with no other cover at
+    /// all: `save_document` needs an `EventLoopProxy` and cannot be driven
+    /// headlessly, and the autosave's equivalent is a different type over a
+    /// different mapping. What it can get wrong is the thing this asks about —
+    /// the *index*. A stack is numbered bottom-first, an archive top-first, and
+    /// a slot is neither; `SaveSource` carries slots gathered from one
+    /// `stack.iter()` and is asked in stack positions, so an off-by-one or a
+    /// reversal there would write somebody's picture with its layers swapped
+    /// and every other guard in the crate would pass.
+    ///
+    /// Each layer is painted a colour of its own and the file is read back
+    /// through Umber's own reader. Deliberately opaque and flat: what is being
+    /// checked is which pixels landed on which layer, and an antialiased edge
+    /// would put a tolerance between the question and the answer.
+    ///
+    /// Skips rather than fails with no adapter, and holds `gputest::lock` for
+    /// its whole length — see `crate::gputest`.
+    #[test]
+    fn an_explicit_save_reads_each_layer_out_of_its_own_slice() {
+        use umber_core::docformat::Canvases;
+        use umber_render::CanvasRenderer;
+
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+
+        let size = UVec2::new(8, 8);
+        let rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: size.x,
+            height: size.y,
+        };
+        let mut stack = umber_core::LayerStack::new();
+        stack.add().expect("a second layer");
+        stack.add().expect("a third");
+        // A mask on the middle layer, so the mask index is asked about a layer
+        // that is neither the first nor the last one — the two positions an
+        // off-by-one is likeliest to still get right.
+        stack.add_mask(1).expect("a mask");
+
+        let mut canvas = CanvasRenderer::new(
+            &gpu.device,
+            size,
+            wgpu::TextureFormat::Rgba8Unorm,
+            stack.slot_capacity_needed(),
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.clear_all_layers(&mut encoder);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        // One flat opaque colour per layer, keyed to its stack position rather
+        // than to its slot, so the assertion below reads as "layer 2 is green"
+        // and not as "slot 2 is green".
+        let colour = |at: usize| [(at as u8 + 1) * 60, 20, 200 - (at as u8) * 60, 255];
+        for at in 0..stack.len() {
+            let slot = stack.layers()[at].slot().expect("no folders here");
+            let fill: Vec<u8> = colour(at)
+                .iter()
+                .copied()
+                .cycle()
+                .take((rect.area() * 4) as usize)
+                .collect();
+            canvas.write_layer_rect(&gpu.device, &gpu.queue, slot, rect, &fill);
+        }
+
+        let layers: Vec<SaveLayer<'_>> = stack
+            .layers()
+            .iter()
+            .map(|layer| {
+                save_layer(
+                    layer,
+                    Canvas::Deferred,
+                    layer.mask().map(|_| Canvas::Deferred),
+                )
+            })
+            .collect();
+        let mut source = SaveSource {
+            canvas: &canvas,
+            gpu,
+            rect,
+            slots: stack.layers().iter().map(umber_core::Layer::slot).collect(),
+            masks: stack.layers().iter().map(umber_core::Layer::mask).collect(),
+            // No effects and no float, so an empty draw list gives a
+            // transparent `mergedimage.png` of the right size. What the preview
+            // holds is `export_rgba`'s business and is covered where that lives.
+            merged_draws: Vec::new(),
+        };
+        // A folder holds no slice, and the archive never asks about one — but
+        // if it ever did, the answer has to be a refusal rather than an empty
+        // layer, and nothing else drives that arm.
+        assert!(
+            SaveSource {
+                canvas: &canvas,
+                gpu,
+                rect,
+                slots: vec![None],
+                masks: vec![None],
+                merged_draws: Vec::new(),
+            }
+            .layer(0)
+            .is_err(),
+            "a slot the stack does not hold was read as blank pixels"
+        );
+
+        let dir = std::env::temp_dir().join(format!("umber-save-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stack.ora");
+        docformat::save_from(
+            &path,
+            &SaveDocument {
+                size,
+                layers: &layers,
+                active: 0,
+                background: umber_core::Background::Transparent,
+                dpi: 72.0,
+                merged: Canvas::Deferred,
+                history: None,
+            },
+            &mut source,
+        )
+        .expect("save");
+
+        let back = umber_core::docimport::import(&path).expect("reopen");
+        assert_eq!(back.layers.len(), stack.len(), "the stack changed length");
+        for at in 0..stack.len() {
+            assert_eq!(
+                back.layers[at].pixels[..4],
+                colour(at),
+                "layer {at} came back holding another layer's pixels"
+            );
+            assert_eq!(
+                back.layers[at].mask.is_some(),
+                stack.layers()[at].mask().is_some(),
+                "layer {at}'s mask moved"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_save_carries_the_effects_the_layer_holds() {
         let mut stack = umber_core::LayerStack::new();
