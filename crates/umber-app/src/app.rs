@@ -169,17 +169,22 @@ impl Graphics {
     /// shaders are shared, so this is a few textures rather than three shader
     /// compilations on the frame the user opened a document.
     /// `slots` is the document's slot high-water mark, not its layer count —
-    /// see [`umber_core::LayerStack::slot_capacity_needed`]. A renderer starts
-    /// with room for a handful of slices, and a document that already has more
-    /// layers than that would otherwise hand the commit and undo paths a slice
-    /// index the texture array does not have.
+    /// see [`umber_core::LayerStack::slot_capacity_needed`]. It is what the
+    /// array is *built* at: a renderer whose speculative floor was all it had
+    /// would hand the commit and undo paths a slice index the texture array does
+    /// not have, and one grown into the count afterwards would pay a growth's
+    /// old-plus-new peak once per slice on the way. The clear below is therefore
+    /// the only one — nothing grows here, so nothing clears a slice twice.
     fn add_canvas(&mut self, id: DocId, doc: &Document, slots: u32) {
         let size = doc.size;
+        // Built at the count rather than grown to it. A growth holds the old
+        // array and the new one at once, so an import that arrived a slice at a
+        // time paid that peak at every step — see
+        // [`CanvasRenderer::for_document`].
         let mut canvas = match self.canvases.values().next() {
-            Some(existing) => existing.for_document(&self.gpu.device, size),
-            None => CanvasRenderer::new(&self.gpu.device, size, self.config.format),
+            Some(existing) => existing.for_document(&self.gpu.device, size, slots),
+            None => CanvasRenderer::new(&self.gpu.device, size, self.config.format, slots),
         };
-        canvas.ensure_slots(&self.gpu.device, &self.gpu.queue, slots);
         // The background belongs to this document, not to whichever one the
         // pipelines were cloned out of.
         canvas.set_background(doc.background);
@@ -192,7 +197,7 @@ impl Graphics {
                 label: Some("init-document"),
             });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&self.gpu.device, &mut enc);
         self.gpu.queue.submit(Some(enc.finish()));
 
         self.canvases.insert(id, canvas);
@@ -467,7 +472,7 @@ impl UmberApp {
         let Some(rect) = bounds.to_pixels_clamped(self.editor.doc.size) else {
             // Stroke fell entirely outside the canvas — nothing to commit, but
             // the scratch surface may still hold dabs.
-            canvas.clear_stroke(&mut enc);
+            canvas.clear_stroke(&gfx.gpu.device, &mut enc);
             gfx.gpu.queue.submit(Some(enc.finish()));
             return;
         };
@@ -540,7 +545,7 @@ impl UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cancel-stroke"),
             });
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gfx.gpu.device, &mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
     }
 
@@ -614,7 +619,7 @@ impl UmberApp {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("begin-stroke"),
                 });
-            canvas.clear_stroke(&mut enc);
+            canvas.clear_stroke(&gfx.gpu.device, &mut enc);
             gfx.gpu.queue.submit(Some(enc.finish()));
         }
     }
@@ -2049,7 +2054,7 @@ impl UmberApp {
                 label: Some("clear"),
             });
         canvas.clear_layer(&mut enc, slot);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gfx.gpu.device, &mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
         // Undo entries reference pixels that no longer exist in any meaningful
         // sense; keeping them would let undo resurrect part of a cleared layer.
@@ -4204,12 +4209,29 @@ impl UmberApp {
         self.stop_autosave_of(id);
         let doc = change.doc;
         let resized = self.editor.apply_canvas(doc);
+        // What the new array has to hold. Read *after* `apply_canvas`, which is
+        // what drops the selection and clears the history — neither of which
+        // moves a claim, but the number has to be the one the stack ends the
+        // command with rather than the one it started it with.
+        //
+        // A resize used to rebuild at the old canvas's slice count, so a 512²
+        // document holding 256 slices came back as 102.4 GB at 10000². See
+        // `CanvasRenderer::resize`; the float is already down (`finish_transform`
+        // above) and the renderer gives its effect slices back itself, so this
+        // figure really is the whole of what the array must carry.
+        let live = self.editor.layers.slot_capacity_needed();
 
         if let Some(gfx) = self.gfx.as_mut()
             && let Some(canvas) = gfx.canvases.get_mut(&id)
         {
             if resized {
-                canvas.resize(&gfx.gpu.device, &gfx.gpu.queue, doc.size, change.anchor);
+                canvas.resize(
+                    &gfx.gpu.device,
+                    &gfx.gpu.queue,
+                    doc.size,
+                    change.anchor,
+                    live,
+                );
             }
             canvas.set_background(doc.background);
         }
@@ -4915,18 +4937,16 @@ impl ApplicationHandler<Wake> for UmberApp {
         splash.show(splash::Stage::Shaders);
         // Compiled once here; every further document clones the pipeline
         // handles out of this one. See `Graphics::add_canvas`.
+        // At start-up the slot count is one and the speculative floor decides.
+        // It matters on the Android path, where `resumed` runs again with a
+        // session already open: the live document can have any number of
+        // layers, and its slots have to exist before the first stroke commits
+        // into one. Stated to the constructor rather than grown into
+        // afterwards, for the reason `CanvasRenderer::for_document` gives.
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
             config.format,
-        );
-        // At start-up this is one layer and does nothing. It matters on the
-        // Android path, where `resumed` runs again with a session already open:
-        // the live document can have any number of layers, and its slots have
-        // to exist before the first stroke commits into one.
-        canvas.ensure_slots(
-            &gpu.device,
-            &gpu.queue,
             self.editor.layers.slot_capacity_needed(),
         );
         // This one renderer is built here rather than by `add_canvas`, so it
@@ -4941,7 +4961,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                 label: Some("init"),
             });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
         splash.show(splash::Stage::Fonts);

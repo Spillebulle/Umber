@@ -313,6 +313,7 @@ fn bake_sweep(gpu: &Gpu, size: u32) {
         &gpu.device,
         glam::UVec2::splat(size),
         wgpu::TextureFormat::Rgba8Unorm,
+        1,
     );
     // Something for the flood to find. A band rather than the whole canvas, so
     // the flood's inner branch is taken — §3.4's own caveat is that a

@@ -452,6 +452,45 @@ Two ways out, and the second is better:
   `EffectCache`, `effect_slot_base` and `begin_float`'s `reserved`, and it is the
   design worth writing up.
 
+#### The second option was attempted and is refused. The `+ 1` is load-bearing.
+
+Stage 0 built the other five items and stopped at this one. Two independent
+reasons, and the first was **measured** rather than argued:
+
+- **`bake_effects` refuses the whole bake when any draw names a slice at or
+  above `base`.** `let highest = stack.iter().flat_map(…).max(); if base <=
+  highest { … return plain(wanted.len()) }` — and `Editor::effected_draws`
+  **substitutes the float's preview slice into the draw it hands the bake**, so
+  during a drag `highest` *is* the float's slot. Today `base` is
+  `slot_capacity_needed() + 1` and the float sits at exactly
+  `slot_capacity_needed()`, so `base > highest` and the guard passes. Take the
+  float's spare from the effect allocator and it sits at or above `base` by
+  construction, the guard fires, and **every effect in the document is dropped
+  for as long as a transform is in hand** — reported to the artist as
+  `EffectsOverBudget`. Driven on the GPU with a draw at `base`: `draws=1,
+  dropped=1`; the same stack one slice lower: `draws=2, dropped=0`. That guard is
+  the one thing standing between an effect write and a layer's pixels, so
+  exempting one slot from it is not a repair.
+- **`forget_all` runs on every frame of a document with no effects**, from
+  `bake_effects`' `wanted.is_empty()` arm, and it clears `free` and resets `next`
+  to zero. An offset the float held would be handed straight to the next effect
+  the document gained — the reissued-slot corruption in a new place. Holding the
+  float's claim *outside* the free list survives that, but then it is a
+  reservation again rather than an allocation, which is what this option was
+  trying to stop being.
+
+**The first option remains available and is safe**, at the stated cost: `base`
+moves by one when a float starts and again when it ends, so `forget_entries`
+drops every cache entry and the document rebakes twice per transform gesture. On
+the canvas this whole document is about that is seconds. It is not obviously the
+better trade, which is why Stage 0 left the 400 MB where it was rather than
+choosing for somebody.
+
+**And the waste is one slice with a precondition**: `ensure_slots` is asked only
+for one past the highest slice a *draw* names, so the reserved index is
+allocated only once the document has at least one baked effect. A document with
+no effects pays nothing for it.
+
 ### 5.4 `resize` is the one shrink that survives, and it survives cleanly
 
 `CanvasRenderer::resize` rebuilds the array at `self.layers.capacity` — a figure
@@ -475,6 +514,13 @@ Three things make this the best benefit-to-risk item in the document:
   Copying slices about to be discarded is the same waste in traffic.
 
 A signature change through one call site.
+
+**Built. One correction to the second bullet, which was true of `forget_all` and
+false of `end_float`**: that call was *below* the copy, not above the rebuild, so
+the claim held only because `App::apply_canvas` calls `finish_transform` first —
+discipline at the call site rather than structure at the allocation. It has been
+moved above the rebuild, which is what makes the sentence true where it is
+written.
 
 ---
 

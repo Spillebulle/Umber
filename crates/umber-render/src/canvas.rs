@@ -472,9 +472,11 @@ const INITIAL_SLOTS: u32 = 4;
 
 /// What one slice of a canvas this size costs.
 ///
-/// One statement of it, because [`initial_slots`] and
-/// [`CanvasRenderer::ensure_slots`] both budget against it and two spellings
-/// would be two chances to budget against different numbers. Saturating,
+/// One statement of it, because everything that budgets against a slice asks
+/// this — [`initial_slots`], [`built_capacity`], [`CanvasRenderer::ensure_slots`],
+/// [`CanvasRenderer::resize`] and [`CanvasRenderer::may_speculate`] — and two
+/// spellings would be two chances to budget against different numbers.
+/// Saturating,
 /// though `max_texture_dimension_2d` keeps a canvas four orders of magnitude
 /// below where this could wrap: the value only ever decides whether to
 /// speculate, so a saturated one reads as "far too big to speculate on", which
@@ -515,12 +517,20 @@ fn initial_slots(slice_bytes: u64) -> u32 {
 /// to 16 slices; at 10000² it allows none, which is correct — nothing should
 /// speculatively allocate 400 MB.
 ///
-/// **Two paths spend slices and only these two consult this.**
-/// [`grown_capacity`] does, and [`initial_slots`] does.
-/// [`CanvasRenderer::resize`] does **not** — it carries the old canvas's slice
-/// count onto the new one, where the same count is a different number of bytes.
-/// That predates this rule and cannot be fixed from inside `resize`; the whole
-/// case is written up there.
+/// **Three things consult this**, and the third is not about slices at all.
+/// [`grown_capacity`] does, [`initial_slots`] does, and
+/// [`CanvasRenderer::speculation_limit`] takes it as the figure past which
+/// nothing lazily allocated is held on the chance it is wanted again. That last
+/// one is the same question in a different currency: a canvas nobody should
+/// speculate a *slice* on is a canvas nobody should speculate a colour scratch
+/// or a distance-field working set on either.
+///
+/// This paragraph used to say [`CanvasRenderer::resize`] was the one path that
+/// did **not** consult it, carrying the old canvas's slice count onto the new
+/// one — 256 MiB of legitimate 512² document becoming 102.4 GB at 10000² — and
+/// that it could not be fixed from inside `resize`. It could not, and it was
+/// fixed from outside: `resize` takes the live count from `App::apply_canvas`
+/// and rebuilds through [`built_capacity`] like everything else.
 ///
 /// **What it actually bounds is the overshoot, at itself**, and it bounds both
 /// halves of [`grown_capacity`] separately. While doubling: the loop runs only
@@ -650,6 +660,26 @@ fn growth_quantum(slice_bytes: u64) -> u32 {
         .checked_div(slice_bytes)
         .unwrap_or(u64::from(u32::MAX))
         .clamp(1, u64::from(u32::MAX)) as u32
+}
+
+/// The capacity to allocate for an array **built from nothing** that has to hold
+/// `slots` slices.
+///
+/// Two callers and they must not disagree: [`CanvasRenderer::with_shared`],
+/// which builds a document's array, and [`CanvasRenderer::resize`], which
+/// rebuilds one. They did disagree — `resize` had the bare `grown_capacity` — so
+/// a one-layer 2048² document came out of `add_canvas` with room for four slices
+/// and out of a resize with room for one, and the *next* layer or mask then paid
+/// a whole reallocate-and-copy of the array. Nothing said so, which is exactly
+/// the shape a second spelling of a policy takes.
+///
+/// [`initial_slots`] is the floor and [`grown_capacity`] the rule. Both already
+/// consult [`GROWTH_DOUBLING_BUDGET_BYTES`], so on a canvas too large to
+/// speculate on the floor is one and this is exactly `slots`. `.min(MAX_SLOTS)`
+/// because a capacity past the device's array depth is a validation error, which
+/// is fatal.
+fn built_capacity(slots: u32, slice_bytes: u64) -> u32 {
+    grown_capacity(0, slots.max(initial_slots(slice_bytes)), slice_bytes).min(MAX_SLOTS as u32)
 }
 
 const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
@@ -2268,6 +2298,23 @@ pub struct CanvasRenderer {
     /// 8192² canvas to reach.
     readback_limit: u64,
 
+    /// How large one layer slice may be before this renderer stops holding
+    /// anything **in case it is wanted again**.
+    ///
+    /// [`GROWTH_DOUBLING_BUDGET_BYTES`] — the same figure `grown_capacity` and
+    /// `initial_slots` refuse to speculate past, which is this codebase's own
+    /// test for "this canvas is too large to guess on somebody's behalf". Two
+    /// allocations answer to it, both lazy and both previously kept for the
+    /// document's life: the per-dab colour scratch, and the effect working set's
+    /// two optional planes. Under it nothing changes at all; above it the cost
+    /// of giving one back is one reallocation on the next stroke or the next
+    /// parameter change, which is latency and not a pixel.
+    ///
+    /// Held as a field for the reason [`Self::readback_limit`] is: the real
+    /// figure is reached at about 8192², which is more memory than a test should
+    /// ask a CI runner for. See [`Self::set_speculation_limit`].
+    speculation_limit: u64,
+
     dab_bind_group: wgpu::BindGroup,
     dab_uniforms: wgpu::Buffer,
     dab_instances: wgpu::Buffer,
@@ -2950,12 +2997,16 @@ impl Shared {
 }
 
 impl CanvasRenderer {
+    /// `slots` is how many slices this document is known to need — a blank
+    /// canvas's 1, an import's `LayerStack::slot_capacity_needed()`. See
+    /// [`CanvasRenderer::for_document`] for why it is worth stating up front.
     pub fn new(
         device: &wgpu::Device,
         doc_size: UVec2,
         surface_format: wgpu::TextureFormat,
+        slots: u32,
     ) -> Self {
-        Self::with_shared(device, doc_size, Shared::new(device, surface_format))
+        Self::with_shared(device, doc_size, Shared::new(device, surface_format), slots)
     }
 
     /// A renderer for a second document, reusing this one's compiled pipelines.
@@ -2969,12 +3020,34 @@ impl CanvasRenderer {
     /// the caller must clear them before the first composite, exactly as it
     /// does after [`CanvasRenderer::new`] — and set the new document's
     /// background, which is its own and not this one's.
-    pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2) -> Self {
-        Self::with_shared(device, doc_size, self.shared.clone())
+    ///
+    /// # Why `slots` is a parameter rather than a growth the caller drives
+    ///
+    /// A renderer used to start at [`initial_slots`] and be grown to what the
+    /// document needed, one [`CanvasRenderer::ensure_slots`] call at a time.
+    /// Growth **holds the old array and the new one at once** — the copy is
+    /// recorded against both and wgpu keeps a texture alive for any submission
+    /// naming it — so the peak of one growth is `old + new` slices, and a
+    /// document that arrives a slice at a time pays that peak repeatedly. At
+    /// 400 MB a slice a twenty-one-layer import walked from 1 to 21 through
+    /// every quantum on the way, allocating a fresh multi-gigabyte texture each
+    /// time; a `create_texture` failure there is an uncaptured device error and
+    /// therefore fatal. Allocating once at the size the document needs removes
+    /// every one of those steps.
+    ///
+    /// It does not remove the speculation an ordinary document wants:
+    /// [`initial_slots`] is still the floor, so a blank canvas gets room for a
+    /// handful of layers and does not reallocate on its second one.
+    pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2, slots: u32) -> Self {
+        Self::with_shared(device, doc_size, self.shared.clone(), slots)
     }
 
-    fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared) -> Self {
-        let layers = LayerStore::new(device, doc_size, initial_slots(slice_bytes(doc_size)));
+    fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared, slots: u32) -> Self {
+        let layers = LayerStore::new(
+            device,
+            doc_size,
+            built_capacity(slots, slice_bytes(doc_size)),
+        );
 
         let stroke = make_stroke_texture(device, doc_size);
         let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
@@ -3091,6 +3164,7 @@ impl CanvasRenderer {
                 .collect(),
             capture: None,
             readback_limit: device.limits().max_buffer_size,
+            speculation_limit: GROWTH_DOUBLING_BUDGET_BYTES,
             dab_bind_group,
             dab_uniforms,
             dab_instances,
@@ -3257,43 +3331,70 @@ impl CanvasRenderer {
     ///   is unclipped rather than one clipped to the wrong place — but it also
     ///   leaves the outline on screen describing nothing, so do not forget.
     ///
-    /// # A known limitation: this carries the old canvas's slice count
+    /// # `live` is the slice count the new array is built at
     ///
-    /// **The array is rebuilt at `self.layers.capacity`, and that figure was
-    /// decided against the canvas being left behind.** [`grown_capacity`] keeps
-    /// speculative slices under [`GROWTH_DOUBLING_BUDGET_BYTES`], but the budget
-    /// is in *bytes* and a resize changes what a slice costs, so a capacity that
-    /// was inside it stops being. A 512² document legitimately holding 256
-    /// slices is 256 MiB; resized to 2048² it is **4.29 GB**, and to 10000²,
-    /// **102.4 GB** — the same figures the growth rule exists to prevent,
-    /// arrived at through a dialog instead. It predates that rule and is not
-    /// caused by it.
+    /// **`LayerStack::slot_capacity_needed()`**, threaded in from
+    /// `App::apply_canvas` — not `Editor::apply_canvas`, which shares the name,
+    /// returns a `bool` and never touches a renderer. This used to rebuild at
+    /// `self.layers.capacity`, a figure decided against the canvas being left
+    /// behind: [`grown_capacity`] keeps speculative slices under
+    /// [`GROWTH_DOUBLING_BUDGET_BYTES`], but the budget is in *bytes* and a
+    /// resize changes what a slice costs, so a capacity that was inside it stops
+    /// being. A 512² document legitimately holding 256 slices is 256 MiB;
+    /// resized to 2048² it was **4.29 GB**, and to 10000², **102.4 GB** — the
+    /// figures the growth rule exists to prevent, arrived at through a dialog
+    /// instead.
     ///
-    /// **It is not fixed here because it cannot be, from inside this method.**
-    /// Shrinking means allocating fewer slices than the array holds, and this
-    /// type does not know which of them hold pixels — `LayerStack` does. A
-    /// resize that guessed would drop layers, which is far worse than holding
-    /// memory, so it deliberately holds memory.
+    /// **The renderer cannot work `live` out for itself, which is why it is a
+    /// parameter.** Shrinking means allocating fewer slices than the array
+    /// holds, and this type does not know which of them hold pixels —
+    /// `LayerStack` does, and a resize that guessed would drop layers.
     ///
-    /// A fix needs the live slot count threaded in from the caller. That is
-    /// **`App::apply_canvas`**, the one production call site, which reaches it
-    /// as `self.editor.layers.slot_capacity_needed()`; not
-    /// `Editor::apply_canvas`, which shares the name, returns a `bool` and never
-    /// touches a renderer. With it this could rebuild at
-    /// `grown_capacity(0, live, slice_bytes(new_size))` and copy only that
-    /// depth. It is a signature change through one call site and it belongs in
-    /// a branch about resizing rather than one about growth.
+    /// **Why `slot_capacity_needed()` really does describe the array here, when
+    /// `docs/perf/slot-lifecycle-and-vram.md` §5.1 says it does not in
+    /// general.** Two things sit *above* it and neither survives this method.
+    /// Every effect slice is genuinely released, by `EffectCache::forget_all`
+    /// above. The float's preview slice is not "released" — `end_float` is one
+    /// field assignment and claims nothing back — it is simply **not carried**:
+    /// its index is `slot_capacity_needed()`, which the new array may be exactly
+    /// as deep as, so a float still standing when the array is swapped would be
+    /// previewing into a slice off the end. `end_float` is called *above* the
+    /// rebuild so that no statement in between can touch it, which is structure;
+    /// what makes it correct in the first place is `App::apply_canvas` calling
+    /// `finish_transform` before it gets here, which is the caller's contract
+    /// stated at the top of this comment. Both, not one.
+    ///
+    /// So this is the one moment in the program when the model's claim count is
+    /// the whole of what the array has to hold, and it is the one shrink with
+    /// **no transient at all**: a resize allocates a fresh array whatever
+    /// happens, so shrinking makes that peak smaller rather than larger. Do not
+    /// copy this reasoning to a shrink anywhere else.
+    ///
+    /// The copy depth is `min(old, new)`. Copying slices that are about to be
+    /// discarded is the same waste in traffic that the capacity is in bytes.
     pub fn resize(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         new_size: UVec2,
         anchor: Anchor,
+        live: u32,
     ) {
         let new_size = new_size.max(UVec2::ONE);
         if new_size == self.doc_size {
             return;
         }
+        // The same named failure `ensure_slots` carries, and for the same
+        // reason: `built_capacity`'s `.min(MAX_SLOTS)` **fails open**, so a
+        // `live` past the ceiling would produce an array shorter than the slices
+        // a `PixelPatch` and the commit path name — silently wrong pixels rather
+        // than a validation error. Unreachable today, because `SlotPool` never
+        // hands out past `MAX_SLOTS`; so is `ensure_slots`', which is exactly
+        // why that one has an assertion rather than trusting the clamp.
+        debug_assert!(
+            live <= MAX_SLOTS as u32,
+            "resizing to hold {live} slices against a ceiling of {MAX_SLOTS}"
+        );
         // Every thumbnail is a picture of a canvas that is about to stop
         // existing, and the one in flight would come home describing the old
         // geometry through the new document's arithmetic.
@@ -3306,6 +3407,17 @@ impl CanvasRenderer {
         // set, whose textures are the old canvas's size — and the bind groups
         // with it, which name a layer array this method is about to replace.
         self.effects.forget_all();
+        // Its base and its floating copy are canvas-sized and its rectangles
+        // name pixels that no longer exist. Thrown away rather than resampled,
+        // for the reason the scratch is: a half-finished gesture has no meaning
+        // at a new size, and the caller owes this no stroke and no float in
+        // flight anyway.
+        //
+        // **Before the rebuild, with `forget_all` above it.** Both are what make
+        // `live` an honest description of the new array — see the note on that
+        // parameter. Moved up from below the copy for exactly that reason;
+        // nothing else about the float depends on where this runs.
+        self.end_float();
         let plan = CanvasCopy::plan(self.doc_size, new_size, anchor);
         log::info!(
             "resizing canvas {} x {} -> {} x {}, {anchor:?}",
@@ -3315,13 +3427,19 @@ impl CanvasRenderer {
             new_size.y,
         );
 
-        let resized = LayerStore::new(device, new_size, self.layers.capacity);
+        // The same rule `with_shared` builds by, asked afresh against what a
+        // slice costs at the *new* size — including the speculative floor, so a
+        // resized document does not start reallocating on its second layer where
+        // a freshly opened one of the same shape would not.
+        let capacity = built_capacity(live, slice_bytes(new_size));
+        let resized = LayerStore::new(device, new_size, capacity);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("resize-canvas"),
         });
         for view in &resized.slot_views {
             clear_view(&mut enc, view, "clear-resized-slot");
         }
+        let carried = self.layers.capacity.min(capacity);
         enc.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.layers.texture,
@@ -3346,11 +3464,20 @@ impl CanvasRenderer {
             wgpu::Extent3d {
                 width: plan.size.x,
                 height: plan.size.y,
-                depth_or_array_layers: self.layers.capacity,
+                depth_or_array_layers: carried,
             },
         );
         queue.submit(Some(enc.finish()));
         self.layers = resized;
+
+        // Everything above this line answers to the canvas being left behind —
+        // `CanvasCopy::plan` and the copy extent. Everything below it is being
+        // built for the new one, and `clear_stroke` in particular asks whether
+        // a slice of *this* canvas is small enough to hold an allocation in
+        // case. It used to be written after that call, so a document grown past
+        // the speculation limit went on holding its colour scratch for one more
+        // stroke.
+        self.doc_size = new_size;
 
         // The scratch is the stroke in progress, and there is not one — see the
         // contract above. Reallocated rather than copied, and it starts clear
@@ -3359,24 +3486,29 @@ impl CanvasRenderer {
         self.stroke_view = self
             .stroke
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // The colour half only where the new canvas is one this renderer would
+        // hold it on. `clear_stroke` below gives it straight back otherwise, and
+        // the round trip is not free: at 10000² this is 800 MB of `Rgba16Float`
+        // asked for while the freshly built layer array is live, and a
+        // `create_texture` failure is an uncaptured device error and therefore
+        // fatal. Releasing it here rather than allocating and releasing is the
+        // same end state reached without the request.
         if self.has_stroke_color {
-            self.stroke_color = make_stroke_color_texture(device, new_size);
-            self.stroke_color_view = self
-                .stroke_color
-                .create_view(&wgpu::TextureViewDescriptor::default());
+            if self.may_speculate() {
+                self.stroke_color = make_stroke_color_texture(device, new_size);
+                self.stroke_color_view = self
+                    .stroke_color
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+            } else {
+                self.release_stroke_color(device);
+            }
         }
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("clear-resized-scratch"),
         });
-        self.clear_stroke(&mut enc);
+        self.clear_stroke(device, &mut enc);
         queue.submit(Some(enc.finish()));
 
-        // Its base and its floating copy are canvas-sized and its rectangles
-        // name pixels that no longer exist. Thrown away rather than resampled,
-        // for the reason the scratch is: a half-finished gesture has no meaning
-        // at a new size, and the caller owes this no stroke and no float in
-        // flight anyway.
-        self.end_float();
         // A sample recorded against the old canvas would be read back as if it
         // belonged to the new one.
         self.reset_probes();
@@ -3384,7 +3516,6 @@ impl CanvasRenderer {
         // into a file with layers of two different sizes in it.
         self.cancel_capture();
 
-        self.doc_size = new_size;
         self.dab_state.doc_size = [new_size.x as f32, new_size.y as f32];
         // The mask names pixels of a canvas that no longer exists. Dropped
         // rather than rescaled: a selection is the artist's statement about
@@ -3663,12 +3794,29 @@ impl CanvasRenderer {
 
     /// Give the stroke somewhere to record a colour per dab.
     ///
-    /// Allocated the first time a smudging stroke needs it and kept thereafter:
-    /// a painter who reaches for a blender once will reach for it again, and
-    /// re-allocating a document-sized texture per stroke would be a stutter at
-    /// exactly the wrong moment. The two bind groups that name it have to be
-    /// rebuilt, which is why this is not simply a lazy getter.
-    fn ensure_stroke_color(&mut self, device: &wgpu::Device) {
+    /// Allocated the first time a smudging stroke needs it, and kept thereafter
+    /// **while the canvas is small enough to speculate on**: a painter who
+    /// reaches for a blender once will reach for it again, and re-allocating a
+    /// document-sized texture per stroke would be a stutter at exactly the wrong
+    /// moment. Past [`Self::speculation_limit`] the texture is 800 MB and
+    /// `clear_stroke` gives it back, so this really does run once a stroke
+    /// there. The two bind groups that name it have to be rebuilt, which is why
+    /// this is not simply a lazy getter.
+    ///
+    /// **The fresh texture is cleared, and that is a real behaviour change —
+    /// the one in this branch.** It was previously never cleared at all, on the
+    /// argument that nothing reads it where no dab has landed: the coverage
+    /// plane and the colour plane are two attachments of one pass, so a texel
+    /// with coverage has had a fragment write its colour, and the composite
+    /// scales colour by that coverage. The argument has a hole, which is why the
+    /// clear is worth its fast-clear: the composite samples the colour plane
+    /// **bilinearly**, so a tap at the antialiased rim of a stroke can reach a
+    /// texel no fragment wrote, and what that holds is whatever the driver left
+    /// — undefined on an adapter that does not zero a fresh allocation. It went
+    /// unnoticed because it could happen once a session; once this runs per
+    /// stroke it would be once a stroke. The change can only make a pixel
+    /// *defined*, never move a defined one.
+    fn ensure_stroke_color(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         if self.has_stroke_color {
             return;
         }
@@ -3677,6 +3825,7 @@ impl CanvasRenderer {
             .stroke_color
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.has_stroke_color = true;
+        clear_view(encoder, &self.stroke_color_view, "clear-stroke-colour");
 
         self.composite_bind_group = make_composite_bind_group(
             device,
@@ -3720,7 +3869,7 @@ impl CanvasRenderer {
         }
         let colored = style.per_dab_color;
         if colored {
-            self.ensure_stroke_color(device);
+            self.ensure_stroke_color(device, encoder);
         }
         let room = MAX_DABS_PER_FRAME.saturating_sub(self.dabs_this_frame as usize);
         if room == 0 {
@@ -3943,7 +4092,7 @@ impl CanvasRenderer {
         let blends = style.mode == BrushMode::Paint && !style.on_mask;
         if blends && style.blend != BlendMode::Normal {
             self.commit_blended(device, encoder, slot, pieces, style);
-            self.clear_stroke(encoder);
+            self.clear_stroke(device, encoder);
             self.touch_slot(slot);
             return;
         }
@@ -3997,7 +4146,7 @@ impl CanvasRenderer {
             }
         }
 
-        self.clear_stroke(encoder);
+        self.clear_stroke(device, encoder);
         self.touch_slot(slot);
     }
 
@@ -4229,11 +4378,62 @@ impl CanvasRenderer {
     /// Both halves of it. Leaving stale colour behind would be the same class
     /// of bug as leaving stale coverage: the next smudging stroke would pick up
     /// the previous one's smear wherever its own dabs had not yet reached.
-    pub fn clear_stroke(&self, encoder: &mut wgpu::CommandEncoder) {
+    ///
+    /// **Above [`Self::speculation_limit`] the colour half is given back rather
+    /// than wiped**, which is a stronger wipe and not a weaker one. This is the
+    /// one place every path that ends a stroke passes through — `commit_stroke`
+    /// finishes here on both its branches, and the app's cancel and its
+    /// stroke-fell-off-the-canvas path call it directly — so putting the release
+    /// here is what makes "a large canvas does not hold the colour scratch
+    /// between strokes" a property of one function rather than of three call
+    /// sites remembering. It takes a device for that and for nothing else.
+    pub fn clear_stroke(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         clear_view(encoder, &self.stroke_view, "clear-stroke");
-        if self.has_stroke_color {
-            clear_view(encoder, &self.stroke_color_view, "clear-stroke-colour");
+        if !self.has_stroke_color {
+            return;
         }
+        if self.may_speculate() {
+            clear_view(encoder, &self.stroke_color_view, "clear-stroke-colour");
+        } else {
+            self.release_stroke_color(device);
+        }
+    }
+
+    /// Give the per-dab colour scratch back.
+    ///
+    /// 800 MB at 100 Mpx, held for the session after one smudging stroke on the
+    /// reasoning that "a painter who reaches for a blender once will reach for
+    /// it again" — sound at 2048², where it is 32 MB, and speculation on
+    /// somebody's behalf at a size this codebase has already decided not to
+    /// speculate at. The cost of being wrong is one reallocation at the start of
+    /// the next smudging stroke, which is latency and not a pixel.
+    ///
+    /// Back to the 1x1 stand-in [`Self::with_shared`] starts with, not to
+    /// nothing: the bind group layout must not vary, so the binding has to be
+    /// filled whether or not a stroke is recording colour.
+    fn release_stroke_color(&mut self, device: &wgpu::Device) {
+        self.stroke_color = make_stroke_color_texture(device, UVec2::ONE);
+        self.stroke_color_view = self
+            .stroke_color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.has_stroke_color = false;
+        self.composite_bind_group = make_composite_bind_group(
+            device,
+            &self.shared.composite_layout,
+            &self.view_uniforms,
+            &self.layers.array_view,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
+        self.commit_bind_group = make_commit_bind_group(
+            device,
+            &self.shared.commit_layout,
+            &self.commit_uniforms,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
     }
 
     /// Wipe one layer.
@@ -6019,28 +6219,79 @@ impl CanvasRenderer {
             );
         }
 
+        // What is left once the effects of layers the composite discards are
+        // taken out — a slice not allocated, a bake not run and a draw not made.
+        //
+        // **The predicate is `composite.wgsl`'s own**, `!visible || opacity <=
+        // 0.0`, read off the layer rather than off the effect draw: an effect
+        // draw takes its `visible` from its layer and its opacity is the
+        // effect's times the layer's, so the two agree by construction. Walk
+        // that shader's loop with either false and every write is dead — a
+        // clipped draw multiplies a local and `continue`s, an unclipped one
+        // writes `select(0.0, lay.a, false)`, which is `0.0` whatever the slice
+        // holds, and `continue`s. So the pixels of an effect on a hidden layer
+        // are never read, and baking them is a canvas-sized slice and up to
+        // several full-screen passes a frame for a picture nobody sees. A layer
+        // inside a hidden **folder** is covered without a second rule:
+        // `LayerStack::effective_visible` has already ANDed its ancestors in, so
+        // it arrives here with `visible: false`.
+        //
+        // **Dropping the draws is safe, and it is not the unconditional
+        // elision `layer-residency.md` §2.2 warns about.** That warning is about
+        // removing an invisible *layer* draw, which can be the one that writes
+        // `clip_alpha` for a clipped run above it. An effect draw cannot be:
+        // an inner one is always `clipped`, so it never writes `clip_alpha` at
+        // all, and an outer one sits immediately before its own layer's draw
+        // with the same `clipped` flag and nothing between them but its
+        // siblings — so the layer's draw, which is *not* dropped, writes the
+        // same `0.0` a moment later.
+        //
+        // **After the budget arithmetic, deliberately.** `dropped` is what the
+        // panel reports and `kept` is which effects an over-budget document
+        // draws; filtering before either would change both, so an over-budget
+        // document would silently start drawing a different set of effects.
+        // Nothing here may move a pixel.
+        //
+        // The obvious neighbour — an effect at zero opacity on a visible layer —
+        // needs nothing here: `effect_marks_nothing` already answers true for
+        // it, so it never reaches `wanted`. This is only about the *layer*.
+        let drawn: Vec<(usize, Effect)> = kept
+            .iter()
+            .copied()
+            .filter(|(i, _)| {
+                let draw = stack[*i].draw;
+                draw.visible && draw.opacity > 0.0
+            })
+            .collect();
+
+        // And give back a working-set plane the document has stopped wanting,
+        // on a canvas too large to hold one in case.
+        self.trim_effect_scratch(&drawn);
+
         if self.effects.base != base {
             self.effects.forget_entries();
             self.effects.base = base;
         }
 
-        // Which cache entry each kept effect is, allocating for the ones that are
-        // new and releasing the ones nothing wants any more. A key is the *slot
-        // the draw carries* and not the layer — §5.2 — so a float's preview slice
-        // falls out of the cache rather than needing a rule.
-        let keys: Vec<(u32, Option<u32>, EffectKind)> = kept
+        // Which cache entry each drawn effect is, allocating for the ones that
+        // are new and releasing the ones nothing wants any more. A key is the
+        // *slot the draw carries* and not the layer — §5.2 — so a float's
+        // preview slice falls out of the cache rather than needing a rule. A
+        // layer that has just been hidden loses its effects' slices here, and
+        // gets them back when it is shown again.
+        let keys: Vec<(u32, Option<u32>, EffectKind)> = drawn
             .iter()
             .map(|(i, e)| (stack[*i].draw.slot, stack[*i].draw.mask, e.kind))
             .collect();
         self.effects.retain_only(&keys);
-        let mut slots = Vec::with_capacity(kept.len());
+        let mut slots = Vec::with_capacity(drawn.len());
         for key in &keys {
             match self.effects.slot_for(*key, capacity) {
                 Some(slot) => slots.push(slot),
                 None => {
-                    // Unreachable: `capacity` bounds `kept` above. Named rather
-                    // than unwrapped because the failure is a draw pointing at a
-                    // slice nobody wrote.
+                    // Unreachable: `capacity` bounds `kept` above, and `drawn`
+                    // is a subset of it. Named rather than unwrapped because the
+                    // failure is a draw pointing at a slice nobody wrote.
                     log::error!("no effect slice for {key:?}");
                     self.effects.forget_all();
                     self.effects.dropped = wanted.len();
@@ -6082,7 +6333,7 @@ impl CanvasRenderer {
         // there until pointer-up moved the slice's revision. Silent, and only
         // reachable once the gate stopped being one value for the whole bake.
         let mut previous_source: Option<(u32, bool)> = None;
-        for ((position, effect), slot) in kept.iter().zip(&slots) {
+        for ((position, effect), slot) in drawn.iter().zip(&slots) {
             let entry = &stack[*position];
             // **One binding, read by the stamp, the grouping key and the extract.**
             // Not three spellings of one expression: the property that has to hold
@@ -6120,7 +6371,7 @@ impl CanvasRenderer {
             self.effects.record(stamp);
         }
         if steps.is_empty() {
-            return self.baked(stack, kept, &slots, frame);
+            return self.baked(stack, &drawn, &slots, frame);
         }
 
         if let Err(what) = self.run_effect_steps(device, queue, encoder, &steps) {
@@ -6136,7 +6387,7 @@ impl CanvasRenderer {
             self.effects.dropped = wanted.len();
             return plain(wanted.len());
         }
-        self.baked(stack, kept, &slots, frame)
+        self.baked(stack, &drawn, &slots, frame)
     }
 
     /// The draw list, with each kept effect spliced in beside its layer.
@@ -6144,6 +6395,12 @@ impl CanvasRenderer {
     /// `docs/layer-effects.md` §4's order, and it falls out of two facts rather
     /// than being restated here: `Layer::effects` is held in composite order, and
     /// `Effect::is_outer` says which side of the layer each falls on.
+    ///
+    /// `kept` is what actually got a slice — which is not every effect the
+    /// document holds, nor even every one inside the budget: an effect on a
+    /// layer the composite discards is neither baked nor drawn. So `active_index`
+    /// is counted off what this pushes rather than off the caller's list, which
+    /// it already was.
     fn baked(
         &self,
         stack: &[LayerEffects<'_>],
@@ -6585,6 +6842,79 @@ impl CanvasRenderer {
         Ok(())
     }
 
+    /// Give the working set back where it is holding a plane **the document**
+    /// no longer wants, on a canvas too large to hold one in case.
+    ///
+    /// [`Self::ensure_effect_scratch`] keeps the two lazy planes once they have
+    /// been allocated, on the argument that an effect whose spread is dragged
+    /// crosses zero repeatedly. That argument is sound at 2048², where the seed
+    /// pair — two [`SEED_FORMAT`] planes at four bytes a pixel — is 33.5 MB; at
+    /// 100 Mpx it is 800 MB and the band plane another 100, which is exactly the
+    /// speculation [`Self::speculation_limit`] exists to refuse. The whole
+    /// working set goes rather than one plane, because the bind groups name the
+    /// views and rebuilding them is rebuilding it.
+    ///
+    /// **The question is what the *document* wants, not what this frame's bake
+    /// wants**, and that is the whole of why this is here rather than inside
+    /// `ensure_effect_scratch`. That one is handed the passes of the effects
+    /// that happen to be stale this frame, so a document with one flooding
+    /// effect and one plain one would drop the seed pair on every frame that
+    /// rebaked only the plain one and allocate it again on the next — 800 MB
+    /// each way, at the frame rate. Asked over `drawn` it moves only when a
+    /// parameter does.
+    ///
+    /// **That makes this a second reading of what `plan_effect` will ask for,
+    /// and it is worth saying so rather than claiming there is one.**
+    /// `run_effect_steps` derives `needs_seeds`/`needs_band` from the
+    /// [`EffectStep`]s actually planned; this derives them from the effects. The
+    /// two agree today — `plan_effect` records a flood exactly where
+    /// `effect_field(e).reach > 0.0` and a band plane exactly for
+    /// [`EffectShape::Centre`], which is what the loop below tests — and nothing
+    /// binds them, so a third pass wanting the band plane would have to be added
+    /// in both places. Both use an exhaustive `match`, which is what makes a
+    /// sixth shape a compile error here as well as there.
+    ///
+    /// An effect the composite discards is not in `drawn`, so hiding the only
+    /// layer with a wide outline on it gives the seed pair back too.
+    fn trim_effect_scratch(&mut self, drawn: &[(usize, Effect)]) {
+        if self.may_speculate() {
+            return;
+        }
+        let Some(scratch) = self.effects.scratch.as_ref() else {
+            return;
+        };
+        // What `plan_effect` will ask for — the second reading named above. An
+        // exhaustive `match` rather than `== EffectShape::Centre`, for the
+        // reason that planner gives: a sixth shape needing two fields would
+        // otherwise be silently told there was no band plane to be had.
+        let (mut wants_seeds, mut wants_band) = (false, false);
+        for (_, effect) in drawn {
+            let plan = effect_field(effect);
+            if plan.reach <= 0.0 {
+                continue;
+            }
+            wants_seeds = true;
+            wants_band |= match plan.shape {
+                EffectShape::Centre => true,
+                EffectShape::Dilate
+                | EffectShape::Outer
+                | EffectShape::Inner
+                | EffectShape::Raw => false,
+            };
+        }
+        // Nothing to bake at all is the case `forget_all` does not cover: it
+        // runs when the *document* holds no effect, and a document whose every
+        // effect is on a hidden layer holds several. The working set's four
+        // mandatory planes are 400 MB at 100 Mpx, for a bake that is not going
+        // to happen until something is shown again.
+        let holding_unwanted = drawn.is_empty()
+            || (scratch.seeds.is_some() && !wants_seeds)
+            || (scratch.band.is_some() && !wants_band);
+        if holding_unwanted {
+            self.effects.scratch = None;
+        }
+    }
+
     /// Build the canvas-sized working set if it is missing or the wrong shape.
     fn ensure_effect_scratch(&mut self, device: &wgpu::Device, seeds: bool, band: bool) {
         let stale = match self.effects.scratch.as_ref() {
@@ -6930,6 +7260,47 @@ impl CanvasRenderer {
     /// silently returns a sheared picture.
     pub fn set_readback_limit(&mut self, bytes: u64) {
         self.readback_limit = bytes;
+    }
+
+    /// Pretend a slice of this canvas costs more than it does, so the paths that
+    /// stop holding an allocation "in case" can be driven on a document small
+    /// enough to check by hand.
+    ///
+    /// Exists for the tests, like [`Self::set_readback_limit`], and for the same
+    /// reason: the real figure is first met at 8192², where a layer slice is
+    /// exactly the budget's 256 MiB and the colour scratch — eight bytes a pixel
+    /// — is 537 MB. See [`Self::speculation_limit`].
+    pub fn set_speculation_limit(&mut self, bytes: u64) {
+        self.speculation_limit = bytes;
+    }
+
+    /// Is this canvas small enough to hold an allocation on the chance it is
+    /// wanted again?
+    ///
+    /// One reading, so the colour scratch and the effect working set cannot
+    /// answer differently. See [`Self::speculation_limit`].
+    fn may_speculate(&self) -> bool {
+        slice_bytes(self.doc_size) <= self.speculation_limit
+    }
+
+    /// Whether the per-dab colour scratch is allocated at canvas size.
+    ///
+    /// Observation only, and the only way a test can say that a large canvas
+    /// gave it back when a stroke ended — the same role
+    /// [`Self::effect_bakes`] plays for the bake.
+    pub fn holds_stroke_color(&self) -> bool {
+        self.has_stroke_color
+    }
+
+    /// Whether the effect working set is allocated at all, and whether it is
+    /// still holding its two optional planes.
+    ///
+    /// `(working set, seed pair, band plane)`. Observation only.
+    pub fn effect_working_set(&self) -> (bool, bool, bool) {
+        match self.effects.scratch.as_ref() {
+            None => (false, false, false),
+            Some(s) => (true, s.seeds.is_some(), s.band.is_some()),
+        }
     }
 
     /// Read a rectangle of one layer back to the CPU, for the undo stack.

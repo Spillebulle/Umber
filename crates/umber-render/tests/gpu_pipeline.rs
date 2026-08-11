@@ -83,13 +83,13 @@ impl Harness {
         let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
         let gpu = shared_gpu()?;
-        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::new(DOC, DOC), TARGET_FORMAT);
+        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::new(DOC, DOC), TARGET_FORMAT, 1);
 
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
         Some(Self {
@@ -735,6 +735,83 @@ fn smudged_dabs_still_do_not_compound() {
     );
 }
 
+/// A canvas too large to speculate on gives the per-dab colour scratch back
+/// when the stroke that used it ends, and the next smudge still paints.
+///
+/// 800 MB at 100 Mpx, held for the session after one smudging stroke. The
+/// threshold is `GROWTH_DOUBLING_BUDGET_BYTES` — this codebase's own test for
+/// "too large to guess on somebody's behalf" — which a real canvas reaches at
+/// about 8192². `set_speculation_limit` is how a document small enough to check
+/// by hand drives it, exactly as `set_readback_limit` drives the banded reader.
+///
+/// **Both directions, because either alone agrees with itself.** Under the
+/// limit the texture must survive, or an ordinary document reallocates a
+/// canvas-sized texture at the start of every blending stroke; over it the
+/// texture must go, *and the mark it makes afterwards must be unchanged*, which
+/// is the pixel this whole item is not allowed to move.
+#[test]
+fn a_large_canvas_gives_the_colour_scratch_back_when_a_stroke_ends() {
+    let mut h = harness_or_skip!();
+    let red = coloured_dab(32.0, 32.0, 12.0, 1.0, [1.0, 0.0, 0.0]);
+
+    // Under the limit: the ordinary case, and it must not change.
+    h.stamp_colored(&[red], true);
+    assert!(
+        h.canvas.holds_stroke_color(),
+        "a smudging stroke recorded no colour"
+    );
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+    // The centre and a texel out at the antialiased rim. The rim is where the
+    // composite's *bilinear* tap on the colour plane can reach a texel no
+    // fragment wrote, which is the reason `ensure_stroke_color` clears what it
+    // allocates — this reading is the only thing that would notice if a
+    // reallocated plane came back holding whatever the driver left. It is not
+    // fully discriminating: an adapter that zeroes a fresh texture passes either
+    // way, which is exactly what makes the clear worth having rather than the
+    // test.
+    let ordinary = h.pixel(32, 32);
+    let rim = h.pixel(32, 20);
+    assert_near(ordinary, [255, 0, 0], 4, "a smudged dab under the limit");
+    assert!(
+        h.canvas.holds_stroke_color(),
+        "an ordinary canvas gave the colour scratch back, so every blending \
+         stroke now reallocates one"
+    );
+
+    // Over it. Zero rather than a contrived figure: no canvas has a slice of
+    // no bytes, so this is "always too large" and says so.
+    h.canvas.set_speculation_limit(0);
+    let mut enc = h.encoder();
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+    assert!(
+        !h.canvas.holds_stroke_color(),
+        "a canvas too large to speculate on held the colour scratch anyway"
+    );
+
+    // And the next stroke paints the same mark, out of a texture that had to be
+    // allocated again. `clear_layer` rather than `Harness::fill`, which stamps a
+    // dab and commits it at full opacity whatever colour it is handed — the
+    // first draft of this used `fill` with a transparent colour and painted
+    // opaque black over the mark it was about to compare against.
+    let mut enc = h.encoder();
+    h.canvas.clear_layer(&mut enc, 0);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.stamp_colored(&[red], true);
+    assert!(h.canvas.holds_stroke_color());
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+    assert_eq!(
+        h.pixel(32, 32),
+        ordinary,
+        "the mark moved when the colour scratch was reallocated"
+    );
+    assert_eq!(
+        h.pixel(32, 20),
+        rim,
+        "the mark's edge moved when the colour scratch was reallocated"
+    );
+}
+
 #[test]
 fn later_dabs_win_the_colour_where_a_smudge_crosses_itself() {
     // Colour blends `over`, so a pixel ends up wearing the most recent dab that
@@ -974,7 +1051,7 @@ fn whole(h: &Harness) -> PixelRect {
 fn reset(h: &mut Harness) {
     let mut enc = h.encoder();
     h.canvas.clear_all_layers(&mut enc);
-    h.canvas.clear_stroke(&mut enc);
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
 }
 
@@ -3319,6 +3396,7 @@ fn resizing_the_canvas_carries_the_artwork_to_its_anchor() {
         &h.gpu.queue,
         UVec2::splat(128),
         Anchor::Centre,
+        1,
     );
     assert_eq!(h.canvas.doc_size(), UVec2::splat(128));
 
@@ -3351,6 +3429,7 @@ fn cropping_a_canvas_keeps_the_anchored_corner() {
         &h.gpu.queue,
         UVec2::splat(32),
         Anchor::TopLeft,
+        1,
     );
     assert_eq!(h.canvas.doc_size(), UVec2::splat(32));
     assert_eq!(h.pixel_in(0, 8, 8)[3], 255, "the near mark should survive");
@@ -3371,6 +3450,7 @@ fn every_layer_moves_together_when_the_canvas_does() {
         &h.gpu.queue,
         UVec2::new(96, 96),
         Anchor::BottomRight,
+        2,
     );
 
     // Held at the bottom right, growing by 32 on each axis offsets by 32.
@@ -3395,6 +3475,7 @@ fn a_stroke_painted_after_a_resize_lands_where_it_is_aimed() {
         &h.gpu.queue,
         UVec2::splat(128),
         Anchor::TopLeft,
+        1,
     );
 
     h.stamp(&[dab(100.0, 100.0, 5.0, 1.0)]);
@@ -3405,6 +3486,104 @@ fn a_stroke_painted_after_a_resize_lands_where_it_is_aimed() {
         h.pixel_in(0, 60, 60)[3],
         0,
         "and it should not be elsewhere"
+    );
+}
+
+/// A renderer is built at the slot count its document needs, so nothing has to
+/// grow it afterwards.
+///
+/// Two properties, and the second is what stops the first being over-corrected.
+///
+/// **Built at the count.** A growth holds the old array and the new one at once,
+/// so an import arriving a slice at a time paid that peak at every step. The
+/// output measured is the capacity that was allocated; asking `ensure_slots` for
+/// the same count afterwards must move nothing, which is what lets
+/// `Graphics::add_canvas` drop its growth — and with the growth goes the second
+/// clear, since `ensure_slots` clears every slice it adds and `clear_all_layers`
+/// then cleared them again.
+///
+/// **The speculative floor survives.** `initial_slots` is still the minimum, so
+/// a blank one-layer document does not reallocate the moment a second layer
+/// arrives.
+#[test]
+fn a_renderer_is_built_at_its_documents_slot_count_and_keeps_the_speculation() {
+    let h = harness_or_skip!();
+
+    let mut deep = h.canvas.for_document(&h.gpu.device, UVec2::splat(64), 21);
+    assert!(
+        deep.slot_capacity() >= 21,
+        "a twenty-one layer document was built at {} slices",
+        deep.slot_capacity()
+    );
+    let built = deep.slot_capacity();
+    deep.ensure_slots(&h.gpu.device, &h.gpu.queue, 21);
+    assert_eq!(
+        deep.slot_capacity(),
+        built,
+        "the document's own count still had to be grown into"
+    );
+
+    let shallow = h.canvas.for_document(&h.gpu.device, UVec2::splat(64), 1);
+    assert!(
+        shallow.slot_capacity() > 1,
+        "an ordinary document lost the handful of slices it speculates on"
+    );
+}
+
+/// A resize rebuilds the array at the *live* slice count, not the one the old
+/// canvas happened to be holding.
+///
+/// The failure this guards is silent and enormous: a 512² document legitimately
+/// holding 256 slices is 256 MiB, and the same capacity carried onto a 10000²
+/// canvas is 102.4 GB. The document arrives at it through a dialog rather than
+/// through the growth rule, so nothing in `grown_capacity` can see it.
+///
+/// **It measures the capacity that was allocated**, which is the output, rather
+/// than restating the rule — and it drives the *shrink*, which is the direction
+/// the bug is in. A capacity of 64 was reachable here before this test existed.
+///
+/// Two live slices at 128² comes out at **four**, not two, and that is
+/// `built_capacity`'s speculative floor rather than slack: a resized document
+/// gets the same handful of spare slices a freshly opened one of its shape does,
+/// or the next layer added after a resize pays a whole reallocate-and-copy that
+/// the same layer added before it would not.
+#[test]
+fn a_resize_rebuilds_at_the_live_slice_count_and_carries_the_picture() {
+    let mut h = harness_or_skip!();
+    // Deliberately far more than the document holds. `ensure_slots` never
+    // shrinks, so this is exactly the state a delete-then-add session leaves.
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 64);
+    assert_eq!(h.canvas.slot_capacity(), 64, "the array should have grown");
+
+    h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
+    h.stamp(&[dab(20.0, 20.0, 5.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(128),
+        Anchor::TopLeft,
+        2,
+    );
+
+    assert_eq!(
+        h.canvas.slot_capacity(),
+        4,
+        "the new array carried the old canvas's slice count"
+    );
+    // And the shorter copy still carried every slice that mattered: the depth
+    // is `min(old, new)`, so trimming the capacity must not trim the picture.
+    assert_near(
+        h.pixel_in(0, 20, 20),
+        [200, 40, 40],
+        2,
+        "slot 0 after a shrinking resize",
+    );
+    assert_eq!(
+        h.pixel_in(1, 20, 20)[3],
+        255,
+        "slot 1 after a shrinking resize"
     );
 }
 
@@ -3766,13 +3945,14 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
         &gpu.device,
         UVec2::new(DOC, DOC),
         wgpu::TextureFormat::Bgra8Unorm,
+        1,
     );
 
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     canvas.clear_all_layers(&mut enc);
-    canvas.clear_stroke(&mut enc);
+    canvas.clear_stroke(&gpu.device, &mut enc);
     canvas.draw_dabs(
         &gpu.device,
         &gpu.queue,
@@ -4334,6 +4514,7 @@ fn a_capture_of_a_large_document_never_costs_a_frame() {
         &h.gpu.queue,
         UVec2::splat(BIG),
         Anchor::Centre,
+        1,
     );
     h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, LAYERS);
     let mut enc = h.encoder();
@@ -4936,12 +5117,12 @@ fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     for side in [100u32, 64] {
-        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT);
+        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT, 1);
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
         // Layer-texture form, and **every pixel of it is exactly valid
@@ -5280,12 +5461,12 @@ fn a_dragged_float_leaves_no_trail_behind_it() {
 /// Random, because the point of every test below is that certain bytes come
 /// back *exactly*: a flat layer would pass them all while restoring nothing.
 fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
-    let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT);
+    let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT, 1);
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     canvas.clear_all_layers(&mut enc);
-    canvas.clear_stroke(&mut enc);
+    canvas.clear_stroke(&gpu.device, &mut enc);
     gpu.queue.submit(Some(enc.finish()));
 
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
@@ -5580,6 +5761,7 @@ fn a_thumbnail_shows_the_layers_content_and_not_the_whole_canvas() {
         &h.gpu.queue,
         UVec2::splat(SIDE),
         Anchor::TopLeft,
+        1,
     );
 
     assert!(
@@ -5669,10 +5851,10 @@ fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
 
     let mut canvas = h
         .canvas
-        .for_document(&h.gpu.device, UVec2::new(width, HEIGHT));
+        .for_document(&h.gpu.device, UVec2::new(width, HEIGHT), 1);
     let mut enc = h.encoder();
     canvas.clear_all_layers(&mut enc);
-    canvas.clear_stroke(&mut enc);
+    canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
 
     let column: Vec<u8> = [255u8, 0, 0, 255].repeat(HEIGHT as usize);
@@ -5991,6 +6173,263 @@ fn an_effect_with_no_reach_produces_no_draw_at_all() {
         edge,
         "the antialiased edge moved, which is the rim this rule refuses"
     );
+}
+
+/// An effect on a layer the composite discards is not baked, not given a slice
+/// and not drawn — and taking it out moves no pixel.
+///
+/// `composite.wgsl`'s loop reads a hidden layer's texels and then `continue`s
+/// past `acc`, so an effect derived from one is a canvas-sized slice and up to
+/// several full-screen passes a frame for a picture nobody sees. The predicate
+/// here is that shader's own, `!visible || opacity <= 0.0`.
+///
+/// **Five outputs, and the last two are the ones that matter.** The bake count,
+/// the slot capacity and the draw list say the work did not happen; the
+/// composite says the elision was safe; and `active_index` says the draw list is
+/// still describable, since eliding a draw shifts every position after it and
+/// the stroke previews on whichever draw sits at the number the composite is
+/// given. The clipped layer above the hidden one is there deliberately: an
+/// unclipped invisible draw is the one shape `layer-residency.md` §2.2 warns
+/// against removing, because it writes `clip_alpha` for whatever is clipped to
+/// it — an effect draw cannot be that draw, because its own layer's draw follows
+/// immediately and writes the same zero, and this is what says so out loud.
+///
+/// **Both halves of the predicate are driven**, hidden and at zero opacity: they
+/// are `composite.wgsl`'s own `!visible || opacity <= 0.0` and a test of only the
+/// first would leave the second free to be deleted.
+///
+/// And showing the layer again brings the effect back, so this is an elision
+/// rather than a loss.
+///
+/// `base` is **4 and not 3**, which is the harness's whole capacity: an effect
+/// slice at 3 would fit in the array already and the capacity reading would be
+/// the same number either way, which is a guard agreeing with itself. At 4 the
+/// un-elided path has to grow. It also keeps the ghost's slot 3 clear of
+/// anything a bake writes.
+#[test]
+fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
+    let mut h = harness_or_skip!();
+    h.write_block(2, WHOLE, [128, 128, 128, 255]);
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    h.write_block(1, WHOLE, [255, 0, 0, 255]);
+
+    let floor = layer(2, 1.0, BlendMode::Normal);
+    let hidden = LayerDraw {
+        visible: false,
+        ..layer(0, 1.0, BlendMode::Normal)
+    };
+    // Clipped to the layer below it, which is the hidden one. Its own draw is
+    // what has to keep bounding this to nothing once the effect draws are gone.
+    let clipped = LayerDraw {
+        clipped: true,
+        ..layer(1, 1.0, BlendMode::Normal)
+    };
+
+    // Angle 180 puts the offset at +x, clear of the square, exactly as
+    // `a_drop_shadow_at_multiply_multiplies_against_the_backdrop` does.
+    let cast = [shadow(Color::BLACK, 180.0, 12.0)];
+    let plain = [floor, hidden, clipped];
+    let stack = [
+        effected(floor, &[]),
+        effected(hidden, &cast),
+        effected(clipped, &[]),
+    ];
+
+    let before_bakes = h.canvas.effect_bakes();
+    let before_slots = h.canvas.slot_capacity();
+    // The stroke is on the hidden layer, whose own outer effect is the draw
+    // being elided — the position that shifts if `baked` counts wrongly.
+    let painting = EffectFrame {
+        active_index: 1,
+        stroke: StrokeStyle {
+            opacity: 0.0,
+            ..Default::default()
+        },
+        stroke_live: false,
+    };
+    let baked = h.bake_frame(&stack, 4, painting);
+
+    // The capacity first, deliberately: it is the reading a shorter test would
+    // never reach, because the draw count below fails on the same mutation and
+    // would mask it.
+    assert_eq!(
+        h.canvas.slot_capacity(),
+        before_slots,
+        "a hidden layer's effect took a canvas-sized slice"
+    );
+    assert_eq!(
+        baked.draws.len(),
+        3,
+        "a hidden layer's effect still produced a draw: {:?}",
+        baked.draws
+    );
+    assert_eq!(
+        h.canvas.effect_bakes(),
+        before_bakes,
+        "a hidden layer's effect was baked into a slice nothing reads"
+    );
+    assert_eq!(
+        baked.active_index, 1,
+        "the stroke would preview on the wrong draw"
+    );
+    assert_eq!(baked.dropped, 0);
+
+    // The other half of the predicate: visible, and at zero opacity.
+    let faded = LayerDraw {
+        opacity: 0.0,
+        ..layer(0, 1.0, BlendMode::Normal)
+    };
+    let baked_faded = h.bake_frame(
+        &[
+            effected(floor, &[]),
+            effected(faded, &cast),
+            effected(clipped, &[]),
+        ],
+        4,
+        painting,
+    );
+    assert_eq!(
+        baked_faded.draws.len(),
+        3,
+        "a layer at zero opacity still baked its effect: {:?}",
+        baked_faded.draws
+    );
+    assert_eq!(h.canvas.effect_bakes(), before_bakes);
+    assert_eq!(h.canvas.slot_capacity(), before_slots);
+
+    // (45, 32) is inside where the shadow would have fallen and clear of the
+    // square, so it is the pixel that would move if any of this were unsound.
+    let probes = [(45, 32), (32, 32), (24, 24), (0, 0)];
+    for (x, y) in probes {
+        assert_eq!(
+            h.composite_pixel(&baked.draws, x, y),
+            h.composite_pixel(&plain, x, y),
+            "the picture moved at ({x}, {y}) when the effect was elided"
+        );
+    }
+
+    // **And the elision itself is what has to be shown safe.** The loop above
+    // compares two lists that are equal whenever the code is right, so on its
+    // own it agrees with itself. This drives `composite.wgsl` directly instead:
+    // an effect draw of a hidden layer, present and invisible, over a slice full
+    // of ink loud enough that any leak would be obvious, against the same stack
+    // with it taken out. If an invisible unclipped draw could ever reach `acc`
+    // or leave `clip_alpha` somewhere the layer's own draw does not, this is
+    // where it shows.
+    h.write_block(3, WHOLE, [0, 255, 0, 255]);
+    let ghost = LayerDraw {
+        visible: false,
+        ..layer(3, 1.0, BlendMode::Normal)
+    };
+    let with_ghost = [floor, ghost, hidden, clipped];
+    for (x, y) in probes {
+        assert_eq!(
+            h.composite_pixel(&with_ghost, x, y),
+            h.composite_pixel(&plain, x, y),
+            "an invisible effect draw was not free at ({x}, {y}), so eliding \
+             one is not free either"
+        );
+    }
+
+    // Show it again and the effect comes back: this is an elision, not a loss.
+    let shown = layer(0, 1.0, BlendMode::Normal);
+    let lit = [
+        effected(floor, &[]),
+        effected(shown, &cast),
+        effected(clipped, &[]),
+    ];
+    let baked = h.bake_frame(&lit, 4, painting);
+    assert_eq!(
+        baked.draws.len(),
+        4,
+        "showing the layer again did not bring its effect back"
+    );
+    assert!(
+        h.canvas.effect_bakes() > before_bakes,
+        "showing the layer again drew a shadow nothing had baked"
+    );
+    assert!(
+        h.canvas.slot_capacity() > before_slots,
+        "the effect drew into a slice the array never grew to hold"
+    );
+    // A drop shadow is an *outer* effect, so its draw is spliced in before its
+    // layer's and the stroke's position moves with it. This is the reading the
+    // elided case above has to agree with, and the pair is what says
+    // `active_index` is counted off what was pushed rather than off the caller's
+    // list.
+    assert_eq!(
+        baked.active_index, 2,
+        "the stroke would preview on the shadow instead of the layer"
+    );
+}
+
+/// A canvas too large to speculate on gives the effect working set's optional
+/// planes back once nothing wants them, and the picture is unchanged.
+///
+/// `ensure_effect_scratch` keeps the seed pair and the band plane once they have
+/// been allocated, because an effect whose spread is dragged crosses zero
+/// repeatedly. Sound at 2048², where the pair is 16 MB; at 100 Mpx it is 800 MB.
+///
+/// **Three readings and a pixel.** The seed pair arrives with a flooding effect,
+/// stays while the document still wants it, goes when the spread reaches zero,
+/// and the shadow the document then draws is byte for byte the shadow a document
+/// that never had a spread draws. The last is the one that matters: nothing here
+/// may move a pixel.
+#[test]
+fn a_large_canvas_gives_the_effect_working_set_back_when_nothing_wants_it() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    h.canvas.set_speculation_limit(0);
+
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let probes = [(45, 32), (32, 32), (24, 24)];
+
+    // The reference, taken before a seed pair has ever existed: a shadow with
+    // no spread needs no flood.
+    let flat = [shadow(Color::BLACK, 180.0, 12.0)];
+    let baked = h.bake(&[effected(draw, &flat)], 1);
+    assert!(
+        !h.canvas.effect_working_set().1,
+        "a shadow with no spread allocated a seed pair"
+    );
+    let reference: Vec<[u8; 4]> = probes
+        .iter()
+        .map(|(x, y)| h.composite_pixel(&baked.draws, *x, *y))
+        .collect();
+
+    // Give it a spread, which is what needs the flood and its seed pair.
+    let spread = [Effect {
+        spread: 4.0,
+        ..shadow(Color::BLACK, 180.0, 12.0)
+    }];
+    h.bake(&[effected(draw, &spread)], 1);
+    assert_eq!(
+        h.canvas.effect_working_set(),
+        (true, true, false),
+        "a flooding effect did not allocate the seed pair"
+    );
+
+    // Still wanted, so still held: this is not a per-frame drop.
+    h.bake(&[effected(draw, &spread)], 1);
+    assert_eq!(
+        h.canvas.effect_working_set(),
+        (true, true, false),
+        "the seed pair was dropped while an effect still wanted it"
+    );
+
+    // Spread back to zero: nothing wants the seeds, and on this canvas they go.
+    let baked = h.bake(&[effected(draw, &flat)], 1);
+    assert!(
+        !h.canvas.effect_working_set().1,
+        "a canvas too large to speculate on held the seed pair anyway"
+    );
+    for ((x, y), was) in probes.iter().zip(&reference) {
+        assert_eq!(
+            h.composite_pixel(&baked.draws, *x, *y),
+            *was,
+            "the shadow moved at ({x}, {y}) when the working set was trimmed"
+        );
+    }
 }
 
 /// **The second gate.** A drop shadow at Multiply multiplies against *the
@@ -6902,7 +7341,7 @@ fn a_cancelled_stroke_rebakes_the_effect_it_was_showing() {
     // Cancelled, not committed: the scratch is thrown away and the layer is
     // untouched.
     let mut enc = h.encoder();
-    h.canvas.clear_stroke(&mut enc);
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
     h.gpu.queue.submit(Some(enc.finish()));
     let before = h.canvas.effect_bakes();
     h.bake(&[effected(draw, &ring)], 1);

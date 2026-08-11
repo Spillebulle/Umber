@@ -2955,12 +2955,13 @@ mod tests {
             &gpu.device,
             editor.doc.size,
             wgpu::TextureFormat::Rgba8Unorm,
+            editor.layers.slot_capacity_needed(),
         );
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         canvas.clear_all_layers(&mut enc);
-        canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
         let mut canvases = HashMap::from([(id, canvas)]);
 
