@@ -217,6 +217,39 @@ pub fn ora(width: u32, height: u32, layers: &[OraLayer]) -> Vec<u8> {
     archive.finish()
 }
 
+/// A one-layer ORA declaring `version` and carrying a mask of `coverage`.
+///
+/// The version is the parameter because a mask's byte changed meaning at
+/// [`crate::docformat::LINEAR_MASK_VERSION`]: below it the entry holds
+/// sRGB-encoded coverage and at or above it the linear multiplier, and the
+/// reader has to convert one and leave the other alone. Nothing else about the
+/// two files differs, which is the point — the bytes are identical and only the
+/// attribute says which they are.
+///
+/// One flat coverage rather than a gradient, and the caller picks it: the
+/// conversion is a per-byte table, so a second value tests the table twice and
+/// the values worth passing are the ones that are *not* fixed points of the
+/// transfer function.
+pub fn ora_masked(version: u32, coverage: u8) -> Vec<u8> {
+    let (w, h) = (4u32, 4u32);
+    let mut archive = Archive::new("image/openraster");
+    archive.add(
+        "data/layer0.png",
+        &png_rgba(w, h, &solid(w, h, &[200, 200, 200, 255])),
+    );
+    archive.add(
+        "umber/masks/000.png",
+        &png_grey(w, h, &vec![coverage; (w * h) as usize]),
+    );
+    let xml = format!(
+        "<image w=\"{w}\" h=\"{h}\" umber-version=\"{version}\">\
+         <stack><layer name=\"Ink\" src=\"data/layer0.png\" x=\"0\" y=\"0\" \
+         umber-mask=\"umber/masks/000.png\"/></stack></image>"
+    );
+    archive.add("stack.xml", xml.as_bytes());
+    archive.finish()
+}
+
 /// Two layers inside a hidden group at half opacity.
 pub fn ora_with_group() -> Vec<u8> {
     let mut archive = Archive::new("image/openraster");

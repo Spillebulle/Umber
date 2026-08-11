@@ -29,13 +29,27 @@ const LAYER_BYTES_PER_PIXEL: u64 = 4;
 
 /// The same bits, viewed without the transfer function.
 ///
-/// Used by one pass and one pass only: [`CanvasRenderer::flip_layers`], which
-/// has to be an exact permutation of texels. Reading through an sRGB view
-/// decodes to linear and writing through one re-encodes, and a round trip
-/// through that pair is a promise about rounding rather than about pixels —
-/// which matters here more than anywhere else in the renderer, because undoing
-/// a flip *is* another flip, so any drift compounds every time. Read as raw
-/// `u8 / 255` and written back, an f32 carries the byte exactly.
+/// Two things read and write the array this way, and their reasons are the same
+/// reason:
+///
+/// * [`CanvasRenderer::flip_layers`], which has to be an exact permutation of
+///   texels. Reading through an sRGB view decodes to linear and writing through
+///   one re-encodes, and a round trip through that pair is a promise about
+///   rounding rather than about pixels — which matters here more than anywhere
+///   else in the renderer, because undoing a flip *is* another flip, so any
+///   drift compounds every time. Read as raw `u8 / 255` and written back, an f32
+///   carries the byte exactly.
+/// * **Every slice holding a mask**, which is a slice of the same array and is
+///   not colour. A mask is a multiplier on *alpha*, and alpha is linear
+///   everywhere in Umber — [`LAYER_FORMAT`] itself encodes RGB only, and
+///   [`STROKE_FORMAT`] is justified below as being exactly as wide as the linear
+///   alpha it lands in. A mask read through the sRGB view was coverage put
+///   through a transfer function nothing downstream wanted, and the map is not
+///   injective: only **183** of the 256 multipliers the composite's own 8-bit
+///   alpha can show were reachable, the 73 missing ones all in the upper reveal
+///   range. So the composite and the effect extract take their mask tap through
+///   this view, and the commit renders a mask through [`LayerStore::raw_page_views`].
+///   `umber_core::docimport::srgb` has the measurement and the file-format half.
 ///
 /// Listed in the layer array's `view_formats`, which is what makes such a view
 /// legal at all.
@@ -2419,7 +2433,7 @@ enum SlotClass {
 impl SlotClass {
     /// The RGBA8 an absent tile of this class reads as, on the CPU side.
     ///
-    /// White for a mask is `[255; 4]` and not `srgb::encode_coverage(0)`'s
+    /// White for a mask is `[255; 4]` and not `srgb::mask_pixel(0)`'s
     /// `[0, 0, 0, 255]`: the composite reads a mask on `.r` and full reveal is
     /// `.r == 1.0`, which is what [`Self::clear_colour`] writes and therefore
     /// what a readback of a *backed* full-reveal tile would hand back.
@@ -2511,6 +2525,16 @@ struct LayerStore {
     /// One per **page**, used as a render target by the commit, the clear and
     /// every path that has promoted its slot.
     page_views: Vec<wgpu::TextureView>,
+    /// The same pages as [`LAYER_FORMAT_LINEAR`], for a commit into a mask.
+    ///
+    /// A page holds tiles of several slots, so this is not "the mask pages" —
+    /// it is the *same* pages seen without the transfer function, and which view
+    /// a pass takes is decided by the class of the slot it is writing. That is
+    /// sound because one commit writes one slot's tiles, so every fragment of a
+    /// pass agrees about which it is. `SlotClass::Layer` takes `page_views` and
+    /// `SlotClass::Mask` takes these, and the pipeline has to be picked to match
+    /// or the target format disagrees with the attachment.
+    raw_page_views: Vec<wgpu::TextureView>,
     /// How deep the atlas is. **Not** how many slots there are.
     pages: u32,
     /// `(tiles.x, tiles.y, MAX_SLOTS)` of [`PAGE_TABLE_FORMAT`].
@@ -2634,16 +2658,24 @@ impl LayerStore {
             ..Default::default()
         });
 
-        let page_views = (0..pages)
-            .map(|i| {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some("umber-layer-page"),
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: i,
-                    array_layer_count: Some(1),
-                    ..Default::default()
-                })
+        let page_view = |i: u32, format: Option<wgpu::TextureFormat>, label: &'static str| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(label),
+                format,
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i,
+                array_layer_count: Some(1),
+                ..Default::default()
             })
+        };
+        let page_views = (0..pages)
+            .map(|i| page_view(i, None, "umber-layer-page"))
+            .collect();
+        // Built alongside rather than on demand: a view is cheap, and the two
+        // vectors being the same length is what lets `commit_stroke` pick
+        // between them by index without a second bounds question.
+        let raw_page_views = (0..pages)
+            .map(|i| page_view(i, Some(LAYER_FORMAT_LINEAR), "umber-layer-page-raw"))
             .collect();
 
         let grid = Grid::new(size);
@@ -2680,6 +2712,7 @@ impl LayerStore {
             array_view,
             raw_array_view,
             page_views,
+            raw_page_views,
             pages,
             table,
             table_view,
@@ -2873,6 +2906,19 @@ struct Shared {
     commit_layout: wgpu::BindGroupLayout,
     commit_pipeline: wgpu::RenderPipeline,
     commit_erase_pipeline: wgpu::RenderPipeline,
+    /// The same two, targeting [`LAYER_FORMAT_LINEAR`], for a stroke on a mask.
+    ///
+    /// **The shader is byte for byte the same and so is the blend state**, which
+    /// is the point: what differs is the *format of the attachment*, and a
+    /// pipeline's target format has to match the view it is drawn into. A mask
+    /// slice holds linear coverage, so the commit renders it through
+    /// [`LayerStore::raw_page_views`] and the fragment's output is stored raw
+    /// rather than re-encoded. Through the sRGB pipeline the same output would
+    /// come back as the old form, which is the bug this pair exists to close —
+    /// and it would come back *plausibly*, a mask merely a shade off, which is
+    /// why `a_mask_stroke_commits_the_coverage_it_previewed` measures the byte.
+    commit_mask_pipeline: wgpu::RenderPipeline,
+    commit_mask_erase_pipeline: wgpu::RenderPipeline,
     /// A commit for a brush whose blend mode is not Normal.
     ///
     /// Its own layout because it needs a fifth binding — a copy of the layer
@@ -3213,6 +3259,10 @@ impl Shared {
                 sampler_entry(3),
                 texture_entry(4),
                 page_table_entry(5),
+                // The same atlas without the transfer function, for the mask
+                // tap. See [`LAYER_FORMAT_LINEAR`]: a mask is coverage rather
+                // than colour, so decoding it costs 73 of its 256 states.
+                texture_array_entry(6),
             ],
         });
         let composite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3303,48 +3353,53 @@ impl Shared {
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         };
-        let make_commit_pipeline = |label: &str, blend: wgpu::BlendState| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&commit_pl),
-                vertex: wgpu::VertexState {
-                    module: &commit_shader,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &commit_shader,
-                    entry_point: Some("fs"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: LAYER_FORMAT,
-                        blend: Some(blend),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+        // Four pipelines out of one descriptor rather than four copies of it,
+        // the arrangement `DabStyle`'s already keeps: two blends × two target
+        // formats. The format is the *slot class* — a layer's slice is sRGB and
+        // a mask's is linear — and nothing else about the pipeline moves.
+        let make_commit_pipeline =
+            |label: &str, blend: wgpu::BlendState, format: wgpu::TextureFormat| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&commit_pl),
+                    vertex: wgpu::VertexState {
+                        module: &commit_shader,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &commit_shader,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
 
-        let commit_pipeline = make_commit_pipeline(
-            "commit-paint",
-            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-        );
-        let commit_erase_pipeline = make_commit_pipeline(
-            "commit-erase",
-            wgpu::BlendState {
-                color: erase_blend,
-                alpha: erase_blend,
-            },
-        );
+        let paint_blend = wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING;
+        let erase = wgpu::BlendState {
+            color: erase_blend,
+            alpha: erase_blend,
+        };
+        let commit_pipeline = make_commit_pipeline("commit-paint", paint_blend, LAYER_FORMAT);
+        let commit_erase_pipeline = make_commit_pipeline("commit-erase", erase, LAYER_FORMAT);
+        let commit_mask_pipeline =
+            make_commit_pipeline("commit-mask-paint", paint_blend, LAYER_FORMAT_LINEAR);
+        let commit_mask_erase_pipeline =
+            make_commit_pipeline("commit-mask-erase", erase, LAYER_FORMAT_LINEAR);
 
         // The blended commit: everything the fixed-function blender cannot do.
         //
@@ -3566,6 +3621,13 @@ impl Shared {
                     count: None,
                 },
                 page_table_entry(6),
+                // The atlas without the transfer function, for the extract's
+                // mask tap — the same binding the composite takes at 6 and for
+                // the same reason. See [`LAYER_FORMAT_LINEAR`]. Read by
+                // `fs_extract` alone; the other six entry points share this
+                // layout and ignore it, which is the arrangement this layout
+                // already documents.
+                texture_array_entry(7),
             ],
         });
         let effect_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3708,6 +3770,8 @@ impl Shared {
             commit_layout,
             commit_pipeline,
             commit_erase_pipeline,
+            commit_mask_pipeline,
+            commit_mask_erase_pipeline,
             commit_blend_layout,
             commit_blend_pipeline,
             flip_layout,
@@ -4149,6 +4213,19 @@ impl CanvasRenderer {
     /// nothing about a rectangle of bytes says what it is for.
     /// [`Self::clear_layer`] is what puts a slot back to a layer, so a slice
     /// recycled from a mask stops reading white.
+    ///
+    /// **There is a third caller that ought to exist and does not**, and naming
+    /// it is the point of saying "two" out loud. `app.rs`'s `resumed` rebuilds
+    /// storage for every open document, and `install_canvas`'s
+    /// [`Self::clear_all_layers`] puts every slot back to `Layer` — with no
+    /// marking loop after it, unlike `install_import`, which runs one before it
+    /// writes. That is harmless only because Android is the only path that
+    /// reaches it and a resume keeps no pixels anyway, both of which are stated
+    /// under "Platform support" and neither of which is a property of *this*
+    /// function. **The class now decides more than it did**: which view of the
+    /// page a commit renders a mask through, so a mask whose class was lost
+    /// would take the sRGB pipeline and write the encoding the composite stopped
+    /// reading. Whoever builds the Android path owes this a call.
     ///
     /// **A `.kra` transparency mask showed nothing today and was still
     /// inconsistent**, which is why it is here rather than left: it arrives as
@@ -5595,7 +5672,22 @@ impl CanvasRenderer {
         // commit onto one would put colour into a mask. Guarding only the
         // eraser is the asymmetry that gets forgotten — a caller reaching
         // `commit_stroke` directly is all that stands between the two.
-        let blends = style.mode == BrushMode::Paint && !style.on_mask;
+        //
+        // **The mask half is asked twice, of both things that know**, and that
+        // is not belt and braces. `style.on_mask` is what the *caller* meant and
+        // `on_mask` below is what the *store* records, and they answer to
+        // different writers — `Editor::stroke_target` for the one, the two
+        // callers of `mark_mask_slot` for the other. The two agreeing is an
+        // invariant rather than a guarantee, and the cost of it failing went up
+        // when the slot's class started deciding the commit's target format:
+        // `commit_blended` has no linear variant, so a disagreement here would
+        // not merely put colour into a mask, it would put it there in the
+        // encoding the composite stopped reading. The `||` fails closed, which
+        // is the direction that matters — a slot either side calls a mask takes
+        // the plain path, which is right for a mask and merely unblended for a
+        // layer nothing should be sending here anyway.
+        let on_mask = self.class_of(slot) == SlotClass::Mask;
+        let blends = style.mode == BrushMode::Paint && !style.on_mask && !on_mask;
         if blends && style.blend != BlendMode::Normal {
             self.commit_blended(device, encoder, slot, pieces, style);
             self.clear_stroke(device, encoder);
@@ -5652,12 +5744,38 @@ impl CanvasRenderer {
             &self.stroke_color_view,
         );
 
+        // **Which view of the page, and therefore which pipeline.** A mask slice
+        // holds *linear* coverage and a layer's holds sRGB colour, and the two
+        // are the same texture — so the difference is the view the attachment is
+        // made from and the target format the pipeline declares, which have to
+        // agree or the pass is a validation error. Read off the slot's class
+        // rather than off `style.on_mask`, because the class is what every other
+        // part of the store already answers to — `back_tiles`' clear above, the
+        // readback's empty value, the flip's `tile_load` — and two sources for
+        // one fact is how they come to disagree. It is also the safer of the
+        // two: a wrong class already breaks a mask at `back_tiles`, by clearing
+        // a fresh tile transparent and hiding the layer where nobody painted, so
+        // this cannot be wrong on its own.
+        let (pages, paint, erase) = if on_mask {
+            (
+                &self.layers.raw_page_views,
+                &self.shared.commit_mask_pipeline,
+                &self.shared.commit_mask_erase_pipeline,
+            )
+        } else {
+            (
+                &self.layers.page_views,
+                &self.shared.commit_pipeline,
+                &self.shared.commit_erase_pipeline,
+            )
+        };
+
         // One pass per page. A page-backed slot is one page and one aim, which
         // is byte for byte the single pass this always was.
         let mut i = 0;
         while i < aims.len() {
             let page = aims[i].page;
-            let Some(view) = self.layers.page_views.get(page as usize) else {
+            let Some(view) = pages.get(page as usize) else {
                 i += 1;
                 continue;
             };
@@ -5678,8 +5796,8 @@ impl CanvasRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(match style.mode {
-                BrushMode::Paint => &self.shared.commit_pipeline,
-                BrushMode::Erase => &self.shared.commit_erase_pipeline,
+                BrushMode::Paint => paint,
+                BrushMode::Erase => erase,
             });
             while i < aims.len() && aims[i].page == page {
                 let aim = &aims[i];
@@ -10149,6 +10267,12 @@ fn make_composite_bind_group(
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(&layers.table_view),
             },
+            // The mask tap's atlas — the same texture as binding 1, seen raw.
+            // Out of the same `LayerStore` for the reason above.
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&layers.raw_array_view),
+            },
         ],
     })
 }
@@ -10451,6 +10575,7 @@ impl EffectScratch {
         // offset.
         let bind = |label: &str,
                     array: &wgpu::TextureView,
+                    raw_array: &wgpu::TextureView,
                     src: &wgpu::TextureView,
                     cov: &wgpu::TextureView,
                     seed: &wgpu::TextureView| {
@@ -10496,6 +10621,21 @@ impl EffectScratch {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(&layers.table_view),
                     },
+                    // The raw atlas, for the extract's mask tap.
+                    //
+                    // **It follows `array` and takes the same stand-in**, which
+                    // is the opposite of what the page table above does and is
+                    // not an inconsistency: the table is a *different* texture,
+                    // and this one is the layer array again. `EffectTarget::
+                    // Slice` renders into a page of it, and a texture may not be
+                    // a colour attachment and bound for sampling in the same
+                    // pass — the constraint `flip.wgsl` and the blended commit
+                    // both work around. Binding the real view in every group
+                    // fails validation on the resolve pass, which is fatal.
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(raw_array),
+                    },
                 ],
             })
         };
@@ -10511,32 +10651,48 @@ impl EffectScratch {
         binds.push(bind(
             "effect-extract",
             &layers.array_view,
+            &layers.raw_array_view,
             stroke_view,
             b,
             none,
         ));
-        binds.push(bind("effect-coverage", a, b, &coverage, none));
-        binds.push(bind("effect-grow-0", a, b, &coverage, seed0));
-        binds.push(bind("effect-grow-1", a, b, &coverage, seed1));
-        binds.push(bind("effect-flood-0", a, b, b, seed0));
-        binds.push(bind("effect-flood-1", a, b, b, seed1));
-        binds.push(bind("effect-src-grown", a, &grown, b, none));
-        binds.push(bind("effect-src-blur-0", a, &blur[0], b, none));
-        binds.push(bind("effect-src-blur-1", a, &blur[1], b, none));
-        binds.push(bind("effect-resolve-grown", a, &grown, &coverage, none));
-        binds.push(bind("effect-resolve-blur-0", a, &blur[0], &coverage, none));
-        binds.push(bind("effect-resolve-blur-1", a, &blur[1], &coverage, none));
-        binds.push(bind("effect-src-coverage", a, &coverage, b, none));
+        binds.push(bind("effect-coverage", a, a, b, &coverage, none));
+        binds.push(bind("effect-grow-0", a, a, b, &coverage, seed0));
+        binds.push(bind("effect-grow-1", a, a, b, &coverage, seed1));
+        binds.push(bind("effect-flood-0", a, a, b, b, seed0));
+        binds.push(bind("effect-flood-1", a, a, b, b, seed1));
+        binds.push(bind("effect-src-grown", a, a, &grown, b, none));
+        binds.push(bind("effect-src-blur-0", a, a, &blur[0], b, none));
+        binds.push(bind("effect-src-blur-1", a, a, &blur[1], b, none));
+        binds.push(bind("effect-resolve-grown", a, a, &grown, &coverage, none));
+        binds.push(bind(
+            "effect-resolve-blur-0",
+            a,
+            a,
+            &blur[0],
+            &coverage,
+            none,
+        ));
+        binds.push(bind(
+            "effect-resolve-blur-1",
+            a,
+            a,
+            &blur[1],
+            &coverage,
+            none,
+        ));
+        binds.push(bind("effect-src-coverage", a, a, &coverage, b, none));
         binds.push(bind(
             "effect-resolve-coverage",
+            a,
             a,
             &coverage,
             &coverage,
             none,
         ));
         let band_src = band.as_ref().unwrap_or(b);
-        binds.push(bind("effect-combine-0", a, band_src, &coverage, seed0));
-        binds.push(bind("effect-combine-1", a, band_src, &coverage, seed1));
+        binds.push(bind("effect-combine-0", a, a, band_src, &coverage, seed0));
+        binds.push(bind("effect-combine-1", a, a, band_src, &coverage, seed1));
         debug_assert_eq!(binds.len(), EFFECT_BIND_COUNT);
 
         Self {

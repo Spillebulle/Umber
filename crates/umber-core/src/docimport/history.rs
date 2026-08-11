@@ -17,7 +17,8 @@
 use glam::UVec2;
 
 use super::container::{self, Zip};
-use super::{ImportWarning, SourceFormat, flat};
+use super::{ImportWarning, SourceFormat, flat, srgb};
+use crate::docformat;
 use crate::docformat::history::{self as fmt, Manifest};
 use crate::geom::PixelRect;
 use crate::history::EditKind;
@@ -91,9 +92,10 @@ pub(crate) fn read(
     manifest_path: &str,
     canvas: UVec2,
     layer_names: &[String],
+    doc_version: u32,
     warnings: &mut Vec<ImportWarning>,
 ) -> Option<ImportedHistory> {
-    match load(zip, manifest_path, canvas, layer_names) {
+    match load(zip, manifest_path, canvas, layer_names, doc_version) {
         Ok(history) => Some(history),
         Err(reason) => {
             warnings.push(ImportWarning::HistoryDropped { reason });
@@ -108,6 +110,7 @@ fn load(
     manifest_path: &str,
     canvas: UVec2,
     layer_names: &[String],
+    doc_version: u32,
 ) -> Result<ImportedHistory, String> {
     let format = SourceFormat::OpenRaster;
     let bytes = container::read_optional_entry(zip, manifest_path, format)
@@ -241,12 +244,26 @@ fn load(
             if image.size != UVec2::new(rect.width, rect.height) {
                 return Err("part of it is not the size it says it is".into());
             }
-            pieces.push(ImportedPiece {
-                rect,
-                // Unconverted: these are layer-texture bytes, not a picture
-                // anyone else reads. See the writer's module docs.
-                bytes: image.rgba,
-            });
+            // Unconverted: these are layer-texture bytes, not a picture anyone
+            // else reads. See the writer's module docs.
+            //
+            // **A mask patch out of a pre-revision-4 document is the exception**,
+            // and it is the same conversion `openraster::load_mask` makes on the
+            // layer's own mask entry, for the same reason and out of the same
+            // file. A mask slice used to hold sRGB-encoded coverage; below
+            // `LINEAR_MASK_VERSION` these bytes are that, and writing them back
+            // unconverted would make one undo put the mask a gamma curve out.
+            // The document's revision is what says which, not
+            // [`fmt::VERSION`] — that one governs the manifest's *shape*, which
+            // did not change, and this is a claim about the bytes a patch
+            // carries. Nothing here has to ask whether the patch is really a
+            // mask's: `entry.mask` is recorded by the writer precisely because a
+            // stack position alone cannot say.
+            let mut bytes = image.rgba;
+            if entry.mask && doc_version < docformat::LINEAR_MASK_VERSION {
+                srgb::decode_v3_mask_buffer(&mut bytes);
+            }
+            pieces.push(ImportedPiece { rect, bytes });
         }
 
         entries.push(ImportedEdit {

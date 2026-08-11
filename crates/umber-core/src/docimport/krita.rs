@@ -56,8 +56,10 @@
 //! revealing. `assemble_tiles` is therefore written once and told how wide a
 //! pixel is, rather than copied.
 //!
-//! That byte is a **linear** multiplier and a mask slice does not hold one; see
-//! [`srgb::encode_coverage`], which is the only place the two meet.
+//! That byte is a **linear** multiplier and a mask slice now holds exactly one,
+//! so it is copied across unchanged and widened by [`srgb::mask_buffer`]. It
+//! used to be squeezed through the sRGB transfer function, which collapsed 73 of
+//! its 256 states — see that module.
 
 use glam::UVec2;
 use quick_xml::events::Event;
@@ -663,8 +665,9 @@ fn load_layer(
 /// The pixels are in the mask's *selection* — `<filename>.pixelselection`,
 /// beside the layer files — and are one byte each, because a Krita pixel
 /// selection lives in the ALPHA colour space. That byte is a linear multiplier
-/// on the layer's alpha, which is not what a mask slice holds; see
-/// [`srgb::encode_coverage`].
+/// on the layer's alpha, which is exactly what a mask slice holds, so nothing
+/// converts it — [`srgb::mask_buffer`] only widens it. Every one of Krita's 256
+/// states arrives; 73 of them used to collide, all in the upper reveal range.
 ///
 /// `None` where nothing could be read, and the caller raises `MaskIgnored`.
 /// Two ordinary files reach it, so it is not the damaged-archive branch it
@@ -718,7 +721,7 @@ fn load_mask(
     // default pixel is — `PixelPiece`'s rule 3.
     Some(vec![PixelPiece::whole(
         canvas,
-        srgb::encode_coverage_buffer(&coverage),
+        srgb::mask_buffer(&coverage),
     )])
 }
 
@@ -1352,23 +1355,36 @@ mod tests {
 
     #[test]
     fn a_masks_coverage_is_stored_the_way_the_composite_reads_it() {
-        // The one thing here that cannot be seen by looking at the picture.
-        // Krita's byte is a linear multiplier on the layer's alpha; a mask
-        // slice is sampled through an sRGB view, so a half has to be stored as
-        // ~188. Copying 128 across unchanged would hide four fifths of a layer
-        // the artist hid by half — a wrong picture that looks deliberate.
-        let kra = fixtures::kra(
-            64,
-            64,
-            &[KraLayer::new("Lines")
-                .pixel(0, 0, [9, 9, 9, 255])
-                .mask(KraMask::transparency("Mask").coverage(0, 0, 128))],
-        );
-        let doc = read(&kra).unwrap();
-        let stored = mask_at(&doc.layers[0], 0, 0, 64);
-        assert!(
-            (stored as i32 - 188).abs() <= 1,
-            "half coverage was stored as {stored}, not ~188"
+        // The one thing here that cannot be seen by looking at the picture, and
+        // this guard used to say the opposite: a mask slice was sampled through
+        // an sRGB view, so a half had to be stored as ~188 and this asserted it.
+        // It is read through the raw view now and holds the linear multiplier,
+        // so Krita's byte is Umber's byte. **The direction is what matters** —
+        // put the old encode back and every one of these arrives brighter than
+        // the artist set it.
+        //
+        // Every one of Krita's 256 states is driven rather than one of them, and
+        // the count is the assertion: the old encode was monotone, so a sampled
+        // check passed while 73 states collided into their neighbours.
+        let steps: Vec<u8> = (0..=255u8).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for &c in &steps {
+            let kra = fixtures::kra(
+                64,
+                64,
+                &[KraLayer::new("Lines")
+                    .pixel(0, 0, [9, 9, 9, 255])
+                    .mask(KraMask::transparency("Mask").coverage(0, 0, c))],
+            );
+            let doc = read(&kra).unwrap();
+            let stored = mask_at(&doc.layers[0], 0, 0, 64);
+            assert_eq!(stored, c, "coverage {c} did not arrive as itself");
+            seen.insert(stored);
+        }
+        assert_eq!(
+            seen.len(),
+            256,
+            "every coverage Krita can state has to reach the slice"
         );
     }
 
@@ -1408,8 +1424,10 @@ mod tests {
         assert_eq!(mask_at(&doc.layers[0], 0, 0, 64), 255);
 
         // A default that is not one of the two fixed points, so it also pins
-        // that the default goes through the same encode the tiles do. 0 and
-        // 255 alone would pass whether it did or not.
+        // that the default goes down the same path the tiles do. 0 and 255
+        // alone would pass whether it did or not — they are the fixed points of
+        // the transfer function, which is exactly why they could not see the
+        // encode this used to assert either.
         let kra = fixtures::kra(
             64,
             64,
@@ -1421,10 +1439,10 @@ mod tests {
             )],
         );
         let doc = read(&kra).unwrap();
-        let stored = mask_at(&doc.layers[0], 0, 0, 64);
-        assert!(
-            (stored as i32 - 188).abs() <= 1,
-            "the default pixel was stored as {stored}, not encoded like the tiles"
+        assert_eq!(
+            mask_at(&doc.layers[0], 0, 0, 64),
+            128,
+            "the default pixel did not go down the path the tiles do"
         );
     }
 

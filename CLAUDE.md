@@ -1044,6 +1044,28 @@ dense 83,740. Re-run both before quoting any of it.
   take the old text off, so a skip-if-empty would leave it on the canvas.
 - **There is no apron.** `composite.wgsl` reconstructs the bilinear tap from four
   `textureLoad`s. See `umber_core::tile`'s module docs.
+- **What the apron's absence costs is measured, and it is the four loads rather
+  than the page table.** `measure-composite` builds a second pipeline from
+  `tiles.wgsl` with `tile_bilinear` replaced by one `textureSampleLevel`, which
+  under the identity page table is exactly the dense slice the atlas replaced. At
+  54 layers into a 1920×1080 window at 1:1 the atlas costs **1.98× on a fully
+  painted document (+1.23 ms a frame) and 1.25× on a realistic one (+0.33 ms)**;
+  a mask on every layer takes the first to 2.16×. **Zoomed out it reverses**: at
+  fit-to-view on a 4096² canvas it is at parity on a dense document and **4.2×
+  faster** on a realistic one, and the crossover is at about zoom 0.75. The
+  decomposition is the part to know — a `table`-only variant shows the dependent
+  page-table read is nearly free, because a slot's table slice is 160 bytes and a
+  54-slot table is 8.4 KB and cache-resident, while four scalar `textureLoad`s
+  against one TMU instruction is about **16:1**. So the staleness argument for
+  refusing the apron stands and now has a bill attached; **`textureGather` inside
+  the existing single-tile fast path is the unmeasured middle.** And the
+  zoomed-out win is a **residency** win rather than a tiling one: the dense tiled
+  column is at parity there, and what makes the sparse one fast is that an
+  unbacked tile issues no fetch at all — which a dense slice cannot do at any
+  residency, because the composite loop has no alpha early-out.
+  `docs/perf/composite-throughput.md` §11 has the tables and retires the proxy
+  array on the strength of them. Measured on one GPU (RTX 3080, Vulkan); the
+  16:1 is a property of that hardware.
 - **The undo budget did not get deeper.** A patch is CPU-side and follows the
   rectangle a stroke covered, not the residency, so a full-canvas stroke on a
   10000² document is still 400 MB and the budget still holds exactly one. The

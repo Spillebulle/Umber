@@ -1455,7 +1455,7 @@ fn build(
                 Ok(mask) => {
                     layer.mask = Some(vec![PixelPiece::whole(
                         canvas.size,
-                        srgb::encode_coverage_buffer(&mask),
+                        srgb::mask_buffer(&mask),
                     )])
                 }
                 Err(_) => warnings.push(ImportWarning::MaskIgnored { layer: name }),
@@ -1692,8 +1692,9 @@ fn block_span(
 }
 
 /// A mask's coverage, canvas-sized, as the **linear** multiplier every source
-/// format states one in — [`srgb::encode_coverage_buffer`] is what turns it
-/// into the bytes a mask slice holds, and it is the caller's to apply.
+/// format states one in — which is what a mask slice holds, so
+/// [`srgb::mask_buffer`] only widens it to four channels and the caller is what
+/// applies that.
 fn coverage(
     attribute: &[u8],
     chunk: &[u8],
@@ -2561,23 +2562,34 @@ mod tests {
         }
     }
 
-    /// A mask's byte is a **linear** multiplier and a mask slice holds
-    /// sRGB-encoded coverage, so a half is stored as ~188 and never as 128.
-    /// Copying the byte across would hide four fifths of a layer somebody hid
-    /// by half.
+    /// A mask's byte is a **linear** multiplier and a mask slice now holds one,
+    /// so it is copied across unchanged.
+    ///
+    /// This guard used to assert the opposite — that a half arrived as ~188,
+    /// because a mask slice was read through the layer array's sRGB view. That
+    /// encode was inherited rather than chosen and it was not injective: 73 of
+    /// its 256 states collided. **The direction is the whole of what this
+    /// catches**: put the encode back and every Clip Studio mask arrives
+    /// revealing more than its author set.
+    ///
+    /// Driven at three values rather than one, and none of them a fixed point of
+    /// the transfer function — 0 and 255 survive either rule, which is why a
+    /// fixture reaching for the ends can see nothing here at all.
     #[test]
-    fn a_mask_arrives_encoded_rather_than_copied_across() {
+    fn a_masks_coverage_arrives_as_the_multiplier_it_was() {
         let (w, h) = (300u32, 300u32);
-        let bytes = fixtures::clip(
-            w,
-            h,
-            &[ClipLayer::flat("Ink", w, h, [0, 0, 0, 255]).mask(vec![128u8; (w * h) as usize])],
-        );
-        let doc = read(&bytes).expect("a document");
-        let mask = doc.layers[0].dense_mask(UVec2::new(w, h)).expect("a mask");
-        assert_eq!(mask.len(), (w * h * 4) as usize);
-        assert!((i32::from(mask[0]) - 188).abs() <= 1, "{}", mask[0]);
-        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        for c in [1u8, 128, 254] {
+            let bytes = fixtures::clip(
+                w,
+                h,
+                &[ClipLayer::flat("Ink", w, h, [0, 0, 0, 255]).mask(vec![c; (w * h) as usize])],
+            );
+            let doc = read(&bytes).expect("a document");
+            let mask = doc.layers[0].dense_mask(UVec2::new(w, h)).expect("a mask");
+            assert_eq!(mask.len(), (w * h * 4) as usize);
+            assert_eq!(mask[0], c, "coverage {c} did not arrive as itself");
+            assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        }
     }
 
     /// **What an unstored mask block holds is read out of the file, not
