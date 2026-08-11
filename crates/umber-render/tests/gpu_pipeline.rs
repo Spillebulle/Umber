@@ -83,7 +83,13 @@ impl Harness {
         let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
         let gpu = shared_gpu()?;
-        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::new(DOC, DOC), TARGET_FORMAT, 1);
+        let mut canvas = CanvasRenderer::new(
+            &gpu.device,
+            &gpu.queue,
+            UVec2::new(DOC, DOC),
+            TARGET_FORMAT,
+            1,
+        );
 
         let mut enc = gpu
             .device
@@ -3509,7 +3515,9 @@ fn a_stroke_painted_after_a_resize_lands_where_it_is_aimed() {
 fn a_renderer_is_built_at_its_documents_slot_count_and_keeps_the_speculation() {
     let h = harness_or_skip!();
 
-    let mut deep = h.canvas.for_document(&h.gpu.device, UVec2::splat(64), 21);
+    let mut deep = h
+        .canvas
+        .for_document(&h.gpu.device, &h.gpu.queue, UVec2::splat(64), 21);
     assert!(
         deep.slot_capacity() >= 21,
         "a twenty-one layer document was built at {} slices",
@@ -3523,7 +3531,9 @@ fn a_renderer_is_built_at_its_documents_slot_count_and_keeps_the_speculation() {
         "the document's own count still had to be grown into"
     );
 
-    let shallow = h.canvas.for_document(&h.gpu.device, UVec2::splat(64), 1);
+    let shallow = h
+        .canvas
+        .for_document(&h.gpu.device, &h.gpu.queue, UVec2::splat(64), 1);
     assert!(
         shallow.slot_capacity() > 1,
         "an ordinary document lost the handful of slices it speculates on"
@@ -3550,10 +3560,12 @@ fn a_renderer_is_built_at_its_documents_slot_count_and_keeps_the_speculation() {
 fn a_reservation_that_fits_builds_what_the_infallible_path_builds() {
     let mut h = harness_or_skip!();
 
-    let expected = h.canvas.for_document(&h.gpu.device, UVec2::splat(64), 21);
+    let expected = h
+        .canvas
+        .for_document(&h.gpu.device, &h.gpu.queue, UVec2::splat(64), 21);
     let reserved = h
         .canvas
-        .try_for_document(&h.gpu.device, UVec2::splat(64), 21)
+        .try_for_document(&h.gpu.device, &h.gpu.queue, UVec2::splat(64), 21)
         .expect("64 square by 21 slices is 344 KB; no device refuses that");
     assert_eq!(
         reserved.slot_capacity(),
@@ -3568,7 +3580,7 @@ fn a_reservation_that_fits_builds_what_the_infallible_path_builds() {
     // array view left unbuilt, or built against the wrong texture, would show.
     h.canvas = h
         .canvas
-        .try_for_document(&h.gpu.device, UVec2::new(DOC, DOC), 4)
+        .try_for_document(&h.gpu.device, &h.gpu.queue, UVec2::new(DOC, DOC), 4)
         .expect("the harness canvas, reserved rather than assumed");
     let mut enc = h.encoder();
     h.canvas.clear_all_layers(&mut enc);
@@ -4039,6 +4051,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
     // Deliberately not TARGET_FORMAT: the whole point is a mismatch.
     let mut canvas = CanvasRenderer::new(
         &gpu.device,
+        &gpu.queue,
         UVec2::new(DOC, DOC),
         wgpu::TextureFormat::Bgra8Unorm,
         1,
@@ -5213,7 +5226,13 @@ fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     for side in [100u32, 64] {
-        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT, 1);
+        let mut canvas = CanvasRenderer::new(
+            &gpu.device,
+            &gpu.queue,
+            UVec2::splat(side),
+            TARGET_FORMAT,
+            1,
+        );
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -5557,7 +5576,13 @@ fn a_dragged_float_leaves_no_trail_behind_it() {
 /// Random, because the point of every test below is that certain bytes come
 /// back *exactly*: a flat layer would pass them all while restoring nothing.
 fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
-    let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT, 1);
+    let mut canvas = CanvasRenderer::new(
+        &gpu.device,
+        &gpu.queue,
+        UVec2::splat(side),
+        TARGET_FORMAT,
+        1,
+    );
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -5945,9 +5970,9 @@ fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
     // is under test is the span along one axis, and the width is that axis.
     const HEIGHT: u32 = 64;
 
-    let mut canvas = h
-        .canvas
-        .for_document(&h.gpu.device, UVec2::new(width, HEIGHT), 1);
+    let mut canvas =
+        h.canvas
+            .for_document(&h.gpu.device, &h.gpu.queue, UVec2::new(width, HEIGHT), 1);
     let mut enc = h.encoder();
     canvas.clear_all_layers(&mut enc);
     canvas.clear_stroke(&h.gpu.device, &mut enc);

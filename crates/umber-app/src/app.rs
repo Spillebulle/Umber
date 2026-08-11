@@ -184,8 +184,14 @@ impl Graphics {
         // time paid that peak at every step — see
         // [`CanvasRenderer::for_document`].
         let mut canvas = match self.canvases.values().next() {
-            Some(existing) => existing.for_document(&self.gpu.device, size, slots),
-            None => CanvasRenderer::new(&self.gpu.device, size, self.config.format, slots),
+            Some(existing) => existing.for_document(&self.gpu.device, &self.gpu.queue, size, slots),
+            None => CanvasRenderer::new(
+                &self.gpu.device,
+                &self.gpu.queue,
+                size,
+                self.config.format,
+                slots,
+            ),
         };
         canvas.set_background(doc.background);
         self.install_canvas(id, canvas);
@@ -207,8 +213,16 @@ impl Graphics {
     /// renderer cloned from another document's does not inherit it.
     fn make_canvas(&self, size: UVec2, slots: u32) -> Result<CanvasRenderer, Vram> {
         match self.canvases.values().next() {
-            Some(existing) => existing.try_for_document(&self.gpu.device, size, slots),
-            None => CanvasRenderer::try_new(&self.gpu.device, size, self.config.format, slots),
+            Some(existing) => {
+                existing.try_for_document(&self.gpu.device, &self.gpu.queue, size, slots)
+            }
+            None => CanvasRenderer::try_new(
+                &self.gpu.device,
+                &self.gpu.queue,
+                size,
+                self.config.format,
+                slots,
+            ),
         }
     }
 
@@ -5077,6 +5091,7 @@ impl ApplicationHandler<Wake> for UmberApp {
         // afterwards, for the reason `CanvasRenderer::for_document` gives.
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
+            &gpu.queue,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
             config.format,
             self.editor.layers.slot_capacity_needed(),
@@ -6167,6 +6182,7 @@ mod tests {
 
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
+            &gpu.queue,
             size,
             wgpu::TextureFormat::Rgba8Unorm,
             stack.slot_capacity_needed(),

@@ -158,6 +158,10 @@ const SHAPE_RAW: u32 = 4u;
 @group(0) @binding(0) var<uniform> c: Cfg;
 // The layer array, read by `fs_extract` alone.
 @group(0) @binding(1) var layers: texture_2d_array<f32>;
+// Where each of each slot's tiles lives. See `tiles.wgsl`, concatenated in
+// front of this file: `layers` is a tile atlas, so a document texel of a slot is
+// `tile_load`'s to find rather than a plain `textureLoad`.
+@group(0) @binding(6) var page_table: texture_2d_array<u32>;
 // Whatever the previous pass wrote — the wet stroke's scratch for `fs_extract`,
 // a coverage field for everything else.
 @group(0) @binding(2) var src: texture_2d<f32>;
@@ -223,10 +227,13 @@ fn coverage_at(p: vec2<i32>) -> f32 {
 fn fs_extract(@builtin(position) f: vec4<f32>) -> @location(0) f32 {
     let lim = vec2<i32>(c.size);
     let p = clamp(vec2<i32>(f.xy), vec2<i32>(0), lim - vec2<i32>(1));
-    var a = textureLoad(layers, p, c.slot, 0).a;
+    // Through the page table, and with the two empty values the composite uses:
+    // transparent for a layer, **white for a mask**. `p` is already clamped to
+    // the canvas, which is what `tile_load` needs and cannot check.
+    var a = tile_load(layers, page_table, c.slot, p, vec4<f32>(0.0)).a;
     var m = 1.0;
     if (c.has_mask != 0u) {
-        m = textureLoad(layers, p, c.mask_slot, 0).r;
+        m = tile_load(layers, page_table, c.mask_slot, p, vec4<f32>(1.0)).r;
     }
     if (c.stroke_here != 0u) {
         let s = at(src, p, lim) * c.stroke_opacity;

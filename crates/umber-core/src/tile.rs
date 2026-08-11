@@ -107,7 +107,14 @@ const _: () = assert!(MAX_TILES_PER_AXIS <= 256);
 /// and [`Entry::PACKING`] is what pins them against each other — a rename or a
 /// shift here that the WGSL did not follow is a picture assembled out of the
 /// wrong tiles, which looks like corruption rather than like a bug.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Pod` because the page table is uploaded as a slice of these — the CPU-side
+/// table is the authority and the texture is a cast of it, so a second buffer
+/// in a second layout would be a second thing to keep in step. `repr(transparent)`
+/// is what makes that cast a description of the memory rather than a hope about
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(transparent)]
 pub struct Entry(pub u32);
 
 impl Entry {

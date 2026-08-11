@@ -94,12 +94,17 @@ struct View {
 };
 
 @group(0) @binding(0) var<uniform> v: View;
+// The tile atlas. Its slices are *pages*, not layers: where a slot's texels are
+// is `page_table`'s to say. See `tiles.wgsl`, concatenated in front of this file
+// along with `blend.wgsl`.
 @group(0) @binding(1) var layer_tex: texture_2d_array<f32>;
 @group(0) @binding(2) var stroke_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 // Per-dab colour, premultiplied linear RGBA. A 1x1 placeholder unless the
 // stroke in progress smudges.
 @group(0) @binding(4) var stroke_color_tex: texture_2d<f32>;
+// Where each of each slot's tiles lives, or that it lives nowhere.
+@group(0) @binding(5) var page_table: texture_2d_array<u32>;
 
 // The stroke's colour at this fragment.
 //
@@ -164,6 +169,12 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // sampling forbids.
     let coverage = textureSampleLevel(stroke_tex, samp, uv, 0.0).r;
 
+    // The layer array is a tile atlas, so its texels are not at `uv` and there
+    // is nothing to hand a sampler. `tile_bilinear` is the tap, reconstructed
+    // through the page table; the stroke scratch above is still a plain
+    // canvas-sized texture and is still sampled.
+    let doc_texels = vec2<i32>(v.doc_size);
+
     var acc = vec4<f32>(0.0);
     // What a clipped layer is bounded by: the alpha of the nearest *unclipped*
     // layer below it, after that layer's own mask and its own wet stroke. One
@@ -190,7 +201,10 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // has to bound whatever is clipped to it — to nothing. Two fetches for
         // a layer that contributes no pixels is the price of that being one
         // rule rather than two.
-        var lay = textureSampleLevel(layer_tex, samp, uv, slot, 0.0);
+        // A layer's empty value is transparent black, which is what a tile
+        // nobody has painted into reads as — byte for byte what a dense slice
+        // held there.
+        var lay = tile_bilinear(layer_tex, page_table, slot, doc, doc_texels, vec4<f32>(0.0));
         let stroke_here = i == v.active_index;
         let cov = coverage * v.stroke_color.a;
 
@@ -201,16 +215,22 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         //
         // A branch, deliberately, where the tip and the paper use a `select`.
         // Those two fold into a multiply by one and cost a fetch that was
-        // happening anyway; this one is a whole extra sample of a
-        // canvas-sized array, on the pass that runs every frame for every
-        // layer. `has_mask` comes out of a uniform, so the branch is uniform
-        // across the draw and an unmasked document really does pay nothing.
-        // `textureSampleLevel` is what makes it legal at all — an explicit LOD
-        // has no derivatives to require uniform control flow, which is the same
-        // reason the loop can sample in the first place.
+        // happening anyway; this one is a whole extra tap of the atlas, on the
+        // pass that runs every frame for every layer. `has_mask` comes out of a
+        // uniform, so the branch is uniform across the draw and an unmasked
+        // document really does pay nothing.
+        //
+        // **A mask's empty value is white, not zero**, and that is the one place
+        // the substitution is not "what a cleared slice held". A mask multiplies
+        // the layer's alpha and a mask nobody has painted on reveals everything,
+        // so an absent tile has to read 1.0 — taking it for zero hides the layer
+        // everywhere nobody painted, which is the bug `clipstudio.rs` records
+        // fixing on the import side, in the same format at the same block size.
         var m = 1.0;
         if (has_mask) {
-            m = textureSampleLevel(layer_tex, samp, uv, mask_slot, 0.0).r;
+            m = tile_bilinear(
+                layer_tex, page_table, mask_slot, doc, doc_texels, vec4<f32>(1.0)
+            ).r;
         }
         // A stroke on the mask previews by blending into `m` here. THIS MUST
         // STAY IDENTICAL to what `commit.wgsl` writes into the mask slice —

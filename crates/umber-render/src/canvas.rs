@@ -5,6 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use umber_core::tile::{Entry, Grid};
 use umber_core::{
     Affine, Anchor, Background, BlendMode, BrushMode, Camera, CanvasCopy, Color, Dab, Effect,
     EffectKind, FlipAxis, OutlinePosition, PixelRect, Selection, TipMask, transform,
@@ -484,8 +485,14 @@ const INITIAL_SLOTS: u32 = 4;
 /// a release-build *wrap* to something small enough to authorise unlimited
 /// doubling, would be the wrong two.
 fn slice_bytes(doc_size: UVec2) -> u64 {
-    u64::from(doc_size.x)
-        .saturating_mul(u64::from(doc_size.y))
+    // The *page*, not the canvas: a slice of the layer array is a page of the
+    // tile atlas, and a page is the canvas rounded up to whole tiles so that
+    // every tile slot in it is a full 256 square. On a 20000×5000 canvas that is
+    // 3.5% more than the document; on a canvas already a multiple of the tile it
+    // is exactly the document. See `umber_core::tile::Grid::page_size`.
+    let page = Grid::new(doc_size).page_size();
+    u64::from(page.x)
+        .saturating_mul(u64::from(page.y))
         .saturating_mul(LAYER_BYTES_PER_PIXEL)
 }
 
@@ -843,8 +850,29 @@ const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
 /// Subtract it before going to look, or the line named will be plausible and
 /// wrong — which is worse than one that is obviously out of range.
 const BLEND_PRELUDE_COMPOSITE: &str = concat!(
+    include_str!("../shaders/tiles.wgsl"),
     include_str!("../shaders/blend.wgsl"),
     include_str!("../shaders/composite.wgsl"),
+);
+
+/// The three passes that read the layer array share one statement of how a
+/// document texel is found in the tile atlas.
+///
+/// `shaders/tiles.wgsl`, in front of each of them, for the reason `blend.wgsl`
+/// is in front of the composite and the commit: three hand-written copies of an
+/// entry unpack is three places for the picture to be assembled out of the wrong
+/// tiles, which reads as corruption rather than as a bug. The composite takes it
+/// as well, above — it takes both preludes, so *its* reported line numbers are
+/// shifted by the length of two files.
+const TILE_PRELUDE_EFFECT: &str = concat!(
+    include_str!("../shaders/tiles.wgsl"),
+    include_str!("../shaders/effect.wgsl"),
+);
+
+/// See [`TILE_PRELUDE_EFFECT`].
+const TILE_PRELUDE_THUMBNAIL: &str = concat!(
+    include_str!("../shaders/tiles.wgsl"),
+    include_str!("../shaders/thumbnail.wgsl"),
 );
 
 /// The commit pass, with the same blend modes in front of it.
@@ -2219,17 +2247,59 @@ struct EffectCache {
 }
 
 /// The layer texture array and the views onto it.
+/// The page table's texel format.
+///
+/// One `u32` an entry, holding a [`umber_core::tile::Entry`]. Read only with
+/// `textureLoad` and written only with `write_texture`, so it needs
+/// `TEXTURE_BINDING | COPY_DST` and — unlike [`SEED_FORMAT`] — not
+/// `RENDER_ATTACHMENT`, which is a weaker demand. Weaker is not none:
+/// `the_page_table_format_is_readable_on_every_device` pins it, for the reason
+/// `the_seed_format_is_a_render_target_on_every_device` exists.
+const PAGE_TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+
+/// The layer array, which is now a **tile atlas plus a page table**.
+///
+/// A slice of `texture` is a *page* rather than a layer. Where a slot's texels
+/// live is `table`'s to say, one [`Entry`] per (tile, slot): a page and a tile
+/// position within it, or [`Entry::UNBACKED`] for a tile that is stored nowhere
+/// and therefore reads as the slot's own empty value. `umber_core::tile` is the
+/// arithmetic and `docs/perf/tiled-layer-storage.md` is the design.
+///
+/// **A page is the canvas rounded up to whole tiles**, so it holds exactly one
+/// layer's worth of tiles, and the *identity* table — page `n` holding slot `n`'s
+/// tiles at their own coordinates — is byte for byte the layout there was before
+/// there was a table at all. That is why nothing about growth, reservation,
+/// [`Vram`]'s refusal, `resize` or [`MAX_SLOTS`] changed shape when this
+/// arrived: a page *is* what a slice was, and every document-space origin a copy
+/// or a scissor already used is still the right atlas-space origin under the
+/// identity.
 struct LayerStore {
+    /// The canvas's tile grid. Carried because every question this type answers
+    /// is a function of the canvas size, and re-deriving it per call would be a
+    /// second statement of `page_size`.
+    grid: Grid,
     texture: wgpu::Texture,
-    /// Sampled by the composite pass.
+    /// Loaded by the composite, the effect extract and the thumbnail — all
+    /// three through the page table, none of them with a sampler.
     array_view: wgpu::TextureView,
-    /// One per slice, used as render targets by commit and clear.
+    /// One per page, used as render targets by commit and clear.
     slot_views: Vec<wgpu::TextureView>,
-    /// The same slices seen as [`LAYER_FORMAT_LINEAR`], for the flip pass and
+    /// The same pages seen as [`LAYER_FORMAT_LINEAR`], for the flip pass and
     /// nothing else. Built here rather than per flip because a view is cheap to
     /// hold and the alternative is allocating one per slice per command.
     raw_slot_views: Vec<wgpu::TextureView>,
     capacity: u32,
+    /// `(tiles.x, tiles.y, capacity)` of [`PAGE_TABLE_FORMAT`].
+    table: wgpu::Texture,
+    table_view: wgpu::TextureView,
+    /// The same table on the CPU, `capacity` slices of `grid.tiles_per_page()`
+    /// entries, row-major within a slice.
+    ///
+    /// The authority: the texture is an upload of this. Every question about
+    /// where a texel is — a copy's origin, a commit's attachment, whether a
+    /// readback has anything to read — is answered here, so the renderer never
+    /// has to read a texture back to find out where a tile went.
+    entries: Vec<Entry>,
 }
 
 /// The layer array's texture, and nothing else.
@@ -2250,11 +2320,16 @@ struct LayerStore {
 /// inside the error scope, so a view built here is one built before the check
 /// however carefully `try_reserve` is written.
 fn layer_texture(device: &wgpu::Device, size: UVec2, capacity: u32) -> wgpu::Texture {
+    // A page, not the canvas — see [`LayerStore`]. Rounding up cannot cross the
+    // device's `max_texture_dimension_2d`, because every value that limit takes
+    // is itself a multiple of the tile and the canvas is already inside it;
+    // `rounding_a_canvas_up_to_tiles_never_passes_the_device_limit` sweeps it.
+    let page = Grid::new(size).page_size();
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("umber-layers"),
         size: wgpu::Extent3d {
-            width: size.x,
-            height: size.y,
+            width: page.x,
+            height: page.y,
             depth_or_array_layers: capacity,
         },
         mip_level_count: 1,
@@ -2274,8 +2349,14 @@ fn layer_texture(device: &wgpu::Device, size: UVec2, capacity: u32) -> wgpu::Tex
 }
 
 impl LayerStore {
-    fn new(device: &wgpu::Device, size: UVec2, capacity: u32) -> Self {
-        Self::from_texture(layer_texture(device, size, capacity), capacity)
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, size: UVec2, capacity: u32) -> Self {
+        Self::from_texture(
+            device,
+            queue,
+            layer_texture(device, size, capacity),
+            size,
+            capacity,
+        )
     }
 
     /// Build the views onto an array texture that has already been allocated.
@@ -2283,7 +2364,13 @@ impl LayerStore {
     /// The texture **must** be one `create_texture` actually made. See
     /// [`layer_texture`]: a view of an error object is a validation error, which
     /// is fatal, so a fallible caller has to have checked before it gets here.
-    fn from_texture(texture: wgpu::Texture, capacity: u32) -> Self {
+    fn from_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: wgpu::Texture,
+        size: UVec2,
+        capacity: u32,
+    ) -> Self {
         let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("umber-layers-array"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -2315,13 +2402,88 @@ impl LayerStore {
             })
             .collect();
 
-        Self {
+        let grid = Grid::new(size);
+        let table = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-page-table"),
+            size: wgpu::Extent3d {
+                width: grid.tiles.x,
+                height: grid.tiles.y,
+                depth_or_array_layers: capacity,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PAGE_TABLE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let table_view = table.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("umber-page-table-array"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        // **The identity table**: page `n` holds slot `n`'s tiles at their own
+        // coordinates, so a document texel is at the atlas texel it was at when
+        // a slice was a canvas. That is what makes every copy origin, every
+        // scissor and every render target in this file still correct while the
+        // indirection is proved against a known-good answer — see [`LayerStore`].
+        let mut entries = Vec::with_capacity((capacity as usize) * grid.tiles_per_page() as usize);
+        for page in 0..capacity {
+            for ty in 0..grid.tiles.y {
+                for tx in 0..grid.tiles.x {
+                    entries.push(Entry::at(page, tx, ty));
+                }
+            }
+        }
+
+        let store = Self {
+            grid,
             texture,
             array_view,
             slot_views,
             raw_slot_views,
             capacity,
+            table,
+            table_view,
+            entries,
+        };
+        store.upload_table(queue);
+        store
+    }
+
+    /// Push the whole table to the GPU.
+    ///
+    /// Whole, not per slot, and that is a measured triviality rather than
+    /// laziness: the table is `tiles.x × tiles.y × slots × 4` bytes — 6.3 KB per
+    /// slot on the 20000×5000 document, 16.8 MB for a full stack at the largest
+    /// canvas Umber makes — and it is uploaded once per frame in which any tile
+    /// was backed or freed, never per tile. A per-slot upload would be a second
+    /// statement of the layout for no figure anybody could measure.
+    fn upload_table(&self, queue: &wgpu::Queue) {
+        if self.entries.is_empty() {
+            return;
         }
+        let raw: &[u8] = bytemuck::cast_slice(&self.entries);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.table,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            raw,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.grid.tiles.x * 4),
+                rows_per_image: Some(self.grid.tiles.y),
+            },
+            wgpu::Extent3d {
+                width: self.grid.tiles.x,
+                height: self.grid.tiles.y,
+                depth_or_array_layers: self.capacity,
+            },
+        );
     }
 }
 
@@ -2687,6 +2849,7 @@ impl Shared {
                 texture_entry(2),
                 sampler_entry(3),
                 texture_entry(4),
+                page_table_entry(5),
             ],
         });
         let composite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2925,11 +3088,15 @@ impl Shared {
         // 30:1 drops nearly every texel it is meant to be summarising.
         let thumb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("thumbnail"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/thumbnail.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(TILE_PRELUDE_THUMBNAIL.into()),
         });
         let thumb_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("thumb-bgl"),
-            entries: &[uniform_entry(0), texture_array_entry(1)],
+            entries: &[
+                uniform_entry(0),
+                texture_array_entry(1),
+                page_table_entry(2),
+            ],
         });
         let thumb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("thumb-pl"),
@@ -2974,7 +3141,7 @@ impl Shared {
         // `Uint` sample type is never filterable.
         let effect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("effect"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/effect.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(TILE_PRELUDE_EFFECT.into()),
         });
         let effect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("effect-bgl"),
@@ -3003,6 +3170,7 @@ impl Shared {
                     },
                     count: None,
                 },
+                page_table_entry(6),
             ],
         });
         let effect_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3171,11 +3339,18 @@ impl CanvasRenderer {
     /// [`CanvasRenderer::for_document`] for why it is worth stating up front.
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         doc_size: UVec2,
         surface_format: wgpu::TextureFormat,
         slots: u32,
     ) -> Self {
-        Self::with_shared(device, doc_size, Shared::new(device, surface_format), slots)
+        Self::with_shared(
+            device,
+            queue,
+            doc_size,
+            Shared::new(device, surface_format),
+            slots,
+        )
     }
 
     /// A renderer for a second document, reusing this one's compiled pipelines.
@@ -3207,8 +3382,14 @@ impl CanvasRenderer {
     /// It does not remove the speculation an ordinary document wants:
     /// [`initial_slots`] is still the floor, so a blank canvas gets room for a
     /// handful of layers and does not reallocate on its second one.
-    pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2, slots: u32) -> Self {
-        Self::with_shared(device, doc_size, self.shared.clone(), slots)
+    pub fn for_document(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        doc_size: UVec2,
+        slots: u32,
+    ) -> Self {
+        Self::with_shared(device, queue, doc_size, self.shared.clone(), slots)
     }
 
     /// [`CanvasRenderer::new`], refusing rather than dying where the device will
@@ -3233,13 +3414,14 @@ impl CanvasRenderer {
     /// document opened with no other renderer alive.
     pub fn try_new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         doc_size: UVec2,
         surface_format: wgpu::TextureFormat,
         slots: u32,
     ) -> Result<Self, Vram> {
         let capacity = built_capacity(slots, slice_bytes(doc_size));
         let texture = try_reserve(device, doc_size, capacity, None)?;
-        let layers = LayerStore::from_texture(texture, capacity);
+        let layers = LayerStore::from_texture(device, queue, texture, doc_size, capacity);
         Ok(Self::assemble(
             device,
             doc_size,
@@ -3253,19 +3435,26 @@ impl CanvasRenderer {
     pub fn try_for_document(
         &self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         doc_size: UVec2,
         slots: u32,
     ) -> Result<Self, Vram> {
-        Self::try_with_shared(device, doc_size, self.shared.clone(), slots)
+        Self::try_with_shared(device, queue, doc_size, self.shared.clone(), slots)
     }
 
-    fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared, slots: u32) -> Self {
+    fn with_shared(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        doc_size: UVec2,
+        shared: Shared,
+        slots: u32,
+    ) -> Self {
         let capacity = built_capacity(slots, slice_bytes(doc_size));
         Self::assemble(
             device,
             doc_size,
             shared,
-            LayerStore::new(device, doc_size, capacity),
+            LayerStore::new(device, queue, doc_size, capacity),
         )
     }
 
@@ -3278,6 +3467,7 @@ impl CanvasRenderer {
     /// apart.
     fn try_with_shared(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         doc_size: UVec2,
         shared: Shared,
         slots: u32,
@@ -3287,7 +3477,7 @@ impl CanvasRenderer {
         // replace — so the transient is the array alone and `Vram::bytes` and
         // `Vram::peak_bytes` agree.
         let texture = try_reserve(device, doc_size, capacity, None)?;
-        let layers = LayerStore::from_texture(texture, capacity);
+        let layers = LayerStore::from_texture(device, queue, texture, doc_size, capacity);
         Ok(Self::assemble(device, doc_size, shared, layers))
     }
 
@@ -3370,7 +3560,7 @@ impl CanvasRenderer {
             device,
             &shared.composite_layout,
             &view_uniforms,
-            &layers.array_view,
+            &layers,
             &stroke_view,
             &shared.sampler,
             &stroke_color_view,
@@ -3493,7 +3683,7 @@ impl CanvasRenderer {
         let Some(capacity) = self.growth_for(needed) else {
             return;
         };
-        let grown = LayerStore::new(device, self.doc_size, capacity);
+        let grown = LayerStore::new(device, queue, self.doc_size, capacity);
         self.adopt(device, queue, grown);
     }
 
@@ -3535,7 +3725,7 @@ impl CanvasRenderer {
         // the wrong answer is now *deleting an argument that is plainly there*
         // rather than writing a `0` that looks like a sensible default.
         let texture = try_reserve(device, self.doc_size, capacity, Some(&self.layers))?;
-        let grown = LayerStore::from_texture(texture, capacity);
+        let grown = LayerStore::from_texture(device, queue, texture, self.doc_size, capacity);
         self.adopt(device, queue, grown);
         Ok(())
     }
@@ -3617,7 +3807,7 @@ impl CanvasRenderer {
             device,
             &self.shared.composite_layout,
             &self.view_uniforms,
-            &grown.array_view,
+            &grown,
             &self.stroke_view,
             &self.shared.sampler,
             &self.stroke_color_view,
@@ -3756,7 +3946,7 @@ impl CanvasRenderer {
         // resized document does not start reallocating on its second layer where
         // a freshly opened one of the same shape would not.
         let capacity = built_capacity(live, slice_bytes(new_size));
-        let resized = LayerStore::new(device, new_size, capacity);
+        let resized = LayerStore::new(device, queue, new_size, capacity);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("resize-canvas"),
         });
@@ -3853,7 +4043,7 @@ impl CanvasRenderer {
             device,
             &self.shared.composite_layout,
             &self.view_uniforms,
-            &self.layers.array_view,
+            &self.layers,
             &self.stroke_view,
             &self.shared.sampler,
             &self.stroke_color_view,
@@ -4155,7 +4345,7 @@ impl CanvasRenderer {
             device,
             &self.shared.composite_layout,
             &self.view_uniforms,
-            &self.layers.array_view,
+            &self.layers,
             &self.stroke_view,
             &self.shared.sampler,
             &self.stroke_color_view,
@@ -4455,6 +4645,7 @@ impl CanvasRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            aim_at_document(&mut pass, self.doc_size);
             pass.set_pipeline(match style.mode {
                 BrushMode::Paint => &self.shared.commit_pipeline,
                 BrushMode::Erase => &self.shared.commit_erase_pipeline,
@@ -4686,6 +4877,7 @@ impl CanvasRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            aim_at_document(&mut pass, self.doc_size);
             pass.set_pipeline(&self.shared.commit_blend_pipeline);
             pass.set_bind_group(0, &bind_group, &[(i * stride) as u32]);
             // The quad already covers exactly this piece, so the scissor is
@@ -4745,7 +4937,7 @@ impl CanvasRenderer {
             device,
             &self.shared.composite_layout,
             &self.view_uniforms,
-            &self.layers.array_view,
+            &self.layers,
             &self.stroke_view,
             &self.shared.sampler,
             &self.stroke_color_view,
@@ -5430,6 +5622,7 @@ impl CanvasRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        aim_at_document(&mut pass, self.doc_size);
         pass.set_pipeline(&self.shared.transform_draw_pipeline);
         pass.set_bind_group(0, &float.bind_group, &[]);
         pass.draw(0..4, 0..1);
@@ -6123,6 +6316,10 @@ impl CanvasRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&self.layers.array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.layers.table_view),
                 },
             ],
         });
@@ -8070,6 +8267,23 @@ fn write_rect(
     );
 }
 
+/// Point a pass drawing into a *page* at the document's own rectangle.
+///
+/// A page of the tile atlas is the canvas rounded up to whole tiles, so it is
+/// larger than the document — and every vertex shader that writes a layer maps
+/// document pixels to clip space through the document size. Without this the
+/// quad stretches over the padding as well and every mark lands at the wrong
+/// scale and the wrong place, with the scissor still clipping it to a plausible
+/// rectangle. The viewport is what makes those shaders correct against a
+/// larger attachment without any of them learning that pages exist.
+///
+/// Three passes take it: the two commits and the float's draw. The effect
+/// passes already set their own from [`EffectStep::viewport`], and every other
+/// pass in this file draws into a document-sized target of its own.
+fn aim_at_document(pass: &mut wgpu::RenderPass<'_>, doc_size: UVec2) {
+    pass.set_viewport(0.0, 0.0, doc_size.x as f32, doc_size.y as f32, 0.0, 1.0);
+}
+
 fn mode_index(mode: BrushMode) -> u32 {
     match mode {
         BrushMode::Paint => 0,
@@ -8315,7 +8529,7 @@ fn make_composite_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     uniforms: &wgpu::Buffer,
-    layers: &wgpu::TextureView,
+    layers: &LayerStore,
     stroke: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
     stroke_color: &wgpu::TextureView,
@@ -8330,7 +8544,7 @@ fn make_composite_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(layers),
+                resource: wgpu::BindingResource::TextureView(&layers.array_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -8343,6 +8557,14 @@ fn make_composite_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::TextureView(stroke_color),
+            },
+            // The atlas and its page table are one binding pair, taken from one
+            // `LayerStore` — passing the two views separately is how a growth
+            // ends up with a fresh atlas beside the table it replaced, which is
+            // a picture assembled from the wrong pages.
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&layers.table_view),
             },
         ],
     })
@@ -8656,6 +8878,15 @@ impl EffectScratch {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(seed),
                     },
+                    // The real page table in every one of these, including the
+                    // groups whose `array` is the 1x1 stand-in: only the extract
+                    // pass reads either, and a second placeholder for a texture
+                    // that already exists would be one more thing to keep the
+                    // right shape.
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&layers.table_view),
+                    },
                 ],
             })
         };
@@ -8909,6 +9140,25 @@ fn texture_array_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// The page table's binding: an integer array, never filtered.
+///
+/// `Uint` rather than `Float { filterable }`, which is not a preference — an
+/// integer format has no filtering to ask for, and declaring one would be a
+/// layout the device refuses. Three passes take this and they must all take the
+/// same one; it is a helper for that reason rather than for brevity.
+fn page_table_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Uint,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -9033,7 +9283,19 @@ mod tests {
     fn a_refused_reservation_states_both_the_array_and_the_transient() {
         let doc_size = UVec2::new(20000, 5000);
         let slice = slice_bytes(doc_size);
-        assert_eq!(slice, 400_000_000, "a slice of this canvas is 400 MB");
+
+        // **A slice is a *page* now, and the figure is derived rather than
+        // typed.** It read 400 MB while a slice was the canvas; a page is the
+        // canvas rounded up to whole tiles — 20224 × 5120 here — which is 3.5%
+        // more. That is the whole of what tiling costs a genuinely *dense*
+        // layer, and this is where the number lives. Derived from the grid,
+        // because a literal would silently stop describing what it names the
+        // day `tile::TILE` moved.
+        let page = Grid::new(doc_size).page_size();
+        assert_eq!(page, UVec2::new(20224, 5120));
+        let expected = u64::from(page.x) * u64::from(page.y) * LAYER_BYTES_PER_PIXEL;
+        assert_eq!(slice, expected, "a slice of this canvas is one page");
+        assert_eq!(slice, 414_187_520);
 
         let fresh = Vram {
             slices: 21,
@@ -9041,7 +9303,7 @@ mod tests {
             slice_bytes: slice,
             doc_size,
         };
-        assert_eq!(fresh.bytes(), 8_400_000_000);
+        assert_eq!(fresh.bytes(), 21 * expected);
         assert_eq!(
             fresh.peak_bytes(),
             fresh.bytes(),
@@ -9049,10 +9311,10 @@ mod tests {
         );
 
         let grown = Vram { held: 21, ..fresh };
-        assert_eq!(grown.bytes(), 8_400_000_000, "the new array alone");
+        assert_eq!(grown.bytes(), 21 * expected, "the new array alone");
         assert_eq!(
             grown.peak_bytes(),
-            16_800_000_000,
+            42 * expected,
             "a growth holds the array it replaces at the same instant"
         );
     }
@@ -9085,6 +9347,91 @@ mod tests {
     const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
     const EFFECT_WGSL: &str = include_str!("../shaders/effect.wgsl");
     const THUMBNAIL_WGSL: &str = include_str!("../shaders/thumbnail.wgsl");
+    const TILES_WGSL: &str = include_str!("../shaders/tiles.wgsl");
+
+    /// A `const NAME: TYPE = LITERAL;` out of a shader, as text.
+    ///
+    /// Parsed rather than named for the reason [`shader_max_draws`] is: a WGSL
+    /// constant is a string until naga sees it, so nothing in Rust can refer to
+    /// one. Anchored to the start of a line and required to appear exactly once,
+    /// so a comment quoting the declaration cannot be what gets read — the
+    /// failure `windows_registration_offers_umber_without_taking_the_file_type`
+    /// hit by scanning WiX that argues for itself.
+    fn shader_const(src: &str, decl: &str) -> String {
+        let needle = format!("\n{decl} = ");
+        let found: Vec<_> = src.match_indices(&needle).collect();
+        assert_eq!(found.len(), 1, "`{decl}` is not declared exactly once");
+        let rest = &src[found[0].0 + needle.len()..];
+        let end = rest.find(';').expect("the declaration has no semicolon");
+        rest[..end].trim().to_string()
+    }
+
+    /// `tiles.wgsl` unpacks a page-table entry by hand, so its three constants
+    /// have to be `umber_core::tile`'s.
+    ///
+    /// **Pinned as the shifts and the sentinel, not as a round trip.** A round
+    /// trip is self-consistent under any rearrangement, which is the failure
+    /// `the_serialised_names_of_a_blend_mode_are_these_exact_strings` records —
+    /// and here the symptom would be a picture assembled out of the wrong tiles,
+    /// which reads as corruption rather than as a bug.
+    ///
+    /// Demonstrated by mutation: change `TILE_PAGE_SHIFT` to `12u` in
+    /// `tiles.wgsl` and this fails; so does the whole GPU suite, which is the
+    /// point — this one says *why* in one line.
+    #[test]
+    fn the_shader_and_the_model_agree_about_a_tile() {
+        use umber_core::tile;
+
+        assert_eq!(
+            shader_const(TILES_WGSL, "const TILE: i32"),
+            tile::TILE.to_string(),
+            "the storage tile"
+        );
+        assert_eq!(
+            shader_const(TILES_WGSL, "const TILE_UNBACKED: u32"),
+            format!("{}u", tile::Entry::UNBACKED.0),
+            "the not-stored sentinel"
+        );
+        let (page, y, _x) = tile::Entry::PACKING;
+        assert_eq!(
+            shader_const(TILES_WGSL, "const TILE_PAGE_SHIFT: u32"),
+            format!("{page}u"),
+        );
+        assert_eq!(
+            shader_const(TILES_WGSL, "const TILE_Y_SHIFT: u32"),
+            format!("{y}u"),
+        );
+    }
+
+    /// Every shader that reads the layer array reads it through the page table,
+    /// and there are exactly three of them.
+    ///
+    /// The array is a tile atlas, so a bare `textureLoad(layers, …)` or a
+    /// `textureSampleLevel(layer_tex, …)` is a read of whatever page happens to
+    /// sit at that slot index — a picture made of other layers. This is a text
+    /// scan for the reason the packaging scans here are: what it covers is that
+    /// nobody added a fourth reader without routing it, and what it cannot see
+    /// is whether the routing is *right*, which
+    /// `a_tiled_layer_composites_byte_for_byte_as_a_dense_one_did` is for.
+    #[test]
+    fn nothing_reads_the_layer_array_except_through_the_page_table() {
+        for (name, src) in [
+            ("composite.wgsl", COMPOSITE_WGSL),
+            ("effect.wgsl", EFFECT_WGSL),
+            ("thumbnail.wgsl", THUMBNAIL_WGSL),
+        ] {
+            for line in src.lines() {
+                let code = line.split("//").next().unwrap_or("");
+                for call in ["textureLoad(layers", "textureSampleLevel(layer_tex"] {
+                    assert!(
+                        !code.contains(call),
+                        "{name} reads the atlas directly: {}",
+                        line.trim()
+                    );
+                }
+            }
+        }
+    }
 
     /// The `MAX_TAPS` the thumbnail shader compiles, as an integer.
     ///
