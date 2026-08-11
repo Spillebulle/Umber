@@ -89,6 +89,37 @@ pub const CLSID_THUMBNAIL: GUID = GUID::from_u128(0x9c2f5b31_4de8_47a6_b0d1_5e3a
 /// while an object is still live frees the vtable somebody is about to call.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Take the right to be the only test holding a [`ThumbnailProvider`].
+///
+/// **A test that writes a process-global must take a lock**, and [`LIVE`] is
+/// one: every `ThumbnailProvider` in this file raises it and every drop lowers
+/// it, while the harness runs the tests on parallel threads. Being an
+/// `AtomicUsize` makes each *write* well defined and does nothing whatever for
+/// the assertions, which are the actual claim — `the_dll_says_when_it_may_be_
+/// unloaded` reads the counter, makes an object, and asserts the counter came
+/// back to where it started, and a sibling holding an object of its own across
+/// that window makes it false.
+///
+/// The comment on that test used to say it was safe because the reading was
+/// "relative to itself". Relative to itself is exactly what it cannot be: the
+/// two loads are a whole object's lifetime apart and anything may happen
+/// between them. Six tests here build a provider.
+///
+/// It lives beside the counter rather than inside `mod tests` for
+/// `prefs::prefs_lock`'s reason — the rule is about everything that touches the
+/// global, not about one module's idea of who does. **The rule is also per test
+/// binary**, and this crate is a third binary that never had one; `umber-app`'s
+/// `gputest` is the second, and it exists because the same rule went unapplied
+/// there until a runner died at process exit.
+///
+/// Poisoning is recovered from, so one failing test reports its own assertion
+/// rather than turning every later one into a mutex error.
+#[cfg(test)]
+fn live_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Run `body`, turning a panic into an error rather than letting it out.
 ///
 /// **Unwinding across an `extern "system"` boundary is undefined behaviour**,
@@ -717,6 +748,7 @@ mod com_tests {
     /// existed.
     #[test]
     fn the_bitmap_explorer_is_handed_is_the_picture_the_document_holds() {
+        let _live = live_lock();
         let bytes = png(SHAPE.0, SHAPE.1, &PIXELS);
         let provider: IInitializeWithStream = ThumbnailProvider::new().into();
         // SAFETY: the slice outlives the call; `SHCreateMemStream` copies it.
@@ -759,6 +791,7 @@ mod com_tests {
     /// and ask for a bitmap, exactly as Explorer's sequence does.
     #[test]
     fn a_stream_of_a_document_becomes_a_bitmap() {
+        let _live = live_lock();
         let bytes = document(64);
         let provider: IInitializeWithStream = ThumbnailProvider::new().into();
 
@@ -798,6 +831,7 @@ mod com_tests {
     /// state.
     #[test]
     fn asking_for_a_thumbnail_before_the_stream_fails_cleanly() {
+        let _live = live_lock();
         let thumbs: IThumbnailProvider = ThumbnailProvider::new().into();
         let mut bitmap = HBITMAP::default();
         let mut alpha = WTS_ALPHATYPE(0);
@@ -809,6 +843,7 @@ mod com_tests {
     /// this either; something else on the machine might.
     #[test]
     fn a_null_out_parameter_is_refused() {
+        let _live = live_lock();
         let bytes = document(8);
         let provider: IInitializeWithStream = ThumbnailProvider::new().into();
         let stream = unsafe { SHCreateMemStream(Some(&bytes)) }.expect("a stream");
@@ -824,6 +859,7 @@ mod com_tests {
     /// the property that matters most, because this runs inside Explorer.
     #[test]
     fn rubbish_in_a_stream_produces_no_thumbnail_and_no_panic() {
+        let _live = live_lock();
         let provider: IInitializeWithStream = ThumbnailProvider::new().into();
         let stream = unsafe { SHCreateMemStream(Some(b"not a document at all")) }.expect("stream");
         unsafe { provider.Initialize(&stream, 0) }.expect("initialise");
@@ -839,6 +875,8 @@ mod com_tests {
     /// a class factory by CLSID, then ask the factory for the object.
     #[test]
     fn the_dll_hands_out_the_class_it_is_registered_as() {
+        // The factory builds a real provider, so this raises `LIVE` too.
+        let _live = live_lock();
         let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = unsafe { DllGetClassObject(&CLSID_THUMBNAIL, &IClassFactory::IID, &mut ptr) };
         assert_eq!(hr, S_OK, "the DLL refused its own class");
@@ -866,10 +904,15 @@ mod com_tests {
     /// call.
     #[test]
     fn the_dll_says_when_it_may_be_unloaded() {
-        // Serialised against the other tests' objects by taking the reading
-        // relative to itself rather than against zero: the harness runs these
-        // on parallel threads and `LIVE` is process-wide.
+        // **The reading is against zero, and it can be, because of the lock.**
+        // This used to take it relative to itself and say that was what made it
+        // safe from the harness's parallel threads. It is not: the two loads
+        // are a whole object's lifetime apart, so a sibling test holding a
+        // provider across that window makes the second one larger and the
+        // assertion below false. Six tests here build one.
+        let _live = live_lock();
         let before = LIVE.load(Ordering::Relaxed);
+        assert_eq!(before, 0, "the lock did not keep the other tests out");
         {
             let _held: IThumbnailProvider = ThumbnailProvider::new().into();
             assert!(LIVE.load(Ordering::Relaxed) > before);
