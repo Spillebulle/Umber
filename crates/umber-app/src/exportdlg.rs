@@ -301,4 +301,165 @@ mod tests {
             assert_eq!(form.options().quality, expected, "{value}");
         }
     }
+
+    // ------------------------------------------------------------- the drawing
+    //
+    // Everything above drives `ExportForm::options()`, which is the value the
+    // encoder is handed. **Nothing drove `show` at all**, and `show` is where
+    // this module's entire reason for existing lives: the losses are named
+    // *before* the write, which is the promise the file's own docs open with.
+    // Three mutations, all of which left every one of the 808 tests in this
+    // crate green:
+    //
+    //   deleting `losses(ui, p, form.format, transparent);`
+    //   `if true` in place of the `needs_matte` gate
+    //   `let transparent = true;`
+    //
+    // So the guards below read the words egui actually drew, the idiom
+    // `canvasdlg` already keeps: a filter restated inside a test can only ever
+    // agree with itself, and `FullOutput::shapes` carries every galley.
+
+    /// Draw the dialog over a document with `background`, and answer every word
+    /// it put on the screen.
+    fn drawn(background: Background, format: ExportFormat) -> Vec<String> {
+        use crate::editor::Editor;
+        use crate::theme::ThemeKind;
+        use egui::{Rect, pos2, vec2};
+
+        let mut ed = Editor::default();
+        ed.doc.background = background;
+        ed.export_form.open = true;
+        ed.export_form.format = format;
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+            ..Default::default()
+        };
+        // Twice, for `canvasdlg::drawn`'s reason: the first pass through a
+        // fresh context builds the font atlas, and a modal laid out against a
+        // half-built one has not settled.
+        let mut words = Vec::new();
+        for _ in 0..2 {
+            let mut out = Outcome::default();
+            let output = ctx.run_ui(input.clone(), |ui| {
+                show(ui, &palette, &mut ed, &mut out);
+            });
+            words.clear();
+            collect_text(&output.shapes, &mut words);
+        }
+        words
+    }
+
+    fn collect_text(shapes: &[egui::epaint::ClippedShape], into: &mut Vec<String>) {
+        fn walk(shape: &egui::Shape, into: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => into.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(inner) => {
+                    for shape in inner {
+                        walk(shape, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in shapes {
+            walk(&clipped.shape, into);
+        }
+    }
+
+    /// Whether `words` holds a line that is `loss`'s own sentence.
+    ///
+    /// Compared against `ExportLoss`'s `Display` rather than against a copy of
+    /// its text, so a reworded warning moves this test with it instead of
+    /// leaving a guard pinned to a sentence nobody says any more. egui wraps a
+    /// long label into several galleys, so the comparison is over the words
+    /// joined back up with the wraps taken out.
+    fn names(words: &[String], loss: export::ExportLoss) -> bool {
+        let flat = words
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let wanted = loss.to_string();
+        let wanted = wanted.split_whitespace().collect::<Vec<_>>().join(" ");
+        flat.contains(&wanted)
+    }
+
+    /// **Every loss is named before the write**, which is what this dialog is
+    /// for. Driven over the formats and both backgrounds rather than over one
+    /// case, because the interesting half of the rule is what is *not* said.
+    #[test]
+    fn the_dialog_names_every_loss_the_format_costs_this_document() {
+        for format in ExportFormat::ALL {
+            for background in [Background::Transparent, Background::opaque(Color::WHITE)] {
+                let transparent = background == Background::Transparent;
+                let words = drawn(background, format);
+                for loss in export::losses(format, transparent) {
+                    assert!(
+                        names(&words, loss),
+                        "{format:?} on a {} document does not say {loss:?} on \
+                         screen, so the artist finds out by looking at the file",
+                        if transparent { "transparent" } else { "white" },
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other half, and the one a test built only out of the first would
+    /// miss: a document with nothing to lose is told so, and is **not** warned
+    /// about an alpha channel it never had.
+    ///
+    /// `losses` takes the document's own transparency for exactly this reason,
+    /// so a guard that never varied the background would leave `let transparent
+    /// = true` — one of the three mutations — passing.
+    #[test]
+    fn an_opaque_document_is_not_warned_about_transparency_it_does_not_have() {
+        let flattened = export::ExportLoss::Flattened;
+
+        // JPEG holds no alpha, so a transparent document loses it and a white
+        // one does not. The same format, the same dialog, opposite sentences.
+        let transparent = drawn(Background::Transparent, ExportFormat::Jpeg);
+        assert!(names(&transparent, flattened), "{transparent:?}");
+
+        let opaque = drawn(Background::opaque(Color::WHITE), ExportFormat::Jpeg);
+        assert!(
+            !names(&opaque, flattened),
+            "a white-backed document was warned it would be flattened onto a \
+             matte, which is the warning that trains people to ignore the rest: \
+             {opaque:?}"
+        );
+
+        // And PNG, which loses nothing either way, says so out loud rather than
+        // saying nothing — the quiet case the module docs argue for.
+        let png = drawn(Background::Transparent, ExportFormat::Png);
+        assert!(
+            png.iter()
+                .any(|w| w.contains("Nothing in this document is lost")),
+            "{png:?}"
+        );
+    }
+
+    /// The matte control is drawn only where it changes a pixel. `needs_matte`
+    /// is false both when the format keeps alpha and when the document has
+    /// none, and a knob that does nothing is worse than one that is not drawn.
+    #[test]
+    fn the_matte_control_appears_only_where_it_would_change_a_pixel() {
+        const HEADING: &str = "Transparency becomes";
+        for format in ExportFormat::ALL {
+            for background in [Background::Transparent, Background::opaque(Color::WHITE)] {
+                let transparent = background == Background::Transparent;
+                let words = drawn(background, format);
+                let drew = words.iter().any(|w| w == HEADING);
+                assert_eq!(
+                    drew,
+                    export::needs_matte(format, transparent),
+                    "{format:?} on a {} document drew the matte control: {drew}",
+                    if transparent { "transparent" } else { "white" },
+                );
+            }
+        }
+    }
 }
