@@ -4069,12 +4069,32 @@ impl CanvasRenderer {
     /// growth line naming it, and returns as though it had done what it was
     /// asked. It is unreachable today: a page is what a slice was, and no
     /// document can hold more painted pages than it has slots.
-    pub fn ensure_pages(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pages: u32) {
+    /// # A growth **inside** a caller's encoder has to be recorded into it
+    ///
+    /// A growth replaces the atlas texture, and the copy from the old one to
+    /// the new is what carries the picture. If that copy is submitted on its own
+    /// while the caller's encoder is open, every command already recorded there
+    /// against the *old* texture runs **after** the copy has read it, into a
+    /// texture nothing will ever look at again — so those writes are silently
+    /// lost. In `render` that is the float's preview, drawn into the encoder
+    /// several statements before an effect bake can promote a slot and grow.
+    ///
+    /// So `into` is where the copy goes: the caller's encoder where there is
+    /// one, which orders it after everything already recorded and before
+    /// everything that follows, and a fresh submitted encoder where there is
+    /// not.
+    pub fn ensure_pages(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        into: Option<&mut wgpu::CommandEncoder>,
+        pages: u32,
+    ) {
         let Some(capacity) = self.growth_for(pages) else {
             return;
         };
         let grown = LayerStore::new(device, queue, self.doc_size, capacity);
-        self.adopt(device, queue, grown);
+        self.adopt(device, queue, into, grown);
     }
 
     /// [`CanvasRenderer::ensure_pages`], refusing rather than dying where the
@@ -4093,6 +4113,7 @@ impl CanvasRenderer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        into: Option<&mut wgpu::CommandEncoder>,
         pages: u32,
     ) -> Result<(), Vram> {
         let Some(capacity) = self.growth_for(pages) else {
@@ -4113,7 +4134,7 @@ impl CanvasRenderer {
         // rather than writing a `0` that looks like a sensible default.
         let texture = try_reserve(device, self.doc_size, capacity, Some(&self.layers))?;
         let grown = LayerStore::from_texture(device, queue, texture, self.doc_size, capacity);
-        self.adopt(device, queue, grown);
+        self.adopt(device, queue, into, grown);
         Ok(())
     }
 
@@ -4160,7 +4181,8 @@ impl CanvasRenderer {
         if self.layers.free.len() >= want {
             return Ok(());
         }
-        self.try_ensure_pages(device, queue, self.layers.pages + 1)
+        // No encoder: this runs from `add_layer`, between frames.
+        self.try_ensure_pages(device, queue, None, self.layers.pages + 1)
     }
 
     /// The page count a growth to `pages` would allocate, or `None` where there
@@ -4226,9 +4248,8 @@ impl CanvasRenderer {
             let short = wanted - self.layers.free.len();
             let per = self.layers.grid.tiles_per_page() as usize;
             let more = short.div_ceil(per.max(1)) as u32;
-            if let Err(refused) =
-                self.try_ensure_pages(device, queue, self.layers.pages.saturating_add(more))
-            {
+            let pages = self.layers.pages.saturating_add(more);
+            if let Err(refused) = self.try_ensure_pages(device, queue, Some(encoder), pages) {
                 log::error!(
                     "the atlas is full: {} tile(s) of slot {slot} cannot be stored ({} pages of {} bytes)",
                     wanted - self.layers.free.len(),
@@ -4325,7 +4346,7 @@ impl CanvasRenderer {
         }
         // A whole free page, or one more. Asked for *before* anything moves, so
         // a refusal leaves the slot exactly as it was.
-        let Some(page) = self.take_whole_page(device, queue) else {
+        let Some(page) = self.take_whole_page(device, queue, encoder) else {
             log::error!("no page for slot {slot}");
             return;
         };
@@ -4386,7 +4407,12 @@ impl CanvasRenderer {
     }
 
     /// A page no slot holds any cell of, growing the atlas if there is none.
-    fn take_whole_page(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<u32> {
+    fn take_whole_page(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        into: &mut wgpu::CommandEncoder,
+    ) -> Option<u32> {
         let per = self.layers.grid.tiles_per_page() as usize;
         let whole = |store: &LayerStore| -> Option<u32> {
             (0..store.pages).find(|p| {
@@ -4399,7 +4425,7 @@ impl CanvasRenderer {
             return Some(page);
         }
         let pages = self.layers.pages;
-        self.ensure_pages(device, queue, pages + 1);
+        self.ensure_pages(device, queue, Some(into), pages + 1);
         if self.layers.pages == pages {
             return None;
         }
@@ -4427,7 +4453,13 @@ impl CanvasRenderer {
     /// decides the figure but runs before the allocation is attempted. Logged
     /// there, a refused growth announced a growth that did not happen and was
     /// then immediately contradicted by `try_reserve`'s own refusal line.
-    fn adopt(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut grown: LayerStore) {
+    fn adopt(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        into: Option<&mut wgpu::CommandEncoder>,
+        mut grown: LayerStore,
+    ) {
         let capacity = grown.pages;
         log::info!(
             "growing the tile atlas {} -> {} pages",
@@ -4435,9 +4467,17 @@ impl CanvasRenderer {
             capacity
         );
         let page = self.layers.grid.page_size();
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("grow-layers"),
+        // Into the caller's encoder where there is one — see `ensure_pages` for
+        // what a separately submitted copy loses.
+        let mut own = into.is_none().then(|| {
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("grow-layers"),
+            })
         });
+        let enc = match into {
+            Some(enc) => enc,
+            None => own.as_mut().expect("one or the other"),
+        };
         enc.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.layers.texture,
@@ -4486,7 +4526,9 @@ impl CanvasRenderer {
         // `back_tiles` that wipes one to the slot's own empty value on the way
         // out of the pool, which is the only place that knows what value that
         // is.
-        queue.submit(Some(enc.finish()));
+        if let Some(own) = own {
+            queue.submit(Some(own.finish()));
+        }
 
         self.composite_bind_group = make_composite_bind_group(
             device,
@@ -6032,7 +6074,11 @@ impl CanvasRenderer {
         if self.layers.free.len() < wanted {
             let per = self.layers.grid.tiles_per_page() as usize;
             let short = (wanted - self.layers.free.len()).div_ceil(per.max(1)) as u32;
-            self.ensure_pages(device, queue, self.layers.pages.saturating_add(short));
+            let pages = self.layers.pages.saturating_add(short);
+            // No encoder yet, and deliberately: the flip's own is created below,
+            // so there is nothing recorded for a separately submitted copy to
+            // lose. See `ensure_pages`.
+            self.ensure_pages(device, queue, None, pages);
         }
 
         let page = self.layers.grid.page_size();
@@ -8461,7 +8507,6 @@ impl CanvasRenderer {
             .iter()
             .any(|s| matches!(s.pass, EffectPass::Seed | EffectPass::Flood));
         let needs_band = steps.iter().any(|s| matches!(s.target, EffectTarget::Band));
-        self.ensure_effect_scratch(device, needs_seeds, needs_band);
         // **Every effect slice is page-backed.** A bake writes the whole
         // viewport of its target every time, so an effect's pixels are a whole
         // canvas by construction and there is nothing sparse to save; and an
@@ -8485,6 +8530,12 @@ impl CanvasRenderer {
             }
             queue.submit(Some(enc.finish()));
         }
+        // **After the promotion, not before**, because a promotion may grow the
+        // atlas and the working set's bind groups name the array view. Built
+        // first, they would have the effect extract reading the atlas the growth
+        // replaced — `bound_capacity` is what notices, and it can only notice
+        // when it is asked afterwards.
+        self.ensure_effect_scratch(device, needs_seeds, needs_band);
         let Some(scratch) = self.effects.scratch.as_ref() else {
             return Err("no working set".into());
         };

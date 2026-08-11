@@ -2738,7 +2738,7 @@ fn growing_the_layer_array_preserves_existing_pixels() {
     h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
     assert!(h.canvas.page_count() < 8);
 
-    h.canvas.ensure_pages(&h.gpu.device, &h.gpu.queue, 8);
+    h.canvas.ensure_pages(&h.gpu.device, &h.gpu.queue, None, 8);
     assert!(h.canvas.page_count() >= 8);
 
     assert_near(h.pixel_in(0, 32, 32), [200, 40, 40], 2, "after growth");
@@ -3622,7 +3622,7 @@ fn growing_through_the_fallible_door_preserves_existing_pixels() {
     assert!(h.canvas.page_count() < 8);
 
     h.canvas
-        .try_ensure_pages(&h.gpu.device, &h.gpu.queue, 8)
+        .try_ensure_pages(&h.gpu.device, &h.gpu.queue, None, 8)
         .expect("eight pages of a 64-square canvas is 512 KB");
     assert!(h.canvas.page_count() >= 8);
 
@@ -3637,7 +3637,7 @@ fn growing_through_the_fallible_door_preserves_existing_pixels() {
     // the early return is what makes a reservation free on every add that fits.
     let held = h.canvas.page_count();
     h.canvas
-        .try_ensure_pages(&h.gpu.device, &h.gpu.queue, 8)
+        .try_ensure_pages(&h.gpu.device, &h.gpu.queue, None, 8)
         .expect("nothing to do cannot fail");
     assert_eq!(h.canvas.page_count(), held);
 
@@ -3681,7 +3681,7 @@ fn a_resize_rebuilds_at_the_live_slice_count_and_carries_the_picture() {
     let mut h = harness_or_skip!();
     // Deliberately far more than the document holds. `ensure_slots` never
     // shrinks, so this is exactly the state a delete-then-add session leaves.
-    h.canvas.ensure_pages(&h.gpu.device, &h.gpu.queue, 64);
+    h.canvas.ensure_pages(&h.gpu.device, &h.gpu.queue, None, 64);
     assert_eq!(h.canvas.page_count(), 64, "the atlas should have grown");
 
     h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
@@ -8653,4 +8653,148 @@ fn a_blended_commit_finds_its_backdrop_in_the_right_tile() {
         "multiply over white",
     );
     assert_near(at(b.x + 8, b.y + 8), [0, 0, 0], 2, "multiply over black");
+}
+
+/// A growth part-way through an encoder does not lose what was already recorded
+/// into it.
+///
+/// **The one defect in this stage that no other guard could see.** A growth
+/// replaces the atlas texture and copies the old one into the new; recorded on
+/// its own encoder and submitted, that copy reads the old texture *before* the
+/// caller's still-open encoder writes to it, so everything already recorded
+/// there lands in a texture nothing will ever read again. In `render` that is
+/// the float's preview, drawn into the frame's encoder several statements before
+/// an effect bake can promote a slot and grow the atlas — a preview that freezes
+/// for a frame, on the frame a document gets one layer heavier.
+///
+/// The sequence here is the same shape and needs no float: two commits into one
+/// encoder, with the pool arranged so the *second* is what runs out of cells.
+#[test]
+fn a_growth_part_way_through_an_encoder_keeps_what_was_recorded_before_it() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 1);
+    let pages_before = canvas.page_count();
+
+    // Fill the pool down to **exactly one free cell**, so the first commit
+    // below fits and the second cannot. Six tiles a slot, so this walks slots
+    // rather than restating the fixture arithmetic.
+    let grid = [(0u32, 0u32), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)];
+    let mut spare = 2;
+    while canvas.free_tiles() > grid.len() {
+        fill_tiled_slot(gpu, &mut canvas, spare, [0, 0, 255, 255]);
+        spare += 1;
+    }
+    let resident = spare - 1;
+    let mut i = 0;
+    while canvas.free_tiles() > 1 {
+        write_flat(
+            gpu,
+            &mut canvas,
+            spare,
+            in_tile(grid[i].0, grid[i].1),
+            [0, 0, 255, 255],
+        );
+        i += 1;
+    }
+    assert_eq!(canvas.free_tiles(), 1, "exactly one cell left");
+    assert_eq!(canvas.page_count(), pages_before, "nothing has grown yet");
+
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+    // First commit: into tile (2, 1), which takes the last free cell. Recorded
+    // against the atlas as it stands.
+    let first = in_tile(2, 1);
+    canvas.begin_frame();
+    canvas.draw_dabs(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &[dab(first.x as f32 + 8.0, first.y as f32 + 8.0, 10.0, 1.0)],
+        DabStyle::default(),
+    );
+    canvas.commit_stroke(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        0,
+        first,
+        &[first],
+        StrokeStyle {
+            color: Color::from_srgb_u8(200, 40, 40, 255),
+            opacity: 1.0,
+            ..StrokeStyle::default()
+        },
+    );
+    assert_eq!(canvas.free_tiles(), 0, "the pool should now be empty");
+    assert_eq!(canvas.page_count(), pages_before, "nothing has grown yet");
+
+    // Second commit: a different slot and a different tile, so it needs a cell
+    // the pool does not have. This is the growth.
+    let second = in_tile(0, 0);
+    canvas.draw_dabs(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &[dab(second.x as f32 + 8.0, second.y as f32 + 8.0, 10.0, 1.0)],
+        DabStyle::default(),
+    );
+    canvas.commit_stroke(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        1,
+        second,
+        &[second],
+        StrokeStyle {
+            color: Color::from_srgb_u8(40, 200, 40, 255),
+            opacity: 1.0,
+            ..StrokeStyle::default()
+        },
+    );
+    assert!(
+        canvas.page_count() > pages_before,
+        "the atlas should have grown"
+    );
+
+    gpu.queue.submit(Some(enc.finish()));
+    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let at = |slot: u32, x: u32, y: u32| {
+        let px = canvas.read_layer_rect(
+            &gpu.device,
+            &gpu.queue,
+            slot,
+            PixelRect {
+                x,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+        [px[0], px[1], px[2], px[3]]
+    };
+    // The first commit was recorded before the growth. It has to have survived
+    // it — this is the assertion the whole test is for.
+    assert_near(
+        at(0, first.x + 8, first.y + 8),
+        [200, 40, 40],
+        3,
+        "the commit recorded before the growth was lost",
+    );
+    // And the second, which was recorded after.
+    assert_near(
+        at(1, second.x + 8, second.y + 8),
+        [40, 200, 40],
+        3,
+        "the commit that caused the growth was lost",
+    );
+    // And so did the layer that was merely sitting there.
+    assert_eq!(
+        at(resident, 100, 100),
+        [0, 0, 255, 255],
+        "a resident layer was lost"
+    );
 }
