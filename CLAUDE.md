@@ -2170,12 +2170,20 @@ reporter's own window.
   says what happened instead of `wgpu_core`'s line number. It stays fatal: a
   device that has reported an uncaptured error produces undefined results from
   then on, and a quietly wrong canvas is what this codebase refuses everywhere.
-- **`panic = "abort"` changes nothing and there is no `catch_unwind`.** The hook
-  runs before the abort exactly as it runs before unwinding, and nothing here
-  needs the stack unwound. Catching around `run_app` would happen *after* every
-  destructor that produced the second panic, `run_app` is not `UnwindSafe`, and
-  on Windows the loop unwinds through a Win32 message callback where catching is
-  not dependable.
+- **Panics *unwind*, and this bullet said the opposite for a long time.**
+  `panic = "abort"` is set in **no** `Cargo.toml` in the workspace — the claim
+  was asserted here and reasoned from, and it is false. What the retracted
+  sentence got right is that the hook would run before an abort exactly as it
+  runs before unwinding, and that nothing here needs the stack unwound; what it
+  got wrong matters in two places. **`umber-shellext::guard` is load-bearing
+  precisely because panics unwind** — unwinding into COM is undefined behaviour,
+  so catching at every entry point is required rather than belt-and-braces, and
+  under a real `abort` it would be pointless. And a **worker** thread that panics
+  merely ends, which is what makes "a dead worker becomes silence" reachable at
+  all; see `Loading::take`. There is still no `catch_unwind` around `run_app`,
+  and those reasons stand: it would run *after* every destructor that produced
+  the second panic, `run_app` is not `UnwindSafe`, and on Windows the loop
+  unwinds through a Win32 message callback where catching is not dependable.
 - **The "Copy details" button copies `Report::details`, the same string the
   block beside it draws, and it sits *above* that block** — a backtrace is
   unbounded, so a control after it is one somebody scrolls a page of frame
