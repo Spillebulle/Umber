@@ -3838,6 +3838,383 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // --- streaming and deferred buffers ------------------------------------
+
+    /// A document with one of everything this module writes, in both forms.
+    ///
+    /// Both halves are built from the *same* buffers and describe the same
+    /// document; the only difference is whether each canvas-sized buffer is
+    /// [`Canvas::Held`] or [`Canvas::Deferred`]. That is what makes a byte
+    /// comparison between them a comparison of the two code paths and not of
+    /// two documents.
+    struct BothWays {
+        size: UVec2,
+        pixels: Vec<u8>,
+        mask: Vec<u8>,
+        merged: Vec<u8>,
+        effects: Vec<Effect>,
+        text: crate::textobj::TextObject,
+    }
+
+    impl BothWays {
+        fn new() -> Self {
+            let size = UVec2::new(6, 5);
+            Self {
+                size,
+                // Not flat: `trim` crops to the non-transparent box and a PNG
+                // filters each row against the one above, so a document of one
+                // colour would compare equal under almost any bug in either.
+                pixels: (0..size.x * size.y)
+                    .flat_map(|i| {
+                        let v = (i * 37 % 251) as u8;
+                        [v, v / 2, 255 - v, if i == 0 { 0 } else { 255 }]
+                    })
+                    .collect(),
+                mask: (0..size.x * size.y)
+                    .flat_map(|i| {
+                        let v = (i * 11 % 253) as u8;
+                        [v, v, v, 255]
+                    })
+                    .collect(),
+                merged: (0..size.x * size.y)
+                    .flat_map(|i| {
+                        let v = (i * 61 % 249) as u8;
+                        [255 - v, v, v / 3, 255]
+                    })
+                    .collect(),
+                effects: vec![Effect::drop_shadow()],
+                text: text_object(),
+            }
+        }
+
+        /// Folder, masked layer, text layer, effected layer, background, a
+        /// blend mode that warns — everything with a branch in `write_archive`.
+        fn layers(&self, deferred: bool) -> Vec<SaveLayer<'_>> {
+            let px = |has: bool| match (deferred, has) {
+                (_, false) => Canvas::Held(&[]),
+                (true, true) => Canvas::Deferred,
+                (false, true) => Canvas::Held(&self.pixels),
+            };
+            let mask = || match deferred {
+                true => Canvas::Deferred,
+                false => Canvas::Held(&self.mask),
+            };
+            vec![
+                SaveLayer {
+                    mask: Some(mask()),
+                    locked: true,
+                    ..SaveLayer::new("Wash", BlendMode::Add, px(true))
+                },
+                SaveLayer::folder("Group", 0, true),
+                SaveLayer {
+                    depth: 1,
+                    clipped: true,
+                    link: Some(2),
+                    effects: &self.effects,
+                    ..SaveLayer::new("Shadowed", BlendMode::Multiply, px(true))
+                },
+                SaveLayer {
+                    depth: 1,
+                    text: Some(&self.text),
+                    ..SaveLayer::new("Caption", BlendMode::Normal, px(true))
+                },
+            ]
+        }
+
+        fn document<'a>(&'a self, layers: &'a [SaveLayer<'a>], deferred: bool) -> SaveDocument<'a> {
+            SaveDocument {
+                size: self.size,
+                layers,
+                active: 2,
+                background: Background::WHITE,
+                dpi: 300.0,
+                merged: match deferred {
+                    true => Canvas::Deferred,
+                    false => Canvas::Held(&self.merged),
+                },
+                history: None,
+            }
+        }
+    }
+
+    /// A source that serves **every** buffer out of one reused allocation.
+    ///
+    /// This is the guard for "one canvas at a time" and it is a compile-time
+    /// one: `Canvases` hands back a `Cow<'_, [u8]>` borrowed from `&mut self`,
+    /// so a writer holding one of these while asking for the next would be
+    /// rejected by the borrow checker. Serving them all out of one buffer is
+    /// what makes that *observable* — every earlier buffer is overwritten, so
+    /// an archive that still comes out byte for byte identical is one that had
+    /// finished with each before it asked for the next.
+    struct OneAtATime<'a> {
+        fixture: &'a BothWays,
+        scratch: Vec<u8>,
+        /// What was asked for, in order, so the sequence can be pinned too.
+        asked: Vec<String>,
+    }
+
+    impl OneAtATime<'_> {
+        fn serve(&mut self, from: &[u8], what: String) -> Result<Cow<'_, [u8]>, SaveError> {
+            self.asked.push(what);
+            self.scratch.clear();
+            self.scratch.extend_from_slice(from);
+            Ok(Cow::Borrowed(&self.scratch))
+        }
+    }
+
+    impl Canvases for OneAtATime<'_> {
+        fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+            let pixels = self.fixture.pixels.clone();
+            self.serve(&pixels, format!("layer {index}"))
+        }
+
+        fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+            let mask = self.fixture.mask.clone();
+            self.serve(&mask, format!("mask {index}"))
+        }
+
+        fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError> {
+            let merged = self.fixture.merged.clone();
+            self.serve(&merged, "merged".to_string())
+        }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("umber-docformat-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point of the change, stated as the only thing that can settle
+    /// it: the file a streamed save writes is the archive `encode` builds,
+    /// byte for byte.
+    ///
+    /// It is a memory change and not a format change, so anything less than a
+    /// byte comparison would be arguing about it. The fixture carries a folder,
+    /// a mask, a text record, effects, a background, a link, a lock, a clip and
+    /// a blend mode that warns, because every one of those is a branch in
+    /// `write_archive` and a branch nothing drove is a branch this cannot speak
+    /// for.
+    #[test]
+    fn a_streamed_save_is_byte_for_byte_the_archive_encode_builds() {
+        let fixture = BothWays::new();
+
+        let held = fixture.layers(false);
+        let (expected, held_warnings) =
+            encode(&fixture.document(&held, false)).expect("encode held");
+
+        let deferred = fixture.layers(true);
+        let mut source = OneAtATime {
+            fixture: &fixture,
+            scratch: Vec::new(),
+            asked: Vec::new(),
+        };
+        let dir = temp_dir("streamed");
+        let path = dir.join("streamed.ora");
+        let streamed_warnings = save_from(&path, &fixture.document(&deferred, true), &mut source)
+            .expect("streamed save");
+        let written = std::fs::read(&path).expect("read back");
+
+        assert_eq!(
+            written,
+            expected,
+            "the streamed archive is not the encoded one ({} bytes against {})",
+            written.len(),
+            expected.len()
+        );
+        assert_eq!(streamed_warnings, held_warnings);
+        assert!(
+            !held_warnings.is_empty(),
+            "the fixture stopped exercising the warning path"
+        );
+
+        // Asked for in archive order — top of the stack first, the flattened
+        // image last — which is what lets a caller that can only produce one at
+        // a time produce them at all.
+        assert_eq!(
+            source.asked,
+            ["layer 3", "layer 2", "layer 0", "mask 0", "merged",],
+            "the writer asked in the wrong order, or asked twice"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same, through the in-memory encoder rather than the file, so the
+    /// deferred path is pinned independently of the streaming one.
+    ///
+    /// Without this a bug in `resolve` and a bug in the streaming could cancel
+    /// out, and the test above would still pass.
+    #[test]
+    fn a_fetched_buffer_writes_what_a_held_one_does() {
+        let fixture = BothWays::new();
+        let held = fixture.layers(false);
+        let (expected, _) = encode(&fixture.document(&held, false)).expect("encode held");
+
+        let deferred = fixture.layers(true);
+        let mut source = OneAtATime {
+            fixture: &fixture,
+            scratch: Vec::new(),
+            asked: Vec::new(),
+        };
+        let dir = temp_dir("fetched");
+        let path = dir.join("fetched.ora");
+        save_from(&path, &fixture.document(&deferred, true), &mut source).expect("save");
+        // Read back through the real reader as well as compared: equal bytes
+        // that neither of them can open would be equally wrong.
+        let written = std::fs::read(&path).expect("read back");
+        assert_eq!(written, expected);
+        let opened = docimport::read_openraster(&written).expect("reopens");
+        assert_eq!(opened.layers.len(), 4, "the folder and three layers");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A deferred buffer handed to the two functions that have no source is
+    /// refused, and the document is not written.
+    ///
+    /// The alternative is a layer written blank, which is a document silently
+    /// damaged by its own save — so this is refused loudly rather than
+    /// defaulted quietly.
+    #[test]
+    fn a_deferred_buffer_with_nothing_to_fetch_it_is_refused() {
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [9, 9, 9, 255]);
+
+        let deferred = vec![SaveLayer::new("Ink", BlendMode::Normal, Canvas::Deferred)];
+        let doc = SaveDocument {
+            size,
+            layers: &deferred,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(&pixels),
+            history: None,
+        };
+        assert!(
+            matches!(encode(&doc), Err(SaveError::NotSupplied { .. })),
+            "encode accepted a buffer it has no way to fetch"
+        );
+
+        let dir = temp_dir("nosource");
+        let path = dir.join("refused.ora");
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            save(&path, &doc),
+            Err(SaveError::NotSupplied { .. })
+        ));
+        assert!(!path.exists(), "a refused save wrote a file");
+
+        // And the merged image is refused on the same terms, which is the arm
+        // reached last and therefore the one a partial fix would leave.
+        let held = vec![SaveLayer::new("Ink", BlendMode::Normal, &pixels)];
+        assert!(matches!(
+            encode(&SaveDocument {
+                merged: Canvas::Deferred,
+                layers: &held,
+                ..doc
+            }),
+            Err(SaveError::NotSupplied { .. })
+        ));
+    }
+
+    /// A source that fails partway through leaves the artist's file exactly as
+    /// it was, and no temporary beside it.
+    ///
+    /// This is the guarantee the temp-and-rename has always made, asked of the
+    /// new failure it makes possible: a readback that could not map now happens
+    /// *while* the archive is being written rather than before it starts.
+    #[test]
+    fn a_save_whose_source_fails_halfway_leaves_the_old_file_alone() {
+        struct FailsOnTheSecond<'a> {
+            fixture: &'a BothWays,
+            served: usize,
+        }
+        impl Canvases for FailsOnTheSecond<'_> {
+            fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+                self.served += 1;
+                if self.served > 1 {
+                    return Err(SaveError::Io(std::io::Error::other("the device went away")));
+                }
+                let _ = index;
+                Ok(Cow::Borrowed(&self.fixture.pixels))
+            }
+            fn mask(&mut self, _: usize) -> Result<Cow<'_, [u8]>, SaveError> {
+                Ok(Cow::Borrowed(&self.fixture.mask))
+            }
+            fn merged(&mut self) -> Result<Cow<'_, [u8]>, SaveError> {
+                Ok(Cow::Borrowed(&self.fixture.merged))
+            }
+        }
+
+        let fixture = BothWays::new();
+        let dir = temp_dir("halfway");
+        let path = dir.join("precious.ora");
+        std::fs::write(&path, b"the artist's last good file").unwrap();
+
+        let deferred = fixture.layers(true);
+        let mut source = FailsOnTheSecond {
+            fixture: &fixture,
+            served: 0,
+        };
+        assert!(save_from(&path, &fixture.document(&deferred, true), &mut source).is_err());
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the artist's last good file",
+            "a failed save replaced the file it was meant to protect"
+        );
+        assert!(
+            !dir.join("precious.ora.saving").exists(),
+            "the temporary was left behind"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `.ora` a save writes is the same file on every machine, still.
+    ///
+    /// `PrettyConfig::new()` taking the platform's line ending was a real bug
+    /// in the effects record, and streaming the archive is exactly the sort of
+    /// change that could reintroduce one — a `BufWriter` over a file is not a
+    /// `Cursor` over a `Vec`, and a writer that translated anything would be
+    /// invisible until two people compared two saves.
+    #[test]
+    fn a_streamed_archive_carries_no_platform_line_endings() {
+        let fixture = BothWays::new();
+        let deferred = fixture.layers(true);
+        let mut source = OneAtATime {
+            fixture: &fixture,
+            scratch: Vec::new(),
+            asked: Vec::new(),
+        };
+        let dir = temp_dir("endings");
+        let path = dir.join("endings.ora");
+        save_from(&path, &fixture.document(&deferred, true), &mut source).expect("save");
+        let written = std::fs::read(&path).expect("read back");
+
+        // Found by name rather than by index, because the archive numbers
+        // entries top-first and the fixture is written bottom-first — a
+        // hand-computed index here would be a second statement of that
+        // reversal, and one that fails as a missing entry rather than as the
+        // thing this is about.
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&written)).unwrap();
+        let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        let effects = names
+            .iter()
+            .find(|n| n.starts_with("umber/effects/"))
+            .expect("the fixture stopped carrying an effects record")
+            .clone();
+        for name in [effects.as_str(), "stack.xml"] {
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut zip.by_name(name).unwrap(), &mut body).unwrap();
+            assert!(
+                !body.windows(2).any(|w| w == b"\r\n"),
+                "{name} carries a Windows line ending"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The `stack.xml` out of an archive, as text.
     fn read_stack_xml(bytes: &[u8]) -> String {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();

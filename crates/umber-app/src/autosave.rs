@@ -2687,6 +2687,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&documents);
     }
 
+    /// **One archive still reaches two places, and this is what now says so.**
+    ///
+    /// It used to be free: both destinations were `write_encoded` calls over
+    /// one `Vec<u8>`, so they could not differ. The archive is streamed into
+    /// the internal copy now and the painter's file is a copy of that finished
+    /// file, so "the same archive" is a property of `copy_archive` rather than
+    /// of a shared buffer — and the failure it guards against is the one nobody
+    /// would look for: two encodes of the same document, differing in whatever
+    /// a second pass over the source happened to change.
+    #[test]
+    fn both_copies_of_one_autosave_are_the_same_bytes() {
+        let internal = scratch("same-internal");
+        let documents = scratch("same-documents");
+        let theirs = documents.join("both.ora");
+
+        let mut doc = candidate(Session::default().active_id(), "both.ora");
+        doc.path = Some(theirs.clone());
+        doc.size = UVec2::ONE;
+        let ours = internal.join("both-6666666666666666.ora");
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours.clone()),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}"
+        );
+        assert_eq!(
+            std::fs::read(&ours).expect("the internal copy"),
+            std::fs::read(&theirs).expect("the painter's file"),
+            "the two destinations of one autosave hold different archives"
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
+        let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// A failed internal copy still leaves the painter's own file written.
+    ///
+    /// It used to be free for the same reason: the encode had already happened
+    /// and the second `write_encoded` did not care that the first had failed.
+    /// Now the painter's file is normally a *copy* of the internal one, so this
+    /// is the path where there is nothing to copy from and the document has to
+    /// be encoded a second time — and a source that could only be read once
+    /// would have made that impossible, which is why `CaptureSource` borrows
+    /// rather than takes.
+    #[test]
+    fn a_failed_internal_copy_still_writes_the_painters_own_file() {
+        let blocked = scratch("blocked-internal");
+        let documents = scratch("blocked-documents");
+        let theirs = documents.join("rescued.ora");
+
+        // A file where the internal copy wants a directory, so `create_dir_all`
+        // refuses on every platform.
+        let wall = blocked.join("wall");
+        std::fs::write(&wall, b"not a directory").expect("write");
+        let ours = wall.join("copies").join("rescued-4444444444444444.ora");
+
+        let mut doc = candidate(Session::default().active_id(), "rescued.ora");
+        doc.path = Some(theirs.clone());
+        doc.size = UVec2::ONE;
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Failed { .. })),
+            "the internal copy failed silently: {reports:?}"
+        );
+        assert!(
+            matches!(
+                reports.last(),
+                Some(Report::Written {
+                    wrote_user_file: true,
+                    ..
+                })
+            ),
+            "{reports:?}"
+        );
+        assert!(
+            umber_core::docimport::import(&theirs).is_ok(),
+            "the painter's own file was not written, or is not a document"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocked);
+        let _ = std::fs::remove_dir_all(&documents);
+    }
+
     /// **The autosave writes a layer's effects, and both writers had to be
     /// wired in the same change.**
     ///
