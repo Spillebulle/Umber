@@ -1939,6 +1939,43 @@ pub fn drive(
     }
 }
 
+/// Give up on the capture reading `id`, because what it is reading is about to
+/// stop being what the document holds — an explicit Save, a canvas flip, a
+/// resize, a document closing.
+///
+/// **Both halves have to be told.** The renderer gives its staging buffer back
+/// and the scheduler stops waiting for pixels that are not coming; telling one
+/// and not the other is a whole capture stranded. Here rather than in `app.rs`
+/// so the rule can be driven by a test — `app.rs`'s `stop_autosave_of` is the
+/// call site and does nothing but hand over the map.
+///
+/// **It takes the whole map and finds the canvas itself**, rather than being
+/// handed one beside an `id`. The two would have to correspond and nothing
+/// would make them: hand it the wrong canvas and it cancels one document's
+/// capture while forgetting another's, which is the stranded job this whole
+/// change is about, arrived at from the other side. `next_due` picks the first
+/// *modified* tab and every caller passes the **active** document, so the two
+/// genuinely differ in an ordinary session — this is not a hypothetical
+/// mismatch. `an_interrupt_naming_another_document_leaves_the_capture_alone`
+/// is the guard.
+///
+/// The map is an `Option` because there may be no renderer at all: the resume
+/// path rebuilds them, and until then there is no capture to cancel — but the
+/// scheduler still has to be told, or it waits for pixels nothing will produce.
+pub fn interrupt(
+    autosave: &mut Autosave,
+    canvases: Option<&mut HashMap<DocId, CanvasRenderer>>,
+    id: DocId,
+) {
+    if autosave.capturing_id() != Some(id) {
+        return;
+    }
+    if let Some(canvas) = canvases.and_then(|c| c.get_mut(&id)) {
+        canvas.cancel_capture();
+    }
+    autosave.abandon();
+}
+
 /// Everything the autosave does *after* the frame has been presented: map what
 /// was recorded, collect what has come home, and apply whatever the writer
 /// thread has finished.
@@ -1997,6 +2034,36 @@ pub fn collect(
             // document is never autosaved again.
             editor.autosave.abandon();
         }
+    }
+
+    // **Every canvas, not only the one the scheduler is tracking.** A capture
+    // interrupted by a Save, a canvas flip or a resize is marked abandoned on
+    // the renderer and forgotten by the scheduler in the same breath — see
+    // [`interrupt`] — and the renderer deliberately does not free the job
+    // there, because a map may still be outstanding. The branch above reaches a
+    // canvas only through `capturing_id`, which the abandon has just emptied,
+    // so without this the job stays in flight for the life of the renderer:
+    // `capture_in_flight` never goes false, `begin_capture` refuses, and that
+    // document is never autosaved again with nothing on screen saying so.
+    //
+    // Free on the frames where there is nothing to settle — `settle_capture`
+    // acts only on an abandoned or failed job, and answers in one `Option` test
+    // otherwise — and it allocates nothing, which is what lets it sit here.
+    // The canvas the scheduler *is* tracking is in the set too and needs no
+    // special case: its live job is refused by that same test, and a job the
+    // collect above found failed is dropped here a frame earlier than it would
+    // have been rather than differently.
+    //
+    // **Every canvas rather than the active one is insurance, not a case
+    // anybody can reach today**, and saying which is the point: every caller of
+    // `interrupt` names the active document or drops the renderer a line later,
+    // so narrowing this to the active canvas would pass every test. What it
+    // would also do is make `collect` — which finds its canvas by
+    // `capturing_id` and never by which tab is in front — depend on the tab
+    // strip, so the day an interruption names a background document the bug
+    // comes back with nothing to catch it.
+    for canvas in canvases.values_mut() {
+        canvas.settle_capture(&gpu.device);
     }
 
     let mut notice = None;
@@ -3759,6 +3826,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&internal);
     }
 
+    /// One document, one real renderer, and the autosave pointed at scratch
+    /// directories and due immediately.
+    ///
+    /// Shared by the two frame-loop tests below rather than written out twice:
+    /// it is forty lines of GPU and directory bookkeeping and none of it is
+    /// what either test is about.
+    struct FrameLoop {
+        editor: Editor,
+        canvases: HashMap<DocId, CanvasRenderer>,
+        id: DocId,
+        documents: PathBuf,
+        internal: PathBuf,
+        /// The painter's own file.
+        theirs: PathBuf,
+        /// The internal copy.
+        ours: PathBuf,
+    }
+
+    impl FrameLoop {
+        /// `tag` keeps two of these out of each other's scratch directories.
+        fn new(gpu: &Gpu, tag: &str) -> Self {
+            let documents = scratch(&format!("{tag}-documents"));
+            let internal = scratch(&format!("{tag}-internal"));
+            let theirs = documents.join("hands.ora");
+            let ours = internal.join("hands-aaaabbbbccccdddd.ora");
+
+            let mut editor = Editor::default();
+            editor.doc = umber_core::Document::new(8, 8);
+            // A document that has a file and has been painted on since — the
+            // case where an autosave writes both destinations.
+            editor.session.mark_saved(theirs.clone());
+            editor.session.mark_modified();
+
+            let id = editor.session.active_id();
+            let mut canvas = CanvasRenderer::new(
+                &gpu.device,
+                &gpu.queue,
+                editor.doc.size,
+                wgpu::TextureFormat::Rgba8Unorm,
+                editor.layers.slot_capacity_needed(),
+            );
+            let mut enc = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            canvas.clear_all_layers(&gpu.queue);
+            canvas.clear_stroke(&gpu.device, &mut enc);
+            gpu.queue.submit(Some(enc.finish()));
+            let canvases = HashMap::from([(id, canvas)]);
+
+            // Due immediately, and pointed at a scratch directory rather than
+            // at the real one — a test must not write into somebody's data
+            // folder.
+            editor.autosave.interval = Duration::ZERO;
+            editor.autosave.expiry = None;
+            // Same rule for the session marker, and it matters more: a marker
+            // left in the real directory would be found by this machine's next
+            // start of Umber and offered to somebody as a document to recover.
+            editor.autosave.marks_dir = Some(scratch(&format!("{tag}-sessions")));
+            editor
+                .autosave
+                .next_due(Instant::now(), true, &editor.session);
+            editor
+                .autosave
+                .docs
+                .get_mut(&id)
+                .expect("a record")
+                .internal = Some(ours.clone());
+
+            Self {
+                editor,
+                canvases,
+                id,
+                documents,
+                internal,
+                theirs,
+                ours,
+            }
+        }
+
+        /// One frame, exactly as `app.rs` spends it: record, submit, collect.
+        fn frame(&mut self, gpu: &Gpu, quiet: bool) -> Option<Notice> {
+            let mut enc = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            drive(&mut self.editor, gpu, &mut self.canvases, &mut enc, quiet);
+            gpu.queue.submit(Some(enc.finish()));
+            collect(&mut self.editor, gpu, &mut self.canvases)
+        }
+
+        /// Both files down and the tab's dot off.
+        ///
+        /// The dot as well as the files, because the writing happens on a
+        /// thread and the dot comes off when its report is *collected* — so
+        /// stopping the moment both files appear can leave one frame's worth of
+        /// bookkeeping undone and fail an assertion the application would never
+        /// fail, since it collects on every frame.
+        fn settled(&self) -> bool {
+            self.theirs.exists() && self.ours.exists() && !self.editor.session.active_tab().modified
+        }
+
+        /// Spend frames until the document has been written, or give up.
+        fn run_until_written(&mut self, gpu: &Gpu) {
+            for _ in 0..2000 {
+                let notice = self.frame(gpu, true);
+                assert!(notice.is_none(), "{:?}", notice.map(|n| n.lines));
+                if self.settled() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Drop for FrameLoop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.documents);
+            let _ = std::fs::remove_dir_all(&self.internal);
+        }
+    }
+
     /// The whole feature through the frame loop, on a real device.
     ///
     /// Every part of this is tested on its own — the capture against the
@@ -3777,95 +3964,149 @@ mod tests {
             eprintln!("no GPU adapter available; skipping");
             return;
         };
-
-        let documents = scratch("loop-documents");
-        let internal = scratch("loop-internal");
-        let theirs = documents.join("hands.ora");
-
-        let mut editor = Editor::default();
-        editor.doc = umber_core::Document::new(8, 8);
-        // A document that has a file and has been painted on since — the case
-        // where an autosave writes both destinations.
-        editor.session.mark_saved(theirs.clone());
-        editor.session.mark_modified();
-
-        let id = editor.session.active_id();
-        let mut canvas = CanvasRenderer::new(
-            &gpu.device,
-            &gpu.queue,
-            editor.doc.size,
-            wgpu::TextureFormat::Rgba8Unorm,
-            editor.layers.slot_capacity_needed(),
-        );
-        let mut enc = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        canvas.clear_all_layers(&gpu.queue);
-        canvas.clear_stroke(&gpu.device, &mut enc);
-        gpu.queue.submit(Some(enc.finish()));
-        let mut canvases = HashMap::from([(id, canvas)]);
-
-        // Due immediately, and pointed at a scratch directory rather than at
-        // the real one — a test must not write into somebody's data folder.
-        editor.autosave.interval = Duration::ZERO;
-        editor.autosave.expiry = None;
-        // Same rule for the session marker, and it matters more: a marker left
-        // in the real directory would be found by this machine's next start of
-        // Umber and offered to somebody as a document to recover.
-        editor.autosave.marks_dir = Some(scratch("loop-sessions"));
-        editor
-            .autosave
-            .next_due(Instant::now(), true, &editor.session);
-        editor
-            .autosave
-            .docs
-            .get_mut(&id)
-            .expect("a record")
-            .internal = Some(internal.join("hands-aaaabbbbccccdddd.ora"));
-        let ours = internal.join("hands-aaaabbbbccccdddd.ora");
+        let mut loops = FrameLoop::new(gpu, "loop");
 
         // A stroke in progress must hold everything back, however overdue it
         // is. This is the guarantee the whole schedule rests on.
-        let mut enc = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        drive(&mut editor, gpu, &mut canvases, &mut enc, false);
-        gpu.queue.submit(Some(enc.finish()));
+        loops.frame(gpu, false);
         assert!(
-            !editor.autosave.capturing(),
+            !loops.editor.autosave.capturing(),
             "an autosave started in the middle of a stroke"
         );
 
-        for _ in 0..2000 {
-            let mut enc = gpu
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            drive(&mut editor, gpu, &mut canvases, &mut enc, true);
-            gpu.queue.submit(Some(enc.finish()));
-            let notice = collect(&mut editor, gpu, &mut canvases);
-            assert!(notice.is_none(), "{:?}", notice.map(|n| n.lines));
-            // Wait for the dot as well as for the files. The writing happens on
-            // a thread and the dot comes off when its report is *collected*,
-            // which is earlier in this same iteration — so stopping the moment
-            // both files appear can leave one frame's worth of bookkeeping
-            // undone and fail an assertion the application would never fail,
-            // since it collects on every frame.
-            if theirs.exists() && ours.exists() && !editor.session.active_tab().modified {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        loops.run_until_written(gpu);
 
-        assert!(theirs.exists(), "the document's own file was never written");
-        assert!(ours.exists(), "the internal copy was never written");
-        assert!(umber_core::docimport::import(&theirs).is_ok());
         assert!(
-            !editor.session.active_tab().modified,
+            loops.theirs.exists(),
+            "the document's own file was never written"
+        );
+        assert!(loops.ours.exists(), "the internal copy was never written");
+        assert!(umber_core::docimport::import(&loops.theirs).is_ok());
+        assert!(
+            !loops.editor.session.active_tab().modified,
             "the tab's dot should come off once its own file has been written"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&documents);
-        let _ = std::fs::remove_dir_all(&internal);
+    /// A Save, a canvas flip or a resize part-way through a capture must not
+    /// stop the document ever being autosaved again.
+    ///
+    /// [`interrupt`] marks the renderer's job abandoned and forgets it on the
+    /// scheduler in the same breath — and the renderer deliberately does *not*
+    /// free the job there, because a map may still be outstanding; see
+    /// `cancel_capture`'s own documentation. Something has to keep asking until
+    /// it settles, and for a long time nothing did: [`drive`] and [`collect`]
+    /// reach a canvas only through `capturing_id`, which the abandon had just
+    /// emptied. The job then stayed in flight for the life of the renderer,
+    /// `capture_in_flight` stayed true, `begin_capture` refused every later
+    /// autosave of that document, and **nothing on screen said so** — the
+    /// painter believes their work is being written every five minutes and it
+    /// is not.
+    ///
+    /// Driven rather than asserted about: the interruption is the real
+    /// `interrupt`, and what is measured is whether a file appears afterwards.
+    #[test]
+    fn a_capture_interrupted_by_a_save_does_not_stop_the_next_autosave() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "interrupted");
+
+        // One frame starts a capture and cannot finish one: an 8-square
+        // document is two steps, and every step needs a frame to record it and
+        // another to collect it.
+        loops.frame(gpu, true);
+        assert!(
+            loops.editor.autosave.capturing(),
+            "there was no capture in flight to interrupt"
+        );
+        assert!(
+            !loops.theirs.exists(),
+            "the capture finished in one frame, so this interrupts nothing"
+        );
+
+        // Exactly what an explicit Save does, through the one function that
+        // states the rule.
+        let id = loops.id;
+        interrupt(&mut loops.editor.autosave, Some(&mut loops.canvases), id);
+        assert!(
+            !loops.editor.autosave.capturing(),
+            "the scheduler went on waiting for a capture it had given up on"
+        );
+
+        loops.run_until_written(gpu);
+
+        assert!(
+            loops.theirs.exists() && loops.ours.exists(),
+            "the document was never autosaved again after one capture was \
+             interrupted: the renderer's abandoned job was left in flight, so \
+             `begin_capture` refused for the rest of the run",
+        );
+        assert!(umber_core::docimport::import(&loops.theirs).is_ok());
+        assert!(
+            !loops.editor.session.active_tab().modified,
+            "the tab's dot should come off once its own file has been written"
+        );
+    }
+
+    /// Interrupting **another** document must leave the capture in flight
+    /// alone, and this is the one predicate `settle_capture` cannot back up.
+    ///
+    /// A live job is refused by the settler on purpose, so the way to
+    /// reintroduce the stranded capture after that fix is to reach
+    /// `Autosave::abandon` while the renderer's job is *not* marked — which is
+    /// what a wrong id does. And the two genuinely differ in an ordinary
+    /// session: `next_due` picks the first **modified** tab while
+    /// `save_document`, `flip_canvas` and `apply_canvas` all pass the
+    /// **active** one, so a Save of the document in front while a background
+    /// tab is being captured is the common case rather than a contrived one.
+    ///
+    /// **The reading of `capturing_id` is what catches it, and the run to a
+    /// written file is not** — said plainly rather than left to look like two
+    /// assertions of equal weight. Once `collect` settles every canvas, a
+    /// capture wrongly given up on is simply restarted a frame later and the
+    /// file appears anyway, so the outcome cannot tell the two apart. What the
+    /// second half is for is that nothing was *stranded* on the way through.
+    /// Demonstrated by mutation: `capturing_id() != Some(id)` weakened to
+    /// `capturing_id().is_none()` fails on the first assertion and would pass
+    /// the second.
+    #[test]
+    fn an_interrupt_naming_another_document_leaves_the_capture_alone() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "other-document");
+
+        loops.frame(gpu, true);
+        assert!(
+            loops.editor.autosave.capturing(),
+            "there was no capture in flight to leave alone"
+        );
+
+        // A document this session has never opened — the id `Session::open`
+        // would have to mint many tabs to reach.
+        let elsewhere = DocId::for_test(u64::MAX);
+        assert_ne!(elsewhere, loops.id);
+        interrupt(
+            &mut loops.editor.autosave,
+            Some(&mut loops.canvases),
+            elsewhere,
+        );
+        assert_eq!(
+            loops.editor.autosave.capturing_id(),
+            Some(loops.id),
+            "interrupting one document gave up on another's capture"
+        );
+
+        loops.run_until_written(gpu);
+        assert!(
+            loops.theirs.exists() && loops.ours.exists(),
+            "the capture never finished: naming another document cancelled the \
+             renderer's half of this one",
+        );
+        assert!(umber_core::docimport::import(&loops.theirs).is_ok());
     }
 
     #[test]

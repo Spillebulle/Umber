@@ -5042,6 +5042,86 @@ fn a_cancelled_capture_hands_its_buffers_back_rather_than_being_dropped() {
     );
 }
 
+#[test]
+fn settling_clears_a_cancelled_capture_and_leaves_a_live_one_alone() {
+    // `cancel_capture` marks the job and does not free it, so *something* has
+    // to keep asking — and the caller that cancels has usually stopped tracking
+    // the document in the same breath. `settle_capture` is that something, and
+    // it is the whole of what stops a cancelled capture holding
+    // `capture_in_flight` true for the life of the renderer, refusing every
+    // later autosave of that document.
+    let mut h = harness_or_skip!();
+    let draws = vec![LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+        mask: None,
+        clipped: false,
+    }];
+
+    // **A live capture is not this function's business**, and what is at stake
+    // is not tidiness: `take_capture` hands the finished document to whoever
+    // asks, so a settle that reached a live job would collect it and drop it on
+    // the floor — its owner would then find nothing in flight and end the
+    // autosave having written nothing. So here is a whole capture's worth of
+    // frames with the settler as the *only* thing asking after it: it must
+    // still be in flight at the end, waiting for the owner that never came.
+    //
+    // Enough frames for a real capture several times over — a settle that
+    // reached this one finishes it in about four, demonstrated by mutation,
+    // taking the abandoned-or-failed test out. Only the first iteration records
+    // anything: `drive_capture` declines a step while one is `Rendering`, which
+    // is exactly the point, since nothing but the settler is here to advance
+    // it.
+    assert!(h.canvas.begin_capture(&[0], &draws));
+    for _ in 0..40 {
+        let mut enc = h.encoder();
+        h.canvas
+            .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
+        h.canvas.settle_capture(&h.gpu.device);
+        if !h.canvas.capture_in_flight() {
+            break;
+        }
+        // As in `drive_to_completion`: the poll does not wait, so this loop has
+        // to, or forty iterations pass before the GPU finishes the first copy
+        // and the test proves nothing.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        h.canvas.capture_in_flight(),
+        "settling collected a capture that was still somebody's, so its \
+         document went nowhere"
+    );
+
+    // That leaves the job exactly where a Save mid-capture leaves one: a copy
+    // recorded and no map outstanding, which is the state that needs *both*
+    // halves of `settle_capture` to move — `submit_capture` to map it and
+    // `take_capture` to unmap it and let it go. It is a different state from
+    // the one `a_cancelled_capture_hands_its_buffers_back_rather_than_being_
+    // dropped` cancels in, which is already mapping.
+    h.canvas.cancel_capture();
+
+    for _ in 0..2000 {
+        h.canvas.settle_capture(&h.gpu.device);
+        if !h.canvas.capture_in_flight() {
+            break;
+        }
+        // As in `drive_to_completion`: the poll does not wait, so this loop has
+        // to.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !h.canvas.capture_in_flight(),
+        "settling never cleared a cancelled capture"
+    );
+    assert!(
+        h.canvas.begin_capture(&[0], &draws),
+        "the next capture was still refused"
+    );
+}
+
 // --- floating transforms ----------------------------------------------------
 
 /// Everything the transform tool asks of the GPU, in the order it asks it.
