@@ -128,8 +128,10 @@
 //! exits non-zero, so a robot reading this example has to read the lines.
 //!
 //! **What that check catches, demonstrated by mutation rather than claimed.**
-//! Dropping the canvas-edge weight collapse is 16 of 255; permuting the gather's
-//! component order is 22; aiming the gather one texel over is 23. What it does
+//! Dropping the canvas-edge weight collapse is 16 of 255 (see [`check_cameras`]
+//! for which aim and which store see it, which is not all of them); permuting
+//! the gather's component order is 22; aiming the gather one texel over is 23;
+//! narrowing the fast-path test to its x half is 24. What it does
 //! **not** catch is aiming at the texel corner (`+ 0.5`) instead of its centre
 //! (`+ 1.0`) — that came back exact. That is the honest reading and it is the
 //! reason the aim is written the way it is: at the corner the hardware's own
@@ -1732,22 +1734,35 @@ fn spread_pct(s: &Summary) -> f64 {
 /// is the high clamp. Both hold whatever the canvas and the output are, which is
 /// the property the centred aim did not have.
 ///
-/// **The bottom-right aim reaches the high clamp and cannot fail on it, and
-/// saying which is the honest move.** Demonstrated by mutation on 2048²:
-/// dropping the weight collapse leaves the interior aim at 0 (it never clamps),
-/// takes the top-left aim to **16 of 255**, and leaves the bottom-right aim at
-/// **0**. The reason is [`page_bytes`]: the padding outside the canvas
-/// *replicates the edge texel*, so at the high end the texel a gather wrongly
-/// reads beside `w - 1` is equal to `w - 1` and the error cancels. That
-/// replication is not incidental and cannot be removed — it is what makes the
-/// `sampled` baseline faithful to the canvas-sized slice the atlas replaced,
-/// whose `ClampToEdge` had nothing beyond the canvas to reach, and without it
-/// the two disagreed by 9 of 255 along the last half-texel band.
+/// **The two clamps are not equally visible, and which is which depends on the
+/// canvas and the store.** Dropping the weight collapse and measuring:
 ///
-/// So the two aims are not symmetric: one is a live guard and one exercises the
-/// path without being able to judge it. What makes that acceptable rather than a
-/// hole is that both ends and both axes go through **one** `select`, so the rule
-/// has a guard even though one of its four cases does not.
+/// | | dense | blob | scatter |
+/// |---|---|---|---|
+/// | 2048², top-left | **16** | 3 | 4 |
+/// | 2048², bottom-right | 0 | 0 | 0 |
+/// | 1920x1080, top-left | **16** | 4 | 7 |
+/// | 1920x1080, bottom-right | 0 | **2** | **3** |
+///
+/// The **low** clamp is caught everywhere: a gather at document 0 reads texels 0
+/// and 1, both real content, on any store.
+///
+/// The **high** clamp is caught only where the texel beside `w - 1` differs from
+/// it, and there are two separate ways for it not to. On the **dense** store
+/// [`page_bytes`] replicates the edge texel into the padding, so they are equal
+/// by construction — and that replication cannot be removed, because it is what
+/// makes the `sampled` baseline faithful to the canvas-sized slice the atlas
+/// replaced, whose `ClampToEdge` had nothing beyond the canvas to reach; without
+/// it the two disagreed by 9 of 255 along the last half-texel band. On **2048²**
+/// the page *is* the canvas, so there is no padding at all and the sampler's own
+/// `ClampToEdge` at the page edge returns `w - 1` again — on every store. Only a
+/// canvas that is not a whole number of tiles, read through a **packed** atlas,
+/// makes that texel unrelated content and the error visible.
+///
+/// **This paragraph previously gave one mechanism for all of that and it was
+/// wrong**, generalised from the 2048² dense reading alone: it said the
+/// bottom-right aim "cannot fail". It can, and does, at 1920x1080 on both packed
+/// stores. Found by a critic, and the table above is what re-measuring produced.
 fn check_cameras(doc: UVec2, output: UVec2) -> Vec<(&'static str, Camera)> {
     let pivot = Vec2::new(output.x as f32 / 2.0, output.y as f32 / 2.0);
     // Far enough in that the corner is comfortably on screen and there is a

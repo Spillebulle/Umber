@@ -1510,10 +1510,12 @@ whole design" — a one-texel seam appearing only at some zooms on some layers
 because one writer forgot to refresh it — and because dropping it makes a tile's
 pitch equal its size, which is what lets a page be the canvas rounded up and
 never larger than a limit the canvas was already inside. Both arguments stand.
-What has changed is that the bill is a number, and that the number is **+0.47 ms
+What has changed is that the bill is a number, and that the number is **+0.20 ms
 of it and not +1.23 ms**: an apron would let the fast path take one hardware tap,
 which the `hw-fast` column measures at 2.29 ms against 2.49 — an **8%** saving on
-the pass, not the 50% the earlier reading implied.
+the pass, not the 50% the earlier reading implied. It is not the 0.47 either,
+which is what four loads cost against *no* fetch and is not a thing an apron
+recovers.
 
 ### 11.3a `textureGather` was measured, and it loses
 
