@@ -12,9 +12,16 @@ wgpu = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }
 log = { workspace = true }
+# One `block_on`, in `canvas::try_reserve`, over a future wgpu builds with
+# `ready(...)` — so it resolves without ever yielding and this is an extractor
+# rather than a wait. wgpu's own documentation for `ErrorScopeGuard::pop` says
+# the pop takes effect immediately and the future need not be awaited before
+# doing work outside the scope, so there is no GPU stall here either. It was
+# already a dev-dependency and is already in the shipped tree through
+# `umber-app`, so this adds nothing to the binary.
+pollster = { workspace = true }
 
 [dev-dependencies]
-pollster = { workspace = true }
 # `examples/measure-effects.rs` writes the pictures that settle how a layer
 # effect's stroke gets its distance. The same crate `umber-core` already uses
 # for export, so this adds nothing to the tree, and it is a dev-dependency

@@ -3530,6 +3530,102 @@ fn a_renderer_is_built_at_its_documents_slot_count_and_keeps_the_speculation() {
     );
 }
 
+/// A reservation the device can satisfy must build **exactly** the renderer the
+/// infallible path would have, and nothing about the picture may move.
+///
+/// This is the constraint the whole refusal path is held to: it changes what
+/// happens when an allocation fails and must change nothing about what happens
+/// when one succeeds. The two easy ways to break that are a different capacity —
+/// `try_with_shared` computing its own rather than sharing `built_capacity` —
+/// and a renderer assembled differently, which would show up as pixels.
+///
+/// So it measures both: the capacity that was allocated, against the infallible
+/// twin asked the same question, and a stroke committed through the reserved
+/// renderer read back off its own slice.
+///
+/// **It does not exercise a refusal.** See
+/// `a_reservation_builds_no_view_before_it_has_checked` in `canvas.rs` for why
+/// nothing here provokes a real out-of-memory.
+#[test]
+fn a_reservation_that_fits_builds_what_the_infallible_path_builds() {
+    let mut h = harness_or_skip!();
+
+    let expected = h.canvas.for_document(&h.gpu.device, UVec2::splat(64), 21);
+    let reserved = h
+        .canvas
+        .try_for_document(&h.gpu.device, UVec2::splat(64), 21)
+        .expect("64 square by 21 slices is 344 KB; no device refuses that");
+    assert_eq!(
+        reserved.slot_capacity(),
+        expected.slot_capacity(),
+        "the fallible door allocated a different array from the one beside it"
+    );
+
+    drop(reserved);
+
+    // And the reserved renderer is a renderer: paint through it and read the
+    // slice back. A store built from a texture the caller passed in is where an
+    // array view left unbuilt, or built against the wrong texture, would show.
+    h.canvas = h
+        .canvas
+        .try_for_document(&h.gpu.device, UVec2::new(DOC, DOC), 4)
+        .expect("the harness canvas, reserved rather than assumed");
+    let mut enc = h.encoder();
+    h.canvas.clear_all_layers(&mut enc);
+    h.canvas.clear_stroke(&h.gpu.device, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    h.stamp(&[dab(32.0, 32.0, 10.0, 1.0)]);
+    h.commit_to(
+        0,
+        Color::from_srgb_u8(200, 40, 40, 255),
+        1.0,
+        BrushMode::Paint,
+    );
+    assert_near(
+        h.pixel_in(0, 32, 32),
+        [200, 40, 40],
+        2,
+        "a stroke committed into a reserved array",
+    );
+}
+
+/// The fallible growth is the same growth: it copies the picture across and
+/// clears what it added.
+///
+/// The twin of `growing_the_layer_array_preserves_existing_pixels`, and it
+/// exists because `ensure_slots` was split into a decision and a copy so the two
+/// doors could share both. A copy the fallible door forgot would lose the
+/// artist's work on the frame they added a layer, and the guard on the
+/// infallible door cannot see it.
+#[test]
+fn growing_through_the_fallible_door_preserves_existing_pixels() {
+    let mut h = harness_or_skip!();
+
+    h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
+    assert!(h.canvas.slot_capacity() < 8);
+
+    h.canvas
+        .try_ensure_slots(&h.gpu.device, &h.gpu.queue, 8)
+        .expect("eight slices of a 64-square canvas is 128 KB");
+    assert!(h.canvas.slot_capacity() >= 8);
+
+    assert_near(h.pixel_in(0, 32, 32), [200, 40, 40], 2, "after growth");
+    assert_eq!(
+        h.pixel_in(7, 32, 32)[3],
+        0,
+        "newly allocated slots must start transparent"
+    );
+
+    // Asked again for what it already holds, it must allocate nothing at all —
+    // the early return is what makes a reservation free on every add that fits.
+    let held = h.canvas.slot_capacity();
+    h.canvas
+        .try_ensure_slots(&h.gpu.device, &h.gpu.queue, 8)
+        .expect("nothing to do cannot fail");
+    assert_eq!(h.canvas.slot_capacity(), held);
+}
+
 /// A resize rebuilds the array at the *live* slice count, not the one the old
 /// canvas happened to be holding.
 ///

@@ -89,6 +89,8 @@ mod ui;
 /// payload back with, so the writer and the reader cannot drift.
 pub mod update;
 mod updatedlg;
+/// What Umber says when the graphics card will not hold a document's layers.
+mod vram;
 mod widgets;
 
 pub use app::{UmberApp, Wake};
