@@ -7,6 +7,7 @@ use glam::UVec2;
 use zip::ZipArchive;
 
 use super::{ImportError, ImportedDocument, SourceFormat};
+use crate::geom::PixelRect;
 
 pub type Zip<'a> = ZipArchive<Cursor<&'a [u8]>>;
 
@@ -179,13 +180,77 @@ impl Attrs {
     }
 }
 
-/// Copy a layer's own rectangle into a canvas-sized buffer.
+/// The part of a layer's own rectangle that lands on the canvas, as its own
+/// tightly packed rectangle.
 ///
 /// Source layers are stored at their bounding box with an offset, which may be
 /// negative and may run past the canvas — Photoshop and Krita both keep pixels
 /// outside the visible area, and a document that has been cropped is full of
 /// them. Everything outside the canvas is dropped here rather than trusted to
 /// arithmetic later.
+///
+/// `None` where nothing lands, which is a layer dragged entirely off the page.
+/// That is not an error: the old dense reader produced a canvas of zeroes for
+/// it, and no piece at all is the same picture — see [`PixelPiece`]'s rule 3.
+///
+/// **The clipping is [`blit`]'s, arithmetic for arithmetic.** They are the same
+/// two intersections and a divergence between them is a layer landing a pixel
+/// out; `cropping_agrees_with_the_dense_blit_it_replaced` drives both over the
+/// same offsets and compares the assembled result.
+///
+/// [`PixelPiece`]: super::PixelPiece
+pub fn crop(
+    src: &[u8],
+    src_size: UVec2,
+    at: (i64, i64),
+    canvas: UVec2,
+) -> Option<(PixelRect, Vec<u8>)> {
+    debug_assert_eq!(src.len(), src_size.x as usize * src_size.y as usize * 4);
+
+    // **Saturating, because the offset is a number out of somebody else's
+    // file.** An ORA's `x`/`y` are parsed as `i64` and `-i64::MIN` panics in a
+    // debug build and wraps in a release one — into a rectangle that then
+    // indexes past the source. Every clamp below refuses anything that does not
+    // land, so saturating to the ends is exactly right: an offset that far out
+    // reaches no canvas. `blit` has the same expressions and is left alone
+    // because both its remaining call sites pass `(0, 0)`; if either ever takes
+    // an offset off a file, it wants this too.
+    let (ox, oy) = at;
+    let y_from = oy.saturating_neg().clamp(0, src_size.y as i64);
+    let y_to = (canvas.y as i64)
+        .saturating_sub(oy)
+        .clamp(0, src_size.y as i64);
+    let x_from = ox.saturating_neg().clamp(0, src_size.x as i64);
+    let x_to = (canvas.x as i64)
+        .saturating_sub(ox)
+        .clamp(0, src_size.x as i64);
+    if y_to <= y_from || x_to <= x_from {
+        return None;
+    }
+
+    let width = (x_to - x_from) as usize;
+    let height = (y_to - y_from) as usize;
+    let mut bytes = Vec::with_capacity(width * height * 4);
+    for sy in y_from..y_to {
+        let start = ((sy * src_size.x as i64 + x_from) * 4) as usize;
+        bytes.extend_from_slice(&src[start..start + width * 4]);
+    }
+    Some((
+        PixelRect {
+            x: (x_from + ox) as u32,
+            y: (y_from + oy) as u32,
+            width: width as u32,
+            height: height as u32,
+        },
+        bytes,
+    ))
+}
+
+/// Copy a layer's own rectangle into a canvas-sized buffer.
+///
+/// The dense form of [`crop`], kept for the flattened fallbacks — a
+/// `mergedimage.png` is one picture at the origin and there is nothing sparse
+/// about it — and for the tests that hold the two in step.
 ///
 /// Both buffers are plain RGBA8 in the same encoding; this is a copy, not a
 /// composite.
@@ -219,6 +284,80 @@ mod tests {
 
     fn canvas(size: UVec2) -> Vec<u8> {
         vec![0; size.x as usize * size.y as usize * 4]
+    }
+
+    /// **The one guard that says the sparse path did not move a pixel.**
+    ///
+    /// `crop` replaced `blit` on the ORA layer path, and the two are the same
+    /// two intersections written twice — which is exactly the shape this
+    /// codebase distrusts. So they are driven against each other over every
+    /// offset that can arise from a real file: inside, hanging off each edge,
+    /// hanging off two at once, and missing the canvas entirely. The source
+    /// carries a different byte in every pixel, so a copy that is out by a row
+    /// or a column cannot pass by accident.
+    ///
+    /// Demonstrated by mutation: change either clamp in `crop` by one and this
+    /// fails; drop the `x_from` term from the destination and it fails.
+    #[test]
+    fn cropping_agrees_with_the_dense_blit_it_replaced() {
+        let size = UVec2::new(7, 5);
+        let src_size = UVec2::new(4, 3);
+        // Every byte distinct, so a shift shows up rather than cancelling.
+        let src: Vec<u8> = (0..(src_size.x * src_size.y * 4) as u8).collect();
+
+        for oy in -4i64..=6 {
+            for ox in -5i64..=8 {
+                let mut dense = canvas(size);
+                blit(&mut dense, size, &src, src_size, (ox, oy));
+
+                let mut sparse = canvas(size);
+                if let Some((rect, bytes)) = crop(&src, src_size, (ox, oy), size) {
+                    assert!(
+                        rect.x + rect.width <= size.x && rect.y + rect.height <= size.y,
+                        "a crop must land inside the canvas: {rect:?} at ({ox}, {oy})"
+                    );
+                    assert_eq!(bytes.len() as u64, rect.area() * 4);
+                    for row in 0..rect.height as usize {
+                        let from = row * rect.width as usize * 4;
+                        let to =
+                            (rect.y as usize + row) * size.x as usize * 4 + rect.x as usize * 4;
+                        let len = rect.width as usize * 4;
+                        sparse[to..to + len].copy_from_slice(&bytes[from..from + len]);
+                    }
+                }
+                assert_eq!(sparse, dense, "offset ({ox}, {oy})");
+            }
+        }
+    }
+
+    /// A layer entirely off the page yields no piece, which is the same picture
+    /// the canvas of zeroes was — and is the case that makes "no piece means
+    /// the empty value" load-bearing rather than decorative.
+    ///
+    /// **The two extremes are in the sweep, and they are not decoration.** An
+    /// ORA's `x`/`y` are parsed as `i64` off a file a stranger wrote, and
+    /// `-i64::MIN` panics in a debug build; the whole arithmetic here is
+    /// saturating because of it. Nothing else in this module drives that value.
+    #[test]
+    fn a_layer_that_misses_the_canvas_yields_nothing_at_all() {
+        let size = UVec2::new(4, 4);
+        let src = vec![255u8; 2 * 2 * 4];
+        for at in [
+            (-2, 0),
+            (4, 0),
+            (0, -2),
+            (0, 4),
+            (-9, -9),
+            (i64::MIN, 0),
+            (0, i64::MIN),
+            (i64::MAX, i64::MAX),
+            (i64::MIN, i64::MAX),
+        ] {
+            assert!(
+                crop(&src, UVec2::new(2, 2), at, size).is_none(),
+                "a 2×2 layer at {at:?} does not reach a 4×4 canvas"
+            );
+        }
     }
 
     #[test]

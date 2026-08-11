@@ -62,8 +62,8 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
-    check_bounds, disable_effects_over_budget, flat, history, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat,
+    StackSize, check_bounds, disable_effects_over_budget, flat, history, srgb,
 };
 use crate::color::Color;
 use crate::docformat;
@@ -169,7 +169,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
             .background
             .map_or(Background::Transparent, Background::opaque);
     }
-    check_bounds(
+    let mut budget = check_bounds(
         FORMAT,
         size.x,
         size.y,
@@ -185,6 +185,11 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         progress(done as u32, total);
         match load_layer(&mut zip, &spec, size, &mut warnings) {
             Ok(layer) => {
+                // Charged as it lands rather than once at the end: what this
+                // bounds is the *accumulation*, and a stack of sixty-four PNGs
+                // each declaring 16384² must not all be decoded before anybody
+                // objects. See `PieceBudget`.
+                budget.charge(&layer)?;
                 if spec.selected {
                     active = Some(layers.len());
                 }
@@ -544,15 +549,18 @@ fn load_layer(
     // layer-texture buffer is the wrong thing to hash.
     let text = load_text(zip, spec, &image, warnings);
 
-    let mut pixels = vec![0u8; canvas.x as usize * canvas.y as usize * 4];
-    container::blit(
-        &mut pixels,
-        canvas,
-        &image.rgba,
-        image.size,
-        (spec.x, spec.y),
-    );
-    srgb::encode_buffer(&mut pixels);
+    // **One piece: the layer's own rectangle clipped to the canvas.** An ORA
+    // layer is one PNG at an offset, so that rectangle is exactly what the file
+    // holds and there is nothing finer to cut it into. A layer entirely off the
+    // page yields no piece, which is the same picture the canvas of zeroes used
+    // to be — `PixelPiece`'s rule 3.
+    let pixels = match container::crop(&image.rgba, image.size, (spec.x, spec.y), canvas) {
+        Some((rect, mut bytes)) => {
+            srgb::encode_buffer(&mut bytes);
+            vec![PixelPiece::new(rect, bytes)]
+        }
+        None => Vec::new(),
+    };
 
     let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
     layer.text = text;
@@ -670,7 +678,7 @@ fn load_mask(
     spec: &LayerSpec,
     canvas: UVec2,
     warnings: &mut Vec<ImportWarning>,
-) -> Option<Vec<u8>> {
+) -> Option<Vec<PixelPiece>> {
     let src = spec.mask_src.as_ref()?;
     let decoded = container::read_optional_entry(zip, src, FORMAT)
         .ok()
@@ -678,7 +686,11 @@ fn load_mask(
         .and_then(|png| flat::decode_png(&png, FORMAT).ok())
         .filter(|image| image.size == canvas);
     match decoded {
-        Some(image) => Some(image.rgba),
+        // One canvas piece, and the filter above is why it can be nothing else:
+        // an Umber mask entry is written at the canvas's own size and one that
+        // is not is refused rather than placed. See `PixelPiece`'s rule 3 for
+        // why a mask may not go sparse yet in any case.
+        Some(image) => Some(vec![PixelPiece::whole(canvas, image.rgba)]),
         None => {
             warnings.push(ImportWarning::MaskIgnored {
                 layer: spec.name.clone(),
@@ -779,7 +791,7 @@ fn flattened_fallback(
         layers: vec![ImportedLayer::new(
             "Merged image",
             BlendMode::Normal,
-            pixels,
+            vec![PixelPiece::whole(canvas, pixels)],
         )],
         active: None,
         // `mergedimage.png` already has the background composited into it, so
@@ -873,12 +885,61 @@ mod tests {
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 
+    /// **An ORA layer yields its own rectangle and not the canvas**, which is
+    /// what makes Umber's own documents cheap to reopen: `docformat::trim`
+    /// writes each layer cropped to its content with an offset, so a stack of
+    /// sketches on a large canvas costs what the sketches cost.
+    ///
+    /// The picture is checked against an expectation built from the fixture, the
+    /// piece rules are driven, and the sparsity is asserted — the third is what
+    /// a version that went back to a canvas-sized buffer would fail.
+    #[test]
+    fn a_layer_yields_only_its_own_rectangle() {
+        let canvas = UVec2::new(64, 64);
+        // The fixture places a layer smaller than the canvas at (1, 1).
+        let ora = fixtures::ora(
+            canvas.x,
+            canvas.y,
+            &[fixtures::OraLayer::new("Ink", 8, 8, &[1, 2, 3, 255])],
+        );
+        let doc = read(&ora).unwrap();
+        let layer = &doc.layers[0];
+
+        crate::docimport::check_piece_rules(&layer.pixels, canvas);
+        assert_eq!(layer.pixels.len(), 1, "one PNG is one rectangle");
+        assert_eq!(
+            layer.pixels[0].rect,
+            crate::geom::PixelRect {
+                x: 1,
+                y: 1,
+                width: 8,
+                height: 8
+            }
+        );
+
+        let mut expected = vec![0u8; (canvas.x * canvas.y * 4) as usize];
+        for y in 1..9usize {
+            for x in 1..9usize {
+                let px = (y * canvas.x as usize + x) * 4;
+                expected[px..px + 4].copy_from_slice(&[1, 2, 3, 255]);
+            }
+        }
+        assert_eq!(layer.dense(canvas), expected, "the picture moved");
+
+        assert_eq!(layer.pixel_bytes(), 8 * 8 * 4);
+        assert!(
+            layer.pixel_bytes() * 16 < u64::from(canvas.x) * u64::from(canvas.y) * 4,
+            "an 8-square layer on a 64-square page must not be charged the page"
+        );
+    }
+
     #[test]
     fn a_small_layer_lands_at_its_offset() {
         // The 1×1 blue top layer sits at x=1,y=1 in the fixture.
         let doc = read(&two_layer_ora()).unwrap();
         let top = &doc.layers[1];
-        let at = |x: usize, y: usize| &top.pixels[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+        let pixels = top.dense(UVec2::new(4, 4));
+        let at = |x: usize, y: usize| &pixels[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
         assert_eq!(at(1, 1), [0, 0, 255, 255]);
         assert_eq!(at(0, 0), [0, 0, 0, 0], "outside the layer must be empty");
     }
@@ -1151,7 +1212,11 @@ mod tests {
             );
             // The pixels are untouched, which is the half that matters. The
             // fixture places every layer at (1,1), so that is where to look.
-            assert_eq!(&doc.layers[0].pixels[12..16], [1, 2, 3, 255], "{record}");
+            assert_eq!(
+                &doc.layers[0].dense(UVec2::new(2, 2))[12..16],
+                [1, 2, 3, 255],
+                "{record}"
+            );
         }
     }
 

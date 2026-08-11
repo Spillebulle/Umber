@@ -322,11 +322,19 @@ mod tests {
     /// large canvas must not allocate sixty canvases, which is what makes this
     /// safe to run inside a file manager.
     ///
-    /// Driven at a canvas whose *import* would be refused outright — 64 layers
-    /// at 10000² is 25.6 GB and past `MAX_TOTAL_BYTES` — so a preview that went
-    /// anywhere near the import path could not merely be slow here, it would
-    /// fail. The fixture stays small because a layer with a 1×1 bitmap and a
-    /// folder both cost nothing.
+    /// Driven at a canvas whose *import* is refused outright, so a preview that
+    /// went anywhere near the import path could not merely be slow here, it
+    /// would fail. The fixture stays small because a layer with a 1×1 bitmap
+    /// costs nothing.
+    ///
+    /// **The refusal used to be the byte bound and no longer can be**, which is
+    /// worth saying rather than quietly swapping: this was 64 layers at 10000²,
+    /// refused as 25.6 GB, and the piece contract retired exactly that — those
+    /// layers hold a pixel each and are now charged a pixel each. The canvas
+    /// ceiling is the bound that still refuses off the header alone, and it is
+    /// derived from `MAX_DIMENSION` rather than written out, so raising it
+    /// moves this case with it instead of leaving one that no longer exercises
+    /// itself.
     #[test]
     fn a_thumbnail_of_a_document_too_large_to_import_still_works() {
         let mut layers =
@@ -334,7 +342,8 @@ mod tests {
         for _ in 0..63 {
             layers.push(ClipLayer::flat("More", 1, 1, [0, 255, 0, 255]).placed((1, 1), (0, 0)));
         }
-        let bytes = fixtures::clip(10000, 10000, &layers);
+        let edge = super::super::ImportedDocument::MAX_DIMENSION + 1;
+        let bytes = fixtures::clip(edge, edge, &layers);
 
         assert!(
             super::super::clipstudio::read(&bytes, &|_, _| {}).is_err(),

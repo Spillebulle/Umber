@@ -99,8 +99,8 @@ use psd::{ColorMode, PsdChannelKind, PsdDepth};
 
 use super::blend::{self, Fidelity};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
-    check_bounds, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat,
+    StackSize, check_bounds, srgb,
 };
 use crate::document::Background;
 use crate::layer::BlendMode;
@@ -134,12 +134,15 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     // This reader makes no folders: a PSD group arrives as nothing at all, so
     // every entry it will produce holds pixels. If groups are ever read, this
     // is one of the two places that has to learn about them.
-    check_bounds(
-        FORMAT,
-        size.x,
-        size.y,
-        StackSize::all_painted(psd.layers().len().max(1)),
-    )?;
+    let painted = psd.layers().len().max(1);
+    let mut budget = check_bounds(FORMAT, size.x, size.y, StackSize::all_painted(painted))?;
+    // **The one reader that must still be refused off its header**, and the
+    // reason is three lines below at `Layer::rgba()`: this reader cannot yield
+    // pieces, so a claim is a cost here where it is not in the other four.
+    // Reserved before the loop rather than charged after each layer, or a
+    // malformed file declaring a huge canvas is refused once the gigabytes are
+    // already resident. See `PieceBudget::reserve`.
+    budget.reserve(u64::from(size.x) * u64::from(size.y) * 4 * painted as u64)?;
 
     let mut warnings = Vec::new();
 
@@ -230,10 +233,19 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         }
         srgb::encode_buffer(&mut pixels);
 
-        let mut imported = ImportedLayer::new(name, mode, pixels);
+        // **One canvas-sized piece, because the crate gives nothing better.**
+        // A `.psd` does store per-layer rectangles, and `psd` 0.3.5's
+        // `Layer::rgba()` resolves them into a canvas-sized buffer before this
+        // reader ever sees one — the layer's own rectangle is behind a private
+        // accessor, the same limit that keeps its masks unreadable. Cropping
+        // this buffer back down would be scanning for content, which is not the
+        // same claim as "the file holds this rectangle" and would cost a full
+        // pass to learn something the file already knows.
+        let mut imported = ImportedLayer::new(name, mode, vec![PixelPiece::whole(size, pixels)]);
         imported.visible = visible;
         imported.opacity = opacity;
         imported.clipped = clipped;
+        budget.charge(&imported)?;
         layers.push(imported);
     }
 
@@ -262,7 +274,11 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
     ImportedDocument {
         format: FORMAT,
         size,
-        layers: vec![ImportedLayer::new("Background", BlendMode::Normal, pixels)],
+        layers: vec![ImportedLayer::new(
+            "Background",
+            BlendMode::Normal,
+            vec![PixelPiece::whole(size, pixels)],
+        )],
         active: None,
         background: Background::Transparent,
         dpi: None,
@@ -418,7 +434,10 @@ mod tests {
     #[test]
     fn pixels_and_blend_modes_come_across() {
         let doc = read(&two_layers()).unwrap();
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(2, 2))[0..4],
+            &[255, 0, 0, 255]
+        );
         assert_eq!(doc.layers[1].blend, BlendMode::Multiply);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
@@ -494,7 +513,7 @@ mod tests {
     fn transparency_is_premultiplied_like_every_other_import() {
         let psd = fixtures::psd(1, 1, &[PsdLayerSpec::new("Soft", [255, 255, 255, 128])]);
         let doc = read(&psd).unwrap();
-        assert!((doc.layers[0].pixels[0] as i32 - 188).abs() <= 1);
+        assert!((doc.layers[0].dense(UVec2::new(1, 1))[0] as i32 - 188).abs() <= 1);
     }
 
     #[test]
@@ -570,9 +589,12 @@ mod tests {
 
         assert_eq!(doc.layers.len(), 2, "{:?}", doc.warnings);
         assert_eq!(doc.layers[0].name, "Paper");
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
         assert_eq!(
-            &doc.layers[1].pixels[0..4],
+            &doc.layers[0].dense(UVec2::new(4, 4))[0..4],
+            &[255, 0, 0, 255]
+        );
+        assert_eq!(
+            &doc.layers[1].dense(UVec2::new(4, 4))[0..4],
             &[0, 0, 255, 255],
             "the mask channel must not be read as the layer's own"
         );
@@ -669,6 +691,9 @@ mod tests {
         let doc = read(&psd).unwrap();
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.layers[0].name, "Background");
-        assert_eq!(&doc.layers[0].pixels[0..4], &[10, 20, 30, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(2, 1))[0..4],
+            &[10, 20, 30, 255]
+        );
     }
 }

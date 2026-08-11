@@ -65,10 +65,11 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
-    check_bounds, flat, lzf, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat,
+    StackSize, check_bounds, flat, lzf, srgb,
 };
 use crate::document::Background;
+use crate::geom::PixelRect;
 use crate::layer::{BlendMode, LayerStack};
 
 const FORMAT: SourceFormat = SourceFormat::Krita;
@@ -117,7 +118,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let maindoc = container::read_entry(&mut zip, "maindoc.xml", FORMAT)?;
     let mut warnings = Vec::new();
     let doc = parse_maindoc(&maindoc, &mut warnings)?;
-    check_bounds(
+    let mut budget = check_bounds(
         FORMAT,
         doc.size.x,
         doc.size.y,
@@ -160,7 +161,12 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
             continue;
         }
         match load_layer(&mut zip, &doc.name, spec, doc.size, &mut warnings) {
-            Ok(layer) => layers.push(layer),
+            Ok(layer) => {
+                // Charged as it lands, so what bounds the accumulation is the
+                // pixels the file actually held. See `PieceBudget`.
+                budget.charge(&layer)?;
+                layers.push(layer);
+            }
             Err(reason) => warnings.push(ImportWarning::LayerSkipped {
                 layer: spec.name.clone(),
                 reason,
@@ -589,16 +595,35 @@ fn load_layer(
             .and_then(|b| (b.len() >= 4).then(|| [b[2], b[1], b[0], b[3]]))
             .unwrap_or([0, 0, 0, 0]);
 
-    let mut pixels = default_pixel
-        .iter()
-        .copied()
-        .cycle()
-        .take(canvas.x as usize * canvas.y as usize * 4)
-        .collect::<Vec<u8>>();
-    assemble_tiles(&data, (spec.x, spec.y), 4, |tile, size, at| {
-        blit_tile(&mut pixels, canvas, tile, size, at);
-    })?;
-    srgb::encode_buffer(&mut pixels);
+    // **One piece per stored tile — but only where the pixels outside the
+    // tiles are transparent.** A Krita layer states what it holds where it
+    // stored nothing, and almost always that is transparent: then a tile the
+    // file kept is a rectangle the file holds, and the canvas between them is
+    // the empty value the upload's clear already leaves. A layer with a
+    // *coloured* default pixel says the opposite — every pixel of the canvas
+    // carries that colour — so there is nothing sparse about it and it takes
+    // the dense path it always had. See `PixelPiece`'s rule 3.
+    let pixels = if default_pixel == [0, 0, 0, 0] {
+        let mut pieces = Vec::new();
+        assemble_tiles(&data, (spec.x, spec.y), 4, |tile, size, at| {
+            if let Some(piece) = tile_piece(canvas, tile, size, at) {
+                pieces.push(piece);
+            }
+        })?;
+        pieces
+    } else {
+        let mut dense = default_pixel
+            .iter()
+            .copied()
+            .cycle()
+            .take(canvas.x as usize * canvas.y as usize * 4)
+            .collect::<Vec<u8>>();
+        assemble_tiles(&data, (spec.x, spec.y), 4, |tile, size, at| {
+            blit_tile(&mut dense, canvas, tile, size, at);
+        })?;
+        srgb::encode_buffer(&mut dense);
+        vec![PixelPiece::whole(canvas, dense)]
+    };
 
     let (mode, fidelity) = blend::nearest(&spec.composite_op);
     match fidelity {
@@ -659,7 +684,12 @@ fn load_layer(
 ///   zero on faith would hide a layer completely on the strength of a file
 ///   that said nothing, which is the silent damage this module refuses in the
 ///   other direction.
-fn load_mask(zip: &mut Zip<'_>, document: &str, spec: &MaskSpec, canvas: UVec2) -> Option<Vec<u8>> {
+fn load_mask(
+    zip: &mut Zip<'_>,
+    document: &str,
+    spec: &MaskSpec,
+    canvas: UVec2,
+) -> Option<Vec<PixelPiece>> {
     if spec.filename.is_empty() {
         return None;
     }
@@ -683,7 +713,13 @@ fn load_mask(zip: &mut Zip<'_>, document: &str, spec: &MaskSpec, canvas: UVec2) 
         blit_coverage_tile(&mut coverage, canvas, tile, size, at);
     })
     .ok()?;
-    Some(srgb::encode_coverage_buffer(&coverage))
+    // One canvas piece. A mask's empty value is white and the upload's clear
+    // leaves transparent black, so a mask may not go sparse yet whatever its
+    // default pixel is — `PixelPiece`'s rule 3.
+    Some(vec![PixelPiece::whole(
+        canvas,
+        srgb::encode_coverage_buffer(&coverage),
+    )])
 }
 
 /// Krita's mask kinds, named the way its own interface names them.
@@ -776,37 +812,88 @@ fn assemble_tiles(
     Ok(())
 }
 
-/// Walk the part of a tile that lands inside the canvas, handing each
-/// `(index in the tile, index of the destination pixel)` pair to `f`.
+/// The part of a tile at `at` that lands inside the canvas, in canvas
+/// coordinates, or `None` for one that misses it entirely.
 ///
 /// Krita keeps whole tiles even where only a corner of one is inside the
 /// canvas, and layers may sit at negative coordinates, so most of a real file's
-/// tiles need clipping on at least one side. Written once and shared by both
-/// blits below: the clipping is the subtle half and two copies of it is two
-/// chances to get an edge wrong.
+/// tiles need clipping on at least one side. **This is the one statement of
+/// that clipping** — [`for_each_visible`] and [`tile_piece`] both derive their
+/// loops from it, because the clipping is the subtle half and three copies of
+/// it would be three chances to get an edge wrong.
+fn visible_rect(canvas: UVec2, tile_size: (usize, usize), at: (i64, i64)) -> Option<PixelRect> {
+    let (tw, th) = tile_size;
+    let x_from = at.0.saturating_neg().clamp(0, tw as i64);
+    let x_to = (canvas.x as i64).saturating_sub(at.0).clamp(0, tw as i64);
+    let y_from = at.1.saturating_neg().clamp(0, th as i64);
+    let y_to = (canvas.y as i64).saturating_sub(at.1).clamp(0, th as i64);
+    if x_to <= x_from || y_to <= y_from {
+        return None;
+    }
+    Some(PixelRect {
+        x: (at.0 + x_from) as u32,
+        y: (at.1 + y_from) as u32,
+        width: (x_to - x_from) as u32,
+        height: (y_to - y_from) as u32,
+    })
+}
+
+/// Walk the part of a tile that lands inside the canvas, handing each
+/// `(index in the tile, index of the destination pixel)` pair to `f`.
 fn for_each_visible(
     canvas: UVec2,
     tile_size: (usize, usize),
     at: (i64, i64),
     mut f: impl FnMut(usize, usize),
 ) {
-    let (tw, th) = tile_size;
-    for row in 0..th {
-        let dy = at.1 + row as i64;
-        if dy < 0 || dy >= canvas.y as i64 {
-            continue;
-        }
-        for col in 0..tw {
-            let dx = at.0 + col as i64;
-            if dx < 0 || dx >= canvas.x as i64 {
-                continue;
-            }
+    let Some(rect) = visible_rect(canvas, tile_size, at) else {
+        return;
+    };
+    let tw = tile_size.0;
+    for dy in rect.y..rect.y + rect.height {
+        let row = (i64::from(dy) - at.1) as usize;
+        for dx in rect.x..rect.x + rect.width {
+            let col = (i64::from(dx) - at.0) as usize;
             f(
                 row * tw + col,
                 dy as usize * canvas.x as usize + dx as usize,
             );
         }
     }
+}
+
+/// One planar BGRA tile as a [`PixelPiece`], already sRGB-encoded.
+///
+/// The sparse half of what [`blit_tile`] does densely, and it is the same
+/// bytes: `srgb::encode_pixel` of a fully transparent pixel is four zeroes —
+/// `TABLE`'s alpha-0 row is all zeroes — so the canvas the dense path filled
+/// with the default transparent pixel and then encoded is exactly the canvas
+/// this leaves untouched.
+fn tile_piece(
+    canvas: UVec2,
+    tile: &[u8],
+    tile_size: (usize, usize),
+    at: (i64, i64),
+) -> Option<PixelPiece> {
+    let rect = visible_rect(canvas, tile_size, at)?;
+    let (tw, th) = tile_size;
+    let plane = tw * th;
+    let mut bytes = Vec::with_capacity(rect.area() as usize * 4);
+    for dy in rect.y..rect.y + rect.height {
+        let row = (i64::from(dy) - at.1) as usize;
+        for dx in rect.x..rect.x + rect.width {
+            let col = (i64::from(dx) - at.0) as usize;
+            let s = row * tw + col;
+            // Planar, and blue first — see `blit_tile`.
+            bytes.extend_from_slice(&srgb::encode_pixel([
+                tile[2 * plane + s],
+                tile[plane + s],
+                tile[s],
+                tile[3 * plane + s],
+            ]));
+        }
+    }
+    Some(PixelPiece::new(rect, bytes))
 }
 
 /// Copy one planar BGRA tile into the RGBA canvas.
@@ -857,6 +944,7 @@ fn flattened_fallback(
     let mut pixels = vec![0u8; canvas.x as usize * canvas.y as usize * 4];
     container::blit(&mut pixels, canvas, &image.rgba, image.size, (0, 0));
     srgb::encode_buffer(&mut pixels);
+    let pixels = vec![PixelPiece::whole(canvas, pixels)];
 
     warnings.push(ImportWarning::DocumentFlattened { reason });
     Ok(ImportedDocument {
@@ -963,7 +1051,17 @@ mod tests {
     /// The mask byte at `(x, y)`, as the composite would read it: the red
     /// channel of the mask slice.
     fn mask_at(layer: &ImportedLayer, x: usize, y: usize, width: usize) -> u8 {
-        layer.mask.as_ref().expect("the layer kept its mask")[(y * width + x) * 4]
+        let mask = layer.mask.as_ref().expect("the layer kept its mask");
+        // A mask is one piece covering the canvas — `PixelPiece`'s rule 3 —
+        // so the row stride is the canvas width and the origin is (0, 0).
+        // Asserted rather than assumed: if a mask ever goes sparse this reads
+        // the wrong byte and says nothing, which is the shape of bug that rule
+        // exists to prevent.
+        assert_eq!(mask.len(), 1, "a mask is one canvas-sized piece");
+        assert_eq!(mask[0].rect.x, 0);
+        assert_eq!(mask[0].rect.y, 0);
+        assert_eq!(mask[0].rect.width as usize, width);
+        mask[0].bytes[(y * width + x) * 4]
     }
 
     #[test]
@@ -979,7 +1077,86 @@ mod tests {
         );
         let doc = read(&kra).unwrap();
         assert_eq!(doc.layers.len(), 1, "{:?}", doc.warnings);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[200, 100, 50, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(64, 64))[0..4],
+            &[200, 100, 50, 255]
+        );
+    }
+
+    /// **The reader yields the tiles the file stores and nothing else.**
+    ///
+    /// Krita keeps a 64-square tile only where something was painted, so a
+    /// layer with one tile on a 256-square canvas is one sixteenth of the page.
+    /// The picture is checked against an expectation built from the fixture
+    /// rather than from the reader, the pieces are held to rules 1 and 2, and
+    /// the sparsity is asserted as a fraction — a version that quietly went back
+    /// to one canvas piece would pass the first two and fail the third.
+    ///
+    /// **The coloured-`.defaultpixel` case is not driven here, and that is a
+    /// gap rather than an omission**: the fixture builder has no way to write
+    /// one, so the dense fallback in `load_layer` is reached by no test. What
+    /// holds it is that it is the *old* code path unchanged, guarded by a
+    /// comparison against `[0, 0, 0, 0]` that a reader cannot get subtly wrong —
+    /// it is either the whole canvas or the tiles.
+    #[test]
+    fn a_layer_yields_only_the_tiles_the_file_stores() {
+        let canvas = UVec2::new(256, 256);
+        let kra = fixtures::kra(
+            canvas.x,
+            canvas.y,
+            &[KraLayer::new("Paint")
+                .pixel(3, 5, [200, 100, 50, 255])
+                .pixel(60, 60, [1, 2, 3, 255])],
+        );
+        let doc = read(&kra).unwrap();
+        let layer = &doc.layers[0];
+
+        crate::docimport::check_piece_rules(&layer.pixels, canvas);
+
+        let mut expected = vec![0u8; (canvas.x * canvas.y * 4) as usize];
+        for (x, y, rgba) in [
+            (3usize, 5usize, [200, 100, 50, 255]),
+            (60, 60, [1, 2, 3, 255]),
+        ] {
+            let px = (y * canvas.x as usize + x) * 4;
+            expected[px..px + 4].copy_from_slice(&rgba);
+        }
+        assert_eq!(layer.dense(canvas), expected, "the picture moved");
+
+        // One 64-square tile, not a 256-square canvas.
+        assert_eq!(layer.pixel_bytes(), 64 * 64 * 4);
+        assert!(
+            layer.pixel_bytes() * 8 < u64::from(canvas.x) * u64::from(canvas.y) * 4,
+            "one tile of sixteen must not be charged the page: {} bytes",
+            layer.pixel_bytes()
+        );
+    }
+
+    /// A tile's position is a number out of somebody else's file, and the
+    /// arithmetic that places it must not panic on any of them.
+    ///
+    /// `-i64::MIN` panics in a debug build, which is why [`visible_rect`] is
+    /// saturating throughout. Nothing that reads a real `.kra` can reach these
+    /// values, which is exactly why they need a test rather than a reader.
+    #[test]
+    fn a_tile_placed_absurdly_far_off_the_page_lands_nowhere() {
+        let canvas = UVec2::new(64, 64);
+        for at in [
+            (i64::MIN, 0),
+            (0, i64::MIN),
+            (i64::MAX, i64::MAX),
+            (i64::MIN, i64::MAX),
+            (-64, 0),
+            (64, 0),
+        ] {
+            assert!(
+                visible_rect(canvas, (64, 64), at).is_none(),
+                "a 64-square tile at {at:?} does not reach a 64-square canvas"
+            );
+        }
+        // And one that does land, so the sweep is not passing by refusing
+        // everything.
+        assert!(visible_rect(canvas, (64, 64), (-1, -1)).is_some());
     }
 
     #[test]
@@ -992,9 +1169,10 @@ mod tests {
                 .compressed()],
         );
         let plain = fixtures::kra(64, 64, &[KraLayer::new("A").pixel(1, 2, [10, 20, 30, 255])]);
+        let canvas = UVec2::new(64, 64);
         assert_eq!(
-            read(&compressed).unwrap().layers[0].pixels,
-            read(&plain).unwrap().layers[0].pixels
+            read(&compressed).unwrap().layers[0].dense(canvas),
+            read(&plain).unwrap().layers[0].dense(canvas)
         );
     }
 
@@ -1031,7 +1209,8 @@ mod tests {
                 .at(5, 7)],
         );
         let doc = read(&kra).unwrap();
-        let at = |x: usize, y: usize| &doc.layers[0].pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        let pixels = doc.layers[0].dense(UVec2::new(64, 64));
+        let at = |x: usize, y: usize| &pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
         assert_eq!(at(5, 7), [1, 2, 3, 255]);
         assert_eq!(at(0, 0), [0, 0, 0, 0]);
     }
@@ -1154,7 +1333,13 @@ mod tests {
         // Canvas-sized and four bytes a pixel, exactly as the layer is —
         // `ImportedDocument::validate` debug-asserts it, and this says so
         // where the failure is legible.
-        assert_eq!(layer.mask.as_ref().unwrap().len(), 64 * 64 * 4);
+        let mask = layer.mask.as_ref().unwrap();
+        assert_eq!(
+            mask.len(),
+            1,
+            "a mask is one piece and it covers the canvas"
+        );
+        assert_eq!(mask[0].bytes.len(), 64 * 64 * 4);
     }
 
     #[test]
@@ -1393,7 +1578,10 @@ mod tests {
         );
         let doc = read(&kra).unwrap();
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[9, 9, 9, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(64, 64))[0..4],
+            &[9, 9, 9, 255]
+        );
         assert!(doc.layers[0].mask.is_none());
         assert!(doc.warnings.iter().any(|w| matches!(
             w,
@@ -1515,8 +1703,9 @@ mod tests {
             .iter()
             .find(|u| u.slot == mask_slot)
             .expect("the mask's slice was never given any pixels");
-        assert_eq!(upload.pixels.len(), 64 * 64 * 4);
-        assert_eq!(&upload.pixels[0..4], &[255, 255, 255, 255]);
+        let pixels = crate::docimport::assemble(&upload.pieces, UVec2::new(64, 64));
+        assert_eq!(pixels.len(), 64 * 64 * 4);
+        assert_eq!(&pixels[0..4], &[255, 255, 255, 255]);
     }
 
     #[test]

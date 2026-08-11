@@ -4614,19 +4614,23 @@ impl UmberApp {
                 // catches up. What is gone is the unbounded case. See
                 // `CanvasRenderer::write_layer_rect`, which says the same thing
                 // about any loop of it and not only about this one.
+                //
+                // **A piece at a time, and the rectangle is the reader's.** It
+                // used to be one canvas-sized write per layer, which is what
+                // made every reader densify what it had read. Whatever no piece
+                // covers is left as `install_canvas`'s clear — that is
+                // `docimport::PixelPiece`'s rule 3, and it is why there is no
+                // "this layer is finished" call here.
                 for upload in &uploads {
-                    canvas.write_layer_rect(
-                        &gfx.gpu.device,
-                        &gfx.gpu.queue,
-                        upload.slot,
-                        umber_core::PixelRect {
-                            x: 0,
-                            y: 0,
-                            width: size.x,
-                            height: size.y,
-                        },
-                        &upload.pixels,
-                    );
+                    for piece in &upload.pieces {
+                        canvas.write_layer_rect(
+                            &gfx.gpu.device,
+                            &gfx.gpu.queue,
+                            upload.slot,
+                            piece.rect,
+                            &piece.bytes,
+                        );
+                    }
                 }
             }
         }
@@ -6248,8 +6252,27 @@ mod tests {
         let back = umber_core::docimport::import(&path).expect("reopen");
         assert_eq!(back.layers.len(), stack.len(), "the stack changed length");
         for at in 0..stack.len() {
+            // **One piece at the origin**, because these layers are solid and
+            // `docformat::trim` therefore writes each at its full size. Read
+            // off the piece rather than a canvas: `ImportedLayer::pixels` is a
+            // sequence of rectangles now, and `docimport`'s assembler is
+            // test-only inside its own crate. Asserting the rectangle as well
+            // as the bytes is what keeps this a check on the *picture* — a
+            // layer that came back at the wrong offset would otherwise pass on
+            // its first four bytes.
+            let piece = &back.layers[at].pixels[0];
             assert_eq!(
-                back.layers[at].pixels[..4],
+                (
+                    piece.rect.x,
+                    piece.rect.y,
+                    piece.rect.width,
+                    piece.rect.height
+                ),
+                (0, 0, size.x, size.y),
+                "layer {at} did not come back covering the canvas"
+            );
+            assert_eq!(
+                piece.bytes[..4],
                 colour(at),
                 "layer {at} came back holding another layer's pixels"
             );

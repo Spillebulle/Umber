@@ -101,12 +101,13 @@ use glam::UVec2;
 
 use super::blend::{self, Fidelity};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, StackSize,
-    check_bounds, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat,
+    StackSize, check_bounds, srgb,
 };
 use crate::color::Color;
 use crate::csblocks::{self, BLOCK, Bitmap, Fill, Packing};
 use crate::document::Background;
+use crate::geom::PixelRect;
 use crate::layer::LayerStack;
 use crate::sqlite::{Database, Table, Value};
 
@@ -186,7 +187,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     // Clip Studio document is usually filed into groups, and charging each one
     // a canvas is what made a 15000×5000 file refuse itself.
     let stack = StackSize::of(nodes.iter().map(|n| n.folder));
-    check_bounds(FORMAT, canvas.size.x, canvas.size.y, stack)?;
+    let mut budget = check_bounds(FORMAT, canvas.size.x, canvas.size.y, stack)?;
 
     let mut out = Vec::with_capacity(nodes.len());
     let total = nodes.len() as u32;
@@ -202,6 +203,10 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         // whose contents were all refused is kept, empty, because it is where
         // the artist put things and an empty row says so.
         if let Some(layer) = build(row, node, &canvas, &layers, &container, &mut warnings) {
+            // Charged as it lands rather than off the header, so the figure is
+            // the paint the file holds and not `canvas x 4 x layers`. See
+            // `PieceBudget`.
+            budget.charge(&layer)?;
             out.push(layer);
         }
     }
@@ -1300,7 +1305,15 @@ fn build(
                 ),
                 canvas.size,
             ) {
-                Ok(mask) => layer.mask = Some(srgb::encode_coverage_buffer(&mask)),
+                // One canvas piece: a mask's empty value is white and the
+                // upload's clear leaves transparent black, so a mask may not go
+                // sparse yet. `PixelPiece`'s rule 3.
+                Ok(mask) => {
+                    layer.mask = Some(vec![PixelPiece::whole(
+                        canvas.size,
+                        srgb::encode_coverage_buffer(&mask),
+                    )])
+                }
                 Err(_) => warnings.push(ImportWarning::MaskIgnored { layer: name }),
             },
             None => warnings.push(ImportWarning::MaskIgnored { layer: name }),
@@ -1380,16 +1393,37 @@ fn read_bitmap<'a>(
     Ok((bitmap, packing, data))
 }
 
-/// A layer's colour, canvas-sized, straight-alpha sRGB, ready for
-/// [`srgb::encode_buffer`] — which is applied here, so the answer is already in
-/// the form a layer texture holds.
+/// A layer's colour, **one [`PixelPiece`] per stored block**, already in the
+/// form a layer texture holds.
+///
+/// This is where the piece contract pays. A `.clip` states which of its
+/// 256-squares it stores and Clip Studio stores only the ones the artist
+/// touched: measured over 33 real documents, 13.5% of a dense store holds
+/// paint, and the 20000×5000 document this was written for holds 6.5%. The
+/// dense form of this function built a canvas-sized buffer per layer and
+/// dropped the whole file's blocks into it, so a 124 MB file became 21.6 GB of
+/// host memory and was then refused for being too big.
+///
+/// **The signal is block *presence*, not an emptiness scan.**
+/// [`csblocks::for_each_block`] hands over the blocks the container says are
+/// there, and a stored block that the artist later erased is carried anyway.
+/// Measured, presence over-reports by 1.13× across the corpus and 1.58× on the
+/// worst document — 13% of a small number, against a full extra pass over every
+/// byte. `docs/perf/roadmap.md` §3.3 is where that trade is settled.
+///
+/// **A block absent from the file contributes nothing, and that is exactly the
+/// old behaviour.** The dense buffer started as zeroes and `Fill::Stated` is
+/// refused above, so an absent block was already four zeroes — and
+/// `srgb::encode_pixel` of a transparent pixel is four zeroes too, since
+/// `TABLE`'s alpha-0 row is all zeroes. So the canvas this leaves untouched is
+/// byte for byte the canvas the dense version wrote.
 fn colour(
     attribute: &[u8],
     chunk: &[u8],
     container: &Container<'_>,
     origin: (i64, i64),
     canvas: UVec2,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<PixelPiece>, String> {
     let (bitmap, packing, data) = read_bitmap(attribute, chunk, container, canvas)?;
     if packing.first != 1 || !matches!(packing.second, 1 | 4) {
         return Err(format!(
@@ -1415,21 +1449,19 @@ fn colour(
         return Err("it lies entirely outside the canvas".to_string());
     }
 
-    let mut out = vec![0u8; canvas.x as usize * canvas.y as usize * 4];
+    let mut pieces = Vec::new();
     csblocks::for_each_block(
         data,
         packing,
         bitmap.columns * bitmap.rows,
         |index, block| {
             let (column, row) = (index % bitmap.columns, index / bitmap.columns);
-            for y in 0..within(row, bitmap.height) {
-                let Some(dst_y) = canvas_at(origin.1, row, y, canvas.y) else {
-                    continue;
-                };
-                for x in 0..within(column, bitmap.width) {
-                    let Some(dst_x) = canvas_at(origin.0, column, x, canvas.x) else {
-                        continue;
-                    };
+            let Some(placed) = block_at(origin, (column, row), &bitmap, canvas) else {
+                return;
+            };
+            let mut bytes = Vec::with_capacity(placed.rect.area() as usize * 4);
+            for y in placed.ys.clone() {
+                for x in placed.xs.clone() {
                     let i = y * BLOCK + x;
                     // **The alpha plane comes first, then the colour interleaved.**
                     // Four bytes at a time it is B, G, R and one nothing reads; one
@@ -1442,15 +1474,77 @@ fn colour(
                         let v = block[at];
                         (v, v, v)
                     };
-                    let px = (dst_y * canvas.x as usize + dst_x) * 4;
-                    out[px..px + 4].copy_from_slice(&[r, g, b, alpha]);
+                    bytes.extend_from_slice(&srgb::encode_pixel([r, g, b, alpha]));
                 }
             }
+            pieces.push(PixelPiece::new(placed.rect, bytes));
         },
     )
     .ok_or_else(|| "its pixels could not be read".to_string())?;
-    srgb::encode_buffer(&mut out);
-    Ok(out)
+    Ok(pieces)
+}
+
+/// Where one 256-square block lands, and which of its own texels go there.
+///
+/// The block's rectangle clipped twice — against the **bitmap**, because a
+/// bitmap is padded out to whole blocks and the padding is not the artist's,
+/// and against the **canvas**, because a layer may hang off the page. Getting
+/// either wrong is a row of somebody else's texels along the edge of the
+/// picture, which is why [`within`] and [`canvas_at`] exist and why this is
+/// their rectangle form rather than a third reading.
+struct BlockAt {
+    rect: PixelRect,
+    /// Within-block column indices that land on the canvas.
+    xs: std::ops::Range<usize>,
+    /// Within-block row indices that land on the canvas.
+    ys: std::ops::Range<usize>,
+}
+
+fn block_at(
+    origin: (i64, i64),
+    block: (usize, usize),
+    bitmap: &Bitmap,
+    canvas: UVec2,
+) -> Option<BlockAt> {
+    let (x, xs) = block_span(origin.0, block.0, within(block.0, bitmap.width), canvas.x)?;
+    let (y, ys) = block_span(origin.1, block.1, within(block.1, bitmap.height), canvas.y)?;
+    Some(BlockAt {
+        rect: PixelRect {
+            x,
+            y,
+            width: (xs.end - xs.start) as u32,
+            height: (ys.end - ys.start) as u32,
+        },
+        xs,
+        ys,
+    })
+}
+
+/// One axis of [`block_at`]: the canvas coordinate the run starts at, and the
+/// within-block indices it covers.
+///
+/// `extent` is how much of this block is inside the bitmap — [`within`]'s
+/// answer. Saturating rather than checked because an origin out of somebody
+/// else's file can be anything at all, and the two clamps below already refuse
+/// everything that does not land.
+fn block_span(
+    origin: i64,
+    block: usize,
+    extent: usize,
+    canvas_extent: u32,
+) -> Option<(u32, std::ops::Range<usize>)> {
+    let base = origin.checked_add((block * BLOCK) as i64)?;
+    let extent = extent as i64;
+    let from = base.saturating_neg().clamp(0, extent);
+    let to = i64::from(canvas_extent)
+        .saturating_sub(base)
+        .clamp(0, extent);
+    if to <= from {
+        return None;
+    }
+    // `base + from` is at least 0 by the clamp above and below `canvas_extent`
+    // because `from < to <= canvas_extent - base`.
+    Some(((base + from) as u32, from as usize..to as usize))
 }
 
 /// A mask's coverage, canvas-sized, as the **linear** multiplier every source
@@ -1947,7 +2041,7 @@ mod tests {
         let bytes = fixtures::clip(w, h, &[ClipLayer::flat("Ink", w, h, [10, 120, 240, 255])]);
         let doc = read(&bytes).expect("a document");
         assert_eq!(doc.layers.len(), 1);
-        let pixels = &doc.layers[0].pixels;
+        let pixels = doc.layers[0].dense(UVec2::new(w, h));
         assert_eq!(pixels.len(), (w * h * 4) as usize);
         for (i, px) in pixels.chunks_exact(4).enumerate() {
             assert_eq!(px, [10, 120, 240, 255], "pixel {i}");
@@ -1964,8 +2058,81 @@ mod tests {
             &[ClipLayer::flat("Soft", 300, 300, [255, 255, 255, 128])],
         );
         let doc = read(&bytes).expect("a document");
-        assert!((i32::from(doc.layers[0].pixels[0]) - 188).abs() <= 1);
-        assert_eq!(doc.layers[0].pixels[3], 128);
+        let pixels = doc.layers[0].dense(UVec2::new(300, 300));
+        assert!((i32::from(pixels[0]) - 188).abs() <= 1);
+        assert_eq!(pixels[3], 128);
+    }
+
+    /// **The reader yields the blocks the file holds and nothing else**, which
+    /// is the whole of Stage 2 on the format that motivated it.
+    ///
+    /// Three claims, and each would be a separate way to get this wrong:
+    ///
+    /// - the *picture* is unchanged, which is the one that must never move: the
+    ///   assembled canvas is exactly what a dense reader would have produced,
+    ///   built here from the fixture's own colour rather than from the reader's
+    ///   output, so it agrees with nothing but the file;
+    /// - the pieces obey rules 1 and 2 — inside the canvas, not overlapping;
+    /// - and it is genuinely **sparse**. That last is the one a version that
+    ///   quietly went back to one canvas piece would fail, and it is stated as a
+    ///   fraction of the canvas rather than as a piece count, because the piece
+    ///   count is a property of the block grid and the fraction is the thing
+    ///   anybody cares about.
+    #[test]
+    fn a_layer_yields_only_the_blocks_the_file_stores() {
+        // A 300-square bitmap in the corner of a 1024-square canvas: 2×2 blocks
+        // of the nine a dense layer would occupy, and 8.6% of the page.
+        let canvas = UVec2::new(1024, 1024);
+        let bytes = fixtures::clip(
+            canvas.x,
+            canvas.y,
+            &[ClipLayer::flat("Ink", 300, 300, [10, 120, 240, 255]).placed((300, 300), (0, 0))],
+        );
+        let doc = read(&bytes).expect("a document");
+        let layer = &doc.layers[0];
+
+        crate::docimport::check_piece_rules(&layer.pixels, canvas);
+
+        // What a dense reader would have written, built from the fixture rather
+        // than from the reader.
+        let mut expected = vec![0u8; (canvas.x * canvas.y * 4) as usize];
+        for y in 0..300usize {
+            for x in 0..300usize {
+                let px = (y * canvas.x as usize + x) * 4;
+                expected[px..px + 4].copy_from_slice(&[10, 120, 240, 255]);
+            }
+        }
+        assert_eq!(layer.dense(canvas), expected, "the picture moved");
+
+        // And it did not cost a canvas to say so. Four 256-squares clipped to
+        // the bitmap is 300×300 pixels; a dense reader spent 1024×1024.
+        assert_eq!(layer.pixel_bytes(), 300 * 300 * 4);
+        assert!(
+            layer.pixel_bytes() * 10 < u64::from(canvas.x) * u64::from(canvas.y) * 4,
+            "a layer covering 8.6% of the page must not be charged the page: {} bytes",
+            layer.pixel_bytes()
+        );
+    }
+
+    /// A bitmap's origin is a number out of somebody else's file, and the
+    /// arithmetic that places its blocks must not panic on any of them.
+    ///
+    /// `-i64::MIN` panics in a debug build and `canvas - origin` overflows for
+    /// a very negative one, which is why [`block_span`] is checked and
+    /// saturating throughout. No real `.clip` reaches these values, which is
+    /// exactly why they need a test rather than a reader.
+    #[test]
+    fn a_block_placed_absurdly_far_off_the_page_lands_nowhere() {
+        for origin in [i64::MIN, i64::MAX, -256, 300, i64::MIN + 1] {
+            assert!(
+                block_span(origin, 0, BLOCK, 256).is_none(),
+                "a block at {origin} does not reach a 256-wide canvas"
+            );
+        }
+        // And one that does land, so the sweep is not passing by refusing
+        // everything: half a block hanging off the left edge.
+        let (at, within) = block_span(-128, 0, BLOCK, 256).expect("half a block lands");
+        assert_eq!((at, within), (0, 128..256));
     }
 
     /// A block Clip Studio did not store is transparent on a layer — the state
@@ -1979,7 +2146,15 @@ mod tests {
             &[ClipLayer::flat("Blank", 300, 300, [0, 0, 0, 0])],
         );
         let doc = read(&bytes).expect("a document");
-        assert!(doc.layers[0].pixels.iter().all(|b| *b == 0));
+        // Under the piece contract the reader also has the option of saying
+        // nothing at all about an unstored block, and that has to mean the same
+        // thing: `dense` is what holds the two readings together.
+        assert!(
+            doc.layers[0]
+                .dense(UVec2::new(300, 300))
+                .iter()
+                .all(|b| *b == 0)
+        );
     }
 
     /// Every flag on the row travels, and an opacity is out of **256**.
@@ -2054,7 +2229,7 @@ mod tests {
             &[ClipLayer::flat("Ink", w, h, [0, 0, 0, 255]).mask(vec![128u8; (w * h) as usize])],
         );
         let doc = read(&bytes).expect("a document");
-        let mask = doc.layers[0].mask.as_ref().expect("a mask");
+        let mask = doc.layers[0].dense_mask(UVec2::new(w, h)).expect("a mask");
         assert_eq!(mask.len(), (w * h * 4) as usize);
         assert!((i32::from(mask[0]) - 188).abs() <= 1, "{}", mask[0]);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
@@ -2097,7 +2272,7 @@ mod tests {
                     .mask_fill(Some(fill))],
             );
             let doc = read(&bytes).expect("a document");
-            let mask = doc.layers[0].mask.clone().expect("a mask");
+            let mask = doc.layers[0].dense_mask(UVec2::new(w, h)).expect("a mask");
             mask[(400 * w as usize + 400) * 4]
         };
 
@@ -2133,10 +2308,11 @@ mod tests {
         );
         let doc = read(&bytes).expect("a document");
         let layer = &doc.layers[0];
-        let mask = layer.mask.as_ref().expect("a mask");
+        let pixels = layer.dense(UVec2::new(w, h));
+        let mask = layer.dense_mask(UVec2::new(w, h)).expect("a mask");
         let at = |x: usize, y: usize| {
             let i = (y * w as usize + x) * 4;
-            (&layer.pixels[i..i + 4], mask[i])
+            (&pixels[i..i + 4], mask[i])
         };
 
         // Inside the placed rectangle.
@@ -2254,7 +2430,10 @@ mod tests {
         );
         let doc = read(&bytes).expect("a document");
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[9, 9, 9, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(300, 300))[0..4],
+            &[9, 9, 9, 255]
+        );
         assert!(
             matches!(
                 doc.warnings.as_slice(),
@@ -2430,7 +2609,10 @@ mod tests {
         assert!(patched > 0, "the fixture must carry an Attribute header");
 
         let doc = read(&bytes).expect("a document");
-        assert_eq!(&doc.layers[0].pixels[0..4], &[7, 8, 9, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(300, 300))[0..4],
+            &[7, 8, 9, 255]
+        );
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 

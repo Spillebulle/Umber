@@ -6,7 +6,8 @@
 use glam::UVec2;
 
 use super::{
-    ImportError, ImportedDocument, ImportedLayer, SourceFormat, StackSize, check_bounds, srgb,
+    ImportError, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat, StackSize,
+    check_bounds, srgb,
 };
 use crate::document::Background;
 use crate::layer::BlendMode;
@@ -90,7 +91,7 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let format = SourceFormat::Png;
     let image = decode_png(bytes, format)?;
     // A flat picture is one layer and no folders.
-    check_bounds(
+    let mut budget = check_bounds(
         format,
         image.size.x,
         image.size.y,
@@ -100,10 +101,20 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let mut pixels = image.rgba;
     srgb::encode_buffer(&mut pixels);
 
+    // **One piece covering the canvas, because a flat picture *is* the
+    // canvas.** There is nothing sparse to find: the PNG decoded to exactly
+    // this rectangle and every pixel of it came out of the file.
+    let layer = ImportedLayer::new(
+        "Image",
+        BlendMode::Normal,
+        vec![PixelPiece::whole(image.size, pixels)],
+    );
+    budget.charge(&layer)?;
+
     Ok(ImportedDocument {
         format,
         size: image.size,
-        layers: vec![ImportedLayer::new("Image", BlendMode::Normal, pixels)],
+        layers: vec![layer],
         active: None,
         background: Background::Transparent,
         dpi: None,
@@ -126,28 +137,34 @@ mod tests {
         assert_eq!(doc.layers.len(), 1);
         assert!(doc.warnings.is_empty(), "a flat PNG loses nothing");
         // Opaque pixels survive the colour-space conversion byte for byte.
-        assert_eq!(doc.layers[0].pixels, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(
+            doc.layers[0].dense(UVec2::new(2, 1)),
+            vec![255, 0, 0, 255, 0, 255, 0, 255]
+        );
     }
 
     #[test]
     fn greyscale_and_rgb_pngs_widen_to_rgba() {
         let grey = fixtures::png_grey(2, 1, &[0, 255]);
         let doc = read_png(&grey).unwrap();
-        assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+        assert_eq!(
+            doc.layers[0].dense(UVec2::new(2, 1)),
+            vec![0, 0, 0, 255, 255, 255, 255, 255]
+        );
 
         let rgb = fixtures::png_rgb(1, 1, &[10, 20, 30]);
         let doc = read_png(&rgb).unwrap();
-        assert_eq!(doc.layers[0].pixels, vec![10, 20, 30, 255]);
+        assert_eq!(doc.layers[0].dense(UVec2::new(1, 1)), vec![10, 20, 30, 255]);
     }
 
     #[test]
     fn transparency_is_premultiplied_on_the_way_in() {
         let png = fixtures::png_rgba(1, 1, &[255, 255, 255, 128]);
         let doc = read_png(&png).unwrap();
+        let pixels = doc.layers[0].dense(UVec2::new(1, 1));
         assert!(
-            (doc.layers[0].pixels[0] as i32 - 188).abs() <= 1,
-            "got {:?} — the layer texture wants premultiplied linear colour",
-            doc.layers[0].pixels
+            (pixels[0] as i32 - 188).abs() <= 1,
+            "got {pixels:?} — the layer texture wants premultiplied linear colour"
         );
     }
 
