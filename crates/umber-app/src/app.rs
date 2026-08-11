@@ -6176,7 +6176,7 @@ mod tests {
             wgpu::TextureFormat::Rgba8Unorm,
             stack.slot_capacity_needed(),
         );
-        let mut encoder = gpu
+        let encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         canvas.clear_all_layers(&gpu.queue);

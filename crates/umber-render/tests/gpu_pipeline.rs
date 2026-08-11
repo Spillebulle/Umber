@@ -800,7 +800,7 @@ fn a_large_canvas_gives_the_colour_scratch_back_when_a_stroke_ends() {
     // dab and commits it at full opacity whatever colour it is handed — the
     // first draft of this used `fill` with a transparent colour and painted
     // opaque black over the mark it was about to compare against.
-    let mut enc = h.encoder();
+    let enc = h.encoder();
     h.canvas.clear_layer(&h.gpu.queue, 0);
     h.gpu.queue.submit(Some(enc.finish()));
     h.stamp_colored(&[red], true);
@@ -944,7 +944,7 @@ fn a_jittered_angle_spreads_a_stroke_the_way_a_fixed_one_cannot() {
         "dabs all lying along the stroke should not reach 10 px off it"
     );
 
-    let mut enc = h.encoder();
+    let enc = h.encoder();
     h.canvas.clear_all_layers(&h.gpu.queue);
     h.gpu.queue.submit(Some(enc.finish()));
 
@@ -2607,7 +2607,7 @@ fn layer_readback_and_writeback_round_trip() {
         .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect);
     assert_eq!(saved.len(), (rect.width * rect.height * 4) as usize);
 
-    let mut enc = h.encoder();
+    let enc = h.encoder();
     h.canvas.clear_layer(&h.gpu.queue, 0);
     h.gpu.queue.submit(Some(enc.finish()));
     assert_eq!(h.pixel(32, 32)[3], 0);
@@ -4647,7 +4647,7 @@ fn a_capture_of_a_large_document_never_costs_a_frame() {
         1,
     );
     h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, LAYERS);
-    let mut enc = h.encoder();
+    let enc = h.encoder();
     h.canvas.clear_all_layers(&h.gpu.queue);
     h.gpu.queue.submit(Some(enc.finish()));
 
@@ -6003,7 +6003,7 @@ fn a_thin_mark_on_the_widest_canvas_this_device_admits_is_still_found() {
     for x in [width / 2, width / 2 + 1] {
         // A fresh slice each time, so the second reading cannot be the first
         // one's ink still standing.
-        let mut enc = h.encoder();
+        let enc = h.encoder();
         canvas.clear_all_layers(&h.gpu.queue);
         h.gpu.queue.submit(Some(enc.finish()));
 
@@ -6131,7 +6131,7 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
     );
 
     let after_write = h.canvas.slot_revision(0);
-    let mut enc = h.encoder();
+    let enc = h.encoder();
     h.canvas.clear_layer(&h.gpu.queue, 0);
     h.gpu.queue.submit(Some(enc.finish()));
     assert!(h.canvas.slot_revision(0) > after_write);
@@ -6395,9 +6395,9 @@ fn an_effect_on_a_layer_that_is_not_composited_is_never_baked() {
     // never reach, because the draw count below fails on the same mutation and
     // would mask it.
     assert_eq!(
-        h.canvas.slot_capacity(),
+        h.canvas.page_count(),
         before_slots,
-        "a hidden layer's effect took a canvas-sized slice"
+        "a hidden layer's effect took a canvas-sized page"
     );
     assert_eq!(
         baked.draws.len(),
