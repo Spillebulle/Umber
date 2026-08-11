@@ -1114,7 +1114,10 @@ mod tests {
         crate::docimport::check_piece_rules(&layer.pixels, canvas);
 
         let mut expected = vec![0u8; (canvas.x * canvas.y * 4) as usize];
-        for (x, y, rgba) in [(3usize, 5usize, [200, 100, 50, 255]), (60, 60, [1, 2, 3, 255])] {
+        for (x, y, rgba) in [
+            (3usize, 5usize, [200, 100, 50, 255]),
+            (60, 60, [1, 2, 3, 255]),
+        ] {
             let px = (y * canvas.x as usize + x) * 4;
             expected[px..px + 4].copy_from_slice(&rgba);
         }
@@ -1304,7 +1307,11 @@ mod tests {
         // `ImportedDocument::validate` debug-asserts it, and this says so
         // where the failure is legible.
         let mask = layer.mask.as_ref().unwrap();
-        assert_eq!(mask.len(), 1, "a mask is one piece and it covers the canvas");
+        assert_eq!(
+            mask.len(),
+            1,
+            "a mask is one piece and it covers the canvas"
+        );
         assert_eq!(mask[0].bytes.len(), 64 * 64 * 4);
     }
 
@@ -1544,7 +1551,10 @@ mod tests {
         );
         let doc = read(&kra).unwrap();
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(&doc.layers[0].dense(UVec2::new(64, 64))[0..4], &[9, 9, 9, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(64, 64))[0..4],
+            &[9, 9, 9, 255]
+        );
         assert!(doc.layers[0].mask.is_none());
         assert!(doc.warnings.iter().any(|w| matches!(
             w,

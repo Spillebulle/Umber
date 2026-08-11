@@ -307,8 +307,8 @@ mod tests {
                     assert_eq!(bytes.len() as u64, rect.area() * 4);
                     for row in 0..rect.height as usize {
                         let from = row * rect.width as usize * 4;
-                        let to = (rect.y as usize + row) * size.x as usize * 4
-                            + rect.x as usize * 4;
+                        let to =
+                            (rect.y as usize + row) * size.x as usize * 4 + rect.x as usize * 4;
                         let len = rect.width as usize * 4;
                         sparse[to..to + len].copy_from_slice(&bytes[from..from + len]);
                     }

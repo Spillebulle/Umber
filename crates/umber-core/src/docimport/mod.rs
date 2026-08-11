@@ -1713,7 +1713,9 @@ mod tests {
         // A folder is charged nothing, and nothing has to remember to skip one:
         // it holds no pieces.
         let before = budget.spent;
-        budget.charge(&ImportedLayer::folder("Group", 0, true)).unwrap();
+        budget
+            .charge(&ImportedLayer::folder("Group", 0, true))
+            .unwrap();
         assert_eq!(budget.spent, before);
     }
 
@@ -1888,7 +1890,10 @@ mod tests {
                 .charge(&ImportedLayer::folder(format!("G{i}"), 0, true))
                 .unwrap();
         }
-        assert_eq!(budget.spent, 0, "a folder holds no pieces to be charged for");
+        assert_eq!(
+            budget.spent, 0,
+            "a folder holds no pieces to be charged for"
+        );
 
         // And the entry bound still counts them, because a folder does occupy a
         // stack entry even though it occupies no memory. One painted layer at

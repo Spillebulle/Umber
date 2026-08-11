@@ -1536,7 +1536,9 @@ fn block_span(
     let base = origin.checked_add((block * BLOCK) as i64)?;
     let extent = extent as i64;
     let from = base.saturating_neg().clamp(0, extent);
-    let to = i64::from(canvas_extent).saturating_sub(base).clamp(0, extent);
+    let to = i64::from(canvas_extent)
+        .saturating_sub(base)
+        .clamp(0, extent);
     if to <= from {
         return None;
     }
@@ -2206,9 +2208,7 @@ mod tests {
             &[ClipLayer::flat("Ink", w, h, [0, 0, 0, 255]).mask(vec![128u8; (w * h) as usize])],
         );
         let doc = read(&bytes).expect("a document");
-        let mask = doc.layers[0]
-            .dense_mask(UVec2::new(w, h))
-            .expect("a mask");
+        let mask = doc.layers[0].dense_mask(UVec2::new(w, h)).expect("a mask");
         assert_eq!(mask.len(), (w * h * 4) as usize);
         assert!((i32::from(mask[0]) - 188).abs() <= 1, "{}", mask[0]);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
@@ -2251,9 +2251,7 @@ mod tests {
                     .mask_fill(Some(fill))],
             );
             let doc = read(&bytes).expect("a document");
-            let mask = doc.layers[0]
-                .dense_mask(UVec2::new(w, h))
-                .expect("a mask");
+            let mask = doc.layers[0].dense_mask(UVec2::new(w, h)).expect("a mask");
             mask[(400 * w as usize + 400) * 4]
         };
 
@@ -2411,7 +2409,10 @@ mod tests {
         );
         let doc = read(&bytes).expect("a document");
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(&doc.layers[0].dense(UVec2::new(300, 300))[0..4], &[9, 9, 9, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(300, 300))[0..4],
+            &[9, 9, 9, 255]
+        );
         assert!(
             matches!(
                 doc.warnings.as_slice(),
@@ -2587,7 +2588,10 @@ mod tests {
         assert!(patched > 0, "the fixture must carry an Attribute header");
 
         let doc = read(&bytes).expect("a document");
-        assert_eq!(&doc.layers[0].dense(UVec2::new(300, 300))[0..4], &[7, 8, 9, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(300, 300))[0..4],
+            &[7, 8, 9, 255]
+        );
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 
