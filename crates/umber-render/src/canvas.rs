@@ -11812,7 +11812,7 @@ mod tests {
         // shorter name, so the infallible calls cannot be counted until it is
         // gone. Both of its spellings, or a `Self::try_…` would survive the
         // first `replace` and then match `::ensure_pages(`.
-        let shipped = |src: &str| -> String {
+        let shipped = |name: &str, src: &str| -> String {
             let lines: Vec<&str> = src.lines().collect();
             // The attribute *and* the module on the next line. `#[cfg(test)]`
             // alone sits on `use`s, helpers and `mod gputest;` declarations,
@@ -11821,6 +11821,24 @@ mod tests {
                 .windows(2)
                 .position(|w| w[0].starts_with("#[cfg(test)]") && w[1].starts_with("mod tests"))
                 .unwrap_or(lines.len());
+            // **What was cut, not how much.** A byte total is a weak instrument
+            // here and was measured to be one: truncating the two largest
+            // `umber-app` files at their first attribute costs 13% of the sweep,
+            // so any floor loose enough to survive the codebase shrinking is
+            // loose enough to admit the bug — the floor below passed exactly
+            // that mutation. What is *exactly* true is that the only thing this
+            // may drop is a test module, so that is what is asserted.
+            // Not `starts_with("mod ")` alone: `lib.rs` declares
+            // `#[cfg(test)] mod gputest;` half way down and the rest of that
+            // file is shipped code.
+            if end < lines.len() {
+                assert!(
+                    lines[end + 1].starts_with("mod tests"),
+                    "{name}: the sweep stopped at `{}`, which is not a test module — it is \
+                     dropping shipped code and reporting nothing about it",
+                    lines[end + 1]
+                );
+            }
             lines[..end]
                 .iter()
                 .map(|l| l.split("//").next().unwrap_or(""))
@@ -11846,7 +11864,9 @@ mod tests {
                     stack.push(path);
                 } else if path.extension().is_some_and(|e| e == "rs") {
                     let text = std::fs::read_to_string(&path).expect("a source file");
-                    sources.push((path.display().to_string(), shipped(&text)));
+                    let name = path.display().to_string();
+                    let swept = shipped(&name, &text);
+                    sources.push((name, swept));
                 }
             }
         }
@@ -11855,9 +11875,10 @@ mod tests {
             "`ensure_pages` was renamed or moved; this guard has to follow it"
         );
 
-        // **A byte total, because a file count cannot see a truncation.** The
-        // two crates are well over a megabyte of source; a sweep that had
-        // stopped at the first attribute in each file read about a tenth of it.
+        // A floor for the *other* failure — a path that resolves to nothing,
+        // or a filter that drops every line. Deliberately far below the real
+        // figure (about 1.5 MB): it guards "read nothing", and what guards
+        // "read the wrong thing" is the assertion inside `shipped`.
         let swept: usize = sources.iter().map(|(_, t)| t.len()).sum();
         assert!(
             sources.len() > 40 && swept > 700_000,
