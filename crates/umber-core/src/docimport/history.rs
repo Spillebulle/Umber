@@ -65,6 +65,15 @@ use crate::time::Timestamp;
 /// for the names. Both terms are existing constants rather than figures picked
 /// here, and neither is tight — what the bound has to do is refuse sixteen
 /// gigabytes of JSON, not sit close to what a real file holds.
+///
+/// **The `2×` answers the second bullet and the third, and not the first**,
+/// which is worth saying rather than letting the derivation read as covering
+/// all three. A flip costs the in-memory budget nothing — `EditBody::Flip` has
+/// no patch — so the *writing* side bounds the entry count not at all, and
+/// enough consecutive canvas flips would write a manifest this refuses at any
+/// multiple. Six hundred thousand of them, at about forty-seven bytes each. The
+/// consequence is benign and is the one this reader is built for: the history is
+/// dropped, `HistoryDropped` says so, and the picture opens.
 pub(super) const MAX_MANIFEST_BYTES: u64 =
     2 * fmt::BUDGET_BYTES as u64 + super::container::MAX_STRUCTURE_BYTES;
 

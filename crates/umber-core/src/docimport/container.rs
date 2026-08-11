@@ -102,6 +102,22 @@ pub fn read_entry_bounded(
 /// It is deliberately **not tighter than a canvas**. A thumbnail of a document
 /// Umber can open has to work, and the figure that would make this small is a
 /// preview-specific one nobody has measured — see `preview::psd_composite`.
+///
+/// **The declared-size half of the check cannot fire on an ordinary ZIP, and
+/// that is a fact about the format rather than a figure to tune.** A non-ZIP64
+/// local header states the uncompressed size in **32 bits**, so `entry.size()`
+/// tops out at `u32::MAX` — which is *below* this, and below the un-padded
+/// 4 GiB canvas figure too, by one byte. Every bound that admits a maximum
+/// canvas is therefore above what a classic header can claim. What actually
+/// bounds an image entry is the `take(limit + 1)` **after** inflation, so the
+/// worst transient is this figure plus `read_to_end`'s geometric growth rather
+/// than a refusal before a byte is decompressed. A ZIP64 entry declaring more
+/// *is* refused up front, which is why the check stays.
+///
+/// So the surrogate-process residual is ~4.25 GiB of inflate here, and it is
+/// **larger** than `preview::psd_composite`'s 3.6 GB, which that function names
+/// as the open one. Both want the same answer: a preview ceiling nobody has
+/// measured yet.
 pub const MAX_IMAGE_BYTES: u64 =
     (ImportedDocument::MAX_DIMENSION as u64) * (ImportedDocument::MAX_DIMENSION as u64) * 4 * 17
         / 16;
@@ -109,9 +125,15 @@ pub const MAX_IMAGE_BYTES: u64 =
 /// Read one entry whole if it is present.
 ///
 /// Bounded at [`MAX_IMAGE_BYTES`], because every remaining caller is a
-/// *picture*: a layer's PNG, a mask's, a history patch, `mergedimage.png`, a
-/// Krita tile file and a `.defaultpixel`. Anything whose own size is bounded by
-/// something else should say so — see [`read_optional_entry_bounded`].
+/// *picture*: a layer's PNG, a mask's, a history patch, `mergedimage.png` and a
+/// Krita tile file. Anything whose own size is bounded by something else should
+/// say so — see [`read_optional_entry_bounded`], and [`check_mimetype`], which
+/// was on this figure and is not a picture at all.
+///
+/// A `.defaultpixel` is four bytes and is named here only because it goes
+/// through this door; the figure is loose for it and costs nothing, where
+/// `mimetype` was worth splitting out because it is the entry both readers open
+/// **first**, on a file nobody has established is a document yet.
 pub fn read_optional_entry(
     zip: &mut Zip<'_>,
     name: &str,
@@ -204,7 +226,18 @@ pub fn check_mimetype(
     expected: &str,
     format: SourceFormat,
 ) -> Result<(), ImportError> {
-    let Some(found) = read_optional_entry(zip, "mimetype", format)? else {
+    /// A `mimetype` entry has to equal one of two short strings, so nothing
+    /// longer than a line of them is worth decompressing.
+    ///
+    /// **It was on `MAX_IMAGE_BYTES` and it is not a picture**, which is the
+    /// same "a list of what a bound covers, written by whoever moved the bound"
+    /// slip that put `stack.xml` on the canvas figure — arriving in the entry
+    /// read *first* by both ZIP readers. A kibibyte is thirty times the longest
+    /// string this compares against.
+    const MAX_MIMETYPE_BYTES: u64 = 1 << 10;
+
+    let Some(found) = read_optional_entry_bounded(zip, "mimetype", format, MAX_MIMETYPE_BYTES)?
+    else {
         // Some writers omit it. Not worth refusing a file over.
         return Ok(());
     };

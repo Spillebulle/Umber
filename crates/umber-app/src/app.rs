@@ -906,6 +906,22 @@ impl UmberApp {
         // which is the entire reason it stores no pixels. The menu item is
         // disabled to match — see `ui::draw`.
         if self.editor.layers.any_locked() {
+            // **It says so, and it did not until the undo path could reach
+            // it.** The menu item is disabled on the same reading, so from the
+            // command this notice is unreachable and the silence cost nothing;
+            // stepping *over* a recorded flip is not gated anywhere, so an
+            // artist who flips, locks a layer and presses Ctrl+Z now correctly
+            // gets nothing — and would have got nothing with no explanation,
+            // which is indistinguishable from an undo that is broken.
+            self.editor.notice = Some(Notice {
+                title: "Could not flip the canvas".to_string(),
+                lines: vec![
+                    "Your picture is unchanged and nothing was mirrored. A flip mirrors \
+                     every layer, so it cannot run while any layer is locked. Unlock them \
+                     and try again."
+                        .to_string(),
+                ],
+            });
             return false;
         }
         // Masks are slices too, and a mask that stayed put while its layer
@@ -965,15 +981,22 @@ impl UmberApp {
         // The scratch surface is not mirrored either, so a stroke still in
         // flight would commit unmirrored over a flipped picture.
         self.finish_stroke();
-        let id = self.editor.session.active_id();
-        // A capture part-way through would assemble a file out of layers that
-        // were mirrored and layers that were not. `flip_layers` cancels the
-        // renderer's half; this is the scheduler's.
-        self.stop_autosave_of(id);
 
         if !self.mirror_document(axis) {
             return;
         }
+        // A capture part-way through would assemble a file out of layers that
+        // were mirrored and layers that were not. `flip_layers` cancels the
+        // renderer's half; this is the scheduler's.
+        //
+        // **After the mirror, not before**, since the flip became refusable.
+        // `flip_layers` reorders its own side so a refusal touches nothing, and
+        // cancelling the scheduler's half up here would have made a refused flip
+        // throw away a capture in flight anyway — recoverable, because `collect`
+        // settles every canvas, but a restarted readback for a command that did
+        // not happen. Nothing between here and the mirror can start one: this is
+        // all inside one frame's event handling.
+        self.stop_autosave_of(self.editor.session.active_id());
         // No pixels: undoing this is flipping again. See
         // `umber_core::history::EditBody`.
         self.editor

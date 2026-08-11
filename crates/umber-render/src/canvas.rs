@@ -11770,20 +11770,32 @@ mod tests {
     /// something is guarded; this cannot.
     ///
     /// [`CanvasRenderer::ensure_pages`] survives for the GPU tests, which want
-    /// an atlas grown without a refusal to unwrap. It is `pub`, so **the scan
-    /// covers `umber-app` as well as this module** — the name of this test says
-    /// "shipped" and `umber-app` is shipped, and a guard whose name claims more
-    /// than its domain is the failure this file records everywhere else. What
-    /// keeps it from matching its own source is the `concat!` split and the
-    /// `#[cfg(test)]` truncation, and **not** the module scope; an earlier
-    /// version of this comment credited the scope, which would have been a
-    /// reason to widen the scan and lose the protection at the same time.
+    /// an atlas grown without a refusal to unwrap. It is `pub`, so **the sweep
+    /// covers `umber-app` as well as `umber-render`** — the name of this test
+    /// says "shipped" and `umber-app` is shipped, and a guard whose name claims
+    /// more than its domain is the failure this file records everywhere else.
+    /// What keeps it from matching its own source is the `concat!` split, and
+    /// **not** the truncation below; an earlier version of this comment credited
+    /// the truncation, which would have been a reason to widen the sweep and
+    /// lose the protection at the same time.
     ///
-    /// Both call forms are matched: a method call and a `Self::` path. Comments
-    /// are stripped, and the strip takes a `//` inside a string literal with it
-    /// — over-stripping can only make the scan miss a call in such a line, which
-    /// nothing here writes, where under-stripping would fail on this file's own
-    /// prose.
+    /// **Truncating at the first `#[cfg(test)]` is what the first attempt at
+    /// this did, and it read 2% of two of the files it claims to cover.** That
+    /// attribute sits on ordinary *items* all over `umber-app` — a `use` at
+    /// `prefs.rs:35`, a helper at `panels.rs:67`, a `mod` at `lib.rs:30` — so
+    /// the sweep stopped at line 35 of 1594 and at line 67 of 3950 and said
+    /// nothing. It looks for the test *module* now, and asserts a byte total, so
+    /// a sweep that reads nothing fails instead of passing. This is the guard
+    /// widened in answer to a critic making the identical mistake one file over;
+    /// the lesson is that "it compiles and passes" says nothing about how much
+    /// of the domain a scan reached.
+    ///
+    /// Three call forms are matched: a method call, and `::ensure_pages(` for
+    /// both `Self::` and the `CanvasRenderer::` spelling every caller outside
+    /// this `impl` would reach for. Comments are stripped, and the strip takes a
+    /// `//` inside a string literal with it — over-stripping can only make the
+    /// sweep miss a call in such a line, which nothing here writes, where
+    /// under-stripping would fail on this file's own prose.
     ///
     /// Demonstrated by mutation: put `self.ensure_pages` back in `flip_layers`
     /// and this fails.
@@ -11792,37 +11804,41 @@ mod tests {
         const DEFINITION: &str = concat!("fn ", "ensure_pages(");
         const CALLS: [&str; 2] = [
             concat!(".", "ensure_pages("),
-            concat!("Self::", "ensure_pages("),
+            concat!("::", "ensure_pages("),
         ];
 
-        // Comments out, the test module off the end, and the fallible sibling
-        // taken out of the text — `try_ensure_pages` contains the shorter name,
-        // so the infallible calls cannot be counted until it is gone.
+        // Comments out, the **test module** off the end, and the fallible
+        // sibling taken out of the text — `try_ensure_pages` contains the
+        // shorter name, so the infallible calls cannot be counted until it is
+        // gone. Both of its spellings, or a `Self::try_…` would survive the
+        // first `replace` and then match `::ensure_pages(`.
         let shipped = |src: &str| -> String {
-            src.lines()
-                .take_while(|l| !l.starts_with("#[cfg(test)]"))
+            let lines: Vec<&str> = src.lines().collect();
+            // The attribute *and* the module on the next line. `#[cfg(test)]`
+            // alone sits on `use`s, helpers and `mod gputest;` declarations,
+            // which is exactly what made the first version read nothing.
+            let end = lines
+                .windows(2)
+                .position(|w| w[0].starts_with("#[cfg(test)]") && w[1].starts_with("mod tests"))
+                .unwrap_or(lines.len());
+            lines[..end]
+                .iter()
                 .map(|l| l.split("//").next().unwrap_or(""))
                 .collect::<Vec<_>>()
                 .join("\n")
                 .replace(concat!(".try_", "ensure_pages("), "")
-                .replace(concat!("Self::try_", "ensure_pages("), "")
+                .replace(concat!("::try_", "ensure_pages("), "")
         };
 
-        let here = shipped(include_str!("canvas.rs"));
-        assert!(
-            here.contains(DEFINITION),
-            "`ensure_pages` was renamed or moved; this guard has to follow it"
-        );
-
         // Every shipped source that can see it. `umber-app` is the only other
-        // crate holding a `CanvasRenderer`, and the whole reason to scan it is
+        // crate holding a `CanvasRenderer`, and the whole reason to sweep it is
         // that nothing in this file could tell you if it grew a caller.
-        let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../umber-app/src");
-        let mut sources = vec![("umber-render/src/canvas.rs".to_string(), here)];
-        let mut stack = vec![app];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut sources: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![root.join("src"), root.join("../umber-app/src")];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
-                panic!("`umber-app/src` is not where this guard expects it: {dir:?}");
+                panic!("a crate is not where this guard expects it: {dir:?}");
             };
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -11835,8 +11851,17 @@ mod tests {
             }
         }
         assert!(
-            sources.len() > 10,
-            "the sweep found {} files, which is not a crate",
+            sources.iter().any(|(_, t)| t.contains(DEFINITION)),
+            "`ensure_pages` was renamed or moved; this guard has to follow it"
+        );
+
+        // **A byte total, because a file count cannot see a truncation.** The
+        // two crates are well over a megabyte of source; a sweep that had
+        // stopped at the first attribute in each file read about a tenth of it.
+        let swept: usize = sources.iter().map(|(_, t)| t.len()).sum();
+        assert!(
+            sources.len() > 40 && swept > 700_000,
+            "the sweep read {swept} bytes of {} files, which is not two crates",
             sources.len()
         );
 

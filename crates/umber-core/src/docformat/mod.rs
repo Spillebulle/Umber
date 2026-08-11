@@ -5153,7 +5153,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The `stack.xml` out of an archive, as text.
     /// **A full stack's own `stack.xml` is far inside what the reader will
     /// take**, which is the half of `container::MAX_STRUCTURE_BYTES` that keeps
     /// "a reader must never be stricter than the writer" honest.
@@ -5198,15 +5197,24 @@ mod tests {
 
         let xml = read_stack_xml(&bytes);
         let bound = crate::docimport::container::MAX_STRUCTURE_BYTES;
+        // **The ratio the constant's own docs quote, not a rounder one.** They
+        // say "about fifteen kilobytes … a thousand times what the writer
+        // produces"; a guard asserting 64× would stay green with the bound cut
+        // to a megabyte, which is the figure-in-a-comment failure this project
+        // records — the next change gets argued against whichever number is
+        // written down. The measured ratio is printed so the comment can be
+        // corrected from a test run rather than from an estimate.
+        let ratio = bound / xml.len().max(1) as u64;
         assert!(
-            (xml.len() as u64) * 64 < bound,
-            "a full stack writes {} bytes of stack.xml against a reader bound of {bound}; \
-             sixty-four times that no longer fits, so the bound's own argument has stopped \
-             holding",
+            ratio >= 1000,
+            "a full stack writes {} bytes of stack.xml against a reader bound of {bound}, a \
+             ratio of {ratio}; `MAX_STRUCTURE_BYTES`' docs claim a thousand times what the \
+             writer produces, so either the bound or that sentence has to move",
             xml.len()
         );
     }
 
+    /// The `stack.xml` out of an archive, as text.
     fn read_stack_xml(bytes: &[u8]) -> String {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let mut body = Vec::new();
