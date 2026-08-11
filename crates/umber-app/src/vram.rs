@@ -131,12 +131,23 @@ mod tests {
 
     /// 21 slices of a 20000 × 5000 canvas, which is the document the whole of
     /// Stage 1 was written for.
+    ///
+    /// **The slice figure is a *page*, and it was the canvas until the tile
+    /// atlas landed.** A page is the canvas rounded up to whole tiles —
+    /// 20224 × 5120 — so this fixture said 400 MB where the renderer produces
+    /// 414.2, and the two figures the sentence test pins were 8.4 and 16.8 GB
+    /// against a real 8.7 and 17.4. It went on passing, because a fixture that
+    /// builds its own arithmetic is a test of the fixture — `umber-render`'s
+    /// `a_refused_reservation_states_both_the_array_and_the_transient` was
+    /// re-derived and this was not. Taken from `tile::Grid` now, which is the
+    /// same source `canvas::slice_bytes` takes it from.
     fn reported(held: u32) -> Vram {
         let doc_size = UVec2::new(20000, 5000);
+        let page = umber_core::tile::Grid::new(doc_size).page_size();
         Vram {
             slices: 21,
             held,
-            slice_bytes: u64::from(doc_size.x) * u64::from(doc_size.y) * 4,
+            slice_bytes: u64::from(page.x) * u64::from(page.y) * 4,
             doc_size,
         }
     }
@@ -196,7 +207,8 @@ mod tests {
     /// need different ones.
     ///
     /// An open has nothing resident beside the array, so its figure is the array
-    /// — 21 slices at 400 MB each. A growth holds the array it replaces as well,
+    /// — 21 slices at 414 MB each, which is what a *page* of this canvas costs.
+    /// A growth holds the array it replaces as well,
     /// so its figure is `c + n`; reading `bytes` there would understate by the
     /// whole of the document already on the card. This measures the strings that
     /// are drawn rather than the accessors: swapping `peak_bytes` for `bytes` in
@@ -205,7 +217,7 @@ mod tests {
     fn each_refusal_names_the_figure_the_device_declined() {
         let open = open_refused("sketch.clip", 21, &reported(0));
         assert!(
-            open.lines[0].contains("8.4 GB"),
+            open.lines[0].contains("8.7 GB"),
             "an open names the array it asked for: {}",
             open.lines[0]
         );
@@ -217,7 +229,7 @@ mod tests {
 
         let grown = slice_refused("a layer", &reported(21));
         assert!(
-            grown.lines[0].contains("16.8 GB"),
+            grown.lines[0].contains("17.4 GB"),
             "a growth names the array it replaces as well as the one it makes: {}",
             grown.lines[0]
         );

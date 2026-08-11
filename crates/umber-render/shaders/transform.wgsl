@@ -131,7 +131,15 @@ fn fs_mask(in: VsOut) -> @location(0) vec4<f32> {
     let cov = select(1.0, sampled, u.use_mask != 0u);
     // Alpha survives the sRGB view unchanged — the transfer function is on the
     // colour channels only — so this is the same linear 0..1 the coverage is.
-    let a = textureSampleLevel(src_tex, samp, in.doc / u.doc_size, 0.0).a;
+    //
+    // **`textureLoad`, not a sampler**, and that is the same argument
+    // `fs_blend` and `flip.wgsl` make: this quad covers the rectangle 1:1, so a
+    // fragment centre lands exactly on a texel centre and a bilinear tap is a
+    // point sample with a chance of rounding into its neighbour. It is also what
+    // makes this independent of how large `src_tex` is — the layer's slice is a
+    // *page* of the tile atlas now, which is the canvas rounded up to whole
+    // tiles, so `in.doc / u.doc_size` stopped being where the texel was.
+    let a = textureLoad(src_tex, vec2<i32>(in.doc), 0).a;
     // `max` in the divisor rather than a branch on `a > 0`: `min(a, cov)` is
     // never above `a` and `a` is never above the divisor, so the share stays
     // within 0..1, and a bare pixel gives `0 / eps` rather than a NaN that

@@ -184,8 +184,14 @@ impl Graphics {
         // time paid that peak at every step — see
         // [`CanvasRenderer::for_document`].
         let mut canvas = match self.canvases.values().next() {
-            Some(existing) => existing.for_document(&self.gpu.device, size, slots),
-            None => CanvasRenderer::new(&self.gpu.device, size, self.config.format, slots),
+            Some(existing) => existing.for_document(&self.gpu.device, &self.gpu.queue, size, slots),
+            None => CanvasRenderer::new(
+                &self.gpu.device,
+                &self.gpu.queue,
+                size,
+                self.config.format,
+                slots,
+            ),
         };
         canvas.set_background(doc.background);
         self.install_canvas(id, canvas);
@@ -205,10 +211,26 @@ impl Graphics {
     /// The background is the caller's to set, because this does not take a
     /// `Document`: [`Graphics::add_canvas`] is what pairs the two, and a
     /// renderer cloned from another document's does not inherit it.
-    fn make_canvas(&self, size: UVec2, slots: u32) -> Result<CanvasRenderer, Vram> {
+    /// Reserve a document's tile atlas, or report what the device refused.
+    ///
+    /// **`pages`, not slots.** Since the atlas has an allocator, a slot costs a
+    /// slice of the page table and no storage at all, so there is nothing to
+    /// reserve per layer; what has to exist up front is enough *pages* to hold
+    /// the tiles about to be uploaded. `install_import` computes that from the
+    /// piece set the reader handed it — which is exactly the residency signal,
+    /// and for a `.clip` is block presence.
+    fn make_canvas(&self, size: UVec2, pages: u32) -> Result<CanvasRenderer, Vram> {
         match self.canvases.values().next() {
-            Some(existing) => existing.try_for_document(&self.gpu.device, size, slots),
-            None => CanvasRenderer::try_new(&self.gpu.device, size, self.config.format, slots),
+            Some(existing) => {
+                existing.try_for_document(&self.gpu.device, &self.gpu.queue, size, pages)
+            }
+            None => CanvasRenderer::try_new(
+                &self.gpu.device,
+                &self.gpu.queue,
+                size,
+                self.config.format,
+                pages,
+            ),
         }
     }
 
@@ -223,7 +245,7 @@ impl Graphics {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("init-document"),
             });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&self.gpu.queue);
         canvas.clear_stroke(&self.gpu.device, &mut enc);
         self.gpu.queue.submit(Some(enc.finish()));
 
@@ -1172,7 +1194,7 @@ impl UmberApp {
             return;
         };
         let Some(damage) = damage else {
-            canvas.end_float();
+            canvas.end_float(&gfx.gpu.queue);
             return;
         };
 
@@ -1286,7 +1308,7 @@ impl UmberApp {
             });
         canvas.commit_float(&gfx.gpu.queue, &mut enc, damage, &params);
         gfx.gpu.queue.submit(Some(enc.finish()));
-        canvas.end_float();
+        canvas.end_float(&gfx.gpu.queue);
 
         // The marquee follows the picture it described. Only for a lift: a
         // paste did not come out of the selection, so moving it would be a
@@ -1368,7 +1390,7 @@ impl UmberApp {
         if let Some(gfx) = self.gfx.as_mut()
             && let Some(canvas) = gfx.canvases.get_mut(&id)
         {
-            canvas.end_float();
+            canvas.end_float(&gfx.gpu.queue);
         }
         self.request_redraw();
         true
@@ -2080,7 +2102,7 @@ impl UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("clear"),
             });
-        canvas.clear_layer(&mut enc, slot);
+        canvas.clear_layer(&gfx.gpu.queue, slot);
         canvas.clear_stroke(&gfx.gpu.device, &mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
         // Undo entries reference pixels that no longer exist in any meaningful
@@ -2245,18 +2267,11 @@ impl UmberApp {
         canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
 
         // A recycled slot still holds the deleted layer's pixels.
-        let mut enc = gfx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("init-layer"),
-            });
-        canvas.clear_layer(&mut enc, slot);
-        gfx.gpu.queue.submit(Some(enc.finish()));
+        canvas.clear_layer(&gfx.gpu.queue, slot);
     }
 
-    /// Ask the device for the storage one more slice would need, changing
-    /// nothing.
+    /// Ask the device for the storage one more *painted* layer would need,
+    /// changing nothing.
     ///
     /// One gate for [`Self::add_layer`] and [`Self::add_mask`], because they are
     /// the same question — both claim exactly one slice off the same pool — and
@@ -2265,10 +2280,19 @@ impl UmberApp {
     /// not happen, where a refusal after it would leave the stack naming a slice
     /// the array does not have.
     ///
-    /// `slot_capacity_after_one_claim` rather than `slot_capacity_needed() + 1`,
-    /// because a claim that fills a parked slice's gap needs no storage at all
-    /// and reserving for it would grow the array by 400 MB at 10000² for a slice
-    /// nobody takes. See that method.
+    /// **What is reserved is a page of headroom, not a slice**, and the
+    /// difference arrived with the tile atlas: a blank layer stores no tile and
+    /// therefore costs nothing, so there is no slice left to refuse at the
+    /// moment one is added. Refusing nothing would be worse than not asking,
+    /// because the gate would go quiet exactly when the card is full — so
+    /// `CanvasRenderer::try_ensure_slots` guarantees the pool holds enough free
+    /// cells that the first stroke on the new layer cannot be the thing that
+    /// meets the ceiling. It is idempotent, so sixty-four blank layers ask for
+    /// one page and not sixty-four.
+    ///
+    /// `slot_capacity_after_one_claim` rather than `slot_capacity_needed() + 1`
+    /// is now only what the ceiling assertion is stated against, since neither
+    /// figure decides an allocation. See that method.
     ///
     /// With no graphics yet — the Android path before `resumed` — there is
     /// nothing to ask and nothing to refuse; the caller's own `self.gfx` check
@@ -2462,16 +2486,12 @@ impl UmberApp {
             return;
         };
         canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
-        let mut enc = gfx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("init-mask"),
-            });
         // White, not cleared: a recycled slice holds the last layer's pixels,
-        // and an empty mask would hide the layer outright.
-        canvas.fill_layer_white(&mut enc, slot);
-        gfx.gpu.queue.submit(Some(enc.finish()));
+        // and an empty mask would hide the layer outright. Since the tile atlas
+        // this is a table write rather than a canvas-sized clear — full reveal
+        // *is* a mask slot's empty value — so a new mask costs no storage at
+        // all until somebody paints on it.
+        canvas.fill_layer_white(&gfx.gpu.queue, slot);
     }
 
     /// Take the selected layer's mask off.
@@ -4537,7 +4557,31 @@ impl UmberApp {
             history,
         } = imported.open();
         let size = doc.size;
-        let slots = layers.slot_capacity_needed();
+        // **The reservation is stated in pages, computed from the residency
+        // about to be uploaded.** It used to be `slot_capacity_needed()` — one
+        // canvas-sized slice a layer — and that figure is what refused the
+        // artist's 20000×5000 document at 21.2 GB while it held 1.42 GB of
+        // paint. A slot costs no storage now, so what has to exist is enough
+        // pages for the tiles the pieces reach; `Opened::uploads` already *is*
+        // the piece set, which for a `.clip` is block presence.
+        //
+        // Presence over-reports residency — measured at 1.13× across the
+        // corpus and 1.58× on the worst document — so this is an upper bound on
+        // what will actually be backed rather than an estimate, which is the
+        // right direction for a reservation.
+        let grid = umber_core::tile::Grid::new(UVec2::new(size.x, size.y));
+        let mut tiles = 0usize;
+        for upload in &uploads {
+            let mut seen: Vec<(u32, u32)> = upload
+                .pieces
+                .iter()
+                .flat_map(|p| grid.tiles_over(p.rect))
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            tiles += seen.len();
+        }
+        let pages = (tiles as u32).div_ceil(grid.tiles_per_page().max(1));
 
         // **The layer array is asked for before `open_document`**, which is the
         // whole of how a card that cannot hold it produces a sentence rather
@@ -4548,11 +4592,11 @@ impl UmberApp {
         // editor. Here nothing has touched the *session*, so a refusal leaves it
         // exactly as it was, exactly as the device-limit check above does.
         //
-        // Not before `imported.open()`, which has already run three lines up:
-        // the slice count is not the layer count — a mask is a slice too — so
-        // there is nothing to ask the device for until the stack exists. That
-        // call has therefore already built this document's host-side buffers,
-        // and a refusal here frees them rather than never allocating them.
+        // Not before `imported.open()`, which has already run: the page count
+        // is derived from the pieces that call produced, so there is nothing to
+        // ask the device for until they exist. That call has therefore already
+        // built this document's host-side buffers, and a refusal here frees
+        // them rather than never allocating them.
         //
         // **It does not cover the uploads below.** Those go through
         // `Queue::write_texture`, whose staging buffer is allocated by wgpu's
@@ -4561,7 +4605,7 @@ impl UmberApp {
         // and the submit in the loop bound how much staging can stand at once;
         // they do not make it reportable. See `vram`'s module docs.
         let reserved = match self.gfx.as_ref() {
-            Some(gfx) => match gfx.make_canvas(UVec2::new(size.x, size.y), slots) {
+            Some(gfx) => match gfx.make_canvas(UVec2::new(size.x, size.y), pages) {
                 Ok(canvas) => Some(canvas),
                 Err(refused) => {
                     // The artist's own count, not the slice count: a masked
@@ -4621,6 +4665,16 @@ impl UmberApp {
                 // covers is left as `install_canvas`'s clear — that is
                 // `docimport::PixelPiece`'s rule 3, and it is why there is no
                 // "this layer is finished" call here.
+                // **Which slices are masks has to be said, before they are
+                // written.** A rectangle of bytes does not say what it is for,
+                // and what a slot's *absent* tiles read as depends on it: a mask
+                // reveals where nothing is stored and a layer is transparent
+                // there. An imported mask arrives fully backed, so nothing shows
+                // today — until a grow-resize adds a region no copy fills. See
+                // `CanvasRenderer::mark_mask_slot`.
+                for slot in self.editor.layers.layers().iter().filter_map(|l| l.mask()) {
+                    canvas.mark_mask_slot(slot);
+                }
                 for upload in &uploads {
                     for piece in &upload.pieces {
                         canvas.write_layer_rect(
@@ -5077,6 +5131,7 @@ impl ApplicationHandler<Wake> for UmberApp {
         // afterwards, for the reason `CanvasRenderer::for_document` gives.
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
+            &gpu.queue,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
             config.format,
             self.editor.layers.slot_capacity_needed(),
@@ -5092,7 +5147,7 @@ impl ApplicationHandler<Wake> for UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("init"),
             });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&gpu.queue);
         canvas.clear_stroke(&gpu.device, &mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
@@ -6167,14 +6222,15 @@ mod tests {
 
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
+            &gpu.queue,
             size,
             wgpu::TextureFormat::Rgba8Unorm,
             stack.slot_capacity_needed(),
         );
-        let mut encoder = gpu
+        let encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        canvas.clear_all_layers(&mut encoder);
+        canvas.clear_all_layers(&gpu.queue);
         gpu.queue.submit(Some(encoder.finish()));
 
         // One flat opaque colour per layer, keyed to its stack position rather

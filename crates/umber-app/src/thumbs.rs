@@ -303,14 +303,15 @@ mod tests {
         editor.doc = umber_core::Document::new(64, 64);
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
+            &gpu.queue,
             editor.doc.size,
             wgpu::TextureFormat::Rgba8Unorm,
             editor.layers.slot_capacity_needed(),
         );
-        let mut enc = gpu
+        let enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        canvas.clear_all_layers(&mut enc);
+        canvas.clear_all_layers(&gpu.queue);
         gpu.queue.submit(Some(enc.finish()));
 
         let ctx = Context::default();

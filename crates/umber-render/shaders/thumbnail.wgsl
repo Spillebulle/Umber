@@ -94,6 +94,10 @@ const MAX_TAPS: i32 = 1024;
 
 @group(0) @binding(0) var<uniform> u: Thumb;
 @group(0) @binding(1) var layers: texture_2d_array<f32>;
+// Where each of each slot's tiles lives. `layers` is a tile atlas, so a document
+// texel of a slot is `tile_load`'s to find. See `tiles.wgsl`, concatenated in
+// front of this file.
+@group(0) @binding(2) var page_table: texture_2d_array<u32>;
 
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let lower = c * 12.92;
@@ -138,7 +142,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // that is what leaves the margin around a mark in the corner.
             var texel = vec4<f32>(0.0);
             if (at.x >= 0 && at.y >= 0 && at.x < bounds.x && at.y < bounds.y) {
-                texel = textureLoad(layers, at, i32(u.slot), 0);
+                // A thumbnail is only ever taken of a *layer*, never of a mask,
+                // so the empty value is transparent — which is also what the
+                // bounds test above already substitutes outside the canvas.
+                texel = tile_load(layers, page_table, i32(u.slot), at, vec4<f32>(0.0));
             }
             acc += texel;
             peak = max(peak, texel.a);

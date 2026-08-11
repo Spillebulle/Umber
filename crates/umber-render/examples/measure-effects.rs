@@ -311,6 +311,7 @@ fn bake_sweep(gpu: &Gpu, size: u32) {
 
     let mut canvas = CanvasRenderer::new(
         &gpu.device,
+        &gpu.queue,
         glam::UVec2::splat(size),
         wgpu::TextureFormat::Rgba8Unorm,
         1,

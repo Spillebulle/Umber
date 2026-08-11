@@ -9,9 +9,286 @@ it can hold.
 
 This document is the design for replacing the array of canvas-sized slices with
 a **tile atlas plus an indirection table**, so that a layer costs what it
-covers. It is not built. What is here is the shape, the arithmetic, the places
-it touches, the ways it could damage the picture and how each is prevented, and
-the measurements that have to happen before any of it is written.
+covers. **It is built, in both stages** — §0a is the record of what that turned
+out to be and where it departs from the rest of this file, and it is the section
+to read before any other. What is here below it is the shape, the arithmetic,
+the places it touches, the ways it could damage the picture and how each is
+prevented, and the measurements that were taken before any of it was written.
+
+---
+
+## 0a. What was built, and where it departs from this document
+
+**Both stages are in.** `umber_core::tile` is the arithmetic, `shaders/tiles.wgsl`
+is the shader-side unpack, `LayerStore` is the atlas and the page table, and the
+allocator is `back_tiles`/`promote`/`release_slot` on `CanvasRenderer`. Read this
+section before the rest of the file: several of the decisions below are
+deliberate departures, and taking the design's own wording for the code is the
+"stale instructions" failure `CLAUDE.md` records.
+
+**Measured, on an RTX 3080 over the artist's 33 real documents**, by
+`umber-core`'s `measure-atlas` (the reservation arithmetic, no device) and
+`umber-render`'s `measure-vram` (the real renderer, the real upload):
+
+| | dense | a page a slice | atlas |
+|---|---|---|---|
+| `Valorants magical bitches.clip`, 20000×5000, 53 slices | 19.74 GB | 20.44 GB | **1.54 GB** |
+| all 33 documents | 55.26 GB | 57.64 GB | **10.44 GB** |
+
+The motivating document opens: four pages, 5,412 tiles backed of a dense 83,740
+(6.5%), uploaded in 703 ms, 908 cells left free in the pool. That is not a
+projection — `measure-vram` puts it on the card.
+
+**The regression is in the same table.** Five documents come out *above* 100% of
+dense, at 104.9%, and that is the page padding on layers covering their whole
+canvas. See "What sparse residency does not do to the padding" below: it follows
+how far a dimension is from a multiple of 256, so it is 4.9% at 3000 square and
+**26.4% at 1920×1080**. The two 1920×1080 documents in the corpus still measure
+32.8% and 36.1% of dense, because their layers are not full.
+
+- **There is no apron, and `A` does not exist.** §8.1's fallback — refusal 7, the
+  hand-reconstructed bilinear tap — is what shipped, and §8.3's mark-and-refresh
+  is therefore not built and not needed. What decided it was not the ranking in
+  §8.1 but §3.5's consequence: an apron makes a tile's pitch 258, and a page
+  whose pitch is not the tile cannot be the canvas rounded up, which is the next
+  bullet. `a_tap_across_a_tile_boundary_blends_the_logical_neighbour` is the
+  guard, and it needs the page table deliberately rearranged to say anything at
+  all — under the identity, adjacent logical tiles are adjacent in the atlas too.
+- **A page is the canvas rounded up to whole tiles, not a fixed 16×16 grid.**
+  §3.1's free parameter is gone: a page holds exactly one layer's worth of tiles,
+  so a page *is* what a slice was and §3.1's growth correction, `try_reserve`,
+  `Vram`, `resize` and every `MAX_SLOTS` figure are unchanged rather than
+  re-derived. The ceiling is therefore today's ceiling and not 17.18 GB. The
+  costs: the page-side sweep §10 asks `measure-atlas.rs` for is not a question
+  any more, and the dense-layer penalty is **per axis** rather than §4.2's flat
+  5.2% — which makes it worst on a *small* dimension and best on the canvas this
+  programme is about. 3.5% at 20000×5000, 5.4% on an A4 page at 600 dpi, 6.7% at
+  2560×1440, **26.4% at 1920×1080** and 63.8% at 800×600. 1080 is 4.22 tiles, so
+  the most ordinary canvas anybody paints on is the worst realistic entry, and
+  `growth_quantum` reads that figure — a 1920×1080 document's quantum falls from
+  32 slices to 25. `canvas.rs`'s `slice_bytes` carries the table. Quoting the
+  3.5% alone, which a first draft of this section did, is "state the figures one
+  by one" broken in the document a later reader takes for instructions.
+  **It rests on one property**: rounding a canvas up to a multiple of 256 cannot
+  cross `max_texture_dimension_2d`, because every value that limit takes is
+  itself a multiple of 256. That is true of every adapter anybody has measured
+  and it is not something the specification promises.
+  `rounding_a_canvas_up_to_tiles_never_passes_the_device_limit` sweeps the real
+  figures; the residual is a device reporting, say, 5000, where a 4900 canvas
+  would want a 5120 page and `create_texture` would refuse it *fatally*. The fix
+  if one ever appears is to round `CanvasLimit::of_device` **down** to a whole
+  tile — and to route `install_import`'s own direct check through the same
+  function, which today keeps a second copy of that comparison.
+- **Vertex shaders were not taught about pages.** A page is larger than the
+  canvas and every vertex shader that writes a layer maps document pixels to clip
+  space through `doc_size`, so `aim_at_document` sets a viewport instead. Three
+  passes take it; the effect passes already set their own. Under stage 2 a pass
+  targets a *tile*, and a viewport cannot express that — the offset can be
+  negative — so that is where the uniform field §5.3 describes has to arrive.
+- **`transform.wgsl`'s `fs_mask` reads with `textureLoad`.** It sampled the layer
+  at `doc / doc_size`, which stopped being where the texel was. Integer is what
+  a 1:1 quad wanted anyway, and it is the same argument `fs_blend` and
+  `flip.wgsl` already make.
+
+### What sparse residency does *not* do to the padding, which is the premise to correct first
+
+The obvious reading of "a page is the canvas rounded up, and unbacked tiles cost
+nothing" is that residency retires the padding. **It does not, and a
+fully-painted layer still pays all of it.** A page is `tiles × 256` and *every*
+tile slot in it is a real tile of the canvas grid — there are no padding tiles,
+only padding *inside* the edge tiles. On 1920×1080 the grid is 8×5 and the
+rightmost column covers document x 1792..1919, 128 of its 256; a layer touching
+that column backs the whole tile. So a layer covering the canvas costs 2.62 Mpx
+against a dense slice's 2.07, at every occupancy of 100%.
+
+What residency retires is the padding **in proportion to sparsity**, which for a
+corpus at 13.5% is nearly all of it and for a background fill layer is none. The
+honest statement is that stage 2 wins overwhelmingly on the documents this
+programme is about and leaves one bounded regression — a fully-painted layer on
+a canvas whose dimensions are far from a multiple of 256 — which is the price of
+free relocation and is the thing to weigh if anybody proposes partial edge
+slots.
+
+### What stage 2 did, and the five places it departs from the plan above
+
+Every numbered item of the plan this section used to hold is built. What follows
+is what it turned out to be, in the same order, with the departures marked —
+because the plan is what somebody will read next and four of its sentences are
+now false.
+
+1. **A tile allocator over pages, and page-backed slots.** `PageUse` is `Pool` or
+   `Owned(slot)`; `free` is the pool's cells as `Entry`s; `back_tiles` hands them
+   out, `promote` takes a whole page identity-mapped, `release_slot` gives
+   everything back. The page table is `MAX_SLOTS` deep from the moment the store
+   exists and is never grown, exactly as the plan says, and `ensure_slots` is
+   therefore an assertion and nothing else.
+
+   **The departure: `try_ensure_slots` did not become vacuous, it became a
+   headroom check.** The plan says a blank layer costs nothing so `add_layer`'s
+   refusal has nothing left to refuse, and moves it to the first stroke. That is
+   right about the cost and wrong about what to do: a gate that goes quiet
+   exactly when the card is full is worse than no gate, and §9.5's stroke-time
+   refusal is still the thing with no good answer. So `try_ensure_slots` reserves
+   a *page of headroom in the pool* — enough free cells that the first stroke on
+   the new layer cannot be the thing that meets the ceiling — which keeps the
+   refusal live and its sentence true, and is idempotent, so sixty-four blank
+   layers grow the atlas once rather than sixty-four times.
+
+2. **`write_layer_rect` backs the tiles it writes**, with no emptiness scan, for
+   the reason the plan gives and the roadmap's §2.1 argues.
+
+3. **The commit is per (piece ∩ tile)**, `CommitUniforms` gained `atlas_delta`
+   and `target_size`, `out.doc` stayed in document space, `commit_layout`'s
+   binding 0 took a dynamic offset and `aim_at_document` came off both commits.
+   The plan's estimate of ninety lines and ten of WGSL was close.
+
+   **One addition the plan does not have: the *blended* commit is cut the same
+   way**, which bounds its backdrop copy at one tile rather than at
+   `canvas width × 64`. That is a straight improvement to §5.4's figure and it
+   arrived for free, because both commits now go through one `commit_aims`.
+
+4. **The readbacks and the capture synthesise.** `read_layer_pieces` fills its
+   output with `SlotClass::empty_bytes` before any copy lands and copies only
+   backed fragments; `read_layer_rect` is one call to it. The capture fills the
+   gaps in `Capture::copy_chunk`, from the slot's own empty value, as the rows
+   come out of the mapped buffer.
+
+   **It was a `clear_buffer` first, and that was the worst defect in the whole
+   stage.** `clear_buffer` writes zeroes, which is a layer's empty value and not
+   a mask's — and the comment beside it asserted that a partly-backed mask could
+   not arise, "every mask a save or an autosave reads is fully backed, from an
+   import's single canvas piece or from a stroke". That stopped being true in
+   the same change that wrote it: item 5 below made `fill_layer_white` a table
+   write, so *add a mask, paint on part of it* is a Mask-class slot with tiles
+   unbacked. Zeroes on `.r` are coverage 0, so the **autosaved file hid the
+   layer everywhere the artist had not painted on its mask**, while the explicit
+   Save — which goes through `read_layer_pieces` — did not. Two writers of one
+   document disagreeing, which is the failure CLAUDE.md calls worse than losing
+   something every time.
+
+   Doing the fill on the CPU is also better for a *layer*: `clear_buffer` was
+   one lump of GPU work per band, up to `readback_limit` and so 268 MB on the
+   motivating document, where `copy_chunk` is already spread across frames by
+   `CAPTURE_CHUNK_BYTES`.
+
+5. **`clear_layer`, `fill_layer_white` and `clear_all_layers` are table writes**,
+   and `fill_layer_white` is the one that is more than a tidy-up: full reveal
+   *is* a mask slot's empty value, so **a new mask now costs no storage at all**
+   until somebody paints on it. That is half of §5 arriving as a side effect of
+   `SlotClass` existing.
+
+6. **`upload_table` is per slot** on every path a drawing frame takes.
+
+7. **`resize` needs no scratch**, exactly as the plan says: clip, shift,
+   `copy_texture_to_texture`.
+
+   **The departure: the flip did not promote.** The plan offers "promote and use
+   today's code, or teach `flip.wgsl` the page table". Promotion is *fatal* here
+   — it is every layer at once, which on the motivating document is the 19.7 GB
+   the whole exercise exists to avoid, reached by pressing a key. So
+   `flip.wgsl` reads the page table, through a raw non-sRGB `D2Array` view, into
+   a **page-sized scratch laid out at identity positions** — which is what lets
+   one pass do a whole slot rather than one pass per tile.
+
+   **And a cost the plan does not anticipate: a flip coarsens residency.** All
+   that is known about a source tile is that it is backed, not where inside it
+   the paint is, so a 256-wide source tile mirrored onto a canvas that is not a
+   whole number of tiles lands across *two* destination tiles. The picture is
+   exact — `a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly`
+   compares every byte — and the storage is an over-approximation that at most
+   doubles per flip and is bounded by the grid. Nothing short of a whole-layer
+   readback can do better.
+
+8. **§9.5's refusal is unchanged and is still the thing with no good answer.**
+   `back_tiles` grows fallibly; where the device refuses, the tiles that could
+   not be backed are logged and skipped and the stroke loses them.
+
+### The hazards that are not in this document at all
+
+**A growth part-way through a caller's encoder loses what was already recorded
+into it.** A growth replaces the atlas texture and copies the old one into the
+new; recorded on its own encoder and submitted, that copy reads the old texture
+*before* the caller's still-open encoder writes to it, so those writes land in a
+texture nothing will ever read again.
+
+It is reachable in `render`: `draw_float` writes the float's preview page into
+the frame's encoder several statements before `bake_effects` can promote an
+effect slice and grow. `commit_stroke`'s own encoder holds only `draw_dabs`,
+which writes the scratch, so `finish_stroke` was safe by accident rather than by
+rule.
+
+`ensure_pages` and `try_ensure_pages` therefore take an
+`Option<&mut CommandEncoder>` — the caller's where there is one, a fresh
+submitted one where there is not — and the second half of it is that
+`ensure_effect_scratch` must run *after* the promotion, because its bind groups
+name the array view a growth replaces and `bound_capacity` can only notice when
+it is asked afterwards.
+`a_growth_part_way_through_an_encoder_keeps_what_was_recorded_before_it` is the
+guard; put the growth back on its own encoder and it fails.
+
+**The rule was then broken at the one call site its own commit message cited**,
+and a critic found it: `run_effect_steps` still promoted into an encoder of its
+own. The guard could not see it, because it drives `commit_stroke`, which reaches
+a growth through `back_tiles` — where the fix *was* applied. A rule enforced in N
+methods still needs somebody to check that N is all of them, which is the lesson
+`slot_revision` already records.
+
+**And an effect slice's page was never handed back.** The comment beside the
+promotion said the pages came back through `EffectCache::forget_all` and
+`retain_only`; neither can, because that type holds no `LayerStore`. Four drop
+shadows enabled and then removed held four whole pages — 1.6 GB on the
+20000×5000 document — until a resize. The three methods are `#[must_use]` now
+and answer with the slots they gave up.
+
+**And the fill that replaced `clear_buffer` then leaked into the step after
+it.** `gaps` and `empty` describe the *step*, and the step following the last
+layer is the flattened preview — which is contiguous and has none. Left alone it
+took the previous one'''s, so `copy_chunk` punched that layer'''s unbacked tiles out
+of the merged image: holes in `mergedimage.png` shaped like wherever the topmost
+layer happened not to be stored. Nothing in the suite compared
+`DocumentCapture::merged` against `export_rgba` on a canvas with more than one
+tile, which is why it took a third pass to find. `gaps` is recomputed on every
+band now rather than on the first of each step, because guarding it on `row == 0`
+is the same staleness one level down.
+
+**`atlas_invariant` is what those two argue for.** Every cell held by exactly one
+slot or free, no duplicates, none leaked, checked as a *set* after every step of
+a session that writes, fills, clears, masks, commits, lifts, flips, resizes and
+clears again. A cell issued twice is one layer's paint in another's and a cell
+leaked is storage nothing can take back; neither appears in a pixel until the two
+slots happen to be drawn together, which is exactly why the effect leak survived
+a critic-reviewed branch and two rounds of mutation testing.
+
+### What is left, and what it is worth
+
+- **A mask at one byte** (§5). `SlotClass` is the hook and it exists; what is
+  left is the format and the readers. There is a measured precision *gain*
+  available with it — `coverage_table` is non-injective, about 74 of 256 states
+  unreachable at the reveal end — but that touches the file format and needs a
+  version bump, so it is deliberately not foreclosed and deliberately not built.
+- **The autosave's whole `DocumentCapture`** (`formats-and-host-memory.md`
+  §10.1's fix 1). `take_capture` still hands the writer thread every canvas at
+  once. Releasing finished slices one at a time is the remaining half of "10 GB
+  every five minutes", and it is `canvas.rs`'s, which is why it was handed to
+  this stage; it did not get done.
+- **A transformed layer stops being sparse.** The float promotes its layer and
+  the page is not given back at commit, because demoting would need to know
+  which tiles are empty and that is a readback. The preview's page *is* given
+  back, by `end_float`.
+- **Residency never shrinks under an undo.** A stroke's patch is captured over
+  the pieces it damaged, so the tiles that were unbacked then read back as the
+  empty value, the undo writes it, and the tile is backed to store nothing. A
+  layer ends up holding the union of everywhere it has ever been painted,
+  bounded by the grid. An emptiness scan is what would avoid it and is the thing
+  `write_layer_rect` must not have.
+- **A flip coarsens residency**, at most doubling per flip and bounded by the
+  grid. See item 7 above.
+- **The Android resume path does not carry the slot classes.** `resumed`
+  rebuilds storage with no pixels — `add_canvas` is handed a `Document` and not
+  a stack — so every slot comes back a Layer and a mask reads transparent rather
+  than white. That is exactly what a cleared slice did before, so it is not a
+  regression; it is cheap to fix and nobody can test it, because the mobile
+  build has never been run.
 
 ---
 
