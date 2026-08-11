@@ -894,10 +894,19 @@ impl ImportedDocument {
         // The readers charge as they decode, which is what bounds the *spend* —
         // a hostile header claiming sixty-four 16384² layers must not be
         // decoded sixteen layers deep before anybody objects. This is the
-        // *guarantee*, for the same reason `disable_effects_over_budget` is
-        // called from both ends: `ImportedLayer::pixels` is a public field on a
-        // public struct, so a caller building an `ImportedDocument` by hand
-        // reaches `open` without passing through any reader at all.
+        // whole-document figure, checked once, so a reader whose own accounting
+        // is wrong still cannot hand back a document past the bound.
+        //
+        // **It is not the guarantee `disable_effects_over_budget` is**, and the
+        // two look alike enough that the difference has to be said. That one is
+        // called from inside `open`, which is what makes it total; this one is
+        // private and `open` does not call it, because `open` answers with an
+        // `Opened` and has nowhere to put a refusal. So the bound belongs to
+        // the `import` entry points — `import_reporting` and
+        // `read_openraster` — and a caller assembling an `ImportedDocument` by
+        // hand and calling `open` on it is checked by nothing. Nothing in the
+        // workspace does that, and saying so is better than a sentence that
+        // reads as cover.
         //
         // Folders contribute nothing because a folder holds no pieces, which is
         // the entries-versus-buffers distinction `StackSize` used to have to
@@ -921,6 +930,28 @@ impl ImportedDocument {
             debug_assert!(
                 !layer.folder || (layer.pixels.is_empty() && layer.mask.is_none()),
                 "reader put pixels on a folder, which holds no slot to write them to"
+            );
+            // **A mask is exactly one piece and it covers the canvas.** The
+            // field's type permits a sequence and `PixelPiece`'s rule 3 forbids
+            // using it — a rule held by prose, which is a rule that will
+            // eventually be broken. Held here instead: a reader that made a
+            // mask sparse would otherwise compile, pass every rule below, and
+            // blank the covered layers wherever no piece reached, because the
+            // clear leaves transparent black and a mask reads that as *fully
+            // hidden*. That is the failure `import-and-limits.md` §7.2 names.
+            debug_assert!(
+                layer.mask.as_ref().is_none_or(|m| {
+                    m.len() == 1
+                        && m[0].rect
+                            == PixelRect {
+                                x: 0,
+                                y: 0,
+                                width: self.size.x,
+                                height: self.size.y,
+                            }
+                }),
+                "a mask must be one piece covering the canvas until a slot class \
+                 carries its own empty value"
             );
             for piece in layer.pixels.iter().chain(layer.mask.iter().flatten()) {
                 debug_assert!(
@@ -1520,21 +1551,64 @@ impl PieceBudget {
         self.spent = self.spent.saturating_add(layer.pixel_bytes());
         check_resident(self.width, self.height, self.layers, self.spent, self.limit)
     }
+
+    /// Refuse a decode that is *about* to cost this much, before it happens.
+    ///
+    /// **For a reader that cannot yield pieces, which today is `.psd` alone.**
+    /// The premise that retired the header comparison is that a hostile header
+    /// claiming a huge canvas yields no pieces and costs nothing — and that is
+    /// true of `.clip`, `.kra` and `.ora` and **false of `.psd`**, because
+    /// `psd` 0.3.5's `Layer::rgba()` hands back a canvas-sized buffer per layer
+    /// and there is nothing better to be had. Charging that reader only after
+    /// each layer means refusing once the memory has been spent: a malformed
+    /// file declaring `MAX_DIMENSION` square with a full stack is 4.29 GB a
+    /// layer, so it would refuse on the fourth, which is the process being
+    /// killed with a sentence written for it.
+    ///
+    /// **It looks ahead rather than committing**, so a reader may reserve for
+    /// the worst case and still charge each layer as it lands: the accumulated
+    /// figure stays what the document actually holds, and a layer the reader
+    /// skipped costs nothing.
+    fn reserve(&mut self, bytes: u64) -> Result<(), ImportError> {
+        check_resident(
+            self.width,
+            self.height,
+            self.layers,
+            self.spent.saturating_add(bytes),
+            self.limit,
+        )
+    }
 }
 
 /// The one comparison against [`ImportedDocument::MAX_TOTAL_BYTES`].
 ///
-/// **Masks are deliberately not counted, and the bound is therefore what a
-/// stack of layers costs rather than what a document costs.** A mask is another
-/// canvas-sized slice, so a document whose every layer carries one reaches
-/// roughly twice the figure. Counting them looks like the obvious tightening
-/// and is wrong in the one direction that matters: this is the check an *Umber*
-/// document goes through on the way back in, so a bound that counted masks
-/// would refuse to reopen large masked documents Umber itself had written — the
-/// reader would be stricter than the writer, and the artist's own file would be
-/// the casualty. The real limits are the caller's `max_texture_dimension_2d`
-/// check, `LayerStack::MAX_SLOTS`, and `umber-app`'s graphics-memory refusal,
-/// all three of which do account for a mask on every layer.
+/// **Masks are deliberately not counted, and what that now costs is much more
+/// than it used to.** Counting them is still wrong in the one direction that
+/// matters: this is the check an *Umber* document goes through on the way back
+/// in, so a bound that counted masks would refuse to reopen large masked
+/// documents Umber itself had written — the reader would be stricter than the
+/// writer, and the artist's own file would be the casualty.
+///
+/// **But the old figure for the exposure is stale and understates it by an
+/// order of magnitude.** It used to read "a document whose every layer carries
+/// one reaches roughly twice the figure", and that was true when a layer *was*
+/// a canvas. The charge is now the pieces and a mask is still one canvas-sized
+/// piece, so the ratio is the layers' occupancy: on the 20000×5000 document
+/// this was built for, 53 layers hold 1.4 GB while masks on all of them would
+/// be 21.2 GB — **fifteen times** the charged figure, admitted by a budget that
+/// sees 1.4. The real mask ceiling is `LayerStack::MAX × canvas × 4`, which at
+/// [`ImportedDocument::MAX_DIMENSION`] is 274 GB, and `.clip`'s mask path holds
+/// the one-byte coverage canvas and its four-byte expansion at once. The
+/// backstops are the caller's `max_texture_dimension_2d` check,
+/// `LayerStack::MAX_SLOTS` and `umber-app`'s graphics-memory refusal, all three
+/// of which do account for a mask on every layer — but none of them is a *host*
+/// bound, and there is not one.
+///
+/// **The way out is to make the mask sparse, not to count it**, and what stops
+/// that is stated at [`PixelPiece`]'s rule 3 rather than here: a `.clip` mask
+/// has exactly the block presence a layer has, and the blocker is that the
+/// upload's clear leaves transparent black, which a coverage slice reads as
+/// *fully hidden*. That is a cost, not a fact about the bound.
 fn check_resident(
     width: u32,
     height: u32,
@@ -1823,47 +1897,155 @@ mod tests {
     /// the only stack that can still be refused is one that genuinely holds
     /// 17.2 GB of it.
     ///
-    /// The second half is what makes this a guard rather than a cheer: a stack
-    /// that really is that full **is** still refused, and stating where keeps
-    /// the trade deliberate.
+    /// **The whole route, not the arithmetic.** A first draft of this asserted
+    /// `check_bounds(...).is_ok()` at every canvas and then charged sixty-four
+    /// tiny rectangles, and both halves were tautologies: `check_bounds` makes
+    /// no byte comparison at all any more, so at a legal canvas and a legal
+    /// count it cannot fail, and a megabyte against 16 GiB cannot either. It
+    /// asserted the mechanism in its own prose and exercised none of it.
+    ///
+    /// So it saves a real full stack through `docformat` and reads it back
+    /// through the reader, which is the only thing that can be wrong: if `trim`
+    /// stopped cropping, or `openraster::load_layer` stopped cropping, every
+    /// layer would come back a canvas.
+    ///
+    /// **The canvas is small and the historical figure is derived from what the
+    /// round trip measured.** Reproducing the refusal in the round trip means a
+    /// canvas over 8192 square — the smallest at which `canvas × 4 × MAX` clears
+    /// 16 GiB — and that is 25 GB of zeroing and sixty-four PNG encodes, about
+    /// seven seconds in a suite that otherwise takes one. What the file half has
+    /// to establish is the *mechanism*; what the arithmetic half then does is
+    /// apply it at the size that used to be refused, against a per-layer cost
+    /// this test measured rather than assumed.
     #[test]
     fn a_document_umber_could_save_can_be_reopened() {
-        let f = SourceFormat::OpenRaster;
-        // The header alone refuses none of these any more, at any canvas Umber
-        // will make and at the full stack.
-        for edge in [2048u32, 4096, 8192, 10000, ImportedDocument::MAX_DIMENSION] {
-            assert!(
-                check_bounds(f, edge, edge, StackSize::all_painted(LayerStack::MAX)).is_ok(),
-                "a full stack on a {edge}² canvas was refused off its header alone"
-            );
-        }
+        use crate::docformat::{self, Canvas, SaveDocument, SaveError, SaveLayer};
 
-        // A 10000² document at 64 layers: the case that used to be refused.
-        // Charged for what its layers hold rather than for its canvas, a stack
-        // of sketches costs kilobytes and opens.
-        let mut budget =
-            check_bounds(f, 10000, 10000, StackSize::all_painted(LayerStack::MAX)).unwrap();
-        let sketch = PixelRect {
-            x: 100,
-            y: 100,
-            width: 64,
-            height: 64,
-        };
-        for i in 0..LayerStack::MAX {
-            budget
-                .charge(&patch(&format!("L{i}"), sketch, 200))
-                .expect("64 sketched layers hold a megabyte between them");
-        }
-
-        // And the bound is still a bound: `MAX_TOTAL_BYTES` past that is the
-        // figure, and a stack that really does hold it is refused. Derived from
-        // the constant rather than written out, so raising it moves this with
-        // it instead of leaving a case that no longer exercises itself.
-        budget.spent = ImportedDocument::MAX_TOTAL_BYTES;
+        // The case that used to be refused, at the shape that refused it: a
+        // full stack on a canvas where `canvas × 4 × MAX` is past the bound.
+        // Derived, so a change to either constant moves the case rather than
+        // leaving one that no longer exercises itself.
+        let refused_edge = 10_000u64;
         assert!(
-            budget.charge(&patch("one more", sketch, 200)).is_err(),
-            "if this now opens, MAX_TOTAL_BYTES was raised and its docs must say so"
+            refused_edge * refused_edge * 4 * LayerStack::MAX as u64
+                > ImportedDocument::MAX_TOTAL_BYTES,
+            "this canvas no longer makes the case: the claim is inside the bound"
         );
+        let edge = 1024u32;
+
+        // Each layer is one small mark, which is what a real stack of sixty-four
+        // mostly is. **Deferred, so one canvas is live at a time** — holding all
+        // sixty-four would be the 25.6 GB this test exists to say nobody has to
+        // spend, which is a funny way to prove it.
+        let size = UVec2::new(edge, edge);
+        let mark_at = |i: usize| ((i + 1) * size.x as usize + i + 1) * 4;
+        struct OneAtATime {
+            size: UVec2,
+            mark: usize,
+        }
+        impl docformat::Canvases for OneAtATime {
+            fn layer(&mut self, index: usize) -> Result<std::borrow::Cow<'_, [u8]>, SaveError> {
+                let mut buf = vec![0u8; self.size.x as usize * self.size.y as usize * 4];
+                let px = ((index + 1) * self.size.x as usize + index + 1) * 4;
+                buf[px..px + 4].copy_from_slice(&[9, 9, 9, 255]);
+                self.mark = px;
+                Ok(std::borrow::Cow::Owned(buf))
+            }
+            fn mask(&mut self, _: usize) -> Result<std::borrow::Cow<'_, [u8]>, SaveError> {
+                unreachable!("no layer here carries one")
+            }
+            fn merged(&mut self) -> Result<std::borrow::Cow<'_, [u8]>, SaveError> {
+                Ok(std::borrow::Cow::Owned(vec![
+                    0u8;
+                    self.size.x as usize
+                        * self.size.y as usize
+                        * 4
+                ]))
+            }
+        }
+
+        let names: Vec<String> = (0..LayerStack::MAX).map(|i| format!("L{i}")).collect();
+        let layers: Vec<SaveLayer<'_>> = names
+            .iter()
+            .map(|name| SaveLayer::new(name.as_str(), BlendMode::Normal, Canvas::Deferred))
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "umber-reopen-a-saved-stack-{}.ora",
+            std::process::id()
+        ));
+        docformat::save_from(
+            &path,
+            &SaveDocument {
+                size,
+                layers: &layers,
+                active: 0,
+                background: Background::Transparent,
+                dpi: Document::DEFAULT_DPI,
+                merged: Canvas::Deferred,
+                history: None,
+            },
+            &mut OneAtATime { size, mark: 0 },
+        )
+        .expect("a document Umber can save");
+
+        let bytes = std::fs::read(&path).expect("the archive");
+        let _ = std::fs::remove_file(&path);
+        let back = read_openraster(&bytes).expect("a document Umber saved must reopen");
+        assert_eq!(back.layers.len(), LayerStack::MAX);
+
+        // And it is cheap because `docformat::trim` wrote each layer at its own
+        // content rectangle: sixty-four one-pixel marks, not sixty-four
+        // canvases.
+        let held: u64 = back.layers.iter().map(ImportedLayer::pixel_bytes).sum();
+        assert!(
+            held < 1 << 20,
+            "a stack of one-pixel marks came back holding {held} bytes"
+        );
+
+        // **The case that used to be refused, at the per-layer cost this test
+        // just measured.** A layer's cost is what it holds, not what canvas it
+        // sits on, so the same stack on the 10000² canvas that met the bound
+        // costs the same kilobytes — where the claim it used to be charged is
+        // 25.6 GB. Both compared against the real function rather than
+        // restated.
+        assert!(
+            check_resident(
+                refused_edge as u32,
+                refused_edge as u32,
+                LayerStack::MAX,
+                held,
+                ImportedDocument::MAX_TOTAL_BYTES,
+            )
+            .is_ok(),
+            "the stack this measured is refused on a large canvas, so trimming              bought nothing"
+        );
+        assert!(
+            check_resident(
+                refused_edge as u32,
+                refused_edge as u32,
+                LayerStack::MAX,
+                refused_edge * refused_edge * 4 * LayerStack::MAX as u64,
+                ImportedDocument::MAX_TOTAL_BYTES,
+            )
+            .is_err(),
+            "if the old claim now passes, MAX_TOTAL_BYTES was raised and its              docs must say so"
+        );
+
+        // The picture is still there, which is what stops "cheap" being
+        // "empty" — the mark of each layer, at each layer's own place. Read off
+        // the piece rather than assembled, because assembling sixty-four of
+        // these canvases is the spend again.
+        for (i, layer) in back.layers.iter().enumerate() {
+            let piece = &layer.pixels[0];
+            let px = mark_at(i);
+            let (x, y) = (px / 4 % size.x as usize, px / 4 / size.x as usize);
+            assert_eq!(
+                (piece.rect.x as usize, piece.rect.y as usize),
+                (x, y),
+                "layer {i}'s piece is not where its mark is"
+            );
+            assert_eq!(&piece.bytes[..4], &[9, 9, 9, 255], "layer {i}'s mark");
+        }
     }
 
     /// A folder holds no slot and no buffer, so it may not be charged a canvas.
@@ -2006,6 +2188,15 @@ mod tests {
     /// **`flat.rs` is in the list deliberately**, though a one-layer PNG cannot
     /// reach the bound: a reader that opts out of the rule for a good reason
     /// today is a reader nobody re-examines when the reason stops holding.
+    ///
+    /// **What the sweep does not cover, said rather than left to be
+    /// discovered**: the three flattened fallbacks — `openraster`'s and
+    /// `krita`'s `flattened_fallback`, and `photoshop`'s `finish_flat` — each
+    /// build one canvas-sized layer on a path that never returns to the loop,
+    /// and none is charged. A scan of a file cannot tell them from the reader's
+    /// main path. They are bounded at one canvas, which is inside the figure
+    /// whatever the file says, and `validate` charges the document they
+    /// produce; so it is a gap in the *sweep* and not in the bound.
     #[test]
     fn every_reader_that_checks_its_header_charges_what_it_decodes() {
         for (name, source) in [
@@ -2017,7 +2208,18 @@ mod tests {
         ] {
             // Only the reader's own code, not its tests: a `charge` inside a
             // `#[cfg(test)]` block would satisfy this while bounding nothing.
-            let code = source.split("\n#[cfg(test)]\n").next().unwrap_or(source);
+            //
+            // **No newline in the needle.** `include_str!` hands back the file
+            // as it sits on disk, and `core.autocrlf` is the default on Windows
+            // and on GitHub's Windows runners while `.gitattributes` says
+            // nothing about `*.rs` — so a needle carrying `\n` matches on an LF
+            // checkout and not on a CRLF one, where this would quietly start
+            // scanning the very block it exists to exclude. Degrading in
+            // silence is the worse shape of that bug, and this codebase has
+            // already been caught by the mechanism once.
+            let code = source
+                .find("#[cfg(test)]")
+                .map_or(source, |at| &source[..at]);
             assert!(
                 code.contains("check_bounds("),
                 "{name} does not check its header at all"

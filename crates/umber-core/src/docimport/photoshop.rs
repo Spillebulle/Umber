@@ -134,12 +134,15 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     // This reader makes no folders: a PSD group arrives as nothing at all, so
     // every entry it will produce holds pixels. If groups are ever read, this
     // is one of the two places that has to learn about them.
-    let mut budget = check_bounds(
-        FORMAT,
-        size.x,
-        size.y,
-        StackSize::all_painted(psd.layers().len().max(1)),
-    )?;
+    let painted = psd.layers().len().max(1);
+    let mut budget = check_bounds(FORMAT, size.x, size.y, StackSize::all_painted(painted))?;
+    // **The one reader that must still be refused off its header**, and the
+    // reason is three lines below at `Layer::rgba()`: this reader cannot yield
+    // pieces, so a claim is a cost here where it is not in the other four.
+    // Reserved before the loop rather than charged after each layer, or a
+    // malformed file declaring a huge canvas is refused once the gigabytes are
+    // already resident. See `PieceBudget::reserve`.
+    budget.reserve(u64::from(size.x) * u64::from(size.y) * 4 * painted as u64)?;
 
     let mut warnings = Vec::new();
 
