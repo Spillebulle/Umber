@@ -8845,14 +8845,26 @@ impl CanvasRenderer {
                         == self.layers.grid.tiles_per_page() as usize,
                 "a partly-backed mask cannot be captured: slot {slot}"
             );
-            encoder.clear_buffer(&buffer, 0, None);
             let band = PixelRect {
                 x: 0,
                 y: band_first as u32,
                 width: job.size.x,
                 height,
             };
-            for fragment in self.layers.grid.fragments(band) {
+            let fragments = self.layers.grid.fragments(band);
+            // **The clear is skipped where nothing is missing**, which is what
+            // keeps the fully-backed case — every mask, every float's layer,
+            // every band of a densely painted layer — at exactly the traffic it
+            // was. The buffer is a whole band, up to `readback_limit`, so a fill
+            // of it on every band of every layer would be real work added to a
+            // path whose whole budget is a millisecond a frame.
+            let gaps = fragments
+                .iter()
+                .any(|f| !self.layers.entry(slot, f.tile).is_backed());
+            if gaps {
+                encoder.clear_buffer(&buffer, 0, None);
+            }
+            for fragment in fragments {
                 let entry = self.layers.entry(slot, fragment.tile);
                 if !entry.is_backed() {
                     continue;
