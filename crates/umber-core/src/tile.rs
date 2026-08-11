@@ -76,6 +76,13 @@ use glam::UVec2;
 /// 256-square blocks and the file says which are absent, so residency for the
 /// documents this exists for is readable without inflating anything. It is also
 /// four times `damage::TILE`, which [`TILE_OVER_DAMAGE`] asserts.
+///
+/// **It collides by name with [`crate::damage::TILE`]**, which is 64 and is a
+/// *damage cell*, and the two are one factor of four apart in a codebase where
+/// mixing them up is a copy issued past a tile's own bounds. Reach them through
+/// their modules — `tile::TILE`, `damage::TILE` — and never through a bare
+/// `use`, which is the rule `theme::text` and `umber_core::text` already keep
+/// against each other for the same reason.
 pub const TILE: u32 = 256;
 
 /// A storage tile is a whole number of damage cells.
