@@ -10545,6 +10545,7 @@ impl EffectScratch {
         // offset.
         let bind = |label: &str,
                     array: &wgpu::TextureView,
+                    raw_array: &wgpu::TextureView,
                     src: &wgpu::TextureView,
                     cov: &wgpu::TextureView,
                     seed: &wgpu::TextureView| {
@@ -10590,14 +10591,20 @@ impl EffectScratch {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(&layers.table_view),
                     },
-                    // The raw atlas, for the extract's mask tap, and the real
-                    // one in every group for exactly the reason the page table
-                    // above is: only the extract reads it, and a stand-in for a
-                    // texture that already exists is one more thing to keep the
-                    // right shape across a growth.
+                    // The raw atlas, for the extract's mask tap.
+                    //
+                    // **It follows `array` and takes the same stand-in**, which
+                    // is the opposite of what the page table above does and is
+                    // not an inconsistency: the table is a *different* texture,
+                    // and this one is the layer array again. `EffectTarget::
+                    // Slice` renders into a page of it, and a texture may not be
+                    // a colour attachment and bound for sampling in the same
+                    // pass — the constraint `flip.wgsl` and the blended commit
+                    // both work around. Binding the real view in every group
+                    // fails validation on the resolve pass, which is fatal.
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: wgpu::BindingResource::TextureView(&layers.raw_array_view),
+                        resource: wgpu::BindingResource::TextureView(raw_array),
                     },
                 ],
             })
@@ -10614,32 +10621,48 @@ impl EffectScratch {
         binds.push(bind(
             "effect-extract",
             &layers.array_view,
+            &layers.raw_array_view,
             stroke_view,
             b,
             none,
         ));
-        binds.push(bind("effect-coverage", a, b, &coverage, none));
-        binds.push(bind("effect-grow-0", a, b, &coverage, seed0));
-        binds.push(bind("effect-grow-1", a, b, &coverage, seed1));
-        binds.push(bind("effect-flood-0", a, b, b, seed0));
-        binds.push(bind("effect-flood-1", a, b, b, seed1));
-        binds.push(bind("effect-src-grown", a, &grown, b, none));
-        binds.push(bind("effect-src-blur-0", a, &blur[0], b, none));
-        binds.push(bind("effect-src-blur-1", a, &blur[1], b, none));
-        binds.push(bind("effect-resolve-grown", a, &grown, &coverage, none));
-        binds.push(bind("effect-resolve-blur-0", a, &blur[0], &coverage, none));
-        binds.push(bind("effect-resolve-blur-1", a, &blur[1], &coverage, none));
-        binds.push(bind("effect-src-coverage", a, &coverage, b, none));
+        binds.push(bind("effect-coverage", a, a, b, &coverage, none));
+        binds.push(bind("effect-grow-0", a, a, b, &coverage, seed0));
+        binds.push(bind("effect-grow-1", a, a, b, &coverage, seed1));
+        binds.push(bind("effect-flood-0", a, a, b, b, seed0));
+        binds.push(bind("effect-flood-1", a, a, b, b, seed1));
+        binds.push(bind("effect-src-grown", a, a, &grown, b, none));
+        binds.push(bind("effect-src-blur-0", a, a, &blur[0], b, none));
+        binds.push(bind("effect-src-blur-1", a, a, &blur[1], b, none));
+        binds.push(bind("effect-resolve-grown", a, a, &grown, &coverage, none));
+        binds.push(bind(
+            "effect-resolve-blur-0",
+            a,
+            a,
+            &blur[0],
+            &coverage,
+            none,
+        ));
+        binds.push(bind(
+            "effect-resolve-blur-1",
+            a,
+            a,
+            &blur[1],
+            &coverage,
+            none,
+        ));
+        binds.push(bind("effect-src-coverage", a, a, &coverage, b, none));
         binds.push(bind(
             "effect-resolve-coverage",
+            a,
             a,
             &coverage,
             &coverage,
             none,
         ));
         let band_src = band.as_ref().unwrap_or(b);
-        binds.push(bind("effect-combine-0", a, band_src, &coverage, seed0));
-        binds.push(bind("effect-combine-1", a, band_src, &coverage, seed1));
+        binds.push(bind("effect-combine-0", a, a, band_src, &coverage, seed0));
+        binds.push(bind("effect-combine-1", a, a, band_src, &coverage, seed1));
         debug_assert_eq!(binds.len(), EFFECT_BIND_COUNT);
 
         Self {

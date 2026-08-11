@@ -2969,9 +2969,12 @@ fn a_mask_hides_what_it_covers() {
 
     fill_slot(&mut h, 0, [255, 255, 255, 255]);
     // The mask: opaque, and grey where the layer should be dimmed. The
-    // composite reads the red channel, and the slice is sRGB-typed, so
-    // sRGB 188 is linear ~0.5.
+    // composite reads the red channel through the array's **raw** view, so the
+    // byte over 255 is the multiplier and 128 is a half. It used to read
+    // through the sRGB view, where the same half was 188 — which is what this
+    // fixture carried, and 73 of the 256 multipliers were unreachable.
     fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    h.canvas.mark_mask_slot(1);
     h.canvas.write_layer_rect(
         &h.gpu.device,
         &h.gpu.queue,
@@ -2994,7 +2997,7 @@ fn a_mask_hides_what_it_covers() {
             width: 20,
             height: DOC,
         },
-        &[188u8, 188, 188, 255].repeat((20 * DOC) as usize),
+        &[128u8, 128, 128, 255].repeat((20 * DOC) as usize),
     );
 
     let mut masked = layer(0, 1.0, BlendMode::Normal);
@@ -3019,6 +3022,68 @@ fn a_mask_hides_what_it_covers() {
     assert!(
         half[0] > 220 && half[0] < 252,
         "a grey mask must be a partial, got {half:?}"
+    );
+}
+
+#[test]
+fn every_level_a_mask_can_hold_moves_the_picture() {
+    // **The guard that was missing, at the far end.** `umber_core::docimport::
+    // srgb` counts the states a mask slice can hold; this counts the ones that
+    // reach the screen, which is the claim that actually matters and the one no
+    // CPU test can make.
+    //
+    // **Measured on the alpha, and that is not a convenience.** A mask
+    // multiplies the layer's alpha, which is linear 8-bit; the *colour* the
+    // composite hands the screen has been through the sRGB encode, whose slope
+    // at the reveal end is about a sixth, so 56 near-white greys are 7 pixels
+    // there whatever the mask holds. Reading the colour would measure the
+    // display encode and call it a mask defect. `export_rgba` is the one path
+    // that hands back straight alpha, and it reuses this very composite pass.
+    //
+    // The reveal range is what is swept, because that is where a mask is visible
+    // and where the sRGB storage this replaced was worst: over 200..=255 it
+    // could express 22 of the 56.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+    fill_slot(&mut h, 0, [255, 255, 255, 255]);
+    fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    h.canvas.mark_mask_slot(1);
+
+    let mut masked = layer(0, 1.0, BlendMode::Normal);
+    masked.mask = Some(1);
+
+    let mut seen = std::collections::BTreeSet::new();
+    for level in 200..=255u8 {
+        h.canvas.write_layer_rect(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: DOC,
+                height: DOC,
+            },
+            &[level, level, level, 255].repeat((DOC * DOC) as usize),
+        );
+        let px = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &[masked]);
+        let at = ((32 * DOC + 32) * 4) as usize;
+        // The layer is opaque, so the alpha *is* the multiplier back again.
+        assert_eq!(
+            px[at + 3],
+            level,
+            "mask level {level} did not reach the alpha"
+        );
+        seen.insert(px[at + 3]);
+    }
+    // Every one of the 56 lands somewhere of its own. A regression here is a
+    // *shortfall* rather than a wrong pixel, which is exactly why counting is
+    // what catches it and why the spot check this file already had could not.
+    assert_eq!(
+        seen.len(),
+        56,
+        "levels 200..=255 collapsed into {} distinct alphas",
+        seen.len()
     );
 }
 
@@ -3184,6 +3249,16 @@ fn a_stroke_on_a_mask_previews_exactly_as_it_commits() {
 
     fill_slot(&mut h, 0, [255, 255, 255, 255]);
     fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    // **Slot 1 is a mask and has to say so.** The class is the store's own
+    // record of it and is already load-bearing without this: `back_tiles` clears
+    // a fresh cell to the class's empty value, so a mask that had not declared
+    // itself would clear *transparent* and hide the layer wherever the stroke
+    // reached a tile nobody had painted. It now decides which view of the page
+    // the commit renders through as well, because a mask slice holds linear
+    // coverage where a layer's holds sRGB colour — so leaving it out here made
+    // the commit write the old form under a composite reading the new one, and
+    // the mask jumped at pointer-up by eight levels.
+    h.canvas.mark_mask_slot(1);
 
     let mut masked = layer(0, 1.0, BlendMode::Normal);
     masked.mask = Some(1);
@@ -3237,6 +3312,35 @@ fn a_stroke_on_a_mask_previews_exactly_as_it_commits() {
             "the mask jumped at pointer-up: previewed {previewed:?}, committed {committed:?}"
         );
     }
+
+    // **And the byte in the slice is the multiplier itself.** The agreement
+    // above is a comparison of two composites, and it would hold just as well if
+    // both sides used the old sRGB form — which is exactly what it did before
+    // the class was declared, in the direction where they happened to agree. So
+    // read the slice.
+    //
+    // The stroke is black at 0.75 opacity over full coverage on a white mask, so
+    // the multiplier is 0.25 and the byte is 64. Under the sRGB form the same
+    // multiplier is stored as 137, which is nowhere near the slack here — the
+    // two readings are 73 levels apart at this coverage, which is why a partial
+    // is the case to drive and 0 or 255 would see nothing at all.
+    let slice = h.canvas.read_layer_rect(
+        &h.gpu.device,
+        &h.gpu.queue,
+        1,
+        PixelRect {
+            x: 32,
+            y: 32,
+            width: 1,
+            height: 1,
+        },
+    );
+    assert!(
+        slice[0].abs_diff(64) <= 2,
+        "a mask slice holds the linear multiplier; got {} where 64 is 0.25 and \
+         137 would be the sRGB form this replaced",
+        slice[0]
+    );
 }
 
 #[test]
