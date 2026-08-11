@@ -946,21 +946,27 @@ fn stream_archive<W: Write + std::io::Seek>(
 ///
 /// **`ZipWriter` may not be shown an I/O error, and that is a real defect
 /// rather than a preference.** Handed one part-way through an entry, zip 8.6.0
-/// unwinds into `ZipWriter::drop`, which tries to finalise the entry it was in
-/// the middle of; `finish_file` then reads a stream position behind where the
-/// entry started and trips `debug_assert!(file_end >= self.stats.start)`. So a
-/// full disk during a save is a **panic** in any build with debug assertions
-/// on, and in a release build the same subtraction merely wraps into a
-/// nonsense entry size. Neither is reachable from the shape this replaced,
-/// where the archive was built in a `Vec<u8>` that could not fail.
+/// finalises the entry it was in the middle of; `finish_file` then reads a
+/// stream position behind where the entry started and trips
+/// `debug_assert!(file_end >= self.stats.start)`. So a full disk during a save
+/// is a **panic** in any build with debug assertions on, and in a release build
+/// the same subtraction merely wraps into a nonsense entry size. Neither is
+/// reachable from the shape this replaced, where the archive was built in a
+/// `Vec<u8>` that could not fail.
 ///
-/// Absorbing is what keeps that away without a `mem::forget` on the error path
-/// — a leak on every failed save — or a second archive writer. Nothing is lost
-/// by it: the bytes after a failure are going into a temporary that is about
-/// to be deleted, and the error itself is kept and returned. Positions are
-/// tracked here rather than asked of the inner sink, because zip seeks back to
-/// patch each local header and those seeks have to keep answering after the
-/// writes have stopped landing.
+/// **It reaches that assertion from `finish()` as well as from `Drop`**, which
+/// is the part that decides the remedy rather than merely describing it.
+/// `finalize` calls `finish_file` directly, so a quarter of the failing
+/// positions panic on the ordinary path — and `mem::forget` on the error path,
+/// which is the obvious alternative and costs a leak on every failed save,
+/// would not have helped with any of them. Absorbing is not the tidier of two
+/// options; it is the one that works.
+///
+/// Nothing is lost by it: the bytes after a failure are going into a temporary
+/// that is about to be deleted, and the error itself is kept and returned.
+/// Positions are tracked here rather than asked of the inner sink, because zip
+/// seeks back to patch each local header and those seeks have to keep answering
+/// after the writes have stopped landing.
 struct Watched<W> {
     inner: W,
     /// The first failure, which is the one worth reporting: everything after
@@ -977,14 +983,19 @@ impl<W: Write + std::io::Seek> Watched<W> {
         // to be right *relative* to the inner sink, and starting it at zero
         // over a sink that was already somewhere would hand the ZIP writer
         // offsets short by that much for as long as it went on writing
-        // successfully. A sink that cannot say where it is is one that cannot
-        // be written to either, so zero is as good an answer as any.
-        let at = inner.stream_position().unwrap_or(0);
-        Self {
-            inner,
-            failed: None,
-            at,
-        }
+        // successfully.
+        //
+        // A sink that cannot say where it is is one that cannot be written to
+        // either, so the position is *also* an error worth keeping rather than
+        // an assumption worth making: it goes into `failed` like any other, and
+        // the save is refused rather than proceeding from a guess. That is what
+        // the rest of this type does with a failure, and this is the one place
+        // it could have been written not to.
+        let (at, failed) = match inner.stream_position() {
+            Ok(at) => (at, None),
+            Err(e) => (0, Some(e)),
+        };
+        Self { inner, failed, at }
     }
 
     fn give_up(self) -> (W, Option<std::io::Error>) {
@@ -1037,8 +1048,12 @@ impl<W: Write + std::io::Seek> std::io::Seek for Watched<W> {
         // Answered from the count this kept, so the writer's own bookkeeping
         // stays consistent after the bytes have stopped landing. `End` is the
         // one it cannot answer for — the inner sink's length is exactly what is
-        // no longer known — so it stands still, which is as good as any other
-        // number for a file that is about to be deleted.
+        // no longer known — and standing still is **not** an arbitrary choice
+        // there: `zip::write::finalize` compares the footer's end against the
+        // archive's, and an answer *larger* than the truth takes a branch whose
+        // own `debug_assert!(stream_position()? == archive_end)` this would then
+        // trip. `u64::MAX` makes `Watched` panic on its own account. Standing
+        // still and delegating are both safe; anything past the end is not.
         self.at = match to {
             std::io::SeekFrom::Start(n) => n,
             std::io::SeekFrom::Current(d) => self.at.saturating_add_signed(d),
@@ -1074,12 +1089,18 @@ pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 
 /// Put whatever `fill` writes at `path`, whole or not at all.
 ///
-/// **The one temp-and-rename in Umber**, and the reason this is the function
-/// rather than [`write_encoded`]: a streamed archive has no `&[u8]` to hand
-/// over, and a second copy of "write beside it, then rename" would be a second
-/// thing to get right. [`write_encoded`] is now one line of this;
-/// [`save_from`] is the other caller, and [`crate::export`] and the autosave
-/// reach it through the first.
+/// **The one temp-and-rename a *document* goes through**, and the reason this
+/// is the function rather than [`write_encoded`]: a streamed archive has no
+/// `&[u8]` to hand over, and a second copy of "write beside it, then rename"
+/// would be a second thing to get right. [`write_encoded`] is now one line of
+/// this; [`save_from`] is the other caller, and [`crate::export`] and the
+/// autosave reach it through the first.
+///
+/// Not the only one in Umber, and a bolder sentence here said it was.
+/// `themelib` and `crate::palette` each keep their own, because both report a
+/// different error type and neither writes anything a painter would lose a
+/// day over. Both still push a fixed `.saving`, which is right for them: what
+/// forced a unique name here is the *window*, and theirs is one `fs::write`.
 ///
 /// If `fill` fails, or the rename does, the temporary is removed and the file
 /// at `path` is untouched — which is the whole point, and is why `fill` writing
@@ -1101,11 +1122,21 @@ pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 /// archive into place as the artist's document and the other fails. Silent
 /// damage to the file the temp-and-rename exists to protect.
 ///
-/// So the name carries the process and a counter. The cost is that a temporary
-/// left behind by a hard kill is no longer overwritten by the next save and
-/// simply sits there — a stray file beside somebody's document, which is
-/// visible, harmless and recoverable, against a corruption that is none of
-/// those. `.saving` stays *in* the name so anything matching on it still does.
+/// So the name carries the process and a counter. `.saving` stays *in* the
+/// name so anything matching on it still does — `autosave::is_autosave_name`
+/// is what that means in practice.
+///
+/// **The cost is worth stating precisely, because the shared name was
+/// self-cleaning and this is not.** A temporary abandoned by a hard kill used
+/// to be overwritten by the next save of that document and renamed away; now
+/// the pid and the counter differ, so a second kill leaves a second file and a
+/// third a third — one per interrupted save, indefinitely. Inside the autosave
+/// folder `autosave::Reaper` clears them. Beside the artist's own document
+/// nothing does, deliberately: `Reaper` is the only thing in Umber that deletes
+/// a file on the user's behalf and its containment is careful for a reason, so
+/// widening it to sweep somebody's documents folder is exactly the loosening
+/// that rule refuses. A visible stray beside a good file beats a truncated file
+/// over a good one, and that is the whole of the trade.
 pub fn write_with(
     path: &Path,
     fill: impl FnOnce(&mut std::fs::File) -> Result<(), SaveError>,
@@ -2068,12 +2099,20 @@ fn write_png(sink: &mut impl Write, size: UVec2, rgba: &[u8]) -> Result<(), Save
 /// earlier version of this comment said it was.** Two things make that claim
 /// false. A sink that refuses the trailer refuses the next entry's local
 /// header too, and the last PNG is followed by the ZIP's own central
-/// directory — so the save is refused either way. And [`Watched`] now absorbs
-/// the failure before any of this sees it, so on the streaming path
-/// `write_image_data` and `finish` cannot fail at all. The call is kept for
-/// what it costs — nothing — and for the day something upstream of it can
-/// fail again; it is not load-bearing today and no test can make it look as
-/// though it is.
+/// directory — so the save is refused either way. And on the streaming path
+/// [`Watched`] absorbs an **I/O** failure before any of this sees one. The
+/// call is kept for what it costs, which is nothing; it is not load-bearing
+/// today and no test can make it look as though it is.
+///
+/// "Cannot fail at all" would be the over-correction, and it is wrong: the sink
+/// here is a `ZipWriter`, whose own `Write` refuses an entry that crosses
+/// `ZIP64_BYTES_THR` because `stored()` and `deflated()` never set
+/// `large_file`. That error is raised *above* `Watched` and reaches this. It is
+/// unreachable for any canvas anybody has, and not for any canvas
+/// `Document::MAX_EDGE` permits — a 32768² layer is 4.3 GB raw, and noisy paint
+/// can store past `u32::MAX` — at which point a save fails with zip's own
+/// wording wrapped as [`SaveError::Io`]. That is the second thing to build on
+/// the very large canvas, after refusing one the card cannot hold.
 fn finish_png<W: Write>(encoder: png::Encoder<'_, W>, data: &[u8]) -> Result<(), SaveError> {
     encoder
         .write_header()
@@ -4224,9 +4263,16 @@ mod tests {
         }
     }
 
+    /// A directory of this test's own, emptied first.
+    ///
+    /// The pid is not enough on its own now that these tests *sweep* the
+    /// directory rather than asking about one name: a previous run that crashed
+    /// with the same pid leaves a temporary this run would blame itself for.
+    /// `autosave::tests::scratch` clears for the same reason.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("umber-docformat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -4427,12 +4473,20 @@ mod tests {
     /// chosen figure would drive whichever of those it happened to hit.
     ///
     /// **It found a panic, which is why it is written this way.** Handed an
-    /// I/O error part-way through an entry, zip 8.6.0 unwinds into
-    /// `ZipWriter::drop`, which finalises the entry it was in the middle of and
-    /// trips `debug_assert!(file_end >= self.stats.start)` — so a full disk
-    /// during a save was a panic in any build with debug assertions on.
-    /// [`Watched`] is what keeps the error away from it, and this sweep is what
-    /// says so: without it, some budget in this loop aborts the test.
+    /// I/O error part-way through an entry, zip 8.6.0 finalises the entry it
+    /// was in the middle of and trips
+    /// `debug_assert!(file_end >= self.stats.start)` — so a full disk during a
+    /// save was a panic in any build with debug assertions on. [`Watched`] is
+    /// what keeps the error away from it, and this is what says so: remove it
+    /// and this test aborts.
+    ///
+    /// **Every budget, not a sample, and that is the difference between a guard
+    /// and a coin toss.** The panicking budgets are twelve-byte windows, one per
+    /// entry — the header patch seeks back, the write fails part-way, and the
+    /// position is left behind where the entry started — so about 3% of the
+    /// range aborts and the rest merely refuses. A stride sweep meets one or
+    /// none depending on arithmetic nobody controls, and re-rolls silently every
+    /// time the fixture changes. Sweeping the lot costs a fraction of a second.
     ///
     /// **What it deliberately does not claim is that it covers `finish_png`'s
     /// explicit `finish`.** Nothing can, and now less than ever: `Watched`
@@ -4469,8 +4523,7 @@ mod tests {
         let held = fixture.layers(false);
         let (whole, _) = encode(&fixture.document(&held, false)).expect("encode");
 
-        let mut drove = 0;
-        for budget in (0..whole.len()).step_by(whole.len() / 24 + 1) {
+        for budget in 0..whole.len() {
             let sink = Fills {
                 inner: std::io::Cursor::new(Vec::new()),
                 budget,
@@ -4486,9 +4539,7 @@ mod tests {
                 "a sink that stopped after {budget} of {} bytes reported success",
                 whole.len()
             );
-            drove += 1;
         }
-        assert!(drove >= 24, "the sweep drove only {drove} budgets");
 
         // And end to end, through the real writer into a real path: an
         // encoder that cannot read must leave the file that was there.

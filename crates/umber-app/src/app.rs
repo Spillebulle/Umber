@@ -5984,14 +5984,6 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 mod tests {
     use super::*;
 
-    /// The behavioural half of the guard below, and the half that was missing.
-    ///
-    /// That one is textual and catches the `effects:` line being deleted. It is
-    /// defeated by `effects: &[]`, which still names the field — and which is
-    /// both what this path held before it was wired and what
-    /// `..SaveLayer::new(…)` defaults to. Verified by mutation in both
-    /// directions: neutering the value fails *this* test and passes that one;
-    /// deleting the line fails that one and passes this.
     /// **A Save reads each layer out of its own slice, one at a time.**
     ///
     /// `SaveSource` is the only part of the save path with no other cover at
@@ -6138,6 +6130,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The behavioural half of the guard below, and the half that was missing.
+    ///
+    /// That one is textual and catches the `effects:` line being deleted. It is
+    /// defeated by `effects: &[]`, which still names the field — and which is
+    /// both what this path held before it was wired and what
+    /// `..SaveLayer::new(…)` defaults to. Verified by mutation in both
+    /// directions: neutering the value fails *this* test and passes that one;
+    /// deleting the line fails that one and passes this.
     #[test]
     fn a_save_carries_the_effects_the_layer_holds() {
         let mut stack = umber_core::LayerStack::new();

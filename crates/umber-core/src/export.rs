@@ -755,9 +755,15 @@ mod tests {
         // `docformat::write_with`'s temporary carries a process id and a
         // counter now, so an assertion naming `"landing.png.saving"` exactly
         // would pass whatever was left behind — a guard that stops guarding
-        // without ever failing. The other half of the old pair, that the
-        // temporary is named after the *export* and not after `.ora`, survives:
-        // an `.ora`-named leftover would be in this list too.
+        // without ever failing.
+        //
+        // **It does not cover which extension the temporary took**, and the
+        // pair it replaced did not either: a successful write renames the
+        // temporary away whatever it was called, so `!landing.ora.saving`
+        // was a path that never existed under either naming. Saying so is
+        // better than keeping an assertion that agrees with everything.
+        // `docformat`'s own `a_save_whose_source_fails_halfway_leaves_the_old_
+        // file_alone` is what drives a temporary that survives at all.
         let leftovers: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)

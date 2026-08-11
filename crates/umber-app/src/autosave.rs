@@ -2142,19 +2142,29 @@ fn run_task(task: Task) -> Vec<Report> {
     // The gate is "either destination landed" rather than the old "the encode
     // succeeded", which also closes the half that predates this: both writes
     // failing used to report `Written` too.
-    if !(encoded_at.is_some() || wrote_user_file) {
-        return reports;
-    }
-
-    // Swept against the directory the internal copy was *just written to*,
-    // rather than against a directory named separately. It is a small thing and
-    // it is the same principle as `Reaper` itself: the only place expiry can
-    // reach is the place Umber puts its own copies, and there is no second
-    // statement of where that is to drift.
+    //
+    // **The sweep is above it and not behind it**, which is not tidiness. Expiry
+    // deletes copies that are already *old*; whether this write landed is a
+    // different question, and the case where neither destination did is
+    // overwhelmingly the full-disk one — exactly where deleting what has expired
+    // might let the next attempt through. Behind the gate, an autosave that had
+    // started failing would never expire anything again until the next launch,
+    // because `sweep_once` runs once a run.
+    //
+    // Swept against the directory the internal copy was *aimed at*, rather than
+    // against a directory named separately. It is a small thing and it is the
+    // same principle as `Reaper` itself: the only place expiry can reach is the
+    // place Umber puts its own copies, and there is no second statement of where
+    // that is to drift.
     let expired = match (&internal, expiry) {
         (Some(path), Some(max_age)) => path.parent().map(|d| sweep_with(d, max_age)).unwrap_or(0),
         _ => 0,
     };
+
+    if !(encoded_at.is_some() || wrote_user_file) {
+        return reports;
+    }
+
     reports.push(Report::Written {
         id: doc.id,
         revision: doc.revision,
@@ -2225,9 +2235,12 @@ impl CaptureSource<'_> {
     /// away rather than never.
     ///
     /// The sentence the artist sees is not this one — `docformat::resolve`
-    /// replaces it with the layer's *name*, which this side does not have. What
-    /// is written here is what a reader of a log or a direct caller gets, so it
-    /// says which slice of the capture was missing.
+    /// replaces it with the layer's *name*, which this side does not have, and
+    /// the replacement is what `write_internal` then formats into the failure
+    /// report. So this string reaches **nobody** today: it is what a direct
+    /// caller would get, and there are none outside the tests. It says which
+    /// slice of the capture was missing because that is the only thing this
+    /// side knows, not because anything reads it.
     fn at(
         &self,
         index: Option<usize>,
