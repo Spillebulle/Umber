@@ -4409,6 +4409,85 @@ mod tests {
         assert_eq!(layer, AFTER);
     }
 
+    /// A capture that gave up must wait for the ordinary interval rather than
+    /// starting another into the same painting on the next frame.
+    ///
+    /// This is the half of the remedy that lives in `collect`, and the
+    /// disturbed-over-and-over guard above cannot see it: that one runs at an
+    /// interval of zero, where deferring is a no-op by construction. Without the
+    /// `defer` a document being painted continuously begins a capture, spends
+    /// its whole re-read budget on the same painting, gives up, and begins
+    /// another on the very next frame — for as long as somebody is working, with
+    /// one staging buffer held throughout and every *other* open document's
+    /// autosave waiting behind it, since only one capture runs at a time.
+    ///
+    /// The interval is real here and the document is made overdue by hand, so
+    /// what is measured is the scheduler declining to start rather than a
+    /// duration: no wall-clock figure is asserted.
+    ///
+    /// Demonstrated by mutation: with the `defer` taken out of `collect` a
+    /// capture starts again at once, runs to completion now that the painting
+    /// has stopped, and the file appears.
+    #[test]
+    fn a_capture_that_gave_up_waits_rather_than_starting_another_at_once() {
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut loops = FrameLoop::new(gpu, "waits");
+        let slot = loops.editor.layers.layers()[0]
+            .slot()
+            .expect("the one layer holds a slice");
+        paint_slice(gpu, &mut loops, slot, [200, 40, 40, 255]);
+
+        // An ordinary cadence, with the document already past due — which is the
+        // state every autosave starts from.
+        let interval = Duration::from_secs(600);
+        loops.editor.autosave.interval = interval;
+        loops
+            .editor
+            .autosave
+            .docs
+            .get_mut(&loops.id)
+            .expect("a record")
+            .last = Instant::now() - interval;
+
+        let mut gave_up = false;
+        for _ in 0..600 {
+            loops.frame(gpu, true);
+            paint_slice(gpu, &mut loops, slot, [40, 160, 60, 255]);
+            if loops
+                .canvases
+                .get(&loops.id)
+                .map(CanvasRenderer::captures_given_up)
+                .unwrap_or(0)
+                > 0
+            {
+                gave_up = true;
+                break;
+            }
+        }
+        assert!(
+            gave_up,
+            "no capture ever gave up, so this guard exercised nothing",
+        );
+        assert!(
+            !loops.theirs.exists(),
+            "a capture completed while the document was edited every frame",
+        );
+
+        // The painting stops, and there is plenty of time for a capture begun
+        // now to finish. Nothing should begin one.
+        for _ in 0..200 {
+            loops.frame(gpu, true);
+        }
+        assert!(
+            !loops.editor.autosave.capturing() && !loops.theirs.exists(),
+            "a capture that gave up was started again on the spot rather than \
+             waiting for the ordinary interval",
+        );
+    }
+
     #[test]
     fn a_title_that_is_not_a_file_name_still_becomes_one() {
         assert_eq!(stem_of("hands"), "hands");
