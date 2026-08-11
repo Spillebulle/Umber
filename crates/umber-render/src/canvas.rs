@@ -2433,7 +2433,7 @@ enum SlotClass {
 impl SlotClass {
     /// The RGBA8 an absent tile of this class reads as, on the CPU side.
     ///
-    /// White for a mask is `[255; 4]` and not `srgb::encode_coverage(0)`'s
+    /// White for a mask is `[255; 4]` and not `srgb::mask_pixel(0)`'s
     /// `[0, 0, 0, 255]`: the composite reads a mask on `.r` and full reveal is
     /// `.r == 1.0`, which is what [`Self::clear_colour`] writes and therefore
     /// what a readback of a *backed* full-reveal tile would hand back.
