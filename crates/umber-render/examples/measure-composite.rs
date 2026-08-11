@@ -35,7 +35,8 @@
 //! the same extra sampler at the same binding whether or not it reads it, so
 //! the pipelines share one layout and differ in nothing else.
 //!
-//! Four variants are compiled, not two:
+//! Six variants are compiled, not two — three that render a picture and three
+//! whose only output is a duration:
 //!
 //! - **tiled** — the shipped `tile_bilinear`, byte for byte.
 //! - **sampled** — one hardware bilinear tap. This is the pre-atlas composite.
@@ -113,11 +114,18 @@
 //! printed. A large one would mean the A/B is comparing two different pictures
 //! and the whole table is void.
 //!
-//! `gather` against `tiled` must be **exactly zero**, on every residency. It
-//! reads the same stored texels and runs the same f32 lerp, so it is one
-//! rendering computed twice; anything else means it is fetching different
-//! texels. Every residency, because the packed atlas and the unbacked branch
-//! are paths the dense store never takes.
+//! `gather` against `tiled` has to be **exactly zero**, on every residency, at
+//! every aim and in both mask states. It reads the same stored texels and runs
+//! the same f32 lerp, so it is one rendering computed twice; anything else means
+//! it is fetching different texels. Every residency, because the packed atlas
+//! and the unbacked branch are paths the dense store never takes; both mask
+//! states, because the mask tap goes through a different *view* of the atlas
+//! with a different empty value.
+//!
+//! It is **printed and counted, not asserted**, and a non-zero line raises a
+//! `!!` summary under the block rather than ending the run: the timing table is
+//! the other half of the output and aborting would throw it away. Nothing here
+//! exits non-zero, so a robot reading this example has to read the lines.
 //!
 //! **What that check catches, demonstrated by mutation rather than claimed.**
 //! Dropping the canvas-edge weight collapse is 16 of 255; permuting the gather's
@@ -254,11 +262,25 @@ impl Variant {
 /// one texel and it lerps a value against itself. A gather cannot be clamped
 /// that way — it fetches `a` and `a + 1` whatever they are, and `a + 1` there is
 /// either a real canvas texel (left edge) or the page's padding (right edge).
-/// Zeroing the weight on any axis where the two taps collapsed is what makes
-/// that exactly equal and not merely close: `mix(x, y, 0.0)` is `x * 1 + y * 0`,
-/// which is `x` for any finite `y`, and an 8-bit unorm texel is always finite.
-/// It is a `select` rather than a branch, so the common path pays two
-/// comparisons and no divergence.
+/// Zeroing the weight on any axis where the two taps collapsed is what closes
+/// the gap. `lo == up` is *exactly* "clamping collapsed this axis" and nothing
+/// else: `base < 0` forces both onto 0, `base >= hi` forces both onto `hi`, and
+/// `base` anywhere between gives `up = base + 1`. So there is no case where
+/// clamping fires without collapse or collapse without clamping, and the texel
+/// the gather picked up beside the right one is multiplied by a hard zero. It is
+/// a `select` rather than a branch, so the common path pays two comparisons and
+/// no divergence.
+///
+/// **The exactness of that rests on `mix(a, a, t) == a`, which is the shipped
+/// path's step and not this one's**, and it is worth saying which side it is on.
+/// This side is `mix(x, y, 0.0)`, which WGSL's own `x*(1 − t) + y*t` makes
+/// `x*1 + y*0` — exactly `x` for any finite `y`, and an 8-bit unorm texel is
+/// always finite. The shipped side is `mix(c, c, w)` at a real `w`, and *that*
+/// is not exact under the stated formula: `c*(1 − w) + c*w` need not round back
+/// to `c`. Every compiler lowers `mix` to the fused `a + t*(b − a)`, where it
+/// is exact because `b − a` is zero, and the check comes back at zero of 255 on
+/// Vulkan and on WARP over Dx12 — so it holds, by a lowering rather than by the
+/// specification. Anything relying on this outside a measurement should say so.
 const GATHER_BODY: &str = r#"
 fn tile_bilinear(
     atlas: texture_2d_array<f32>,
@@ -341,6 +363,57 @@ fn tile_bilinear(
 /// about *where* the rounding falls and a single frame on a single adapter is
 /// one sample of that. Read the column as a ceiling on what any fast-path
 /// change could buy, and nothing more.
+///
+/// **This block sat above `PROLOGUE_BODY` for one commit and belonged to it.**
+/// A run of `///` attaches to the next *item*, not to the next comment block,
+/// so inserting a second documented constant between a doc comment and its
+/// constant silently rehomes the whole thing — which left the three references
+/// to `HW_FAST_BODY` pointing at the wrong text, including the one the check
+/// leans on to stop a deviation of 1 of 255 reading as evidence this is safe.
+/// CLAUDE.md records the same failure for a `#[test]` between a doc comment and
+/// its function; a `const` does it just as well.
+const HW_FAST_BODY: &str = r#"
+fn tile_bilinear(
+    atlas: texture_2d_array<f32>,
+    table: texture_2d_array<u32>,
+    slot: i32,
+    doc: vec2<f32>,
+    doc_size: vec2<i32>,
+    empty: vec4<f32>,
+) -> vec4<f32> {
+    let centred = doc - vec2<f32>(0.5);
+    let base = floor(centred);
+    let w = centred - base;
+    let hi = doc_size - vec2<i32>(1);
+    let lo = clamp(vec2<i32>(base), vec2<i32>(0), hi);
+    let up = clamp(vec2<i32>(base) + vec2<i32>(1), vec2<i32>(0), hi);
+
+    let t_lo = lo / TILE;
+    let t_up = up / TILE;
+    if (t_lo.x == t_up.x && t_lo.y == t_up.y) {
+        let entry = textureLoad(table, t_lo, slot, 0).r;
+        if (entry == TILE_UNBACKED) {
+            return empty;
+        }
+        let cell = vec2<f32>(
+            f32((entry >> TILE_X_SHIFT) & 255u),
+            f32((entry >> TILE_Y_SHIFT) & 255u),
+        );
+        let at = cell * f32(TILE) + (doc - vec2<f32>(t_lo * TILE));
+        let dim = vec2<f32>(((doc_size + TILE - 1) / TILE) * TILE);
+        return textureSampleLevel(
+            atlas, measure_samp, at / dim, i32(entry >> TILE_PAGE_SHIFT), 0.0
+        );
+    }
+
+    let c00 = tile_load(atlas, table, slot, vec2<i32>(lo.x, lo.y), empty);
+    let c10 = tile_load(atlas, table, slot, vec2<i32>(up.x, lo.y), empty);
+    let c01 = tile_load(atlas, table, slot, vec2<i32>(lo.x, up.y), empty);
+    let c11 = tile_load(atlas, table, slot, vec2<i32>(up.x, up.y), empty);
+    return mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
+}
+"#;
+
 /// Everything `tile_bilinear` does except read the atlas, and why the table
 /// needed a second control beside `table`.
 ///
@@ -399,48 +472,6 @@ fn tile_bilinear(
     let e11 = textureLoad(table, vec2<i32>(up.x, up.y) / TILE, slot, 0).r;
     let mixed = (e00 ^ e10 ^ e01 ^ e11) & 255u;
     return vec4<f32>(f32(mixed) * (0.25 / 255.0) + (w.x + w.y) * 0.001);
-}
-"#;
-
-const HW_FAST_BODY: &str = r#"
-fn tile_bilinear(
-    atlas: texture_2d_array<f32>,
-    table: texture_2d_array<u32>,
-    slot: i32,
-    doc: vec2<f32>,
-    doc_size: vec2<i32>,
-    empty: vec4<f32>,
-) -> vec4<f32> {
-    let centred = doc - vec2<f32>(0.5);
-    let base = floor(centred);
-    let w = centred - base;
-    let hi = doc_size - vec2<i32>(1);
-    let lo = clamp(vec2<i32>(base), vec2<i32>(0), hi);
-    let up = clamp(vec2<i32>(base) + vec2<i32>(1), vec2<i32>(0), hi);
-
-    let t_lo = lo / TILE;
-    let t_up = up / TILE;
-    if (t_lo.x == t_up.x && t_lo.y == t_up.y) {
-        let entry = textureLoad(table, t_lo, slot, 0).r;
-        if (entry == TILE_UNBACKED) {
-            return empty;
-        }
-        let cell = vec2<f32>(
-            f32((entry >> TILE_X_SHIFT) & 255u),
-            f32((entry >> TILE_Y_SHIFT) & 255u),
-        );
-        let at = cell * f32(TILE) + (doc - vec2<f32>(t_lo * TILE));
-        let dim = vec2<f32>(((doc_size + TILE - 1) / TILE) * TILE);
-        return textureSampleLevel(
-            atlas, measure_samp, at / dim, i32(entry >> TILE_PAGE_SHIFT), 0.0
-        );
-    }
-
-    let c00 = tile_load(atlas, table, slot, vec2<i32>(lo.x, lo.y), empty);
-    let c10 = tile_load(atlas, table, slot, vec2<i32>(up.x, lo.y), empty);
-    let c01 = tile_load(atlas, table, slot, vec2<i32>(lo.x, up.y), empty);
-    let c11 = tile_load(atlas, table, slot, vec2<i32>(up.x, up.y), empty);
-    return mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
 }
 "#;
 
@@ -524,9 +555,17 @@ fn shader_source(variant: Variant, page: UVec2) -> String {
 // ---------------------------------------------------------------------------
 
 /// `MAX_DRAWS` in `canvas.rs` and in `composite.wgsl`. Restated here because
-/// neither is public, and `the_view_uniform_is_the_size_canvas_writes` below
-/// would catch a divergence at the first run rather than silently reading past
-/// the block.
+/// neither is public.
+///
+/// **Nothing checks that this still agrees with them.** This comment used to
+/// name a test, `the_view_uniform_is_the_size_canvas_writes`, that has never
+/// existed anywhere in the repository — the example has no `#[cfg(test)]` module
+/// at all, being an example. What would actually happen if `canvas.rs` raised
+/// its figure is that `ViewUniforms` here comes out smaller than the shader's
+/// `View`, which wgpu reports as a validation error naming both sizes at the
+/// first `create_bind_group` — loud, immediate and legible, but a run-time
+/// failure and not a guard. `the_three_draw_capacities_agree` in `canvas.rs` is
+/// the real guard and it cannot see this file.
 const MAX_DRAWS: usize = 191;
 
 #[repr(C)]
@@ -1461,97 +1500,87 @@ fn sweep_canvas(
 
     // ---- the check the whole table rests on ----------------------------
     //
-    // Two renderings of one picture. A hardware bilinear tap and a hand lerp of
-    // four `textureLoad`s agree to within the last bit rather than exactly, so
-    // this reports the largest deviation rather than asserting equality — but a
-    // large one means the A/B is comparing two different pictures.
-    for (aim, camera) in check_cameras(doc, plan.output) {
-        let pivot = Vec2::new(plan.output.x as f32 / 2.0, plan.output.y as f32 / 2.0);
-        gpu.queue.write_buffer(
-            &uniforms,
-            0,
-            bytemuck::bytes_of(&view_uniforms(doc, &camera, pivot, 4.min(slots), false)),
-        );
-        // Every residency, not only the dense one. The dense store is the only
-        // one the *sampled* baseline can be compared against — it is the only
-        // identity layout — but `gather` has to answer for the packed atlas
-        // too, and for the unbacked branch, which the dense store never takes.
-        for &residency in &Residency::ALL {
-            let bg = find_bg(residency);
-            let a = read_back(
-                gpu,
-                find_pipeline(Variant::Tiled),
-                bg,
-                target,
-                target_view,
-                plan.output,
+    // `gather` against `tiled` is one rendering computed twice and must come
+    // back at **zero**. `hw-fast` and `sampled` against `tiled` are two
+    // *renderings* of one picture, so those report a deviation and assert
+    // nothing — a large one means the A/B is comparing two different pictures.
+    //
+    // **Both mask states**, because `composite.wgsl` has *two* `tile_bilinear`
+    // call sites and they are not the same call: the mask one reads `mask_tex`,
+    // which is the **raw non-sRGB** view of the same atlas, and carries an empty
+    // value of white rather than transparent black. §11.3a published a masked
+    // timing row while only the unmasked configuration had ever been compared.
+    // Only `gather` is re-compared under a mask, because it is the only one that
+    // has to be exact.
+    let mut inexact = 0usize;
+    for (masks, coat) in [(false, ""), (true, ", masked")] {
+        for (aim, camera) in check_cameras(doc, plan.output) {
+            let pivot = Vec2::new(plan.output.x as f32 / 2.0, plan.output.y as f32 / 2.0);
+            gpu.queue.write_buffer(
+                &uniforms,
+                0,
+                bytemuck::bytes_of(&view_uniforms(doc, &camera, pivot, 4.min(slots), masks)),
             );
-            let g = read_back(
-                gpu,
-                find_pipeline(Variant::Gather),
-                bg,
-                target,
-                target_view,
-                plan.output,
-            );
-            let worst = worst_deviation(&a, &g);
-            // **Exact, not close.** `gather` is a pure optimisation of a path
-            // with a known-correct answer: it reads the same stored texels and
-            // runs the same f32 lerp, so anything other than zero means it is
-            // reading different texels — a shifted picture, a wrong component
-            // order, or the canvas-edge clamp not being reproduced.
-            println!(
-                "  check: gather against tiled, {aim}, {} store — \
-                 largest channel deviation {worst} of 255{}",
-                residency.label(),
-                if worst == 0 {
-                    "  (exact)"
-                } else {
-                    "  <-- NOT EXACT. gather is reading different texels; the column is void."
+            for &residency in &Residency::ALL {
+                let bg = find_bg(residency);
+                let shot = |v: Variant| {
+                    read_back(gpu, find_pipeline(v), bg, target, target_view, plan.output)
+                };
+                let a = shot(Variant::Tiled);
+
+                let worst = worst_deviation(&a, &shot(Variant::Gather));
+                inexact += usize::from(worst != 0);
+                println!(
+                    "  check: gather against tiled, {aim}{coat}, {} store — \
+                     largest channel deviation {worst} of 255{}",
+                    residency.label(),
+                    if worst == 0 {
+                        "  (exact)"
+                    } else {
+                        "  <-- NOT EXACT. gather is reading different texels; the column is void."
+                    }
+                );
+                if masks {
+                    continue;
                 }
-            );
 
-            // `hw-fast` is a *rendering* of the same picture rather than a
-            // recomputation of it — hardware weights against f32 ones — so this
-            // is reported and never asserted. See `HW_FAST_BODY` for why even a
-            // small figure here settles nothing about the seam it risks.
-            let h = read_back(
-                gpu,
-                find_pipeline(Variant::HwFast),
-                bg,
-                target,
-                target_view,
-                plan.output,
-            );
-            println!(
-                "  check: hw-fast against tiled, {aim}, {} store — \
-                 largest channel deviation {} of 255  (not exact by construction)",
-                residency.label(),
-                worst_deviation(&a, &h),
-            );
+                // `hw-fast` is a *rendering* of the same picture rather than a
+                // recomputation of it — hardware weights against f32 ones — so
+                // this is reported and never asserted. See `HW_FAST_BODY` for
+                // why even a small figure settles nothing about the seam it
+                // risks.
+                println!(
+                    "  check: hw-fast against tiled, {aim}, {} store — \
+                     largest channel deviation {} of 255  (not exact by construction)",
+                    residency.label(),
+                    worst_deviation(&a, &shot(Variant::HwFast)),
+                );
 
-            if residency != Residency::Dense {
-                continue;
+                // The dense store is the only identity layout, so it is the only
+                // one the sampled baseline stands for.
+                if residency != Residency::Dense {
+                    continue;
+                }
+                let worst = worst_deviation(&a, &shot(Variant::Sampled));
+                println!(
+                    "  check: tiled against sampled, {aim}, dense store — \
+                     largest channel deviation {worst} of 255{}",
+                    if worst <= 2 {
+                        ""
+                    } else {
+                        "  <-- LARGE. The two columns may not be one picture; \
+                         treat the table as void."
+                    }
+                );
             }
-            let b = read_back(
-                gpu,
-                find_pipeline(Variant::Sampled),
-                bg,
-                target,
-                target_view,
-                plan.output,
-            );
-            let worst = worst_deviation(&a, &b);
-            println!(
-                "  check: tiled against sampled, {aim}, dense store — \
-                 largest channel deviation {worst} of 255{}",
-                if worst <= 2 {
-                    ""
-                } else {
-                    "  <-- LARGE. The two columns may not be one picture; treat the table as void."
-                }
-            );
         }
+    }
+    // A wall of timings must not be able to bury one non-zero line.
+    if inexact > 0 {
+        println!(
+            "  !! {inexact} exact comparison(s) on this canvas came back non-zero. \
+             Every gather figure below is void."
+        );
     }
 
     // ---- the sweep ------------------------------------------------------
