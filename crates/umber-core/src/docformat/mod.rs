@@ -4527,10 +4527,19 @@ mod tests {
                     canvas(53, false),
                     canvas(71, true),
                 ],
+                // **No two channels alike**, and a real mask slice carries the
+                // same value in all three. That is the point: a mask is written
+                // from its *red* channel, by two functions now — the inline
+                // reduce in `write_archive` and `MaskImage::of` — and with three
+                // equal channels either could read green and the archives would
+                // still agree. Demonstrated by mutation: `px[0]` to `px[1]` in
+                // `MaskImage::of` walked through the byte comparison untouched.
+                // A fixture that only carries data a real file produces cannot
+                // tell two copies of one rule apart.
                 mask: (0..size.x * size.y)
                     .flat_map(|i| {
                         let v = (i * 11 % 253) as u8;
-                        [v, v, v, 255]
+                        [v, 255 - v, v / 3, 255]
                     })
                     .collect(),
                 merged: (0..size.x * size.y)
