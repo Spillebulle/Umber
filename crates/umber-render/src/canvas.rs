@@ -4690,7 +4690,23 @@ impl CanvasRenderer {
                                 continue;
                             };
                             // Fresh, so it holds whatever the driver left there
-                            // and only part of it is about to be written.
+                            // and only part of it is about to be written. This
+                            // is the whole-slice `clear_view` loop this method
+                            // used to open with, narrowed to the cells that are
+                            // actually handed out.
+                            //
+                            // **Undefeatable rather than guarded, and saying so
+                            // is the honest move.** Every cell here comes out of
+                            // a texture `create_texture` made a moment ago, so
+                            // there is no earlier slot's paint for it to hold —
+                            // only whatever the driver did not promise to zero.
+                            // Removing this clear leaves all 161 GPU tests green
+                            // on this machine, which is a statement about the
+                            // driver and not about the code. The rule it belongs
+                            // to is enforced where it *is* checkable: a cell
+                            // handed out of the pool is cleared, and
+                            // `a_recycled_atlas_cell_carries_none_of_the_last_
+                            // layers_paint` drives `back_tiles`'s copy of it.
                             let class = resized.class[slot as usize];
                             let blank = match class {
                                 SlotClass::Layer => &self.shared.blank_tile,
