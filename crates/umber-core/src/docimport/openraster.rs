@@ -1139,6 +1139,89 @@ mod tests {
     /// A layer whose blend mode would erase the one below it is reported, not
     /// composited over it in silence.
     ///
+    /// A mask entry's byte, as the slice ends up holding it.
+    fn mask_byte(doc: &ImportedDocument) -> u8 {
+        let pieces = doc.layers[0].mask.as_ref().expect("a mask");
+        assert_eq!(pieces.len(), 1, "a mask is one canvas piece");
+        pieces[0].bytes[0]
+    }
+
+    /// **A revision-4 mask goes in raw and a revision-3 one is converted.**
+    ///
+    /// The two files are byte for byte identical apart from the attribute, which
+    /// is what makes this a test of the *reading* rather than of two fixtures. A
+    /// mask slice used to hold sRGB-encoded coverage and now holds the linear
+    /// multiplier, so a document written before the bump means something else by
+    /// the same byte and has to be converted on the way in.
+    ///
+    /// Driven at values that are **not** fixed points of the transfer function.
+    /// 0 and 255 survive either reading, so a fixture reaching for the ends —
+    /// which is what a mask fixture naturally reaches for — could not tell a
+    /// missing conversion from a present one. That is this codebase's own rule
+    /// about a two-state reading, and it is why the version *and* the coverage
+    /// are both parameters of `fixtures::ora_masked`.
+    #[test]
+    fn a_mask_written_before_the_bump_is_converted_and_a_current_one_is_not() {
+        for coverage in [1u8, 64, 128, 200, 254] {
+            let now = read(&fixtures::ora_masked(docformat::VERSION, coverage)).unwrap();
+            assert_eq!(
+                mask_byte(&now),
+                coverage,
+                "a revision-{} mask must go in raw",
+                docformat::VERSION
+            );
+
+            let old = read(&fixtures::ora_masked(3, coverage)).unwrap();
+            let converted = mask_byte(&old);
+            assert_ne!(
+                converted, coverage,
+                "coverage {coverage} was copied across from a revision-3 file \
+                 rather than converted"
+            );
+            // What the old file *meant*, which is the only thing that has to
+            // survive: the byte cannot, because the encode it went through was
+            // not injective.
+            let meant = crate::color::srgb_to_linear(coverage as f32 / 255.0);
+            assert!(
+                (converted as f32 / 255.0 - meant).abs() * 255.0 <= 0.5,
+                "coverage {coverage} meant {meant} and came back as {converted}"
+            );
+        }
+
+        // The two ends are the fixed points, so they cross the bump untouched —
+        // stated rather than left out, because "nothing moves at 0 and 255" is
+        // what makes an old fully-revealed mask still fully reveal.
+        for coverage in [0u8, 255] {
+            assert_eq!(
+                mask_byte(&read(&fixtures::ora_masked(3, coverage)).unwrap()),
+                coverage
+            );
+        }
+    }
+
+    /// **The other half of the bump: a file from a newer build is refused.**
+    ///
+    /// This is what makes the version worth raising at all. The reason a mask's
+    /// coverage earned one is that an older build would not merely *drop*
+    /// something — it would decode the new byte through the transfer function
+    /// and show every mask in the document a full gamma curve out, silently, on
+    /// a picture that opened without a word. So the gate has to be a refusal
+    /// with the number named, and this is the only way this build can state it:
+    /// it cannot run an older one, but it can be handed a file from a newer.
+    #[test]
+    fn a_document_from_a_newer_build_is_refused_by_number() {
+        match read(&fixtures::ora_masked(docformat::VERSION + 1, 128)) {
+            Err(ImportError::NewerVersion { version, supported }) => {
+                assert_eq!(version, docformat::VERSION + 1);
+                assert_eq!(supported, docformat::VERSION);
+            }
+            other => panic!("a newer document must be refused by number, got {other:?}"),
+        }
+        // And the revision this build writes is not refused, which is the half
+        // that stops the gate being satisfied by refusing everything.
+        assert!(read(&fixtures::ora_masked(docformat::VERSION, 128)).is_ok());
+    }
+
     /// `svg:dst-in` is the mode a mask written as a layer would carry, and it
     /// is also just a blend mode Krita offers on ordinary layers. Umber has
     /// neither, so the layer arrives Normal — which over the layer below is a

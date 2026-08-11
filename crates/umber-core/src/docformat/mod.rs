@@ -2734,6 +2734,80 @@ mod tests {
         );
     }
 
+    /// **A mask patch written by this build comes back byte for byte.**
+    ///
+    /// The bytes go in raw at both ends, so this is the mask's half of
+    /// `saving_and_reopening_does_not_move_a_pixel` — and it is a real claim
+    /// rather than a tautology now, because the reader has a branch that
+    /// *would* convert them. A document this build writes declares 4, so that
+    /// branch must not fire; one written before it declares 3 and it must. The
+    /// coverage is a partial for the reason it is everywhere else here: 0 and
+    /// 255 are the transfer function's fixed points and survive either way.
+    ///
+    /// **What this does not drive is the conversion itself**, only its absence.
+    /// Building a revision-3 archive carrying a manifest is more fixture than
+    /// the claim is worth, and the conversion is the same
+    /// `srgb::decode_v3_mask_buffer` `openraster::load_mask` calls, which
+    /// `a_mask_written_before_the_bump_is_converted_and_a_current_one_is_not`
+    /// does drive. Said out loud rather than left for somebody to assume.
+    #[test]
+    fn a_mask_patch_survives_a_round_trip_unconverted() {
+        use crate::history::{Edit, EditBody, EditKind, History, PixelPatch};
+
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [9, 9, 9, 255]);
+        let mask = solid(size, [128, 128, 128, 255]);
+
+        let mut stack = LayerStack::empty();
+        stack.push_imported(false, 0, "Ink".into());
+        let slot = stack.get(0).unwrap().slot().unwrap();
+        // The patch names the *mask's* slice, which is what makes the entry
+        // record `mask: true` and reach the branch under test.
+        let mask_slot = stack.add_mask(0).expect("a mask slice");
+
+        let rect = crate::geom::PixelRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let mut history = History::default();
+        history.record(Edit::new(
+            EditKind::Paint,
+            EditBody::Pixels(PixelPatch::new(rect, mask_slot, vec![77; 2 * 2 * 4])),
+        ));
+        let saved = super::history::SaveHistory::new(&history, &stack)
+            .expect("every patch names a live slice");
+        assert_ne!(slot, mask_slot, "the fixture is not testing anything");
+
+        let layers = vec![SaveLayer {
+            mask: Some(Canvas::Held(&mask)),
+            ..layer("Ink", &px)
+        }];
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(&px),
+            history: Some(saved),
+        });
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        let opened = doc.open();
+        assert_eq!(opened.history.len(), 1, "the history came back");
+        let patch = &opened.history.entry_at(0).unwrap().patches()[0];
+        assert_eq!(
+            patch.pieces()[0].bytes()[0],
+            77,
+            "a mask patch this build wrote must come back unconverted"
+        );
+        // And the layer's own mask entry beside it, which travels the same file
+        // and has to answer to the same revision.
+        assert_eq!(opened.stack.get(0).unwrap().mask(), Some(mask_slot));
+    }
+
     /// Write a document and read it straight back through the importer, which
     /// is the only round trip that matters: the file is only worth anything if
     /// Umber's own reader gets the document back out of it.
