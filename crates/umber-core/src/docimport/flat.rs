@@ -186,20 +186,21 @@ mod tests {
 
     /// **A PNG header alone cannot choose an allocation.**
     ///
-    /// The fixture is a valid IHDR and an IEND, under a hundred bytes, claiming
-    /// one pixel past [`ImportedDocument::MAX_DIMENSION`] on a side — where
-    /// `output_buffer_size` answers `Some(4_295_098_372)` and `vec![0u8; …]`
-    /// **aborts** rather than failing, taking the panic hook, the crash report
-    /// and the autosave with it.
+    /// The fixture is a valid IHDR, an **empty** IDAT and an IEND — forty-odd
+    /// bytes — claiming one pixel past [`ImportedDocument::MAX_DIMENSION`] on a
+    /// side, where `output_buffer_size` answers `Some(4_295_098_372)` and
+    /// `vec![0u8; …]` **aborts** rather than failing, taking the panic hook, the
+    /// crash report and the autosave with it.
     ///
     /// **Refusing on the header rather than on the frame is what is being
-    /// asserted, and the fixture is what makes that legible.** There is no IDAT
-    /// at all, so a reader that allocated first and asked afterwards fails with
-    /// a *decode* error — a different variant, from `next_frame`, with the
+    /// asserted, and the fixture is what makes that legible.** The IDAT is empty
+    /// — present so `read_info` will parse the file at all, holding nothing — so
+    /// a reader that allocated first and asked afterwards fails inside
+    /// `next_frame` with a *decode* error, a different variant with the
     /// allocation already spent. Only a check off `reader.info()` produces
-    /// `ImageTooLarge`. Demonstrated by mutation: move the call below
-    /// `output_buffer_size` and it is still `ImageTooLarge`; delete it and this
-    /// reads `Malformed`.
+    /// `ImageTooLarge`. Demonstrated by mutation: delete the call and this reads
+    /// `Malformed { detail: "the PNG could not be decoded (Corrupt deflate
+    /// stream. InsufficientInput)" }`.
     ///
     /// The case is derived from the constant rather than written out, so raising
     /// the ceiling moves the case with it instead of leaving one that no longer
