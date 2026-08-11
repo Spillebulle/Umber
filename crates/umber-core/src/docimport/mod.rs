@@ -871,6 +871,7 @@ impl ImportedDocument {
             self.size.y,
             self.layers.iter().filter(|l| !l.folder).count(),
             self.layers.iter().map(ImportedLayer::pixel_bytes).sum(),
+            Self::MAX_TOTAL_BYTES,
         )?;
         // Rules 1 and 3 of the piece contract, per piece. Rule 2 — that pieces
         // do not overlap — is deliberately not asserted over a foreign file;
@@ -1430,6 +1431,7 @@ fn check_bounds(
         height,
         layers: stack.painted,
         spent: 0,
+        limit: ImportedDocument::MAX_TOTAL_BYTES,
     })
 }
 
@@ -1442,13 +1444,21 @@ fn check_bounds(
 /// tidier number, and decoding the rest is exactly the spend the bound exists
 /// to prevent.
 ///
-/// It comes out of [`check_bounds`] and nowhere else, so it cannot exist
-/// without the header having been checked.
+/// A reader gets one out of [`check_bounds`] and nowhere else, so it cannot
+/// charge a decode without having checked the header.
+///
+/// **`limit` is a field rather than a constant read inside**, for the reason
+/// `CanvasRenderer::set_readback_limit` is one: reaching 16 GiB honestly means
+/// allocating 16 GiB, which is not something to ask a CI runner for, and a test
+/// that drove the comparison directly instead would be restating the rule it
+/// claims to check. A test builds one of these with a small limit and charges
+/// real pieces through the real function.
 struct PieceBudget {
     width: u32,
     height: u32,
     layers: usize,
     spent: u64,
+    limit: u64,
 }
 
 impl PieceBudget {
@@ -1458,7 +1468,7 @@ impl PieceBudget {
     /// remember to skip one.
     fn charge(&mut self, layer: &ImportedLayer) -> Result<(), ImportError> {
         self.spent = self.spent.saturating_add(layer.pixel_bytes());
-        check_resident(self.width, self.height, self.layers, self.spent)
+        check_resident(self.width, self.height, self.layers, self.spent, self.limit)
     }
 }
 
@@ -1480,8 +1490,9 @@ fn check_resident(
     height: u32,
     layers: usize,
     bytes: u64,
+    limit: u64,
 ) -> Result<(), ImportError> {
-    if bytes > ImportedDocument::MAX_TOTAL_BYTES {
+    if bytes > limit {
         return Err(ImportError::StackTooLarge {
             width,
             height,
@@ -1500,7 +1511,19 @@ mod tests {
         ImportedLayer::new(
             name,
             BlendMode::Normal,
-            vec![0; size.x as usize * size.y as usize * 4],
+            vec![PixelPiece::whole(
+                size,
+                vec![0; size.x as usize * size.y as usize * 4],
+            )],
+        )
+    }
+
+    /// A layer holding one rectangle of solid `value`, and nothing elsewhere.
+    fn patch(name: &str, rect: PixelRect, value: u8) -> ImportedLayer {
+        ImportedLayer::new(
+            name,
+            BlendMode::Normal,
+            vec![PixelPiece::new(rect, vec![value; rect.area() as usize * 4])],
         )
     }
 
@@ -1597,14 +1620,101 @@ mod tests {
             check_bounds(f, 100, 100, StackSize::all_painted(LayerStack::MAX + 1)),
             Err(ImportError::TooManyLayers { .. })
         ));
-        // 16384² is a legal canvas and 64 of them is 68.7 GB, which is the
-        // document the byte bound exists for: a header asking for tens of
-        // gigabytes before a pixel has been decoded.
-        assert!(matches!(
-            check_bounds(f, 16384, 16384, StackSize::all_painted(64)),
-            Err(ImportError::StackTooLarge { .. })
-        ));
+        // **And the byte bound is deliberately no longer among them.** 16384²
+        // at 64 layers is a header claiming 68.7 GB, which this used to refuse
+        // on the spot; it now passes, because a claim is not a cost. What the
+        // file will actually be charged is the pieces it produces, and a header
+        // claiming a canvas nobody painted on produces none.
+        assert!(check_bounds(f, 16384, 16384, StackSize::all_painted(64)).is_ok());
         assert!(check_bounds(f, 2048, 2048, StackSize::all_painted(8)).is_ok());
+    }
+
+    /// The header's claim costs nothing and the file's content costs what it
+    /// costs — which is the whole of Stage 2's bound.
+    ///
+    /// Driven through [`PieceBudget`] rather than through `check_resident`
+    /// directly, because the budget is what a reader holds and the thing that
+    /// could be got wrong is *what it charges*: a version that billed
+    /// `canvas × 4` per layer, or that billed a folder, passes a test of the
+    /// comparison and fails this one.
+    #[test]
+    fn a_document_is_charged_for_the_pixels_it_holds_and_not_for_its_canvas() {
+        let f = SourceFormat::ClipStudio;
+        // 16384² × 64 is 68.7 GB claimed. The stack is legal, so the header
+        // check passes and the budget starts at nothing.
+        let mut budget = check_bounds(f, 16384, 16384, StackSize::all_painted(64)).unwrap();
+        assert_eq!(budget.spent, 0);
+
+        // A layer holding one 256-square block costs a quarter of a megabyte,
+        // not a quarter of a gigabyte.
+        let block = PixelRect {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 256,
+        };
+        for i in 0..64 {
+            budget
+                .charge(&patch(&format!("L{i}"), block, 9))
+                .expect("64 blocks is 16.8 MB and must not refuse");
+        }
+        assert_eq!(budget.spent, 64 * 256 * 256 * 4);
+
+        // A folder is charged nothing, and nothing has to remember to skip one:
+        // it holds no pieces.
+        let before = budget.spent;
+        budget.charge(&ImportedLayer::folder("Group", 0, true)).unwrap();
+        assert_eq!(budget.spent, before);
+    }
+
+    /// The accumulation is what the bound stops, and it stops it partway.
+    ///
+    /// A reader charges as it decodes, so the layer that puts the document over
+    /// is the last one read and the rest are never decoded — which is the spend
+    /// the figure exists to prevent. The sentence therefore says "at least"
+    /// rather than claiming to have measured the whole document.
+    ///
+    /// The limit is the budget's own field so this can drive the **real**
+    /// `charge` over **real** pieces; see [`PieceBudget`] for why a test at
+    /// 16 GiB is not one anybody can run, and note that a version reading the
+    /// constant inside would have forced this test to restate the comparison
+    /// instead of exercising it.
+    #[test]
+    fn the_budget_refuses_partway_through_and_says_so() {
+        // Ten pixels a layer, and room for three of them.
+        let rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 1,
+        };
+        let mut budget = PieceBudget {
+            width: 4000,
+            height: 4000,
+            layers: 64,
+            spent: 0,
+            limit: 3 * 10 * 4,
+        };
+
+        for i in 0..3 {
+            budget
+                .charge(&patch(&format!("L{i}"), rect, 7))
+                .unwrap_or_else(|e| panic!("layer {i} is inside the budget: {e}"));
+        }
+        let err = budget.charge(&patch("L3", rect, 7)).unwrap_err();
+
+        // Ten of the sixty-four were never reached, and the sentence must not
+        // pretend otherwise.
+        let said = err.to_string();
+        assert!(
+            said.contains("at least"),
+            "a refusal that stopped partway may not claim to have measured the whole \
+             document: {said}"
+        );
+        assert!(
+            said.contains("64 layers") && said.contains("4000×4000"),
+            "the sentence names the stack and the canvas, which are the two levers: {said}"
+        );
     }
 
     /// The refusal the artist actually met, and the two things wrong with it.
@@ -1645,69 +1755,95 @@ mod tests {
         assert!(check_bounds(f, 10000, 10000, StackSize::all_painted(40)).is_ok());
     }
 
-    /// **A reader must never be stricter than the writer** is the rule the mask
-    /// paragraph on [`check_bounds`] states, and `MAX_TOTAL_BYTES` does not
-    /// fully meet it. This says exactly how far it gets, because a guard
-    /// written to the rule rather than to the code would be asserting something
-    /// that does not ship — and one quietly narrowed until it passed would be
-    /// the bound loosened to admit the thing it exists to catch.
+    /// **A reader must never be stricter than the writer**, and the piece
+    /// contract is what finally makes that true of the byte bound.
     ///
-    /// Where it holds: every canvas up to 8192², at the full stack. That covers
-    /// what Umber's own dialog offers and every document anybody has brought
-    /// here.
+    /// It used to be false in a stated, known way: a full 64-layer stack claims
+    /// 16 GiB from 8192² upwards, so a 10000² document at 40 layers opened and
+    /// the same canvas at 64 did not — a document Umber's own dialog will make
+    /// and Umber's own writer will save. The claim was the whole problem, and
+    /// the claim is gone.
     ///
-    /// Where it does not, and it is a **known gap** rather than an oversight:
-    /// a full 64-layer stack needs 16 GiB from 8192² upwards, so a 10000²
-    /// document at 40 layers opens and the same canvas at 64 does not. The
-    /// argument for stopping somewhere is on `MAX_TOTAL_BYTES` — every figure
-    /// that admits a real 25.6 GB document also admits a malformed header
-    /// asking for 25.6 GB, because the two are the same header. Raising it to
-    /// `MAX_DIMENSION² × 4 × LayerStack::MAX` closes the gap and retires the
-    /// check; that is a product decision, and this test is where its terms are
-    /// written down so it can be taken deliberately.
+    /// **`docformat` trims**, which is what closes it rather than a larger
+    /// figure: `docformat::trim` writes each layer's PNG at its own content
+    /// rectangle with an offset, and `openraster::load_layer` reads that back as
+    /// one piece. So an Umber document is charged for the paint it holds, and
+    /// the only stack that can still be refused is one that genuinely holds
+    /// 17.2 GB of it.
+    ///
+    /// The second half is what makes this a guard rather than a cheer: a stack
+    /// that really is that full **is** still refused, and stating where keeps
+    /// the trade deliberate.
     #[test]
     fn a_document_umber_could_save_can_be_reopened() {
         let f = SourceFormat::OpenRaster;
-        for edge in [2048u32, 4096, 8192] {
+        // The header alone refuses none of these any more, at any canvas Umber
+        // will make and at the full stack.
+        for edge in [2048u32, 4096, 8192, 10000, ImportedDocument::MAX_DIMENSION] {
             assert!(
                 check_bounds(f, edge, edge, StackSize::all_painted(LayerStack::MAX)).is_ok(),
-                "a full stack on a {edge}² canvas could be saved and not reopened"
+                "a full stack on a {edge}² canvas was refused off its header alone"
             );
         }
 
-        // The gap, pinned so that closing it is a change to this test and not a
-        // silent one. Whichever way it moves, both halves move together.
+        // A 10000² document at 64 layers: the case that used to be refused.
+        // Charged for what its layers hold rather than for its canvas, a stack
+        // of sketches costs kilobytes and opens.
+        let mut budget =
+            check_bounds(f, 10000, 10000, StackSize::all_painted(LayerStack::MAX)).unwrap();
+        let sketch = PixelRect {
+            x: 100,
+            y: 100,
+            width: 64,
+            height: 64,
+        };
+        for i in 0..LayerStack::MAX {
+            budget
+                .charge(&patch(&format!("L{i}"), sketch, 200))
+                .expect("64 sketched layers hold a megabyte between them");
+        }
+
+        // And the bound is still a bound: `MAX_TOTAL_BYTES` past that is the
+        // figure, and a stack that really does hold it is refused. Derived from
+        // the constant rather than written out, so raising it moves this with
+        // it instead of leaving a case that no longer exercises itself.
+        budget.spent = ImportedDocument::MAX_TOTAL_BYTES;
         assert!(
-            check_bounds(f, 10000, 10000, StackSize::all_painted(64)).is_err(),
+            budget.charge(&patch("one more", sketch, 200)).is_err(),
             "if this now opens, MAX_TOTAL_BYTES was raised and its docs must say so"
         );
-        assert!(check_bounds(f, 10000, 10000, StackSize::all_painted(40)).is_ok());
     }
 
     /// A folder holds no slot and no buffer, so it may not be charged a canvas.
     ///
-    /// Driven through [`StackSize::of`] from folder *readings* rather than from
-    /// two hand-written counts, because that constructor is what every reader
-    /// calls and hand-written counts would only agree with themselves. The case
-    /// is one where the two readings disagree loudly: 60 folders over 4 painted
-    /// layers on a 10000² canvas is 9.6 GB counted properly and 25.6 GB counted
-    /// off the entries, so a version that charged folders fails here.
+    /// **This used to be a property of the arithmetic and is now a property of
+    /// the data**, which is the stronger form: `StackSize::painted` decided what
+    /// the byte total charged, and a caller passing its entry count twice
+    /// charged every folder a canvas — a Clip Studio document filed into groups
+    /// paying for its own filing. A folder now yields no [`PixelPiece`], so
+    /// there is nothing left to bill however the counts are read.
     ///
-    /// This is the *function's* half. Whether a reader hands it the right
-    /// reading is `a_document_filed_into_folders_is_not_charged_for_the_folders`
-    /// in `clipstudio`, and it has to be there: this test passes whatever the
-    /// caller does.
+    /// What `StackSize` still decides is the entry bound and the word the
+    /// refusal prints, and both halves are driven here.
     #[test]
     fn folders_are_not_charged_for_pixels_they_do_not_hold() {
         let f = SourceFormat::ClipStudio;
         let stack = StackSize::of((0..64).map(|i| i >= 4));
         assert_eq!((stack.entries, stack.painted), (64, 4));
-        assert!(check_bounds(f, 10000, 10000, stack).is_ok());
+        let mut budget = check_bounds(f, 10000, 10000, stack).unwrap();
+
+        // Sixty folders charge nothing at all, whatever the canvas.
+        for i in 0..60 {
+            budget
+                .charge(&ImportedLayer::folder(format!("G{i}"), 0, true))
+                .unwrap();
+        }
+        assert_eq!(budget.spent, 0, "a folder holds no pieces to be charged for");
 
         // And the entry bound still counts them, because a folder does occupy a
         // stack entry even though it occupies no memory. One painted layer at
-        // the bottom of `MAX + 1` entries costs no more in bytes than a single
-        // layer and is still a stack too tall to hold.
+        // the bottom of `MAX + 1` entries costs no bytes at all and is still a
+        // stack too tall to hold.
         let too_tall = StackSize::of((0..=LayerStack::MAX).map(|i| i > 0));
         assert!(matches!(
             check_bounds(f, 100, 100, too_tall),
@@ -1719,10 +1855,10 @@ mod tests {
     /// the stack rather than the canvas and carries the figure to act on.
     #[test]
     fn a_stack_refusal_names_the_stack_and_not_the_canvas() {
-        let f = SourceFormat::ClipStudio;
-        let err = check_bounds(f, 16384, 16384, StackSize::all_painted(64)).unwrap_err();
+        let err = check_resident(16384, 16384, 64, 68_719_476_736, 16 << 30).unwrap_err();
         let said = err.to_string();
         assert!(said.contains("64 layers"), "{said}");
+        assert!(said.contains("16384×16384"), "{said}");
         assert!(said.contains("68.7 GB"), "{said}");
         assert!(
             said.contains("17.2 GB"),
@@ -1732,6 +1868,60 @@ mod tests {
             !said.contains("larger than Umber can open"),
             "a stack refusal must not wear the canvas refusal's words: {said}"
         );
+        // **It offers the canvas as well as the stack.** Halving each edge
+        // quarters the figure, which is the lever with the most leverage and
+        // the one the sentence used to withhold — see
+        // `docs/perf/import-and-limits.md` §5.2. And it no longer tells anybody
+        // that Umber "holds at most" a figure, which reads as a promise about
+        // their machine rather than about a constant.
+        assert!(
+            said.contains("smaller canvas"),
+            "the canvas is a term in the arithmetic and has to be offered: {said}"
+        );
+        assert!(
+            !said.contains("holds at most"),
+            "a statement about a constant must not read as one about the machine: {said}"
+        );
+    }
+
+    /// Rule 2: pieces do not overlap, and the sweep that says so actually
+    /// notices when they do.
+    ///
+    /// Both directions, because a detector that answered `Some` for everything
+    /// would pass the half of this that matters most to the readers.
+    #[test]
+    fn the_overlap_sweep_finds_an_overlap_and_leaves_a_grid_alone() {
+        let cell = |x: u32, y: u32| PixelPiece {
+            rect: PixelRect {
+                x,
+                y,
+                width: 16,
+                height: 16,
+            },
+            bytes: Vec::new(),
+        };
+        // A 4×4 grid of touching-but-not-overlapping squares, which is the
+        // shape every block and tile reader produces.
+        let grid: Vec<PixelPiece> = (0..4)
+            .flat_map(|r| (0..4).map(move |c| cell(c * 16, r * 16)))
+            .collect();
+        assert_eq!(overlapping_pieces(&grid), None);
+
+        // One pixel of overlap, in the middle of the sweep rather than at
+        // either end.
+        let mut broken = grid.clone();
+        broken.push(cell(15, 15));
+        assert!(overlapping_pieces(&broken).is_some());
+    }
+
+    /// A folder is not merely uncharged, it may hold no pieces at all: it takes
+    /// no slot, so a rectangle on one has nowhere to be written.
+    #[test]
+    fn a_folder_carries_no_pieces() {
+        let folder = ImportedLayer::folder("Group", 0, true);
+        assert!(folder.pixels.is_empty());
+        assert!(folder.mask.is_none());
+        assert_eq!(folder.pixel_bytes(), 0);
     }
 
     #[test]
@@ -1783,11 +1973,23 @@ mod tests {
         assert_eq!(document.size, UVec2::new(2, 2));
         assert_eq!(stack.layers()[0].name, "Paper");
         assert_eq!(uploads.len(), 2);
+        // **An upload is the rectangle the file holds, clipped to the page —
+        // not a canvas.** This used to assert one layer's worth of bytes, and
+        // that was a statement about the reader densifying rather than about
+        // the document: the fixture places a 2×2 layer at (1, 1) on a 2×2
+        // canvas, so one pixel of it is on the page and the other three were
+        // transparent padding nobody wrote.
+        assert_eq!(uploads[0].pieces.len(), 1);
         assert_eq!(
-            uploads[0].pixels.len() as u64,
-            document.layer_bytes(),
-            "an upload must be exactly one layer's worth of bytes"
+            uploads[0].pieces[0].rect,
+            PixelRect {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1
+            }
         );
+        assert_eq!(uploads[0].pieces[0].bytes.len(), 4);
     }
 
     #[test]

@@ -1762,7 +1762,7 @@ mod tests {
             doc.warnings
         );
         // The painting is what is kept, which is the whole of the trade.
-        assert_eq!(doc.layers[0].pixels[0], 255);
+        assert_eq!(doc.layers[0].dense(size)[0], 255);
     }
 
     /// A record from a newer revision, and one that is simply rubbish, are both
@@ -2162,8 +2162,12 @@ mod tests {
         assert!(!doc.layers[1].visible, "visibility was lost");
 
         assert_eq!(doc.active, Some(0), "the selected layer was lost");
-        assert_eq!(doc.layers[0].pixels, bottom);
-        assert_eq!(doc.layers[1].pixels, top);
+        // **The pixel-identity check for a whole round trip**, and it is
+        // stated over the assembled canvas rather than over the pieces: what
+        // the piece contract promises is that the *picture* is unchanged, and
+        // a reader is free to cut it up however the file did.
+        assert_eq!(doc.layers[0].dense(size), bottom);
+        assert_eq!(doc.layers[1].dense(size), top);
     }
 
     /// A mask, a clip, a lock and a link all the way out and back.
@@ -2244,11 +2248,11 @@ mod tests {
         assert_eq!(doc.layers.len(), 2);
         assert!(doc.layers[0].locked, "the lock was lost");
         assert!(!doc.layers[0].clipped);
-        assert_eq!(doc.layers[0].mask, None);
+        assert!(doc.layers[0].mask.is_none());
         assert!(doc.layers[1].clipped, "the clip was lost");
         assert_eq!(doc.layers[1].link, Some(3), "the link group was lost");
         assert_eq!(
-            doc.layers[1].mask.as_deref(),
+            doc.layers[1].dense_mask(size).as_deref(),
             Some(&mask[..]),
             "the mask did not come back byte for byte"
         );
@@ -2262,7 +2266,8 @@ mod tests {
             opened
                 .uploads
                 .iter()
-                .any(|u| u.slot == mask_slot && u.pixels == mask),
+                .any(|u| u.slot == mask_slot
+                    && crate::docimport::assemble(&u.pieces, size) == mask),
             "the mask's pixels were not handed over for upload"
         );
     }
@@ -2983,10 +2988,13 @@ mod tests {
         assert_eq!(back.layers.len(), 2, "the background is a layer to them");
         assert_eq!(back.layers[0].name, "Background", "and it is at the bottom");
         assert!(
-            back.layers[0].pixels.chunks_exact(4).all(|p| p[3] == 255),
+            back.layers[0]
+                .dense(size)
+                .chunks_exact(4)
+                .all(|p| p[3] == 255),
             "the background layer must be opaque everywhere"
         );
-        assert_eq!(&back.layers[0].pixels[..4], &[20, 120, 200, 255]);
+        assert_eq!(&back.layers[0].dense(size)[..4], &[20, 120, 200, 255]);
     }
 
     #[test]
@@ -3079,7 +3087,7 @@ mod tests {
             merged: &merged,
             history: None,
         });
-        assert_eq!(doc.layers[0].pixels, pixels);
+        assert_eq!(doc.layers[0].dense(size), pixels);
     }
 
     #[test]
@@ -3102,7 +3110,7 @@ mod tests {
             merged: &merged,
             history: None,
         });
-        assert_eq!(doc.layers[0].pixels, pixels);
+        assert_eq!(doc.layers[0].dense(size), pixels);
     }
 
     #[test]
@@ -3123,7 +3131,7 @@ mod tests {
 
         assert_eq!(doc.layers.len(), 2, "the empty layer was dropped");
         assert_eq!(doc.layers[0].name, "Blank");
-        assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));
+        assert!(doc.layers[0].dense(size).iter().all(|&b| b == 0));
     }
 
     #[test]

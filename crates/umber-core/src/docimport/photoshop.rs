@@ -431,7 +431,10 @@ mod tests {
     #[test]
     fn pixels_and_blend_modes_come_across() {
         let doc = read(&two_layers()).unwrap();
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(2, 2))[0..4],
+            &[255, 0, 0, 255]
+        );
         assert_eq!(doc.layers[1].blend, BlendMode::Multiply);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
@@ -507,7 +510,7 @@ mod tests {
     fn transparency_is_premultiplied_like_every_other_import() {
         let psd = fixtures::psd(1, 1, &[PsdLayerSpec::new("Soft", [255, 255, 255, 128])]);
         let doc = read(&psd).unwrap();
-        assert!((doc.layers[0].pixels[0] as i32 - 188).abs() <= 1);
+        assert!((doc.layers[0].dense(UVec2::new(1, 1))[0] as i32 - 188).abs() <= 1);
     }
 
     #[test]
@@ -583,9 +586,12 @@ mod tests {
 
         assert_eq!(doc.layers.len(), 2, "{:?}", doc.warnings);
         assert_eq!(doc.layers[0].name, "Paper");
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
         assert_eq!(
-            &doc.layers[1].pixels[0..4],
+            &doc.layers[0].dense(UVec2::new(4, 4))[0..4],
+            &[255, 0, 0, 255]
+        );
+        assert_eq!(
+            &doc.layers[1].dense(UVec2::new(4, 4))[0..4],
             &[0, 0, 255, 255],
             "the mask channel must not be read as the layer's own"
         );
@@ -682,6 +688,9 @@ mod tests {
         let doc = read(&psd).unwrap();
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.layers[0].name, "Background");
-        assert_eq!(&doc.layers[0].pixels[0..4], &[10, 20, 30, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(2, 1))[0..4],
+            &[10, 20, 30, 255]
+        );
     }
 }

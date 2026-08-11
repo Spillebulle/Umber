@@ -890,7 +890,8 @@ mod tests {
         // The 1×1 blue top layer sits at x=1,y=1 in the fixture.
         let doc = read(&two_layer_ora()).unwrap();
         let top = &doc.layers[1];
-        let at = |x: usize, y: usize| &top.pixels[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+        let pixels = top.dense(UVec2::new(4, 4));
+        let at = |x: usize, y: usize| &pixels[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
         assert_eq!(at(1, 1), [0, 0, 255, 255]);
         assert_eq!(at(0, 0), [0, 0, 0, 0], "outside the layer must be empty");
     }
@@ -1163,7 +1164,11 @@ mod tests {
             );
             // The pixels are untouched, which is the half that matters. The
             // fixture places every layer at (1,1), so that is where to look.
-            assert_eq!(&doc.layers[0].pixels[12..16], [1, 2, 3, 255], "{record}");
+            assert_eq!(
+                &doc.layers[0].dense(UVec2::new(2, 2))[12..16],
+                [1, 2, 3, 255],
+                "{record}"
+            );
         }
     }
 

@@ -137,28 +137,34 @@ mod tests {
         assert_eq!(doc.layers.len(), 1);
         assert!(doc.warnings.is_empty(), "a flat PNG loses nothing");
         // Opaque pixels survive the colour-space conversion byte for byte.
-        assert_eq!(doc.layers[0].pixels, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(
+            doc.layers[0].dense(UVec2::new(2, 1)),
+            vec![255, 0, 0, 255, 0, 255, 0, 255]
+        );
     }
 
     #[test]
     fn greyscale_and_rgb_pngs_widen_to_rgba() {
         let grey = fixtures::png_grey(2, 1, &[0, 255]);
         let doc = read_png(&grey).unwrap();
-        assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+        assert_eq!(
+            doc.layers[0].dense(UVec2::new(2, 1)),
+            vec![0, 0, 0, 255, 255, 255, 255, 255]
+        );
 
         let rgb = fixtures::png_rgb(1, 1, &[10, 20, 30]);
         let doc = read_png(&rgb).unwrap();
-        assert_eq!(doc.layers[0].pixels, vec![10, 20, 30, 255]);
+        assert_eq!(doc.layers[0].dense(UVec2::new(1, 1)), vec![10, 20, 30, 255]);
     }
 
     #[test]
     fn transparency_is_premultiplied_on_the_way_in() {
         let png = fixtures::png_rgba(1, 1, &[255, 255, 255, 128]);
         let doc = read_png(&png).unwrap();
+        let pixels = doc.layers[0].dense(UVec2::new(1, 1));
         assert!(
-            (doc.layers[0].pixels[0] as i32 - 188).abs() <= 1,
-            "got {:?} — the layer texture wants premultiplied linear colour",
-            doc.layers[0].pixels
+            (pixels[0] as i32 - 188).abs() <= 1,
+            "got {pixels:?} — the layer texture wants premultiplied linear colour"
         );
     }
 

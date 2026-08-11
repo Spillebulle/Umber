@@ -2039,7 +2039,7 @@ mod tests {
         let bytes = fixtures::clip(w, h, &[ClipLayer::flat("Ink", w, h, [10, 120, 240, 255])]);
         let doc = read(&bytes).expect("a document");
         assert_eq!(doc.layers.len(), 1);
-        let pixels = &doc.layers[0].pixels;
+        let pixels = doc.layers[0].dense(UVec2::new(w, h));
         assert_eq!(pixels.len(), (w * h * 4) as usize);
         for (i, px) in pixels.chunks_exact(4).enumerate() {
             assert_eq!(px, [10, 120, 240, 255], "pixel {i}");
@@ -2056,8 +2056,9 @@ mod tests {
             &[ClipLayer::flat("Soft", 300, 300, [255, 255, 255, 128])],
         );
         let doc = read(&bytes).expect("a document");
-        assert!((i32::from(doc.layers[0].pixels[0]) - 188).abs() <= 1);
-        assert_eq!(doc.layers[0].pixels[3], 128);
+        let pixels = doc.layers[0].dense(UVec2::new(300, 300));
+        assert!((i32::from(pixels[0]) - 188).abs() <= 1);
+        assert_eq!(pixels[3], 128);
     }
 
     /// A block Clip Studio did not store is transparent on a layer — the state
@@ -2071,7 +2072,15 @@ mod tests {
             &[ClipLayer::flat("Blank", 300, 300, [0, 0, 0, 0])],
         );
         let doc = read(&bytes).expect("a document");
-        assert!(doc.layers[0].pixels.iter().all(|b| *b == 0));
+        // Under the piece contract the reader also has the option of saying
+        // nothing at all about an unstored block, and that has to mean the same
+        // thing: `dense` is what holds the two readings together.
+        assert!(
+            doc.layers[0]
+                .dense(UVec2::new(300, 300))
+                .iter()
+                .all(|b| *b == 0)
+        );
     }
 
     /// Every flag on the row travels, and an opacity is out of **256**.
@@ -2146,7 +2155,9 @@ mod tests {
             &[ClipLayer::flat("Ink", w, h, [0, 0, 0, 255]).mask(vec![128u8; (w * h) as usize])],
         );
         let doc = read(&bytes).expect("a document");
-        let mask = doc.layers[0].mask.as_ref().expect("a mask");
+        let mask = doc.layers[0]
+            .dense_mask(UVec2::new(w, h))
+            .expect("a mask");
         assert_eq!(mask.len(), (w * h * 4) as usize);
         assert!((i32::from(mask[0]) - 188).abs() <= 1, "{}", mask[0]);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
@@ -2189,7 +2200,9 @@ mod tests {
                     .mask_fill(Some(fill))],
             );
             let doc = read(&bytes).expect("a document");
-            let mask = doc.layers[0].mask.clone().expect("a mask");
+            let mask = doc.layers[0]
+                .dense_mask(UVec2::new(w, h))
+                .expect("a mask");
             mask[(400 * w as usize + 400) * 4]
         };
 
@@ -2225,10 +2238,11 @@ mod tests {
         );
         let doc = read(&bytes).expect("a document");
         let layer = &doc.layers[0];
-        let mask = layer.mask.as_ref().expect("a mask");
+        let pixels = layer.dense(UVec2::new(w, h));
+        let mask = layer.dense_mask(UVec2::new(w, h)).expect("a mask");
         let at = |x: usize, y: usize| {
             let i = (y * w as usize + x) * 4;
-            (&layer.pixels[i..i + 4], mask[i])
+            (&pixels[i..i + 4], mask[i])
         };
 
         // Inside the placed rectangle.
@@ -2346,7 +2360,7 @@ mod tests {
         );
         let doc = read(&bytes).expect("a document");
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[9, 9, 9, 255]);
+        assert_eq!(&doc.layers[0].dense(UVec2::new(300, 300))[0..4], &[9, 9, 9, 255]);
         assert!(
             matches!(
                 doc.warnings.as_slice(),
@@ -2522,7 +2536,7 @@ mod tests {
         assert!(patched > 0, "the fixture must carry an Attribute header");
 
         let doc = read(&bytes).expect("a document");
-        assert_eq!(&doc.layers[0].pixels[0..4], &[7, 8, 9, 255]);
+        assert_eq!(&doc.layers[0].dense(UVec2::new(300, 300))[0..4], &[7, 8, 9, 255]);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 

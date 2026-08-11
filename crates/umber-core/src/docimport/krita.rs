@@ -1051,7 +1051,17 @@ mod tests {
     /// The mask byte at `(x, y)`, as the composite would read it: the red
     /// channel of the mask slice.
     fn mask_at(layer: &ImportedLayer, x: usize, y: usize, width: usize) -> u8 {
-        layer.mask.as_ref().expect("the layer kept its mask")[(y * width + x) * 4]
+        let mask = layer.mask.as_ref().expect("the layer kept its mask");
+        // A mask is one piece covering the canvas — `PixelPiece`'s rule 3 —
+        // so the row stride is the canvas width and the origin is (0, 0).
+        // Asserted rather than assumed: if a mask ever goes sparse this reads
+        // the wrong byte and says nothing, which is the shape of bug that rule
+        // exists to prevent.
+        assert_eq!(mask.len(), 1, "a mask is one canvas-sized piece");
+        assert_eq!(mask[0].rect.x, 0);
+        assert_eq!(mask[0].rect.y, 0);
+        assert_eq!(mask[0].rect.width as usize, width);
+        mask[0].bytes[(y * width + x) * 4]
     }
 
     #[test]
@@ -1067,7 +1077,10 @@ mod tests {
         );
         let doc = read(&kra).unwrap();
         assert_eq!(doc.layers.len(), 1, "{:?}", doc.warnings);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[200, 100, 50, 255]);
+        assert_eq!(
+            &doc.layers[0].dense(UVec2::new(64, 64))[0..4],
+            &[200, 100, 50, 255]
+        );
     }
 
     #[test]
@@ -1080,9 +1093,10 @@ mod tests {
                 .compressed()],
         );
         let plain = fixtures::kra(64, 64, &[KraLayer::new("A").pixel(1, 2, [10, 20, 30, 255])]);
+        let canvas = UVec2::new(64, 64);
         assert_eq!(
-            read(&compressed).unwrap().layers[0].pixels,
-            read(&plain).unwrap().layers[0].pixels
+            read(&compressed).unwrap().layers[0].dense(canvas),
+            read(&plain).unwrap().layers[0].dense(canvas)
         );
     }
 
@@ -1119,7 +1133,8 @@ mod tests {
                 .at(5, 7)],
         );
         let doc = read(&kra).unwrap();
-        let at = |x: usize, y: usize| &doc.layers[0].pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        let pixels = doc.layers[0].dense(UVec2::new(64, 64));
+        let at = |x: usize, y: usize| &pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
         assert_eq!(at(5, 7), [1, 2, 3, 255]);
         assert_eq!(at(0, 0), [0, 0, 0, 0]);
     }
@@ -1242,7 +1257,9 @@ mod tests {
         // Canvas-sized and four bytes a pixel, exactly as the layer is —
         // `ImportedDocument::validate` debug-asserts it, and this says so
         // where the failure is legible.
-        assert_eq!(layer.mask.as_ref().unwrap().len(), 64 * 64 * 4);
+        let mask = layer.mask.as_ref().unwrap();
+        assert_eq!(mask.len(), 1, "a mask is one piece and it covers the canvas");
+        assert_eq!(mask[0].bytes.len(), 64 * 64 * 4);
     }
 
     #[test]
@@ -1481,7 +1498,7 @@ mod tests {
         );
         let doc = read(&kra).unwrap();
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[9, 9, 9, 255]);
+        assert_eq!(&doc.layers[0].dense(UVec2::new(64, 64))[0..4], &[9, 9, 9, 255]);
         assert!(doc.layers[0].mask.is_none());
         assert!(doc.warnings.iter().any(|w| matches!(
             w,
@@ -1603,8 +1620,9 @@ mod tests {
             .iter()
             .find(|u| u.slot == mask_slot)
             .expect("the mask's slice was never given any pixels");
-        assert_eq!(upload.pixels.len(), 64 * 64 * 4);
-        assert_eq!(&upload.pixels[0..4], &[255, 255, 255, 255]);
+        let pixels = crate::docimport::assemble(&upload.pieces, UVec2::new(64, 64));
+        assert_eq!(pixels.len(), 64 * 64 * 4);
+        assert_eq!(&pixels[0..4], &[255, 255, 255, 255]);
     }
 
     #[test]
