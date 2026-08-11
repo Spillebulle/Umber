@@ -17,7 +17,7 @@
 //! outlived it: both were worse versions of "put the panels where you want
 //! them".
 
-use crate::editor::{self, BrushTab, Editor, Tool};
+use crate::editor::{self, BrushTab, Editor, StepGate, Tool};
 use crate::icons::{self, Icon};
 use crate::loupe;
 use crate::panels;
@@ -1574,7 +1574,9 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // that half happened cannot be undone by flipping again. Said
     // here rather than only refused in `mirror_document`, so the
     // menu does not offer what it will not do.
-    let flip_locked = ed.layers.any_locked();
+    // The same reading the Edit menu's Undo and Redo rows take, and the same
+    // one `App::mirror_document` gates on. See `Editor::flip_refused_by_lock`.
+    let flip_locked = ed.flip_refused_by_lock();
     for (axis, hint) in [
         (
             umber_core::FlipAxis::Horizontal,
@@ -1673,15 +1675,35 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // deep can reach this line, and a sentence claiming nothing had been done
     // to it would be flatly false in exactly the case the paragraph above
     // names.
-    if menu_item(ui, Action::Undo, ed.history.can_undo())
-        .on_disabled_hover_text("Nothing in the history to undo.")
+    // **A step over a canvas flip is refused while any layer is locked**, in
+    // both directions, and these two rows are disabled to match — exactly as
+    // the Image menu's flip rows already are, from the same reading. Without
+    // this the menu offers a command that raises a box instead of doing
+    // anything, which is the control-that-lies failure; with it, the notice
+    // `App::settle_step` raises is left catching the keystroke alone. Each
+    // reason gets its own sentence, because "nothing to undo" over a document
+    // twenty strokes deep sends somebody looking for the wrong problem.
+    let undo_locked = ed.undo_gate() == StepGate::FlipLocked;
+    if menu_item(ui, Action::Undo, ed.history.can_undo() && !undo_locked)
+        .on_disabled_hover_text(if undo_locked {
+            "The next step back is a canvas flip, and a layer is locked. A flip \
+             mirrors every layer at once, so it cannot skip one. Unlock it first."
+        } else {
+            "Nothing in the history to undo."
+        })
         .clicked()
     {
         actions.undo = true;
         ui.close();
     }
-    if menu_item(ui, Action::Redo, ed.history.can_redo())
-        .on_disabled_hover_text("Nothing undone to put back.")
+    let redo_locked = ed.redo_gate() == StepGate::FlipLocked;
+    if menu_item(ui, Action::Redo, ed.history.can_redo() && !redo_locked)
+        .on_disabled_hover_text(if redo_locked {
+            "The next step forward is a canvas flip, and a layer is locked. A flip \
+             mirrors every layer at once, so it cannot skip one. Unlock it first."
+        } else {
+            "Nothing undone to put back."
+        })
         .clicked()
     {
         actions.redo = true;

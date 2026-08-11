@@ -794,6 +794,33 @@ impl History {
         self.evict_to_budget();
     }
 
+    /// The entry [`History::take_undo`] would hand over, without taking it.
+    ///
+    /// **What a caller that may *refuse* to carry an entry out needs.** A
+    /// refusal has to be settled before the entry leaves the stack, because an
+    /// entry spent on a step that did not happen is a history that disagrees
+    /// with the picture — and for a flip, which stores no pixels, the *next*
+    /// step back then writes a patch recorded in an orientation the canvas is
+    /// no longer in, at its own rectangle, mirrored. That damage is not
+    /// undoable: the redo entry beside it was captured from the pixels the bad
+    /// write produced.
+    ///
+    /// Deliberately a borrow rather than a copy of the kind. A caller wanting
+    /// the kind can take it; one wanting to look at the body can, and neither
+    /// has to be anticipated here.
+    pub fn next_undo(&self) -> Option<&Edit> {
+        self.undo.last()
+    }
+
+    /// The entry [`History::take_redo`] would hand over, without taking it.
+    ///
+    /// [`History::next_undo`]'s twin, and needed for the same reason: a flip
+    /// is refused in *both* directions, so a redo that spends an entry it could
+    /// not carry out damages the document exactly as an undo does.
+    pub fn next_redo(&self) -> Option<&Edit> {
+        self.redo.last()
+    }
+
     /// Pop the state to restore. The caller must capture the *current* contents
     /// of the same rect first and hand it to [`History::push_redo`].
     pub fn take_undo(&mut self) -> Option<Edit> {

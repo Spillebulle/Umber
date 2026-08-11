@@ -2,7 +2,7 @@
 
 use crate::canvasdlg;
 use crate::crash;
-use crate::editor::{self, Editor, Floating, Interaction, Tool};
+use crate::editor::{self, Editor, Floating, Interaction, StepGate, Tool};
 use crate::gesture;
 use crate::keylayout;
 use crate::loading;
@@ -673,7 +673,12 @@ impl UmberApp {
         }
     }
 
-    fn undo(&mut self) {
+    /// Step one entry backwards, and answer whether one was actually spent.
+    ///
+    /// The `bool` is `jump_history`'s: a jump is a count of single steps, so a
+    /// step that refuses has to stop the loop rather than let it spend the
+    /// remaining count raising the same notice over and over.
+    fn undo(&mut self) -> bool {
         // Put the floating picture down first. Undo writes straight into the
         // layer, and a preview standing in front of it would go on showing the
         // state the undo just replaced — and would then commit back over it.
@@ -682,12 +687,16 @@ impl UmberApp {
         // would have been forgotten.
         self.finish_transform();
         if !self.canvas_is_ready() {
-            return;
+            return false;
+        }
+        // **Before the entry is taken, never after.** See `settle_step`.
+        if !self.settle_step(self.editor.undo_gate(), "undone") {
+            return false;
         }
         // The history is the live document's own, so this can only ever undo
         // work done on the canvas the user is looking at.
         let Some(edit) = self.editor.history.take_undo() else {
-            return;
+            return false;
         };
         let inverse = self.reverse(edit.kind, edit.body);
         // The label and the time travel with the entry rather than being
@@ -698,21 +707,82 @@ impl UmberApp {
             .history
             .push_redo(Edit::made_at(edit.kind, edit.at, inverse));
         self.editor.mark_modified();
+        true
     }
 
-    fn redo(&mut self) {
+    /// [`App::undo`]'s twin. Answers whether an entry was spent, for the same
+    /// reason.
+    fn redo(&mut self) -> bool {
         self.finish_transform();
         if !self.canvas_is_ready() {
-            return;
+            return false;
+        }
+        if !self.settle_step(self.editor.redo_gate(), "put back") {
+            return false;
         }
         let Some(edit) = self.editor.history.take_redo() else {
-            return;
+            return false;
         };
         let inverse = self.reverse(edit.kind, edit.body);
         self.editor
             .history
             .push_undo(Edit::made_at(edit.kind, edit.at, inverse));
         self.editor.mark_modified();
+        true
+    }
+
+    /// Make the document quiet enough for the step the gate describes, and
+    /// answer whether the step may go ahead at all.
+    ///
+    /// **This runs before the entry leaves the stack**, and that ordering is the
+    /// whole of the fix it exists for. A refused step that had already spent its
+    /// entry leaves a history claiming a flip was undone over a canvas still in
+    /// the flipped orientation, and the *next* step back then writes a patch
+    /// recorded before the flip into pixels that are now mirrored — a rectangle
+    /// of the old picture landing the wrong way round, in one entry, which redo
+    /// cannot take back because the redo patch was captured from the damage.
+    ///
+    /// The two things a flip settles are exactly the two `flip_canvas` settles,
+    /// and for its reasons: the stroke scratch is not mirrored with the layers,
+    /// so one in flight would commit unmirrored over a flipped picture; and a
+    /// capture part-way through would assemble a file out of layers that were
+    /// mirrored and layers that were not. `flip_layers` cancels the renderer's
+    /// half of that, `stop_autosave_of` the scheduler's.
+    ///
+    /// **The settling is deliberately after the refusal.** Committing somebody's
+    /// live stroke as a side effect of a keystroke that then does nothing would
+    /// be a worse answer than the inertness it is meant to explain.
+    ///
+    /// **And `take_undo` may then hand back a different entry than the gate was
+    /// asked about**, because `finish_stroke` records one. That is correct
+    /// rather than tolerated: the artist painted and then pressed Ctrl+Z, so the
+    /// newest edit is the stroke and the newest edit is what a step back takes.
+    /// The flip is still there, reached by the next press, and re-gated then.
+    ///
+    /// `step` names what did not happen, for the notice: "undone" or "put back".
+    fn settle_step(&mut self, gate: StepGate, step: &'static str) -> bool {
+        match gate {
+            StepGate::Clear => true,
+            StepGate::FlipLocked => {
+                // A notice rather than silence, and it is the *paste's*
+                // precedent rather than the canvas press's: an undo is an
+                // explicit command with one obvious outcome, where a press on
+                // the canvas happens every time somebody puts the pen down. It
+                // is one `Option` slot, so a held Ctrl+Z that auto-repeats
+                // raises one box and not a pile of them — and the Edit menu's
+                // rows are disabled to match, so this catches a keystroke
+                // rather than being the only thing between a live control and a
+                // dialog. See `ui::draw`.
+                self.editor.notice = Some(flip_step_refusal(step));
+                false
+            }
+            StepGate::SettleForFlip => {
+                self.finish_stroke();
+                let id = self.editor.session.active_id();
+                self.stop_autosave_of(id);
+                true
+            }
+        }
     }
 
     /// Does the document in front have GPU storage to be undone into?
@@ -777,7 +847,28 @@ impl UmberApp {
             }
             EditBody::Flip => {
                 if let Some(axis) = kind.flip_axis() {
-                    self.mirror_document(axis);
+                    // **The answer is read, not discarded.** `undo` and `redo`
+                    // ask `settle_step` before the entry is taken, so a refusal
+                    // never reaches here — which is exactly why the one line
+                    // that would tell us otherwise has to be looked at. This
+                    // used to be a bare call: `mirror_document` refuses a
+                    // locked stack and the entry was spent anyway, leaving the
+                    // history one step ahead of the picture and the next patch
+                    // written back mirrored. It cannot be a `debug_assert!`
+                    // alone, because that compiles the call itself away in
+                    // release and nothing would mirror at all.
+                    let mirrored = self.mirror_document(axis);
+                    debug_assert!(
+                        mirrored,
+                        "a flip entry was spent on a mirror that did not happen; \
+                         `settle_step` was supposed to have refused it first"
+                    );
+                    if !mirrored {
+                        log::error!(
+                            "a canvas flip could not be stepped over; the history \
+                             is now one entry ahead of the picture"
+                        );
+                    }
                 }
                 EditBody::Flip
             }
@@ -820,18 +911,31 @@ impl UmberApp {
     /// direction — a flip is its own inverse, so a second implementation for
     /// the undo would be a second thing to keep exact.
     ///
-    /// Returns false when the document has no GPU storage, in which case
-    /// nothing at all was mirrored and the caller must not record an entry
-    /// saying otherwise.
+    /// Returns false when a layer is locked or the document has no GPU storage,
+    /// in which case nothing at all was mirrored and the caller must not record
+    /// an entry saying otherwise — nor spend one.
+    ///
+    /// **`#[must_use]` is not decoration here.** Ignoring this answer is the
+    /// defect this function's own docs already warned against and its undo
+    /// caller committed anyway: a discarded `false` is a history that has moved
+    /// while the picture has not. With the attribute that call does not compile,
+    /// and CI builds with `-D warnings`, so it cannot come back as a warning
+    /// somebody scrolls past.
+    #[must_use]
     fn mirror_document(&mut self, axis: umber_core::FlipAxis) -> bool {
         // **The one gate a lock has on the flip**, on the way out as well as on
         // the way back, since undoing a flip comes through here too. Refused
         // *whole* rather than applied to the unlocked layers: a picture with
         // some layers mirrored and some not is one that was never on screen,
         // and a flip that half happened cannot be undone by flipping again,
-        // which is the entire reason it stores no pixels. The menu item is
-        // disabled to match — see `ui::draw`.
-        if self.editor.layers.any_locked() {
+        // which is the entire reason it stores no pixels.
+        //
+        // Read through `Editor::flip_refused_by_lock`, which is also what
+        // disables the Image menu's two flip rows and the Edit menu's Undo and
+        // Redo, so no control can offer a flip this will then decline. This
+        // stays as the gate rather than becoming an assertion about the
+        // callers: it is the last thing between a keystroke and the GPU.
+        if self.editor.flip_refused_by_lock() {
             return false;
         }
         // Masks are slices too, and a mask that stayed put while its layer
@@ -2049,16 +2153,26 @@ impl UmberApp {
     /// [`umber_core::History::steps_to`] clamps the count to what is held, so
     /// a click on a list drawn a frame ago cannot run past the end.
     fn jump_history(&mut self, position: usize) {
+        // A step that refuses stops the walk. Carrying on would spend the
+        // remaining count on calls that each do nothing but re-raise the same
+        // notice, and would leave the artist reading a box about a flip after
+        // the six strokes above it had already been stepped over — which they
+        // have, correctly: a partial jump is exactly what pressing Ctrl+Z by
+        // hand until it stopped working would have given.
         match self.editor.history.steps_to(position) {
             Jump::Stay => {}
             Jump::Undo(steps) => {
                 for _ in 0..steps {
-                    self.undo();
+                    if !self.undo() {
+                        break;
+                    }
                 }
             }
             Jump::Redo(steps) => {
                 for _ in 0..steps {
-                    self.redo();
+                    if !self.redo() {
+                        break;
+                    }
                 }
             }
         }
@@ -2586,8 +2700,12 @@ impl UmberApp {
             // Only the dialog. The chord asks the question; it does not write a
             // file behind the artist's back.
             Action::Export => self.editor.export_form.open = true,
-            Action::Undo => self.undo(),
-            Action::Redo => self.redo(),
+            Action::Undo => {
+                self.undo();
+            }
+            Action::Redo => {
+                self.redo();
+            }
             Action::Deselect => self.editor.deselect(),
             Action::Copy => self.copy_selection(),
             Action::Cut => self.cut_selection(),
@@ -6118,6 +6236,33 @@ fn blit_into(dest: &mut [u8], to: PixelRect, src: &[u8], from: PixelRect) {
         if d + width <= dest.len() && s + width <= src.len() {
             dest[d..d + width].copy_from_slice(&src[s..s + width]);
         }
+    }
+}
+
+/// What to tell somebody whose Ctrl+Z or Ctrl+Y met a canvas flip a locked
+/// layer refuses.
+///
+/// A free function for [`paste_refusal`]'s reason, and phrased for
+/// [`paste_refusal`]'s shape: it names what did **not** happen first, then why,
+/// then the one thing that would let it happen. Without the last clause an
+/// artist is told an operation is refused with nothing to do about it, and the
+/// remedy is two panels away.
+///
+/// `step` is "undone" or "put back", so the box does not say "undone" over a
+/// redo. One string rather than a direction enum: the sentence is the only place
+/// the difference shows, and a second enum for it would be a thing to keep in
+/// step with `StepGate` for no gain.
+///
+/// The wording has no em-dash in it, and that is the rule for everything the
+/// interface draws rather than a preference about this box.
+fn flip_step_refusal(step: &'static str) -> Notice {
+    Notice {
+        title: "A layer is locked".into(),
+        lines: vec![format!(
+            "Nothing was {step}. That step is a canvas flip, and a flip mirrors every \
+             layer at once, so it cannot skip a locked one. Unlock the layer in the \
+             Layers panel and try again."
+        )],
     }
 }
 

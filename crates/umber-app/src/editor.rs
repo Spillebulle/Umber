@@ -311,6 +311,34 @@ pub enum BrushTab {
     Blending,
 }
 
+/// What one step of the history needs of the document before it can be carried
+/// out, or why it cannot be.
+///
+/// The answer to [`Editor::undo_gate`] and [`Editor::redo_gate`], and the reason
+/// this is an enum rather than a `bool` is that the two non-`Clear` answers ask
+/// for opposite things: one says *settle the document and go on*, the other says
+/// *leave the entry where it is*. A caller that collapsed them would either
+/// refuse every flip or quiet the document for a refusal it is about to make.
+///
+/// Exhaustively matched at its one call site in `App`, deliberately: a fourth
+/// answer must be a compile error there rather than a silent `_ => carry on`.
+/// See CLAUDE.md's "Partial exhaustiveness is worse than none".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepGate {
+    /// Nothing in the way. Every entry that swaps pixels or stack shape, and
+    /// the empty stack.
+    Clear,
+    /// A canvas flip. The mirror is a GPU permutation of every layer slice, so
+    /// the live stroke has to be committed and any autosave capture cancelled
+    /// first — `flip_canvas` does both before it mirrors and stepping over one
+    /// has to do the same.
+    SettleForFlip,
+    /// A canvas flip a locked layer refuses. The entry stays where it is, and
+    /// the artist is told: a flip that half happened cannot be undone by
+    /// flipping again.
+    FlipLocked,
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
@@ -1291,6 +1319,57 @@ impl Editor {
             self.camera.center = self.camera.center.clamp(Vec2::ZERO, doc.size_vec2());
         }
         resized
+    }
+
+    /// **The one reading of "may this document be mirrored".**
+    ///
+    /// A canvas flip is refused *whole* when any layer is locked — see
+    /// `App::mirror_document` for why half a flip is not a state the history's
+    /// pixel-less entry can describe — and three separate controls have to
+    /// agree about it: the Image menu's two flip rows, the Edit menu's Undo and
+    /// Redo rows, and the keystroke behind each. One statement here rather than
+    /// three `layers.any_locked()` calls that happen to be spelled the same, so
+    /// a change to what refuses a flip cannot leave one control offering it.
+    pub fn flip_refused_by_lock(&self) -> bool {
+        self.layers.any_locked()
+    }
+
+    /// What carrying the entry at the top of the undo stack backwards needs of
+    /// this document first, or why it cannot be carried out at all.
+    ///
+    /// The **plan half** of `App::reverse`, in `LayerStack::plan_reorder`'s
+    /// shape: the answer is available without spending the entry, so a control
+    /// can be disabled to match and the entry can be left alone where it cannot
+    /// be carried out. See [`StepGate`] for what the three answers cost.
+    pub fn undo_gate(&self) -> StepGate {
+        self.gate_for(self.history.next_undo().map(|edit| edit.kind))
+    }
+
+    /// [`Editor::undo_gate`]'s twin for the redo stack.
+    ///
+    /// A flip is refused in both directions, so this is not a courtesy: a redo
+    /// that spent an entry it could not carry out would damage the document in
+    /// exactly the way an undo does.
+    pub fn redo_gate(&self) -> StepGate {
+        self.gate_for(self.history.next_redo().map(|edit| edit.kind))
+    }
+
+    /// The rule both gates share, over the kind of whichever entry is next.
+    ///
+    /// `None` — nothing on that stack — answers [`StepGate::Clear`] rather than
+    /// a fourth variant: the caller's `take_undo` already returns `None` a line
+    /// later, and "there is nothing to step over" is not a refusal anybody has
+    /// to be told about. `History::can_undo` is what a control asks about that.
+    fn gate_for(&self, next: Option<umber_core::EditKind>) -> StepGate {
+        // Read off `flip_axis` rather than `matches!` on the two flip variants,
+        // so a third axis would arrive here already handled. The axis itself is
+        // `reverse`'s to read back off the kind — carrying it in the gate would
+        // be a second copy of a number that has exactly one source.
+        match next.and_then(umber_core::EditKind::flip_axis) {
+            None => StepGate::Clear,
+            Some(_) if self.flip_refused_by_lock() => StepGate::FlipLocked,
+            Some(_) => StepGate::SettleForFlip,
+        }
     }
 
     /// Mirror the live document, in everything but its pixels.
