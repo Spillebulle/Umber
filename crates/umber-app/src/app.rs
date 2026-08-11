@@ -2173,6 +2173,24 @@ impl UmberApp {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
         self.finish_transform();
+        // **The stack's own limits before the device's**, and the order is not
+        // cosmetic. `add`'s two refusals that no slice can mend are a full stack
+        // and a folder already at `MAX_DEPTH`; reserving ahead of them would
+        // grow the texture array for a layer the model is about to decline —
+        // 400 MB at 10000², never given back, and `ensure_slots` does not
+        // shrink — and where the growth is what fails it would answer a full
+        // stack with a sentence about graphics memory. That is the refusal
+        // naming the wrong bound this codebase has already paid for once.
+        //
+        // The two conditions are the ones the retry arm below used to state, so
+        // this is where they were rather than a second copy of them: hoisted,
+        // that arm's "only where a slice is the plausible reason" becomes
+        // automatic instead of restated.
+        if self.editor.layers.len() >= umber_core::LayerStack::MAX || self.selected_folder_is_full()
+        {
+            log::warn!("layer limit reached");
+            return;
+        }
         // **Before the add**, for the reason `install_import` reserves before it
         // opens: a stack holding a slice the texture array does not have is one
         // the composite indexes off the end of, and nothing here could put that
@@ -2191,20 +2209,16 @@ impl UmberApp {
             Some(slot) => slot,
             // A parked layer may be holding the last slice, so give the oldest
             // entries up and try once more — but **only where a slice is the
-            // plausible reason**, which means excluding *both* of `add`'s other
-            // refusals. A full stack is the obvious one: on a dry pool that is
-            // exactly where releasing would throw an artist's oldest edits away
-            // and then refuse anyway, since 64 masked layers is 128 slices and
-            // the 64-entry cap at once. The second is a folder already at
-            // `MAX_DEPTH`, which no released slice mends either.
+            // plausible reason**. `add`'s other two refusals are a full stack
+            // and a folder at `MAX_DEPTH`, and on a dry pool this is exactly
+            // where releasing would throw an artist's oldest edits away and
+            // then refuse anyway; both are now refused above, before the
+            // reservation, so a `None` here can only be the pool.
             //
             // The shape is not re-taken. A release touches the history and the
             // pool and never the stack, so the snapshot is still the one this
             // add is about to change.
-            None if self.editor.layers.len() < umber_core::LayerStack::MAX
-                && !self.selected_folder_is_full()
-                && self.free_a_slot() =>
-            {
+            None if self.free_a_slot() => {
                 let Some(slot) = self.editor.layers.add() else {
                     log::warn!("layer limit reached");
                     return;
@@ -2390,6 +2404,16 @@ impl UmberApp {
         if self.editor.layers.locked_at(index) {
             return;
         }
+        // `add_mask`'s two refusals that no slice can mend, before the device is
+        // asked, for the reason `add_layer` states at length: reserving ahead of
+        // them grows the array for a mask the model will decline, and where the
+        // growth is what fails it answers "this layer already has a mask" with a
+        // sentence about graphics memory. `active_index` is always in range, so
+        // the mask is the only one of the two that can fire here — the retry arm
+        // below tested both because it also ran after a release.
+        if self.editor.layers.mask_at(index).is_some() {
+            return;
+        }
         // Before the model change, exactly as `add_layer` does and through the
         // same gate. A mask is an ordinary slice of the same array, so it is the
         // same question and must not be the forgotten half of it.
@@ -2410,13 +2434,10 @@ impl UmberApp {
             // is the plausible reason — the other refusals here are "this layer
             // already has a mask" and an index off the end, neither of which a
             // released slice would mend and both of which would otherwise cost
-            // the artist their oldest edits for nothing. `mask_at` answers
-            // `None` to both, so the index is checked separately.
+            // the artist their oldest edits for nothing. Both are refused above,
+            // before the reservation, so a `None` here can only be the pool.
             // The shape is not re-taken: a release never touches the stack.
-            None if index < self.editor.layers.len()
-                && self.editor.layers.mask_at(index).is_none()
-                && self.free_a_slot() =>
-            {
+            None if self.free_a_slot() => {
                 let Some(slot) = self.editor.layers.add_mask(index) else {
                     return;
                 };
