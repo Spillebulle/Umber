@@ -512,8 +512,8 @@ pub fn kind_from_id(id: &str) -> Option<EditKind> {
 ///
 /// Nothing here reaches the GPU: the patches are already in memory, having been
 /// captured at commit time. A save's blocking readbacks are unchanged.
-pub(crate) fn write(
-    zip: &mut ZipWriter<std::io::Cursor<Vec<u8>>>,
+pub(crate) fn write<W: Write + std::io::Seek>(
+    zip: &mut ZipWriter<W>,
     canvas: UVec2,
     layers: &[String],
     history: &SaveHistory<'_>,
@@ -649,7 +649,7 @@ pub(crate) fn patch_src(index: usize, piece: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docformat::{SaveDocument, SaveLayer, encode};
+    use crate::docformat::{Canvas, SaveDocument, SaveLayer, encode};
     use crate::docimport::{self, ImportWarning};
     use crate::document::{Background, Document};
     use crate::geom::PixelRect;
@@ -704,7 +704,7 @@ mod tests {
                 // A mask goes into the file wherever the stack has one, so a
                 // patch recorded against a mask has something to be placed
                 // against when the document comes back.
-                mask: l.mask().map(|_| &pixels[..]),
+                mask: l.mask().map(|_| Canvas::Held(&pixels)),
                 ..SaveLayer::new(&l.name, BlendMode::Normal, &pixels)
             })
             .collect();
@@ -714,12 +714,97 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: SaveHistory::new(history, stack),
         })
         .expect("encode");
         let doc = docimport::read_openraster(&bytes).expect("read back");
         (bytes, doc)
+    }
+
+    /// A history streamed straight into a file is the archive [`encode`]
+    /// builds, byte for byte.
+    ///
+    /// The equivalent guard in [`super`] carries a folder, a mask, text and
+    /// effects and deliberately no history, because building one needs a
+    /// `LayerStack` and that fixture lives here. This is the half it cannot
+    /// reach, and it is worth reaching: `write` became generic over the sink for
+    /// this change, and it is the one entry in the archive whose *own* budget
+    /// decides how much of it goes in — a writer that behaved differently
+    /// against a file than against a `Vec` would drop entries from somebody's
+    /// saved timeline and nothing else would notice.
+    #[test]
+    fn a_streamed_history_is_the_archive_encode_builds() {
+        let stack = stack(&["Paper", "Ink"]);
+        let slot = stack.get(1).unwrap().slot().unwrap();
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(slot, 9, 7, 44)));
+        history.record(Edit::new(EditKind::FlipHorizontal, EditBody::Flip));
+        history.record(Edit::new(EditKind::Erase, patch(slot, 5, 5, 88)));
+        let (expected, _) = round_trip(&stack, &history);
+        // The vacuity this test is one line away from: `SaveHistory::new`
+        // answering `None` would write no history at all, both paths would
+        // agree about writing none, and the comparison below would pass while
+        // driving nothing. So the fixture is required to have put a manifest
+        // and three patches in.
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&expected)).unwrap();
+        assert!(archive.by_name(MANIFEST).is_ok(), "no history was written");
+        assert_eq!(
+            archive
+                .file_names()
+                .filter(|n| n.starts_with("umber/history/") && n.ends_with(".png"))
+                .count(),
+            2,
+            "the fixture stopped writing the patches it is about"
+        );
+
+        // The same document with nothing held, written straight to a file.
+        struct Blank(Vec<u8>);
+        impl crate::docformat::Canvases for Blank {
+            fn layer(&mut self, _: usize) -> Result<std::borrow::Cow<'_, [u8]>, SaveError> {
+                Ok(std::borrow::Cow::Borrowed(&self.0))
+            }
+            fn mask(&mut self, _: usize) -> Result<std::borrow::Cow<'_, [u8]>, SaveError> {
+                Ok(std::borrow::Cow::Borrowed(&self.0))
+            }
+            fn merged(&mut self) -> Result<std::borrow::Cow<'_, [u8]>, SaveError> {
+                Ok(std::borrow::Cow::Borrowed(&self.0))
+            }
+        }
+        let layers: Vec<SaveLayer<'_>> = stack
+            .layers()
+            .iter()
+            .map(|l| SaveLayer {
+                visible: true,
+                opacity: 1.0,
+                mask: l.mask().map(|_| Canvas::Deferred),
+                ..SaveLayer::new(&l.name, BlendMode::Normal, Canvas::Deferred)
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("umber-history-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("timeline.ora");
+        crate::docformat::save_from(
+            &path,
+            &SaveDocument {
+                size: CANVAS,
+                layers: &layers,
+                active: 0,
+                background: Background::Transparent,
+                dpi: Document::DEFAULT_DPI,
+                merged: Canvas::Deferred,
+                history: SaveHistory::new(&history, &stack),
+            },
+            &mut Blank(blank()),
+        )
+        .expect("streamed save");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            expected,
+            "a streamed history is not the one `encode` writes"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The one test that matters: a document saved mid-timeline comes back
@@ -868,7 +953,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: None,
         })
         .unwrap();
@@ -997,7 +1082,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
-            merged: &pixels,
+            merged: Canvas::Held(&pixels),
             history: SaveHistory::new(&history, &stack),
         })
         .unwrap();

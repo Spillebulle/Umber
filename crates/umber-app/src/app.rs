@@ -24,10 +24,11 @@ use crate::ui;
 use crate::update;
 use crate::vram;
 use glam::{UVec2, Vec2};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::docformat::{self, Canvas, SaveDocument, SaveLayer};
 use umber_core::export;
 use umber_core::history::PatchPiece;
 use umber_core::{
@@ -3148,48 +3149,41 @@ impl UmberApp {
             };
             let stack = self.editor.layers.layers();
 
-            // Every layer comes off the GPU whole, and all of them are held at
-            // once — 16 MB each at 2048², so a full stack is a few hundred
-            // megabytes for as long as the save takes. That is the price of a
-            // format that keeps layers, and `read_layer_rect` blocks, which is
-            // why this is only ever reached from an explicit Save and never
-            // from the drawing loop.
-            // A folder holds no slice, so it reads back as nothing at all and
-            // `SaveLayer::folder` writes it as a nested `<stack>` with no
-            // `src`. Kept in step with the stack positionally rather than
-            // filtered out, because `doc.active` and the history's positions
-            // both count every entry.
-            let pixels: Vec<Vec<u8>> = stack
-                .iter()
-                .map(|layer| match layer.slot() {
-                    Some(slot) => {
-                        canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect)
-                    }
-                    None => Vec::new(),
-                })
-                .collect();
-            // The masks, read the same way and only where there is one. A
-            // document with no masks pays for nothing here.
-            let masks: Vec<Option<Vec<u8>>> = stack
-                .iter()
-                .map(|layer| {
-                    layer.mask().map(|slot| {
-                        canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect)
-                    })
-                })
-                .collect();
-            // The flattened preview the format requires comes from the same
-            // composite pass the screen uses, so it cannot disagree with it — and
-            // from the same *draw list*, effects included, which is the other half
-            // of that and is not free: see `App::baked_draws`.
-            let merged = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &merged_draws);
-
+            // **Nothing canvas-sized is read here.** Every layer, every mask and
+            // the flattened preview are `Canvas::Deferred`, and `SaveSource`
+            // below reads exactly one of them at a time as the archive reaches
+            // it. Holding them all was 16 MB each at 2048² and 400 MB each at
+            // the canvas `docs/perf/formats-and-host-memory.md` §10.2 argues
+            // from, where a twenty-four-slice document came to ten gigabytes for
+            // as long as the save took.
+            //
+            // `read_layer_rect` still blocks and is still called once per slice,
+            // which is why this is only ever reached from an explicit Save and
+            // never from the drawing loop. What changed is when, not how often.
+            //
+            // A folder holds no slice and is never asked about — `SaveLayer::
+            // folder` writes it as a nested `<stack>` with no `src`. Kept in
+            // step with the stack positionally rather than filtered out, because
+            // `doc.active`, the history's positions and `SaveSource`'s own
+            // indices all count every entry.
             let layers: Vec<SaveLayer<'_>> = stack
                 .iter()
-                .zip(&pixels)
-                .zip(&masks)
-                .map(|((layer, px), mask)| save_layer(layer, px, mask.as_deref()))
+                .map(|layer| {
+                    save_layer(
+                        layer,
+                        Canvas::Deferred,
+                        layer.mask().map(|_| Canvas::Deferred),
+                    )
+                })
                 .collect();
+            let mut source = SaveSource {
+                canvas,
+                gpu: &gfx.gpu,
+                rect,
+                slots: stack.iter().map(umber_core::Layer::slot).collect(),
+                masks: stack.iter().map(umber_core::Layer::mask).collect(),
+                merged_draws,
+            };
 
             // The undo history, resolved against the stack it belongs to. No
             // GPU work: the patches have been in memory since they were
@@ -3207,7 +3201,7 @@ impl UmberApp {
                 .then(|| docformat::SaveHistory::new(&self.editor.history, &self.editor.layers))
                 .flatten();
 
-            docformat::save(
+            docformat::save_from(
                 &path,
                 &SaveDocument {
                     size,
@@ -3215,9 +3209,10 @@ impl UmberApp {
                     active: self.editor.layers.active_index(),
                     background: self.editor.doc.background,
                     dpi: self.editor.doc.dpi,
-                    merged: &merged,
+                    merged: Canvas::Deferred,
                     history,
                 },
+                &mut source,
             )
         };
 
@@ -5765,8 +5760,8 @@ fn file_name_of(path: &Path) -> String {
 /// share a guard unless somebody arranges it.
 fn save_layer<'a>(
     layer: &'a umber_core::Layer,
-    px: &'a [u8],
-    mask: Option<&'a [u8]>,
+    px: Canvas<'a>,
+    mask: Option<Canvas<'a>>,
 ) -> SaveLayer<'a> {
     SaveLayer {
         visible: layer.visible,
@@ -5789,6 +5784,101 @@ fn save_layer<'a>(
         depth: layer.depth,
         folder: layer.is_folder(),
         ..SaveLayer::new(&layer.name, layer.blend, px)
+    }
+}
+
+/// Where an explicit Save reads its canvas-sized buffers from.
+///
+/// One at a time, off the GPU, in the order the archive wants them. That is the
+/// whole of why a save no longer holds the stack: at
+/// `docs/perf/formats-and-host-memory.md`'s reference canvas a layer is 400 MB,
+/// so twenty-four of them held at once was ten gigabytes and what is resident
+/// now does not follow the layer count at all.
+///
+/// **Not "one canvas" — about two.** `docformat`'s `trim` crops each layer to
+/// its content rectangle and owns what it produces, so the fetched buffer and
+/// the trimmed copy are both alive for a moment, and §10.1 lists that copy as a
+/// row of its own. `crates/umber-core/tests/save_peak.rs` measures the whole of
+/// it rather than reasoning about it, and is the figure to quote.
+///
+/// **It changes nothing about the readback itself.** `read_layer_rect` still
+/// blocks and is still called once per slice — that is the price of a format
+/// that keeps layers, and it is why a save is the only thing that may call it.
+/// What moved is when each call happens: as the writer reaches that layer,
+/// rather than all of them up front.
+///
+/// It carries slots rather than `&Layer`s so nothing here can be tempted into
+/// re-deriving what `save_layer` already wrote into the document — the two are
+/// built from the same `stack.iter()` in the same order, and a slot is what a
+/// readback actually needs.
+struct SaveSource<'a> {
+    canvas: &'a CanvasRenderer,
+    gpu: &'a Gpu,
+    rect: PixelRect,
+    /// Layer slice per stack entry; `None` for a folder, which holds none.
+    slots: Vec<Option<u32>>,
+    /// Mask slice per stack entry, where there is one.
+    masks: Vec<Option<u32>>,
+    /// The draw list the flattened preview is composited from — the *baked* one,
+    /// so `mergedimage.png` shows the effects the screen shows. See
+    /// `App::baked_draws`.
+    merged_draws: Vec<LayerDraw>,
+}
+
+impl SaveSource<'_> {
+    /// One slice off the GPU, or a refusal.
+    ///
+    /// The sentence the artist sees is not this one — `docformat::resolve`
+    /// replaces it with the layer's *name*, which this side does not have, and
+    /// a source asked in indices would otherwise refuse a document by a number
+    /// nobody has seen. What is written here is what a direct caller gets.
+    fn read(
+        &self,
+        slot: Option<u32>,
+        what: impl FnOnce() -> String,
+    ) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        // A slot the stack does not hold cannot be reached from the save — the
+        // document was built from the same iteration this was — and it is
+        // refused rather than read as an empty layer, because a document
+        // silently saved with a blank layer is worse than one not saved at all.
+        let Some(slot) = slot else {
+            return Err(docformat::SaveError::NotSupplied { what: what() });
+        };
+        Ok(Cow::Owned(self.canvas.read_layer_rect(
+            &self.gpu.device,
+            &self.gpu.queue,
+            slot,
+            self.rect,
+        )))
+    }
+}
+
+impl docformat::Canvases for SaveSource<'_> {
+    fn layer(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.read(self.slots.get(index).copied().flatten(), || {
+            format!("pixels of stack entry {index}, which holds no slice")
+        })
+    }
+
+    fn mask(&mut self, index: usize) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        self.read(self.masks.get(index).copied().flatten(), || {
+            format!("mask of stack entry {index}, which holds no slice")
+        })
+    }
+
+    fn merged(&mut self) -> Result<Cow<'_, [u8]>, docformat::SaveError> {
+        // The flattened preview the format requires comes from the same
+        // composite pass the screen uses, so it cannot disagree with it — and
+        // from the same *draw list*, effects included, which is the other half
+        // of that and is not free: see `App::baked_draws`.
+        //
+        // Asked last, after every layer's PNG is already on disk, so it is never
+        // resident beside one.
+        Ok(Cow::Owned(self.canvas.export_rgba(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.merged_draws,
+        )))
     }
 }
 
@@ -6031,6 +6121,152 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 mod tests {
     use super::*;
 
+    /// **A Save reads each layer out of its own slice, one at a time.**
+    ///
+    /// `SaveSource` is the only part of the save path with no other cover at
+    /// all: `save_document` needs an `EventLoopProxy` and cannot be driven
+    /// headlessly, and the autosave's equivalent is a different type over a
+    /// different mapping. What it can get wrong is the thing this asks about —
+    /// the *index*. A stack is numbered bottom-first, an archive top-first, and
+    /// a slot is neither; `SaveSource` carries slots gathered from one
+    /// `stack.iter()` and is asked in stack positions, so an off-by-one or a
+    /// reversal there would write somebody's picture with its layers swapped
+    /// and every other guard in the crate would pass.
+    ///
+    /// Each layer is painted a colour of its own and the file is read back
+    /// through Umber's own reader. Deliberately opaque and flat: what is being
+    /// checked is which pixels landed on which layer, and an antialiased edge
+    /// would put a tolerance between the question and the answer.
+    ///
+    /// Skips rather than fails with no adapter, and holds `gputest::lock` for
+    /// its whole length — see `crate::gputest`.
+    #[test]
+    fn an_explicit_save_reads_each_layer_out_of_its_own_slice() {
+        use umber_core::docformat::Canvases;
+        use umber_render::CanvasRenderer;
+
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+
+        let size = UVec2::new(8, 8);
+        let rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: size.x,
+            height: size.y,
+        };
+        let mut stack = umber_core::LayerStack::new();
+        stack.add().expect("a second layer");
+        stack.add().expect("a third");
+        // A mask on the middle layer, so the mask index is asked about a layer
+        // that is neither the first nor the last one — the two positions an
+        // off-by-one is likeliest to still get right.
+        stack.add_mask(1).expect("a mask");
+
+        let mut canvas = CanvasRenderer::new(
+            &gpu.device,
+            size,
+            wgpu::TextureFormat::Rgba8Unorm,
+            stack.slot_capacity_needed(),
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.clear_all_layers(&mut encoder);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        // One flat opaque colour per layer, keyed to its stack position rather
+        // than to its slot, so the assertion below reads as "layer 2 is green"
+        // and not as "slot 2 is green".
+        let colour = |at: usize| [(at as u8 + 1) * 60, 20, 200 - (at as u8) * 60, 255];
+        for at in 0..stack.len() {
+            let slot = stack.layers()[at].slot().expect("no folders here");
+            let fill: Vec<u8> = colour(at)
+                .iter()
+                .copied()
+                .cycle()
+                .take((rect.area() * 4) as usize)
+                .collect();
+            canvas.write_layer_rect(&gpu.device, &gpu.queue, slot, rect, &fill);
+        }
+
+        let layers: Vec<SaveLayer<'_>> = stack
+            .layers()
+            .iter()
+            .map(|layer| {
+                save_layer(
+                    layer,
+                    Canvas::Deferred,
+                    layer.mask().map(|_| Canvas::Deferred),
+                )
+            })
+            .collect();
+        let mut source = SaveSource {
+            canvas: &canvas,
+            gpu,
+            rect,
+            slots: stack.layers().iter().map(umber_core::Layer::slot).collect(),
+            masks: stack.layers().iter().map(umber_core::Layer::mask).collect(),
+            // No effects and no float, so an empty draw list gives a
+            // transparent `mergedimage.png` of the right size. What the preview
+            // holds is `export_rgba`'s business and is covered where that lives.
+            merged_draws: Vec::new(),
+        };
+        // A folder holds no slice, and the archive never asks about one — but
+        // if it ever did, the answer has to be a refusal rather than an empty
+        // layer, and nothing else drives that arm.
+        assert!(
+            SaveSource {
+                canvas: &canvas,
+                gpu,
+                rect,
+                slots: vec![None],
+                masks: vec![None],
+                merged_draws: Vec::new(),
+            }
+            .layer(0)
+            .is_err(),
+            "a slot the stack does not hold was read as blank pixels"
+        );
+
+        let dir = std::env::temp_dir().join(format!("umber-save-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stack.ora");
+        docformat::save_from(
+            &path,
+            &SaveDocument {
+                size,
+                layers: &layers,
+                active: 0,
+                background: umber_core::Background::Transparent,
+                dpi: 72.0,
+                merged: Canvas::Deferred,
+                history: None,
+            },
+            &mut source,
+        )
+        .expect("save");
+
+        let back = umber_core::docimport::import(&path).expect("reopen");
+        assert_eq!(back.layers.len(), stack.len(), "the stack changed length");
+        for at in 0..stack.len() {
+            assert_eq!(
+                back.layers[at].pixels[..4],
+                colour(at),
+                "layer {at} came back holding another layer's pixels"
+            );
+            assert_eq!(
+                back.layers[at].mask.is_some(),
+                stack.layers()[at].mask().is_some(),
+                "layer {at}'s mask moved"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The behavioural half of the guard below, and the half that was missing.
     ///
     /// That one is textual and catches the `effects:` line being deleted. It is
@@ -6050,7 +6286,7 @@ mod tests {
         let layer = &stack.layers()[0];
         assert_eq!(layer.effects().len(), 1, "precondition: the layer holds it");
 
-        let written = save_layer(layer, &[], None);
+        let written = save_layer(layer, Canvas::Held(&[]), None);
         assert_eq!(
             written.effects,
             layer.effects(),
@@ -6104,7 +6340,7 @@ mod tests {
         let layer = &stack.layers()[0];
         assert!(layer.is_text(), "precondition: the layer holds it");
 
-        let written = save_layer(layer, &[], None);
+        let written = save_layer(layer, Canvas::Held(&[]), None);
         assert_eq!(
             written.text,
             Some(&record),
