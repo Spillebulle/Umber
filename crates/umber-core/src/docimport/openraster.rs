@@ -1460,21 +1460,33 @@ mod tests {
     ///
     /// The manifest is JSON whose entry count nothing in the format bounds, read
     /// at the *document* ceiling and then handed whole to `serde_json`. What is
-    /// asserted is both halves: the picture still opens, and the drop is said
-    /// out loud as a warning rather than passed over — the rule `HistoryDropped`
-    /// already lives by.
+    /// asserted is three things: the picture still opens, the drop is said out
+    /// loud as a warning rather than passed over — the rule `HistoryDropped`
+    /// already lives by — and **which refusal fired**.
+    ///
+    /// **The third is the one doing the work, and the first draft did not have
+    /// it.** With the bound raised back to `MAX_TOTAL_BYTES` the entry is read
+    /// whole and `serde_json` then refuses it, so the history is dropped, the
+    /// warning appears and the picture opens either way: a test asking only
+    /// those passed the mutation it was written for. Sixteen gigabytes of JSON
+    /// materialised on the way to a refusal is exactly the failure, so the
+    /// sentence has to say the size stopped it. Demonstrated by mutation.
     #[test]
     fn a_saved_history_past_its_own_bound_is_dropped_and_the_picture_opens() {
         let bytes = fixtures::ora_with_padded_history(32 * 1024 * 1024 + 1);
         let doc = read(&bytes).expect("the document opens regardless");
         assert_eq!(doc.layers.len(), 1, "the picture is untouched");
         assert!(doc.history.is_none(), "the history should not have loaded");
+        let Some(ImportWarning::HistoryDropped { reason }) = doc
+            .warnings
+            .iter()
+            .find(|w| matches!(w, ImportWarning::HistoryDropped { .. }))
+        else {
+            panic!("a dropped history has to be said out loud: {:?}", doc.warnings);
+        };
         assert!(
-            doc.warnings
-                .iter()
-                .any(|w| matches!(w, ImportWarning::HistoryDropped { .. })),
-            "a dropped history has to be said out loud: {:?}",
-            doc.warnings
+            reason.contains("claims to be"),
+            "the manifest was decompressed before anything objected: {reason}"
         );
     }
 }
