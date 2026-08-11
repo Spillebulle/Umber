@@ -1235,10 +1235,11 @@ const CAPTURE_CHUNK_BYTES: usize = 4 << 20;
 ///
 /// [`Capture::rereads`] is the step count, so the worst case is twice the work.
 /// That is the right shape on a document large enough for an edit to land inside
-/// a capture at all, and degenerate on a small one: a single-layer document is
-/// two steps, so one disturbance would exhaust it. The floor is what keeps a
-/// small document from giving up on its first interruption for want of a budget
-/// it could spend in a couple of frames.
+/// a capture at all, and degenerate on a small one: one disturbance costs two
+/// re-reads — the layer, then the preview — so a single-layer document's two
+/// steps buy exactly one, and it gives up on the *second*. The floor is what
+/// keeps a small document from giving up almost at once for want of a budget it
+/// could spend in a couple of frames.
 const REREAD_FLOOR: usize = 4;
 
 /// Where a [`Capture`]'s one staging buffer has got to.
@@ -1455,9 +1456,12 @@ impl Capture {
     /// Marks the step reading that slice stale if it has already been read; see
     /// [`Self::stale`] for why a step the pass has not reached needs nothing.
     /// The preview is deliberately **not** marked here — it is marked when a
-    /// layer is actually re-read, because until then the pass has not composited
-    /// it yet and marking it early would buy a second whole-canvas read of a
-    /// preview that was going to be right anyway.
+    /// layer is actually re-read. Where the pass has not reached it, marking it
+    /// early would buy a second whole-canvas read of a preview that was going to
+    /// be composited afterwards and be right anyway; where the pass *has*
+    /// reached it, which is the ordinary case, the preview is stale and gets
+    /// marked a moment later by the re-read that repairs the layer. Either way
+    /// the cost falls on the re-read rather than on every write.
     ///
     /// The test is against the **linear cursor** and not against
     /// [`Self::reading`]: once the pass is over `step` is `steps()`, so every
@@ -8033,14 +8037,15 @@ impl CanvasRenderer {
 
     /// Note that every slice has changed — a flip, a resize, a fresh document.
     ///
-    /// A capture is **given up on** rather than marked. Every one of these
-    /// either changes the canvas out from under it (`resize`) or replaces the
-    /// document wholesale (`clear_all_layers`), so there is nothing left worth
-    /// re-reading — and `flip_layers` also moves the pixels of every slice at
-    /// once, which is the whole capture stale in one step. `resize` and
-    /// `flip_layers` cancelled by hand already; putting it here is what covers
-    /// the third and whatever a fourth turns out to be, the rule this file
-    /// applies to `slot_revision` itself.
+    /// A capture is **given up on** rather than marked. The two callers are
+    /// `resize`, which changes the canvas out from under it, and
+    /// `clear_all_layers`, which replaces the document wholesale; neither leaves
+    /// anything worth re-reading. `resize` cancelled by hand already and
+    /// `clear_all_layers` did not, so putting it here is what covers the second
+    /// and whatever a third turns out to be — the rule this file applies to
+    /// `slot_revision` itself. (`flip_layers` is *not* one of them: it touches
+    /// each slot in turn and cancels by hand, because its pixels move rather
+    /// than go.)
     fn touch_all_slots(&mut self) {
         for rev in &mut self.slot_revisions {
             *rev += 1;
@@ -9442,6 +9447,10 @@ impl CanvasRenderer {
         if self.capture.is_some() || slots.is_empty() {
             return false;
         }
+        // A latch belonging to the capture that has just ended, cleared here as
+        // well as by the read — see [`Self::take_capture_gave_up`] for the Save
+        // that can leave one with no owner.
+        self.capture_gave_up = false;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded = (self.doc_size.x * 4).div_ceil(align) * align;
         self.capture = Some(Capture {
@@ -9814,7 +9823,19 @@ impl CanvasRenderer {
         // a layer is the worst thing on this path, and `CaptureSource` refuses
         // a slice it was never given — so this is the diagnosis rather than the
         // defence.
-        let missed = job.handed.iter().filter(|h| !**h).count();
+        // Handed over at least once **and** holding nothing now. The second
+        // clause is what makes this see a *re-read* nobody drained: `handed`
+        // latches on the first hand-over, so a step read again after an edit and
+        // then left in `results` would pass a flag-only count while the writer
+        // kept the image from before the edit — the very bug the re-read exists
+        // to repair, arriving through the diagnostic that exists to report it.
+        // Unreachable today, and only because choosing a layer to re-read marks
+        // the preview too, so at least one more step and therefore one more of
+        // the caller's drain passes always follows. That is a property of
+        // another function; this is the reading that does not depend on it.
+        let missed = (0..job.slots.len())
+            .filter(|i| !job.handed[*i] || job.results[*i].is_some())
+            .count();
         if missed > 0 {
             log::error!(
                 "a capture was collected with {} of {} slices never taken",
@@ -9849,9 +9870,11 @@ impl CanvasRenderer {
     /// reported autosave failure and not a damaged file; `take_capture` logs the
     /// count as the diagnosis.
     ///
-    /// In the order the caller asked for the slots, which is the order they are
-    /// read back, and never the flattened preview: that one is the last step and
-    /// [`Self::take_capture`] hands it over whole.
+    /// Lowest index first, and never the flattened preview: that one is the last
+    /// step and [`Self::take_capture`] hands it over whole. That is the order
+    /// the caller asked for the slots *while the linear pass lasts* and no
+    /// longer once a step has been read again — index 0 can arrive after
+    /// `1..n` — which is what the scan below is for.
     ///
     /// `None` means nothing more has landed *yet*, not that nothing more is
     /// coming. An abandoned or failed capture answers `None` too, and its
@@ -9930,6 +9953,22 @@ impl CanvasRenderer {
     ///
     /// Idempotent, and free on a canvas with no capture at all: one `Option`
     /// test, no device poll.
+    pub fn settle_capture(&mut self, device: &wgpu::Device) {
+        if !self
+            .capture
+            .as_ref()
+            .is_some_and(|job| job.abandoned || job.failed)
+        {
+            return;
+        }
+        // A job cancelled mid-step has a copy recorded and no map outstanding;
+        // this is what maps it, and `take_capture` is what unmaps it and drops
+        // the job once nothing is outstanding. One of each per frame, so a
+        // cancelled capture settles in a frame or two.
+        self.submit_capture();
+        let _ = self.take_capture(device);
+    }
+
     /// Whether the capture that has just ended gave up because edits kept
     /// outrunning it, rather than being interrupted or failing. Clears on read.
     ///
@@ -9945,7 +9984,13 @@ impl CanvasRenderer {
     ///
     /// A latch rather than a reading of the job, because by the time the
     /// scheduler notices the capture has gone the job is already dropped. The
-    /// shape [`Self::take_effect_refusal`] keeps.
+    /// shape [`Self::take_effect_refusal`] keeps — and, like that one, it is
+    /// **cleared by [`Self::begin_capture`]** as well as by the read: the only
+    /// reader is a branch the caller takes when it notices the capture has gone,
+    /// and a Save landing between the giving-up frame and that notice empties
+    /// the caller's own tracking, so the branch never runs and a latch with no
+    /// owner would be spent on some later capture that failed for another
+    /// reason.
     pub fn take_capture_gave_up(&mut self) -> bool {
         std::mem::take(&mut self.capture_gave_up)
     }
@@ -9973,22 +10018,6 @@ impl CanvasRenderer {
     #[doc(hidden)]
     pub fn capture_progress_for_test(&self) -> Option<(usize, u32)> {
         self.capture.as_ref().map(|job| (job.step, job.row))
-    }
-
-    pub fn settle_capture(&mut self, device: &wgpu::Device) {
-        if !self
-            .capture
-            .as_ref()
-            .is_some_and(|job| job.abandoned || job.failed)
-        {
-            return;
-        }
-        // A job cancelled mid-step has a copy recorded and no map outstanding;
-        // this is what maps it, and `take_capture` is what unmaps it and drops
-        // the job once nothing is outstanding. One of each per frame, so a
-        // cancelled capture settles in a frame or two.
-        self.submit_capture();
-        let _ = self.take_capture(device);
     }
 
     /// Take one tile of one slot out of the page table, so it reads as the

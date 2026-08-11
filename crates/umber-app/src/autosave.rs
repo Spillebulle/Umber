@@ -3869,6 +3869,13 @@ mod tests {
 
             let mut editor = Editor::default();
             editor.doc = umber_core::Document::new(8, 8);
+            // **Two layers, and that is not decoration.** A guard about which
+            // layer a slice lands on can say nothing on a stack of one: every
+            // index is zero, so every wrong index is the right one and a
+            // `disturb` that marked `stale[0]` whatever it was handed would pass
+            // everything here. See
+            // `an_edit_during_a_capture_is_never_written_as_two_instants`.
+            editor.layers.add().expect("a second layer");
             // A document that has a file and has been painted on since — the
             // case where an autosave writes both destinations.
             editor.session.mark_saved(theirs.clone());
@@ -4151,39 +4158,57 @@ mod tests {
             .write_layer_rect(&gpu.device, &gpu.queue, slot, rect, &bytes);
     }
 
-    /// The one colour the whole of a written archive's layer holds, and the one
-    /// its flattened preview holds.
+    /// The one flat colour each layer of a written archive holds, bottom to top,
+    /// and the one its flattened preview holds.
     ///
     /// Read out of the **file** rather than asserted about a flag, because what
     /// the bug produced was a perfectly valid archive holding two instants of
-    /// one document. Both halves come from the same capture and must therefore
-    /// agree; the layer is trimmed on the way out, so a flat opaque fill covers
-    /// the canvas and the piece is the whole of it.
-    fn colours_written(path: &Path) -> ([u8; 4], [u8; 4]) {
-        let bytes = layer_written(path);
-        let first: [u8; 4] = bytes[..4].try_into().expect("four bytes");
-        assert!(
-            bytes.chunks_exact(4).all(|p| p == first),
-            "the fill was not flat, so this comparison says nothing",
-        );
+    /// one document. Every half comes from the same capture and they must
+    /// therefore agree.
+    fn colours_written(path: &Path) -> (Vec<[u8; 4]>, [u8; 4]) {
+        let doc = umber_core::docimport::import(path).expect("the archive reads back");
+        let layers = (0..doc.layers.len())
+            .map(|index| {
+                let bytes = layer_written(path, index);
+                let first: [u8; 4] = bytes[..4].try_into().expect("four bytes");
+                assert!(
+                    bytes.chunks_exact(4).all(|p| p == first),
+                    "layer {index}'s fill was not flat, so this comparison says \
+                     nothing",
+                );
+                first
+            })
+            .collect();
         let preview = umber_core::docimport::preview::from_path(path).expect("a preview");
         let merged: [u8; 4] = preview.rgba[..4].try_into().expect("four bytes");
-        (first, merged)
+        (layers, merged)
     }
 
-    /// The one layer of a written archive, straight-alpha sRGB.
+    /// One layer of a written archive, bottom to top, straight-alpha sRGB.
     ///
     /// One piece, because `docformat` trims to what the layer covers and every
     /// fill here is opaque over the whole canvas.
-    fn layer_written(path: &Path) -> Vec<u8> {
+    fn layer_written(path: &Path, index: usize) -> Vec<u8> {
         let doc = umber_core::docimport::import(path).expect("the archive reads back");
-        let layer = doc.layers.last().expect("a layer");
-        layer
+        doc.layers
+            .get(index)
+            .expect("the archive holds that layer")
             .pixels
             .first()
             .expect("the layer holds pixels")
             .bytes
             .clone()
+    }
+
+    /// The slice each of the fixture's two layers occupies, bottom first —
+    /// which is also the order [`Candidate::slots`] puts them in, so index 0
+    /// here is step 0 of the capture.
+    fn fixture_slots(loops: &FrameLoop) -> [u32; 2] {
+        let layers = loops.editor.layers.layers();
+        [
+            layers[0].slot().expect("the lower layer holds a slice"),
+            layers[1].slot().expect("the upper layer holds a slice"),
+        ]
     }
 
     /// An edit landing between two steps of a capture must not be written as a
@@ -4201,14 +4226,21 @@ mod tests {
     ///
     /// **The file is what is read**, not a flag: asserting that the capture
     /// noticed would only restate the rule the fix is written in. And the moment
-    /// of the edit is taken from `capture_step_for_test` rather than from a
+    /// of the edit is taken from `capture_progress_for_test` rather than from a
     /// count of frames, or the guard would go quiet the day a step takes one
     /// frame more and the edit started landing before the layer was read — where
     /// there is nothing to repair and the assertion passes for the wrong reason.
     ///
+    /// **The edit lands on the *upper* of two layers**, which is what makes this
+    /// say anything about *which* layer was repaired. On a stack of one every
+    /// index is zero, so a `disturb` that marked `stale[0]` whatever slot it was
+    /// handed — or one whose slot lookup always answered `Some(0)` — would pass.
+    ///
     /// Demonstrated by mutation: with `Capture::disturb` no longer called from
     /// `touch_slot` the layer comes back as the colour before the edit while the
-    /// preview comes back as the colour after it.
+    /// preview comes back as the colour after it; with `stale[index]` written as
+    /// `stale[0]` the lower layer is re-read instead and the upper one comes back
+    /// stale.
     #[test]
     fn an_edit_during_a_capture_is_never_written_as_two_instants() {
         let Some((gpu, _serial)) = crate::gputest::lock() else {
@@ -4216,17 +4248,17 @@ mod tests {
             return;
         };
         let mut loops = FrameLoop::new(gpu, "two-instants");
-        let slot = loops.editor.layers.layers()[0]
-            .slot()
-            .expect("the one layer holds a slice");
+        let [lower, upper] = fixture_slots(&loops);
 
+        const UNDER: [u8; 4] = [30, 60, 190, 255];
         const BEFORE: [u8; 4] = [200, 40, 40, 255];
         const AFTER: [u8; 4] = [40, 160, 60, 255];
-        paint_slice(gpu, &mut loops, slot, BEFORE);
+        paint_slice(gpu, &mut loops, lower, UNDER);
+        paint_slice(gpu, &mut loops, upper, BEFORE);
 
-        // Spend frames until the layer has been read and the preview has not.
-        // One layer means two steps, so a linear cursor of 1 is exactly the gap
-        // an edit has to land in for the two halves to disagree.
+        // Spend frames until both layers have been read and the preview has not.
+        // Two layers means three steps, so a linear cursor of 2 is exactly the
+        // gap an edit has to land in for the halves to disagree.
         let mut between = false;
         for _ in 0..64 {
             loops.frame(gpu, true);
@@ -4235,7 +4267,7 @@ mod tests {
                 .get(&loops.id)
                 .and_then(CanvasRenderer::capture_progress_for_test)
                 .map(|(step, _)| step)
-                == Some(1)
+                == Some(2)
             {
                 between = true;
                 break;
@@ -4243,23 +4275,28 @@ mod tests {
         }
         assert!(
             between,
-            "the capture never sat between its layer and its preview, so this \
+            "the capture never sat between its layers and its preview, so this \
              guard exercised nothing",
         );
 
-        paint_slice(gpu, &mut loops, slot, AFTER);
+        paint_slice(gpu, &mut loops, upper, AFTER);
         loops.run_until_written(gpu);
         assert!(loops.theirs.exists(), "the document was never written");
 
-        let (layer, merged) = colours_written(&loops.theirs);
+        let (layers, merged) = colours_written(&loops.theirs);
         assert_eq!(
-            layer, merged,
-            "the archive holds a layer and a flattened preview from two \
-             different instants of the document",
+            layers,
+            vec![UNDER, AFTER],
+            "the archive's layers are not the document as it stood: the edited \
+             one was written from before the edit, or the wrong one was read \
+             again",
         );
+        // The upper layer is opaque and covers the canvas, so the flattened
+        // preview is exactly it. Both halves come off the same capture.
         assert_eq!(
-            layer, AFTER,
-            "the file was written from before the edit rather than after it",
+            merged, AFTER,
+            "the archive holds layers and a flattened preview from two different \
+             instants of the document",
         );
     }
 
@@ -4287,13 +4324,16 @@ mod tests {
             return;
         };
         let mut loops = FrameLoop::new(gpu, "torn");
-        let slot = loops.editor.layers.layers()[0]
-            .slot()
-            .expect("the one layer holds a slice");
+        // The **lower** layer, because that is the one step 0 reads and the row
+        // cursor below is read against step 0.
+        let [slot, upper] = fixture_slots(&loops);
 
         const BEFORE: [u8; 4] = [200, 40, 40, 255];
         const AFTER: [u8; 4] = [40, 160, 60, 255];
         paint_slice(gpu, &mut loops, slot, BEFORE);
+        // Opaque, so it has pixels to be written and trimmed to; nothing here
+        // reads it.
+        paint_slice(gpu, &mut loops, upper, [90, 90, 90, 255]);
         // One padded row, so every step of this capture is eight bands.
         loops
             .canvases
@@ -4327,7 +4367,7 @@ mod tests {
         loops.run_until_written(gpu);
         assert!(loops.theirs.exists(), "the document was never written");
 
-        let bytes = layer_written(&loops.theirs);
+        let bytes = layer_written(&loops.theirs, 0);
         assert!(
             bytes.chunks_exact(4).all(|p| p == AFTER),
             "the layer was written from the bands read before the edit and the \
@@ -4366,19 +4406,19 @@ mod tests {
             return;
         };
         let mut loops = FrameLoop::new(gpu, "storm");
-        let slot = loops.editor.layers.layers()[0]
-            .slot()
-            .expect("the one layer holds a slice");
+        let [lower, upper] = fixture_slots(&loops);
 
+        const UNDER: [u8; 4] = [30, 60, 190, 255];
         const AFTER: [u8; 4] = [40, 160, 60, 255];
-        paint_slice(gpu, &mut loops, slot, [200, 40, 40, 255]);
+        paint_slice(gpu, &mut loops, lower, UNDER);
+        paint_slice(gpu, &mut loops, upper, [200, 40, 40, 255]);
 
-        // Somebody painting on the bottom layer without ever pausing. Every
-        // frame, so nothing the capture reads is ever still what the document
-        // holds by the time the next step is recorded.
+        // Somebody painting without ever pausing. Every frame, so nothing the
+        // capture reads is ever still what the document holds by the time the
+        // next step is recorded.
         for _ in 0..400 {
             loops.frame(gpu, true);
-            paint_slice(gpu, &mut loops, slot, AFTER);
+            paint_slice(gpu, &mut loops, upper, AFTER);
         }
         assert!(
             !loops.theirs.exists(),
@@ -4404,9 +4444,9 @@ mod tests {
             "a document disturbed until its capture gave up was never autosaved \
              again",
         );
-        let (layer, merged) = colours_written(&loops.theirs);
-        assert_eq!(layer, merged, "two instants in one archive");
-        assert_eq!(layer, AFTER);
+        let (layers, merged) = colours_written(&loops.theirs);
+        assert_eq!(layers, vec![UNDER, AFTER], "two instants in one archive");
+        assert_eq!(merged, AFTER);
     }
 
     /// A capture that gave up must wait for the ordinary interval rather than
@@ -4435,10 +4475,9 @@ mod tests {
             return;
         };
         let mut loops = FrameLoop::new(gpu, "waits");
-        let slot = loops.editor.layers.layers()[0]
-            .slot()
-            .expect("the one layer holds a slice");
-        paint_slice(gpu, &mut loops, slot, [200, 40, 40, 255]);
+        let [lower, upper] = fixture_slots(&loops);
+        paint_slice(gpu, &mut loops, lower, [30, 60, 190, 255]);
+        paint_slice(gpu, &mut loops, upper, [200, 40, 40, 255]);
 
         // An ordinary cadence, with the document already past due — which is the
         // state every autosave starts from.
@@ -4455,7 +4494,7 @@ mod tests {
         let mut gave_up = false;
         for _ in 0..600 {
             loops.frame(gpu, true);
-            paint_slice(gpu, &mut loops, slot, [40, 160, 60, 255]);
+            paint_slice(gpu, &mut loops, upper, [40, 160, 60, 255]);
             if loops
                 .canvases
                 .get(&loops.id)
@@ -4485,6 +4524,23 @@ mod tests {
             !loops.editor.autosave.capturing() && !loops.theirs.exists(),
             "a capture that gave up was started again on the spot rather than \
              waiting for the ordinary interval",
+        );
+
+        // **And it is a wait rather than a stop**, which the assertion above
+        // cannot tell apart: anything that gave up on autosaving this document
+        // altogether would pass it. Winding the clock on is what an interval
+        // elapsing does, and the document is written on the next quiet frames.
+        loops
+            .editor
+            .autosave
+            .docs
+            .get_mut(&loops.id)
+            .expect("a record")
+            .last = Instant::now() - interval;
+        loops.run_until_written(gpu);
+        assert!(
+            loops.theirs.exists() && loops.ours.exists(),
+            "the document was never autosaved again after one capture gave up",
         );
     }
 
