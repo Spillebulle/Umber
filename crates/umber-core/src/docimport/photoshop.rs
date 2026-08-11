@@ -293,7 +293,30 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
 /// indexes slices unchecked in several places, so a truncated or merely unusual
 /// file can panic. Opening a file the user chose must not be able to end the
 /// process.
-fn catch<T>(f: impl FnOnce() -> T, detail: &str) -> Result<T, ImportError> {
+///
+/// **`pub(super)` because [`super::preview`] is the other entry point into this
+/// crate**, and it was the one that had no `catch` around it. One function
+/// rather than a second `catch_unwind` over there: the sentence a refusal
+/// carries and the format it names are as much part of this as the
+/// `catch_unwind` is, and two copies would drift.
+///
+/// **It only works because panics unwind.** `panic = "abort"` is set in no
+/// manifest in this workspace — see `CLAUDE.md`'s Crash reporting section, which
+/// asserted the opposite for a long time — and setting it would turn every
+/// refusal here into the process dying.
+///
+/// **What it does not stop is the crash reporter**, and that is worth saying
+/// beside the sentence above rather than leaving somebody to find it. The panic
+/// hook has already run by the time this catches: on the **main** thread it
+/// writes a report, spawns the reporter window and latches `REPORTING` for the
+/// rest of the session, so a *later* genuine crash produces no report at all.
+/// That is the ordinary import path — `open_path` → [`read`] → here.
+/// `umber-app::thumbnail::run` returns before `crash::install_hook` is called,
+/// and `umber-shellext` installs no hook, so neither of the callers this
+/// function was made `pub(super)` for is affected. Closing it means a
+/// `panic::take_hook` around these calls, which is a change to the *hook's*
+/// contract rather than to this one.
+pub(super) fn catch<T>(f: impl FnOnce() -> T, detail: &str) -> Result<T, ImportError> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|_| ImportError::Malformed {
         format: FORMAT,
         detail: if detail.is_empty() {

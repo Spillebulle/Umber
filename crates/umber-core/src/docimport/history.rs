@@ -24,6 +24,59 @@ use crate::geom::PixelRect;
 use crate::history::EditKind;
 use crate::time::Timestamp;
 
+/// Largest history manifest this reader will decompress.
+///
+/// **The manifest is an *index*, and the thing it indexes already has a
+/// bound.** Every entry it can honestly describe names PNGs in the archive, and
+/// [`fmt::BUDGET_BYTES`] is what the writer will spend on those — encoded,
+/// oldest dropped first. So the manifest and the patches take the same figure:
+/// an index larger than everything it indexes is not a history, and this is the
+/// only constant in the file that already means "how much of an undo history one
+/// document may carry". Deriving a per-entry JSON size instead would be a second
+/// statement of the serialised form, which changes whenever a field is added —
+/// the reason [`super::openraster::MAX_EFFECTS_BYTES`] refuses the same shape.
+///
+/// **It is a count and not a canvas, which is the whole reason it needs one.**
+/// `container::read_optional_entry` bounds an entry at
+/// [`super::ImportedDocument::MAX_TOTAL_BYTES`], and this was read there: sixteen
+/// gigabytes of JSON, materialised by `read_to_end` and then handed whole to
+/// `serde_json::from_slice`, which builds every entry before
+/// `manifest.entries.len()` is looked at. Nothing in the format bounds the entry
+/// count.
+///
+/// **Where `BUDGET_BYTES` alone would be stricter than the writer is three
+/// places, not one**, which is why the figure is a multiple of it rather than
+/// equal to it. The first draft said "one case" and was wrong twice over:
+///
+/// * **A flip writes no PNG.** That is what makes it free of the budget above,
+///   so a session of nothing but flips is a manifest with no patches beside it.
+/// * **A manifest entry is *larger* than the PNG it indexes, at the small end.**
+///   A minimal `ManifestEdit` with one piece is on the order of 135 bytes of
+///   JSON — kind, layer, four rectangle fields, a piece with its `src` path, a
+///   timestamp — against about 70 to 90 for a 1×1 RGBA PNG at
+///   `Compression::Fast`. So a session of very many very small edits reaches
+///   this before the patches reach `BUDGET_BYTES`, at a ratio near 1.6:1.
+/// * **`Manifest::layers` is unbounded.** It is every layer's *name*, and a name
+///   comes out of whatever wrote the file the layers were imported from. That is
+///   the identical argument `container::MAX_STRUCTURE_BYTES` makes for
+///   `stack.xml`, and it applies here because the same names are in both.
+///
+/// So: twice the patch budget for the entries, plus one structure entry's worth
+/// for the names. Both terms are existing constants rather than figures picked
+/// here, and neither is tight — what the bound has to do is refuse sixteen
+/// gigabytes of JSON, not sit close to what a real file holds.
+///
+/// **The `2×` answers the second bullet and the third, and not the first**,
+/// which is worth saying rather than letting the derivation read as covering
+/// all three. A flip costs the in-memory budget nothing — `EditBody::Flip` has
+/// no patch — so the *writing* side bounds the entry count not at all, and
+/// enough consecutive canvas flips would write a manifest this refuses at any
+/// multiple. Six hundred thousand of them, at about forty-seven bytes each. The
+/// consequence is benign and is the one this reader is built for: the history is
+/// dropped, `HistoryDropped` says so, and the picture opens.
+pub(super) const MAX_MANIFEST_BYTES: u64 =
+    2 * fmt::BUDGET_BYTES as u64 + super::container::MAX_STRUCTURE_BYTES;
+
 /// One recorded edit as it came out of a file.
 #[derive(Clone, Debug)]
 pub struct ImportedEdit {
@@ -113,9 +166,10 @@ fn load(
     doc_version: u32,
 ) -> Result<ImportedHistory, String> {
     let format = SourceFormat::OpenRaster;
-    let bytes = container::read_optional_entry(zip, manifest_path, format)
-        .map_err(|e| e.to_string())?
-        .ok_or("the document says it has one, but the record is not in the file")?;
+    let bytes =
+        container::read_optional_entry_bounded(zip, manifest_path, format, MAX_MANIFEST_BYTES)
+            .map_err(|e| e.to_string())?
+            .ok_or("the document says it has one, but the record is not in the file")?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .map_err(|e| format!("the record of it could not be read ({e})"))?;
 

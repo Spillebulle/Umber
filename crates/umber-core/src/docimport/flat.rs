@@ -7,7 +7,7 @@ use glam::UVec2;
 
 use super::{
     ImportError, ImportedDocument, ImportedLayer, PixelPiece, SourceFormat, StackSize,
-    check_bounds, srgb,
+    check_bounds, check_image_size, srgb,
 };
 use crate::document::Background;
 use crate::layer::BlendMode;
@@ -27,6 +27,11 @@ pub struct Image {
 /// those properly means a colour engine Umber does not have. ORA and Krita both
 /// specify sRGB, which is also what a PNG without a profile means, so sRGB is
 /// what is assumed.
+///
+/// **The size is checked off the header before the buffer is made**, because
+/// `output_buffer_size` is a figure the file chooses and `vec![0; …]` on a
+/// figure that large aborts rather than failing. [`check_image_size`] has the
+/// whole argument, including why `png::Limits` does not reach it.
 pub fn decode_png(bytes: &[u8], format: SourceFormat) -> Result<Image, ImportError> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -39,6 +44,11 @@ pub fn decode_png(bytes: &[u8], format: SourceFormat) -> Result<Image, ImportErr
     let mut reader = decoder
         .read_info()
         .map_err(|e| malformed(format!("the PNG header could not be read ({e})")))?;
+    // Before `output_buffer_size`, not after: that call is what would hand back
+    // the figure, and this is the one place it can be refused without having
+    // been believed first.
+    let (width, height) = reader.info().size();
+    check_image_size(width, height)?;
     let size = reader
         .output_buffer_size()
         .ok_or_else(|| malformed("the PNG is too large to decode".into()))?;
@@ -89,7 +99,21 @@ fn widen(src: &[u8], stride: usize, f: impl Fn(&[u8]) -> [u8; 4]) -> Vec<u8> {
 /// never lose anything.
 pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     let format = SourceFormat::Png;
-    let image = decode_png(bytes, format)?;
+    // **Here the picture *is* the canvas, so the canvas refusal is the accurate
+    // one.** `ImageTooLarge` exists because an ORA layer is stored at its own
+    // bounding box and may be larger than the page it sits on, which makes
+    // "the canvas is 60000×60000" a sentence sending the artist to shrink
+    // something that is nowhere near the bound. A flat PNG has no such gap: its
+    // image and its canvas are one rectangle, and `check_bounds` two lines
+    // below would have said `CanvasTooLarge` if the decode had got that far.
+    // Same figure, same remedy, and the sentence that names what the file
+    // actually has.
+    let image = decode_png(bytes, format).map_err(|e| match e {
+        ImportError::ImageTooLarge { width, height } => {
+            ImportError::CanvasTooLarge { width, height }
+        }
+        other => other,
+    })?;
     // A flat picture is one layer and no folders.
     let mut budget = check_bounds(
         format,
@@ -172,5 +196,86 @@ mod tests {
     fn a_file_that_is_not_a_png_is_refused() {
         let err = read_png(b"not a png at all").unwrap_err();
         assert!(matches!(err, ImportError::Malformed { .. }), "{err:?}");
+    }
+
+    /// **A PNG header alone cannot choose an allocation.**
+    ///
+    /// The fixture is a valid IHDR, an **empty** IDAT and an IEND — forty-odd
+    /// bytes — claiming one pixel past [`ImportedDocument::MAX_DIMENSION`] on a
+    /// side, where `output_buffer_size` answers `Some(4_295_098_372)` and
+    /// `vec![0u8; …]` **aborts** rather than failing, taking the panic hook, the
+    /// crash report and the autosave with it.
+    ///
+    /// **Refusing on the header rather than on the frame is what is being
+    /// asserted, and the fixture is what makes that legible.** The IDAT is empty
+    /// — present so `read_info` will parse the file at all, holding nothing — so
+    /// a reader that allocated first and asked afterwards fails inside
+    /// `next_frame` with a *decode* error, a different variant with the
+    /// allocation already spent. Only a check off `reader.info()` produces
+    /// `ImageTooLarge`. Demonstrated by mutation: delete the call and this reads
+    /// `Malformed { detail: "the PNG could not be decoded (Corrupt deflate
+    /// stream. InsufficientInput)" }`.
+    ///
+    /// The case is derived from the constant rather than written out, so raising
+    /// the ceiling moves the case with it instead of leaving one that no longer
+    /// exercises itself — `a_lock_that_saturates_stops_being_the_shape` is the
+    /// recorded reason.
+    #[test]
+    fn a_png_header_alone_cannot_ask_for_an_allocation() {
+        // `Image` holds a buffer and derives no `Debug`, so the refusal is read
+        // out rather than unwrapped — which also keeps a failure from printing
+        // a canvas.
+        let refusal = |w: u32, h: u32| match decode_png(
+            &fixtures::png_header_only(w, h),
+            SourceFormat::Png,
+        ) {
+            Ok(_) => panic!("a {w}×{h} header decoded, which needs the file to hold pixels"),
+            Err(e) => e,
+        };
+
+        let edge = ImportedDocument::MAX_DIMENSION + 1;
+        for (w, h) in [(edge, 1), (1, edge), (edge, edge)] {
+            let err = refusal(w, h);
+            assert!(
+                matches!(err, ImportError::ImageTooLarge { width, height } if width == w && height == h),
+                "a {w}×{h} header was not refused off the header: {err:?}"
+            );
+        }
+
+        // **And the bound is not off by one, which is the half that keeps the
+        // reader from being stricter than the writer.** A picture exactly at the
+        // ceiling gets past the size check and fails on the missing frame
+        // instead. One pixel tall, so the assertion costs 131 KB rather than
+        // four gigabytes.
+        let err = refusal(ImportedDocument::MAX_DIMENSION, 1);
+        assert!(
+            matches!(err, ImportError::Malformed { .. }),
+            "a picture at exactly the ceiling was refused for its size: {err:?}"
+        );
+    }
+
+    /// **A flat PNG's picture *is* its canvas, so it is refused as one.**
+    ///
+    /// `read_png` maps the decoder's `ImageTooLarge` back to `CanvasTooLarge`,
+    /// because the variant that distinguishes the two exists for the ORA layer
+    /// case — a layer stored at its own bounding box, larger than the page it
+    /// sits on — and there is no such gap here. Both sentences name the same
+    /// figure and the same remedy; only one of them is true about this file.
+    ///
+    /// Demonstrated by mutation: drop the `map_err` and this reads
+    /// `ImageTooLarge`, which is a document being told a picture inside it is
+    /// too large when the picture is the whole of it.
+    #[test]
+    fn a_flat_png_too_large_is_refused_as_a_canvas() {
+        let edge = ImportedDocument::MAX_DIMENSION + 1;
+        let err = read_png(&fixtures::png_header_only(edge, 1)).expect_err("past the ceiling");
+        assert!(
+            matches!(err, ImportError::CanvasTooLarge { width, height } if width == edge && height == 1),
+            "{err:?}"
+        );
+        assert!(
+            format!("{err}").starts_with("The canvas is"),
+            "the sentence names the wrong thing: {err}"
+        );
     }
 }

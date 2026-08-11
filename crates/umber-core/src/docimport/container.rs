@@ -19,34 +19,127 @@ pub fn open(bytes: &[u8], format: SourceFormat) -> Result<Zip<'_>, ImportError> 
     })
 }
 
-/// Read one entry whole.
+/// Largest `stack.xml` or `maindoc.xml` either ZIP reader will decompress.
 ///
-/// Refuses anything whose declared size is beyond what an import could use.
+/// **A document's structure entry is the third of the shape
+/// [`read_optional_entry_bounded`] exists for**, and it arrived by the same
+/// reasoning as the first two: its size follows a *count* the format does not
+/// bound, so [`ImportedDocument::MAX_TOTAL_BYTES`]' sixteen gigabytes is the
+/// wrong instrument. XML deflates around 1000:1, so at that figure a sixteen
+/// megabyte archive entry is a `read_to_end` growing a `Vec` to 16 GiB — an
+/// abort, from a small file, before quick-xml has seen a byte.
+///
+/// **The figure has to be generous, and that is not laziness.** Umber refuses a
+/// stack past [`LayerStack::MAX`] and it must be *that* refusal an over-tall
+/// document meets, not this one: a bound tight enough to catch a thousand-layer
+/// file would tell an artist their file was unreadable when it merely has too
+/// many layers, which is the wrong-bound failure `CanvasTooLarge`'s own docs
+/// record. Nor can the honest size be derived, because a layer's *name* is
+/// unbounded — it comes out of whatever wrote the file — so sixty-four legal
+/// layers can carry an arbitrarily long `stack.xml`.
+///
+/// So it is stated as headroom rather than as a derivation, and the two ends are
+/// what make it defensible. A full sixty-four-layer document Umber writes is
+/// about fifteen kilobytes of `stack.xml`, so this is a thousand times what the
+/// writer produces — `a_full_stacks_own_structure_is_far_inside_the_bound` is
+/// the measurement rather than the claim. And a stack tall enough to be refused
+/// for its layer count is roughly two hundred bytes an element, so this admits
+/// tens of thousands of them: `TooManyLayers` is what such a file meets.
+///
+/// **What it does not bound is what the parse then builds.** A `stack.xml` of
+/// nested `<stack>` elements pushes a `LayerSpec` and possibly a warning per
+/// element before the count is checked, which is perhaps twenty times the text.
+/// Sixteen mebibytes of that is a few hundred megabytes rather than sixteen
+/// gigabytes; it is bounded and survivable where it was neither, and it is not
+/// zero. Said out loud rather than left for the next reader to find.
+///
+/// [`LayerStack::MAX`]: crate::layer::LayerStack::MAX
+pub const MAX_STRUCTURE_BYTES: u64 = 16 << 20;
+
+/// Read one entry whole, at a bound the caller states.
+///
+/// Refuses anything whose declared size is beyond what its own content can be.
 /// Both ORA and KRA are ZIPs supplied by strangers, and a 20 KB file that
 /// claims to expand to 40 GB is a well-known way to knock over a program that
 /// reads to the end without looking.
-pub fn read_entry(
+///
+/// **The limit is a parameter and there is no unbounded form**, which is the
+/// half that was missing: this used to read every required entry at
+/// [`ImportedDocument::MAX_TOTAL_BYTES`], and both of its call sites are a
+/// document's structure XML rather than a canvas. See [`MAX_STRUCTURE_BYTES`],
+/// and [`read_optional_entry_bounded`] for the rule.
+pub fn read_entry_bounded(
     zip: &mut Zip<'_>,
     name: &str,
     format: SourceFormat,
+    limit: u64,
 ) -> Result<Vec<u8>, ImportError> {
-    read_optional_entry(zip, name, format)?.ok_or_else(|| ImportError::Malformed {
+    read_optional_entry_bounded(zip, name, format, limit)?.ok_or_else(|| ImportError::Malformed {
         format,
         detail: format!("the archive has no `{name}`"),
     })
 }
 
+/// Largest single *image* entry either ZIP reader will decompress.
+///
+/// **Derived from the canvas ceiling rather than picked, and it is the same
+/// figure [`super::check_image_size`] enforces one layer down.** A layer's PNG,
+/// a mask's PNG, a saved history patch and `mergedimage.png` are all pictures,
+/// and a picture Umber will decode is at most
+/// [`ImportedDocument::MAX_DIMENSION`] on each edge — so its raw RGBA is
+/// `32768² × 4`, which is 4 GiB. A PNG of incompressible data is a shade larger
+/// than raw: deflate's stored blocks add about 0.03%, plus a filter byte per row
+/// and the chunk framing. A sixteenth on top covers that with room to spare.
+///
+/// **What it replaces is [`ImportedDocument::MAX_TOTAL_BYTES`]**, the *whole
+/// document's* figure, which is four times this and was what every image entry
+/// was read at. That is the same shape [`MAX_STRUCTURE_BYTES`] was introduced
+/// for, in the entries somebody would think of last: a 16 MiB archive entry of
+/// deflated zeroes is a `read_to_end` growing a `Vec` to sixteen gigabytes
+/// before a single PNG chunk is parsed, and `preview::from_bytes` takes that
+/// route inside Explorer's surrogate process.
+///
+/// It is deliberately **not tighter than a canvas**. A thumbnail of a document
+/// Umber can open has to work, and the figure that would make this small is a
+/// preview-specific one nobody has measured — see `preview::psd_composite`.
+///
+/// **The declared-size half of the check cannot fire on an ordinary ZIP, and
+/// that is a fact about the format rather than a figure to tune.** A non-ZIP64
+/// local header states the uncompressed size in **32 bits**, so `entry.size()`
+/// tops out at `u32::MAX` — which is *below* this, and below the un-padded
+/// 4 GiB canvas figure too, by one byte. Every bound that admits a maximum
+/// canvas is therefore above what a classic header can claim. What actually
+/// bounds an image entry is the `take(limit + 1)` **after** inflation, so the
+/// worst transient is this figure plus `read_to_end`'s geometric growth rather
+/// than a refusal before a byte is decompressed. A ZIP64 entry declaring more
+/// *is* refused up front, which is why the check stays.
+///
+/// So the surrogate-process residual is ~4.25 GiB of inflate here, and it is
+/// **larger** than `preview::psd_composite`'s 3.6 GB, which that function names
+/// as the open one. Both want the same answer: a preview ceiling nobody has
+/// measured yet.
+pub const MAX_IMAGE_BYTES: u64 =
+    (ImportedDocument::MAX_DIMENSION as u64) * (ImportedDocument::MAX_DIMENSION as u64) * 4 * 17
+        / 16;
+
 /// Read one entry whole if it is present.
 ///
-/// Bounded at [`ImportedDocument::MAX_TOTAL_BYTES`], which is a sanity bound
-/// for a *canvas*. Anything whose own size is bounded by something much smaller
-/// should say so — see [`read_optional_entry_bounded`].
+/// Bounded at [`MAX_IMAGE_BYTES`], because every remaining caller is a
+/// *picture*: a layer's PNG, a mask's, a history patch, `mergedimage.png` and a
+/// Krita tile file. Anything whose own size is bounded by something else should
+/// say so — see [`read_optional_entry_bounded`], and [`check_mimetype`], which
+/// was on this figure and is not a picture at all.
+///
+/// A `.defaultpixel` is four bytes and is named here only because it goes
+/// through this door; the figure is loose for it and costs nothing, where
+/// `mimetype` was worth splitting out because it is the entry both readers open
+/// **first**, on a file nobody has established is a document yet.
 pub fn read_optional_entry(
     zip: &mut Zip<'_>,
     name: &str,
     format: SourceFormat,
 ) -> Result<Option<Vec<u8>>, ImportError> {
-    read_optional_entry_bounded(zip, name, format, ImportedDocument::MAX_TOTAL_BYTES)
+    read_optional_entry_bounded(zip, name, format, MAX_IMAGE_BYTES)
 }
 
 /// The same, for an entry whose content has a bound of its own.
@@ -69,6 +162,13 @@ pub fn read_optional_entry(
 /// is what the parameter is for — [`crate::textobj::MAX_RECORD_BYTES`] is the
 /// other one — and the fact that the second case reached this signature without
 /// changing it is the check on the first.
+///
+/// **There are four now**, and the two that arrived last are the ones this
+/// module read at the canvas bound for as long as it existed: a document's
+/// structure XML ([`MAX_STRUCTURE_BYTES`]) and the undo history's manifest
+/// (`docimport::history::MAX_MANIFEST_BYTES`). Both are counts rather than
+/// canvases and neither had a figure of its own, which is the failure the first
+/// two paragraphs describe arriving in the entries somebody would think of last.
 ///
 /// So the caller states what its own content can be, and the check happens
 /// against the *declared* size before a byte is decompressed as well as against
@@ -126,7 +226,18 @@ pub fn check_mimetype(
     expected: &str,
     format: SourceFormat,
 ) -> Result<(), ImportError> {
-    let Some(found) = read_optional_entry(zip, "mimetype", format)? else {
+    /// A `mimetype` entry has to equal one of two short strings, so nothing
+    /// longer than a line of them is worth decompressing.
+    ///
+    /// **It was on `MAX_IMAGE_BYTES` and it is not a picture**, which is the
+    /// same "a list of what a bound covers, written by whoever moved the bound"
+    /// slip that put `stack.xml` on the canvas figure — arriving in the entry
+    /// read *first* by both ZIP readers. A kibibyte is thirty times the longest
+    /// string this compares against.
+    const MAX_MIMETYPE_BYTES: u64 = 1 << 10;
+
+    let Some(found) = read_optional_entry_bounded(zip, "mimetype", format, MAX_MIMETYPE_BYTES)?
+    else {
         // Some writers omit it. Not worth refusing a file over.
         return Ok(());
     };
@@ -407,5 +518,70 @@ mod tests {
         let src = vec![255u8; 8 * 8 * 4];
         blit(&mut dst, size, &src, UVec2::new(8, 8), (-1, -1));
         assert!(dst.iter().all(|&b| b == 255));
+    }
+
+    /// **A document's structure entry is refused at its own bound**, on both
+    /// formats, from a file of a few hundred bytes.
+    ///
+    /// Read at [`ImportedDocument::MAX_TOTAL_BYTES`] this was a `read_to_end`
+    /// growing a `Vec` to sixteen gigabytes before quick-xml saw a byte, which
+    /// aborts. The fixture is legal XML behind a comment, so the shape is not
+    /// what refuses it; the size is.
+    ///
+    /// **Driven one byte past the constant rather than at a figure of its
+    /// own**, so raising the bound moves the case with it. Both directions are
+    /// asserted: an entry a byte over is refused and one a byte under is read,
+    /// because a guard that only drove the first would pass with the bound at
+    /// zero.
+    #[test]
+    fn a_structure_entry_past_its_own_bound_is_refused_on_both_formats() {
+        use super::super::fixtures;
+
+        let over = MAX_STRUCTURE_BYTES as usize + 1;
+        for (bytes, format, name) in [
+            (
+                fixtures::ora_with_padded_stack(over),
+                SourceFormat::OpenRaster,
+                "stack.xml",
+            ),
+            (
+                fixtures::kra_with_padded_maindoc(over),
+                SourceFormat::Krita,
+                "maindoc.xml",
+            ),
+        ] {
+            assert!(
+                bytes.len() < 64 * 1024,
+                "the fixture is meant to be small and claim to be large: {} bytes",
+                bytes.len()
+            );
+            let mut zip = open(&bytes, format).expect("an archive");
+            let err = read_entry_bounded(&mut zip, name, format, MAX_STRUCTURE_BYTES)
+                .expect_err("an entry past the bound");
+            // **Which of the two refusals fired, not merely that one did.**
+            // Both name the entry — the declared-size check before anything is
+            // decompressed, and the `take` check after — so asserting on the
+            // name alone leaves deleting the first one green, which is the
+            // whole point of having it. `openraster`'s history guard makes the
+            // same distinction and this one did not.
+            assert!(
+                format!("{err}").contains(&format!("`{name}` claims to be")),
+                "the entry was decompressed before anything objected: {err}"
+            );
+        }
+
+        // A byte under is an ordinary read. Without this the bound could be any
+        // figure at all, including one that refuses every document.
+        let under = MAX_STRUCTURE_BYTES as usize - 1;
+        let bytes = fixtures::ora_with_padded_stack(under);
+        let mut zip = open(&bytes, SourceFormat::OpenRaster).expect("an archive");
+        let entry = read_entry_bounded(
+            &mut zip,
+            "stack.xml",
+            SourceFormat::OpenRaster,
+            MAX_STRUCTURE_BYTES,
+        )
+        .expect("an entry inside the bound");
+        assert!(entry.len() as u64 <= MAX_STRUCTURE_BYTES);
     }
 }

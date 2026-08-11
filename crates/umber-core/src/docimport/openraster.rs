@@ -152,7 +152,14 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let mut zip = container::open(bytes, FORMAT)?;
     container::check_mimetype(&mut zip, "image/openraster", FORMAT)?;
 
-    let stack_xml = container::read_entry(&mut zip, "stack.xml", FORMAT)?;
+    // Bounded at what a *structure* entry can be rather than at the canvas
+    // figure every other entry answers to — see `container::MAX_STRUCTURE_BYTES`.
+    let stack_xml = container::read_entry_bounded(
+        &mut zip,
+        "stack.xml",
+        FORMAT,
+        container::MAX_STRUCTURE_BYTES,
+    )?;
     let mut warnings = Vec::new();
     let Stack {
         size,
@@ -1429,5 +1436,60 @@ mod tests {
     fn a_file_that_is_not_a_zip_is_refused() {
         let err = read(b"PK not really").unwrap_err();
         assert!(matches!(err, ImportError::Malformed { .. }), "{err:?}");
+    }
+
+    /// **The reader passes the structure bound, and this is what says so.**
+    ///
+    /// `container`'s own guard drives `read_entry_bounded` with the figure and
+    /// cannot see what the caller hands it — the "a guard on a model is not a
+    /// guard on the call site" failure this project records four times over.
+    /// Demonstrated by mutation: put `ImportedDocument::MAX_TOTAL_BYTES` back at
+    /// the call site and this fails while every test in `container` stays green.
+    #[test]
+    fn a_stack_xml_past_the_structure_bound_is_refused_by_the_reader() {
+        let bytes = fixtures::ora_with_padded_stack(container::MAX_STRUCTURE_BYTES as usize + 1);
+        let err = read(&bytes).expect_err("a stack.xml past the bound");
+        assert!(
+            matches!(err, ImportError::Malformed { ref detail, .. } if detail.contains("stack.xml")),
+            "{err:?}"
+        );
+    }
+
+    /// **A history manifest is bounded too, and losing it costs the history and
+    /// nothing else.**
+    ///
+    /// The manifest is JSON whose entry count nothing in the format bounds, read
+    /// at the *document* ceiling and then handed whole to `serde_json`. What is
+    /// asserted is three things: the picture still opens, the drop is said out
+    /// loud as a warning rather than passed over — the rule `HistoryDropped`
+    /// already lives by — and **which refusal fired**.
+    ///
+    /// **The third is the one doing the work, and the first draft did not have
+    /// it.** With the bound raised back to `MAX_TOTAL_BYTES` the entry is read
+    /// whole and `serde_json` then refuses it, so the history is dropped, the
+    /// warning appears and the picture opens either way: a test asking only
+    /// those passed the mutation it was written for. Sixteen gigabytes of JSON
+    /// materialised on the way to a refusal is exactly the failure, so the
+    /// sentence has to say the size stopped it. Demonstrated by mutation.
+    #[test]
+    fn a_saved_history_past_its_own_bound_is_dropped_and_the_picture_opens() {
+        let bytes = fixtures::ora_with_padded_history(history::MAX_MANIFEST_BYTES as usize + 1);
+        let doc = read(&bytes).expect("the document opens regardless");
+        assert_eq!(doc.layers.len(), 1, "the picture is untouched");
+        assert!(doc.history.is_none(), "the history should not have loaded");
+        let Some(ImportWarning::HistoryDropped { reason }) = doc
+            .warnings
+            .iter()
+            .find(|w| matches!(w, ImportWarning::HistoryDropped { .. }))
+        else {
+            panic!(
+                "a dropped history has to be said out loud: {:?}",
+                doc.warnings
+            );
+        };
+        assert!(
+            reason.contains("claims to be"),
+            "the manifest was decompressed before anything objected: {reason}"
+        );
     }
 }

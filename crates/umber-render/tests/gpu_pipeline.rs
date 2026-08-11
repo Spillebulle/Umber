@@ -15,7 +15,7 @@ use umber_core::{
 };
 use umber_render::{
     BakedStack, CanvasRenderer, Choice, CompositeParams, DabStyle, EffectFrame, FloatParams,
-    FloatSource, Gpu, LayerDraw, LayerEffects, ProbeParams, StrokeStyle, Thumbnail,
+    FloatSource, Gpu, LayerDraw, LayerEffects, PageRefusal, ProbeParams, StrokeStyle, Thumbnail,
 };
 
 const DOC: u32 = 64;
@@ -6237,7 +6237,9 @@ fn a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly() {
         .collect();
 
     for axis in [FlipAxis::Horizontal, FlipAxis::Vertical] {
-        canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis);
+        canvas
+            .flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis)
+            .expect("a flip on a device with room for it");
 
         for slot in 0..2 {
             let after = canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE));
@@ -6250,7 +6252,9 @@ fn a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly() {
 
         // And back. This is the assertion the design rests on: not "close
         // enough", but the same bytes.
-        canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis);
+        canvas
+            .flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis)
+            .expect("a flip on a device with room for it");
         for slot in 0..2 {
             assert_eq!(
                 canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE)),
@@ -6665,7 +6669,8 @@ fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
     let flipped = [h.canvas.slot_revision(0), h.canvas.slot_revision(1)];
     let untouched = h.canvas.slot_revision(2);
     h.canvas
-        .flip_layers(&h.gpu.device, &h.gpu.queue, &[0, 1], FlipAxis::Horizontal);
+        .flip_layers(&h.gpu.device, &h.gpu.queue, &[0, 1], FlipAxis::Horizontal)
+        .expect("a flip on a device with room for it");
     assert!(
         h.canvas.slot_revision(0) > flipped[0] && h.canvas.slot_revision(1) > flipped[1],
         "a canvas flip mirrors every layer, so every thumbnail of one is a \
@@ -9170,7 +9175,9 @@ fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
     };
     let before = read_all(&canvas);
 
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal)
+        .expect("a flip on a device with room for it");
     let once = read_all(&canvas);
     assert_ne!(once, before, "the flip did nothing");
 
@@ -9191,7 +9198,9 @@ fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
         "the mark is still where it was as well"
     );
 
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal)
+        .expect("a flip on a device with room for it");
     assert_eq!(
         read_all(&canvas),
         before,
@@ -9217,6 +9226,129 @@ fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
         "two flips of two marks took the whole grid: {} tiles",
         canvas.backed_tiles(0)
     );
+}
+
+/// **A flip the atlas cannot make room for takes none of the picture with it.**
+///
+/// This is the guard for the worst thing that could have come out of making the
+/// flip's growth fallible. Both of its allocations used to be infallible, so a
+/// card with room for the document and not for one more page beside it met
+/// `crash::device_error` — but the obvious repair inverts a far worse defect.
+/// The tile loop met a cell it could not back with a `log::error!` and a
+/// `continue`, and a tile dropped by a *flip* is paint no undo can reach: the
+/// entry carries no pixels, so it is in no patch and no parked slice, and
+/// undoing a flip is flipping again. A visible crash box traded for permanent
+/// silent loss is not a fix.
+///
+/// So the flip is atomic, and what is measured here is the picture rather than
+/// the rule: every byte of both layers, before and after a refusal, plus
+/// `atlas_invariant` for the bookkeeping a partial flip would have left behind.
+///
+/// The refusal is provoked with `set_page_ceiling_for_test`, because a runner
+/// has no card to put under memory pressure — the same instrument
+/// `a_bake_refused_its_page_draws_the_layer_and_reports_once` uses.
+///
+/// **What this covers is the *device* arm and not the ceiling one**, and the
+/// difference was found by mutation rather than reasoned about: restoring the
+/// tile-drop `continue` leaves this green, because the refusal here comes out of
+/// `try_ensure_pages` before the loop is reached at all. Driving the loop's own
+/// shortfall needs the atlas at `MAX_SLOTS` — 256 pages, hundreds of megabytes
+/// at this canvas, and not a test hook — so that path and the `free.len() <
+/// wanted` check above it are reasoned about and unexercised. Both are refusals
+/// *before* anything is written, so a mistake in either is a flip that does not
+/// happen rather than one that half does; `flip_layers`' own docs say the same
+/// where somebody changing it will read it.
+///
+/// The `Err` is matched on the arm that is actually reachable here, not on
+/// "either" — a guard that accepted both would stop saying which one it drove
+/// the moment the other became reachable.
+#[test]
+fn a_flip_the_atlas_cannot_hold_leaves_every_pixel_where_it_was() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 8);
+
+    // One mark in tile (0, 0). 700 wide is 2.73 tiles, so its mirror lands
+    // across tiles 1 and 2 — neither backed, so the flip needs new cells and
+    // the ceiling can refuse them. A mark whose mirror fell on its own tile
+    // would need none and this test would pass with no reservation at all.
+    write_flat(gpu, &mut canvas, 0, in_tile(0, 0), [200, 40, 40, 255]);
+    let backed = canvas.backed_tiles(0);
+
+    let read_all = |canvas: &CanvasRenderer, slot: u32| {
+        canvas.read_layer_rect(
+            &gpu.device,
+            &gpu.queue,
+            slot,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: TILED_W,
+                height: TILED_H,
+            },
+        )
+    };
+    let before = read_all(&canvas, 0);
+
+    // Spend every free cell on the other slots, then hold the atlas where it
+    // is. Slot 0 keeps its one tile, so what the flip needs is exactly the two
+    // the mirror lands on and the pool has neither. The page table is
+    // `MAX_SLOTS` deep from the moment the store exists, so a slot past the
+    // count `tiled_canvas` was told about is an ordinary slot with no tiles —
+    // which is what lets this drain a pool of any size.
+    'fill: for slot in 1..64 {
+        for ty in 0..2 {
+            for tx in 0..3 {
+                if canvas.free_tiles() == 0 {
+                    break 'fill;
+                }
+                write_flat(gpu, &mut canvas, slot, in_tile(tx, ty), [0, 0, 0, 255]);
+            }
+        }
+    }
+    assert_eq!(canvas.free_tiles(), 0, "the atlas still has room");
+    canvas.set_page_ceiling_for_test(canvas.page_count());
+
+    let other = read_all(&canvas, 1);
+    let refused = canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0, 1], FlipAxis::Horizontal)
+        .expect_err("the atlas cannot supply the cells a mirror needs");
+    assert!(
+        matches!(refused, PageRefusal::Device(_)),
+        "the ceiling hook stands in for a card that would not allocate, so this is \
+         the device arm: {refused:?}"
+    );
+
+    // **Nothing moved.** Not the layer that would have been mirrored first, not
+    // the one after it, and not the bookkeeping.
+    assert_eq!(
+        read_all(&canvas, 0),
+        before,
+        "a refused flip mirrored part of a layer"
+    );
+    assert_eq!(
+        read_all(&canvas, 1),
+        other,
+        "a refused flip reached the second layer"
+    );
+    assert_eq!(
+        canvas.backed_tiles(0),
+        backed,
+        "a refused flip changed which tiles a layer holds"
+    );
+    assert!(
+        canvas.atlas_invariant().is_ok(),
+        "{:?}",
+        canvas.atlas_invariant()
+    );
+
+    // And with room again it goes through, so the refusal is the pressure and
+    // not the fixture.
+    canvas.set_page_ceiling_for_test(canvas.page_count() + 64);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal)
+        .expect("a flip with room for it");
+    assert_ne!(read_all(&canvas, 0), before, "the flip did nothing");
 }
 
 /// A resize carries a sparse layer, and a destination tile it only partly fills
@@ -9632,9 +9764,13 @@ fn every_atlas_cell_is_held_by_one_slot_or_is_free() {
         "the preview kept its page after the float ended"
     );
 
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Horizontal);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Horizontal)
+        .expect("a flip on a device with room for it");
     check(&canvas, "a horizontal flip");
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Vertical);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Vertical)
+        .expect("a flip on a device with room for it");
     check(&canvas, "a vertical flip");
 
     canvas.resize(

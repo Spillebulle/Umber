@@ -5153,6 +5153,67 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **A full stack's own `stack.xml` is far inside what the reader will
+    /// take**, which is the half of `container::MAX_STRUCTURE_BYTES` that keeps
+    /// "a reader must never be stricter than the writer" honest.
+    ///
+    /// The figure over there is headroom rather than a derivation — a layer's
+    /// name is unbounded, so no honest derivation exists — so it is argued from
+    /// two ends, and this is the writer's end **measured** rather than claimed.
+    /// It is here rather than in `docimport` because it is a statement about
+    /// what `stack_xml` produces, and a guard living beside the constant it
+    /// justifies would only agree with itself.
+    ///
+    /// [`LayerStack::MAX`] entries, every flag set so every optional attribute
+    /// is written, and names long enough to be somebody's real filing. If this
+    /// ever comes within reach of the bound, the bound is what has to move.
+    #[test]
+    fn a_full_stacks_own_structure_is_far_inside_the_bound() {
+        let size = UVec2::new(2, 2);
+        let px = solid(size, [1, 2, 3, 255]);
+        let names: Vec<String> = (0..LayerStack::MAX)
+            .map(|i| format!("Rough colour pass {i} — under the line art, do not merge"))
+            .collect();
+        let layers: Vec<SaveLayer<'_>> = names
+            .iter()
+            .map(|name| SaveLayer {
+                clipped: true,
+                locked: true,
+                link: Some(3),
+                blend: BlendMode::ColorDodge,
+                ..layer(name, &px)
+            })
+            .collect();
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(&px),
+            history: None,
+        })
+        .expect("encode");
+
+        let xml = read_stack_xml(&bytes);
+        let bound = crate::docimport::container::MAX_STRUCTURE_BYTES;
+        // **The ratio the constant's own docs quote, not a rounder one.** They
+        // say "about fifteen kilobytes … a thousand times what the writer
+        // produces"; a guard asserting 64× would stay green with the bound cut
+        // to a megabyte, which is the figure-in-a-comment failure this project
+        // records — the next change gets argued against whichever number is
+        // written down. The measured ratio is printed so the comment can be
+        // corrected from a test run rather than from an estimate.
+        let ratio = bound / xml.len().max(1) as u64;
+        assert!(
+            ratio >= 1000,
+            "a full stack writes {} bytes of stack.xml against a reader bound of {bound}, a \
+             ratio of {ratio}; `MAX_STRUCTURE_BYTES`' docs claim a thousand times what the \
+             writer produces, so either the bound or that sentence has to move",
+            xml.len()
+        );
+    }
+
     /// The `stack.xml` out of an archive, as text.
     fn read_stack_xml(bytes: &[u8]) -> String {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
