@@ -3087,9 +3087,9 @@ impl UmberApp {
     /// Called wherever an autosave could otherwise finish *after* something
     /// that supersedes it: an explicit Save, a resize, a document closing.
     ///
-    /// The rule itself is [`autosave::interrupt`]'s, in the module that owns
-    /// both halves of it and can be driven by a test; all this does is find the
-    /// canvas, which is the one thing that needs `self`.
+    /// The rule itself is [`crate::autosave::interrupt`]'s, in the module that
+    /// owns both halves of it and can be driven by a test; all this does is
+    /// find the canvas, which is the one thing that needs `self`.
     fn stop_autosave_of(&mut self, id: DocId) {
         let canvas = self.gfx.as_mut().and_then(|gfx| gfx.canvases.get_mut(&id));
         crate::autosave::interrupt(&mut self.editor.autosave, canvas, id);
