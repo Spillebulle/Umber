@@ -2454,12 +2454,18 @@ impl LayerStore {
 
     /// Push the whole table to the GPU.
     ///
-    /// Whole, not per slot, and that is a measured triviality rather than
-    /// laziness: the table is `tiles.x × tiles.y × slots × 4` bytes — 6.3 KB per
-    /// slot on the 20000×5000 document, 16.8 MB for a full stack at the largest
-    /// canvas Umber makes — and it is uploaded once per frame in which any tile
-    /// was backed or freed, never per tile. A per-slot upload would be a second
-    /// statement of the layout for no figure anybody could measure.
+    /// Whole, not per slot, and that is affordable only because of **when this
+    /// runs**: the table is written when the store is built, when it grows and
+    /// when the canvas is resized, and nowhere else. Nothing on the drawing path
+    /// touches it while residency is the identity.
+    ///
+    /// **The sparse stage may not keep this shape**, and the figure is why. The
+    /// table is `tiles.x × tiles.y × slots × 4` bytes: 6.3 KB per slot on the
+    /// 20000×5000 document, and **16.8 MB** for a full stack at the largest
+    /// canvas Umber makes. Once a commit backs tiles, that is a 16.8 MB upload
+    /// at every pointer-up, which is worse than the readback beside it. The
+    /// upload has to become per slot — one slice, `tiles.x × tiles.y × 4` — and
+    /// this is where the layout it would have to agree with is stated.
     fn upload_table(&self, queue: &wgpu::Queue) {
         if self.entries.is_empty() {
             return;
@@ -3774,6 +3780,7 @@ impl CanvasRenderer {
             self.layers.capacity,
             capacity
         );
+        let page = self.layers.grid.page_size();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("grow-layers"),
         });
@@ -3790,9 +3797,17 @@ impl CanvasRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
+            // **The whole page, not the document.** Under the identity table
+            // the two differ only by padding nothing reads, so copying the
+            // document would look right — and a page is a grid of tile *slots*,
+            // every one of which a sparse table may point some slot's tile at,
+            // including the ones whose document rectangle is clipped by the
+            // canvas edge. A growth that carried the document alone would drop
+            // whatever had been relocated there, silently, on the frame a stack
+            // got one layer deeper.
             wgpu::Extent3d {
-                width: self.doc_size.x,
-                height: self.doc_size.y,
+                width: page.x,
+                height: page.y,
                 depth_or_array_layers: self.layers.capacity,
             },
         );
