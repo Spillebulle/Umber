@@ -3089,14 +3089,15 @@ pub struct CanvasRenderer {
     /// 8192² canvas to reach.
     readback_limit: u64,
 
-    /// How deep the atlas may grow, in pages.
+    /// How deep the atlas may grow before [`CanvasRenderer::try_ensure_pages`]
+    /// declines, standing in for the device declining it.
     ///
-    /// [`MAX_SLOTS`] in every build that ships, and it is a field for the reason
-    /// [`Self::readback_limit`] is: what has to be tested is what the paths that
-    /// can be **refused a page** do about it, and the two ways to be refused —
-    /// the device declining the allocation, and the ceiling — arrive at the same
-    /// `Err`. A runner has no card to put under memory pressure, so the ceiling
-    /// is the reachable one. See [`Self::set_page_ceiling_for_test`].
+    /// [`MAX_SLOTS`] in every build that ships, where `growth_for` has already
+    /// capped below it and it can never fire. It is a field for the reason
+    /// [`Self::readback_limit`] is: what has to be tested is what a caller does
+    /// about being refused a page, and a runner has no card to put under memory
+    /// pressure. See [`Self::set_page_ceiling_for_test`], which says why it is
+    /// read on the fallible path alone.
     page_ceiling: u32,
 
     /// How large one layer slice may be before this renderer stops holding
@@ -4388,6 +4389,25 @@ impl CanvasRenderer {
         let Some(capacity) = self.growth_for(pages) else {
             return Ok(());
         };
+        // The test hook, and it sits **here** rather than in `growth_for` on
+        // purpose: what it stands in for is a device declining the allocation,
+        // and a device declining is only ever *visible* on this path. Put in
+        // `growth_for` it would cap the infallible `ensure_pages` too, which
+        // makes the two indistinguishable — and a guard that cannot tell them
+        // apart cannot say that a caller was moved onto the fallible one, which
+        // is the whole of the change it is guarding. Demonstrated by mutation:
+        // with the cap shared, swapping `try_ensure_pages` back for
+        // `ensure_pages` in `take_whole_page` left the guard green.
+        // `MAX_SLOTS` in every shipping build, where `growth_for` has already
+        // capped below it and this can never fire.
+        if capacity > self.page_ceiling {
+            return Err(Vram {
+                slices: capacity,
+                held: self.layers.pages,
+                slice_bytes: slice_bytes(self.doc_size),
+                doc_size: self.doc_size,
+            });
+        }
         // The atlas this one replaces is still resident while it is made — the
         // copy is recorded against both — so it is what `Vram::peak_bytes` adds.
         //
@@ -4473,8 +4493,7 @@ impl CanvasRenderer {
             // actually being built for.
             slice_bytes(self.doc_size),
         )
-        .min(MAX_SLOTS as u32)
-        .min(self.page_ceiling);
+        .min(MAX_SLOTS as u32);
         // A ceiling already met is nothing to grow, and saying so here rather
         // than letting a `Some(capacity)` through is what stops a growth that
         // reallocates the atlas at exactly the size it already is.
@@ -9594,15 +9613,19 @@ impl CanvasRenderer {
         self.readback_limit = bytes;
     }
 
-    /// Pretend the atlas may not grow past `pages`, so the paths that have to
-    /// survive being refused one can be driven without a card under pressure.
+    /// Pretend the device will not allocate an atlas deeper than `pages`, so
+    /// the paths that have to survive being refused one can be driven without a
+    /// card under memory pressure.
     ///
-    /// Exists for the tests, like [`Self::set_readback_limit`]. The failure it
-    /// stands in for is a device that will not allocate the grown atlas, which
-    /// nothing on a CI runner can provoke — and which is the case an effect bake
-    /// meets on an ordinary frame. Both arrive at the same `Err` out of
-    /// `take_whole_page`, so what is driven here is the whole of what a caller
-    /// does about it.
+    /// Exists for the tests, like [`Self::set_readback_limit`]. What it stands
+    /// in for is `try_reserve` catching an out-of-memory, which is why it is
+    /// read **only by [`Self::try_ensure_pages`]** — the infallible
+    /// [`Self::ensure_pages`] goes on growing past it. That asymmetry is
+    /// deliberate and is what makes a guard able to say which of the two a
+    /// caller reaches: capping both would leave "the bake still grows fatally"
+    /// indistinguishable from "the bake asks and is refused", and the real thing
+    /// has the same asymmetry — an infallible allocation is not refused, it
+    /// takes the process down, which no test can reproduce.
     #[doc(hidden)]
     pub fn set_page_ceiling_for_test(&mut self, pages: u32) {
         self.page_ceiling = pages;
