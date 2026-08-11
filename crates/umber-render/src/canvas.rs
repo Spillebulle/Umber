@@ -1304,6 +1304,33 @@ struct Capture {
     /// A map failed, so nothing can be assembled. The job is dropped once the
     /// buffer has settled.
     failed: bool,
+    /// The tiles of the **step in flight** that are stored nowhere, and what
+    /// they read as.
+    ///
+    /// A layer's texels are tiled, so a canvas-wide band is not one contiguous
+    /// copy: it is one copy per backed fragment, and the columns of an unbacked
+    /// tile are never written at all. Something has to put the slot's own empty
+    /// value there, and it is [`Self::copy_chunk`] rather than a `clear_buffer`
+    /// on the GPU — for two reasons.
+    ///
+    /// **`clear_buffer` writes zeroes, which is a *layer's* empty value and not
+    /// a mask's.** A mask reveals everything where nothing is stored, and since
+    /// `fill_layer_white` became a table write a partly-painted mask is the
+    /// ordinary case rather than an unreachable one: add a mask, paint on part
+    /// of it, and the tiles nobody reached hold nothing. Zeroes there are
+    /// coverage 0 on `.r`, so the autosaved file would **hide the layer
+    /// everywhere the artist did not paint on its mask** — and the explicit Save
+    /// would not, because `read_layer_pieces` synthesises properly. Two writers
+    /// of one document disagreeing is the failure CLAUDE.md calls worse than
+    /// losing something every time.
+    ///
+    /// **And it is bounded here.** `clear_buffer` fills a whole band — up to
+    /// `readback_limit`, so 268 MB on the 20000×5000 document — as one lump of
+    /// GPU work per band. Filling the gaps as the rows are copied out spreads it
+    /// across frames exactly as `CAPTURE_CHUNK_BYTES` already spreads the copy,
+    /// which is the whole reason this path is bearable at all.
+    gaps: Vec<(u32, u32)>,
+    empty: [u8; 4],
 }
 
 impl Capture {
@@ -1359,6 +1386,7 @@ impl Capture {
             .slice(..(self.padded as u64) * ((band_last - band_first) as u64))
             .get_mapped_range();
 
+        let (gaps, empty, tiles_x) = (&self.gaps, self.empty, self.size.x);
         let out = self
             .partial
             .get_or_insert_with(|| Vec::with_capacity(row * height));
@@ -1370,7 +1398,20 @@ impl Capture {
             // Band-relative: row `band_first` of the layer is row 0 of the
             // buffer.
             let start = (y - band_first) * self.padded as usize;
+            let at = out.len();
             out.extend_from_slice(&mapped[start..start + row]);
+            // Whatever no fragment copied is undefined, so the slot's empty
+            // value goes over it — see [`Capture::gaps`]. The tile row is the
+            // document row's, and a gap's columns are clipped to the canvas
+            // because the rightmost tile is partial.
+            let ty = y as u32 / TILE;
+            for (gx, _) in gaps.iter().filter(|(_, gy)| *gy == ty) {
+                let x0 = (gx * TILE) as usize;
+                let x1 = ((gx + 1) * TILE).min(tiles_x) as usize;
+                for px in out[at + x0 * 4..at + x1 * 4].chunks_exact_mut(4) {
+                    px.copy_from_slice(&empty);
+                }
+            }
         }
         to >= band_last
     }
@@ -4028,6 +4069,60 @@ impl CanvasRenderer {
         self.layers.backed(slot).count()
     }
 
+    /// Every atlas cell is held by exactly one slot or is free, and every cell
+    /// is accounted for.
+    ///
+    /// **The one property of the allocator whose failure is silent and total.**
+    /// A cell issued to two slots is one layer's paint appearing in another's —
+    /// which is not a wrong picture so much as somebody else's — and a cell
+    /// leaked is storage nothing can ever take back. Neither shows up in a
+    /// pixel until the two slots happen to be drawn together, so it is checked
+    /// as a set rather than looked for.
+    ///
+    /// `Err` carries what is wrong, because "the invariant broke" and "slot 7
+    /// and slot 12 both hold page 2 cell (1, 0)" are different amounts of help
+    /// at three in the morning. Public because the guards live in a separate
+    /// test binary; nothing in the application calls it, and it is `O(slots ×
+    /// tiles)`, which is 16.8 million comparisons at the largest canvas.
+    pub fn atlas_invariant(&self) -> Result<(), String> {
+        use std::collections::HashMap;
+        let mut owner: HashMap<u32, String> = HashMap::new();
+        for slot in 0..MAX_SLOTS as u32 {
+            for (tile, entry) in self.layers.backed(slot) {
+                if entry.page() >= self.layers.pages {
+                    return Err(format!(
+                        "slot {slot} tile {tile:?} names page {} of {}",
+                        entry.page(),
+                        self.layers.pages
+                    ));
+                }
+                if let Some(held) = owner.insert(entry.0, format!("slot {slot} tile {tile:?}")) {
+                    return Err(format!(
+                        "{held} and slot {slot} tile {tile:?} both hold atlas cell {:?}",
+                        entry.origin()
+                    ));
+                }
+            }
+        }
+        for cell in &self.layers.free {
+            if let Some(held) = owner.insert(cell.0, "the free list".into()) {
+                return Err(format!(
+                    "{held} holds atlas cell {:?}, which is also free",
+                    cell.origin()
+                ));
+            }
+        }
+        let total = self.layers.pages as usize * self.layers.grid.tiles_per_page() as usize;
+        if owner.len() != total {
+            return Err(format!(
+                "{} cell(s) accounted for of {total}: {} leaked",
+                owner.len(),
+                total - owner.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// What a slot's absent tiles read as.
     fn class_of(&self, slot: u32) -> SlotClass {
         self.layers
@@ -4434,6 +4529,19 @@ impl CanvasRenderer {
         Some(page)
     }
 
+    /// Give up every effect slice **and its page**.
+    ///
+    /// The three places a bake abandons the whole cache share it, because
+    /// `EffectCache` holds no `LayerStore` and so cannot hand a page back
+    /// itself — see `EffectCache::forget_all`. One helper rather than three
+    /// copies of the loop, for the reason `touch_slot` is inside the methods
+    /// that write a slice rather than beside their call sites.
+    fn release_effect_pages(&mut self, queue: &wgpu::Queue) {
+        for slot in self.effects.forget_all() {
+            self.release_slot(queue, slot);
+        }
+    }
+
     /// Give every cell a slot holds back, and push the emptied table slice.
     fn release_slot(&mut self, queue: &wgpu::Queue, slot: u32) {
         if slot as usize >= MAX_SLOTS {
@@ -4647,7 +4755,11 @@ impl CanvasRenderer {
         // has already made every entry stale; this also gives back the working
         // set, whose textures are the old canvas's size — and the bind groups
         // with it, which name a layer array this method is about to replace.
-        self.effects.forget_all();
+        // The store is about to be replaced wholesale, so the pages these
+        // slices held go with it — there is nothing to hand back to a pool
+        // that will not exist. Every other caller releases; see
+        // `EffectCache::forget_all`.
+        let _ = self.effects.forget_all();
         // Its base and its floating copy are canvas-sized and its rectangles
         // name pixels that no longer exist. Thrown away rather than resampled,
         // for the reason the scratch is: a half-finished gesture has no meaning
@@ -7906,7 +8018,7 @@ impl CanvasRenderer {
             // produced before this feature existed, entry for entry — the
             // regression that matters most. Nothing is allocated and the scratch
             // is given back.
-            self.effects.forget_all();
+            self.release_effect_pages(queue);
             return plain(0);
         }
 
@@ -7920,7 +8032,7 @@ impl CanvasRenderer {
             .unwrap_or(0);
         if base <= highest {
             log::error!("effect slices would start at {base}, over slot {highest} in use");
-            self.effects.forget_all();
+            self.release_effect_pages(queue);
             self.effects.dropped = wanted.len();
             return plain(wanted.len());
         }
@@ -7939,7 +8051,7 @@ impl CanvasRenderer {
             // and, in a release build, a fresh 256-slice array allocated and
             // copied every frame.
             log::warn!("no slices left for effects: they start at {base} of {MAX_SLOTS}");
-            self.effects.forget_all();
+            self.release_effect_pages(queue);
             self.effects.dropped = wanted.len();
             return plain(wanted.len());
         }
@@ -8015,7 +8127,9 @@ impl CanvasRenderer {
         self.trim_effect_scratch(&drawn);
 
         if self.effects.base != base {
-            self.effects.forget_entries();
+            for slot in self.effects.forget_entries() {
+                self.release_slot(queue, slot);
+            }
             self.effects.base = base;
         }
 
@@ -8029,7 +8143,9 @@ impl CanvasRenderer {
             .iter()
             .map(|(i, e)| (stack[*i].draw.slot, stack[*i].draw.mask, e.kind))
             .collect();
-        self.effects.retain_only(&keys);
+        for slot in self.effects.retain_only(&keys) {
+            self.release_slot(queue, slot);
+        }
         let mut slots = Vec::with_capacity(drawn.len());
         for key in &keys {
             match self.effects.slot_for(*key, capacity) {
@@ -8039,7 +8155,7 @@ impl CanvasRenderer {
                     // is a subset of it. Named rather than unwrapped because the
                     // failure is a draw pointing at a slice nobody wrote.
                     log::error!("no effect slice for {key:?}");
-                    self.effects.forget_all();
+                    self.release_effect_pages(queue);
                     self.effects.dropped = wanted.len();
                     return plain(wanted.len());
                 }
@@ -8129,7 +8245,7 @@ impl CanvasRenderer {
             // with it, so the next frame rebakes from nothing rather than
             // trusting a stamp recorded for a pass that did not run.
             log::error!("effect bake abandoned: {what}");
-            self.effects.forget_all();
+            self.release_effect_pages(queue);
             self.effects.dropped = wanted.len();
             return plain(wanted.len());
         }
@@ -8505,24 +8621,26 @@ impl CanvasRenderer {
         // viewport of its target every time, so an effect's pixels are a whole
         // canvas by construction and there is nothing sparse to save; and an
         // owned page is identity-mapped, so the pass targets it with the
-        // viewport and the origins it always used. See [`PageUse`]. The pages
-        // come back through `EffectCache::forget_all` and `retain_only`, which
-        // is where an effect slice was always released.
-        {
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("effect-promote"),
-            });
-            let slices: Vec<u32> = steps
-                .iter()
-                .filter_map(|s| match s.target {
-                    EffectTarget::Slice(slot) => Some(slot),
-                    _ => None,
-                })
-                .collect();
-            for slot in slices {
-                self.promote(device, queue, &mut enc, slot);
-            }
-            queue.submit(Some(enc.finish()));
+        // viewport and the origins it always used. See [`PageUse`].
+        //
+        // **Into the caller's encoder, and that is not tidiness.** A promotion
+        // can grow the atlas, and `ensure_pages` records the old-to-new copy
+        // into whatever encoder it is handed; on its own, submitted here, that
+        // copy would run *before* everything already in the frame's encoder —
+        // which in `render` is `draw_float`'s write to the float's preview page,
+        // recorded several statements earlier. It would land in the texture the
+        // growth had just replaced. See `ensure_pages`, and
+        // `a_growth_part_way_through_an_encoder_keeps_what_was_recorded_before_it`,
+        // which drives the same rule through `back_tiles`.
+        let slices: Vec<u32> = steps
+            .iter()
+            .filter_map(|s| match s.target {
+                EffectTarget::Slice(slot) => Some(slot),
+                _ => None,
+            })
+            .collect();
+        for slot in slices {
+            self.promote(device, queue, encoder, slot);
         }
         // **After the promotion, not before**, because a promotion may grow the
         // atlas and the working set's bind groups name the array view. Built
@@ -8771,6 +8889,10 @@ impl CanvasRenderer {
             merged_target: None,
             abandoned: false,
             failed: false,
+            // Filled in per step by `drive_capture`, which is where the slot is
+            // known. The flattened preview is contiguous and has neither.
+            gaps: Vec::new(),
+            empty: [0; 4],
         });
         true
     }
@@ -8825,46 +8947,25 @@ impl CanvasRenderer {
                 self.capture = Some(job);
                 return;
             }
-            // **The band is filled with the slot's empty value first, then the
-            // fragments that are stored land on top.** A layer's texels are
-            // tiled, so a canvas-wide band is not one contiguous copy; what is
-            // not backed has to read as the slot's own empty value rather than
-            // as whatever the atlas cell holds, which would be another layer's
-            // paint in this one's autosaved file.
-            //
-            // `clear_buffer` writes zeroes, which is [`SlotClass::Layer`]'s
-            // empty value and not a mask's — and that is why a **mask** is the
-            // one class this cannot yet capture sparsely. It is not reachable:
-            // `Thumbs`, the save and the autosave read mask slices that arrive
-            // fully backed, from an import's single canvas piece or from a
-            // stroke. The assertion is what says so out loud rather than
-            // leaving it to be discovered.
-            debug_assert!(
-                self.class_of(slot) == SlotClass::Layer
-                    || self.layers.backed(slot).count()
-                        == self.layers.grid.tiles_per_page() as usize,
-                "a partly-backed mask cannot be captured: slot {slot}"
-            );
+            // **What is not stored is filled in on the way out**, by
+            // `copy_chunk`, from the slot's own empty value — see
+            // [`Capture::gaps`] for why that is there rather than a
+            // `clear_buffer` here. Recorded per step, because it is the step's
+            // slot whose residency it describes.
+            job.empty = self.class_of(slot).empty_bytes();
+            if job.state == StepState::Waiting && job.row == 0 {
+                job.gaps = (0..self.layers.grid.tiles.y)
+                    .flat_map(|ty| (0..self.layers.grid.tiles.x).map(move |tx| (tx, ty)))
+                    .filter(|t| !self.layers.entry(slot, *t).is_backed())
+                    .collect();
+            }
             let band = PixelRect {
                 x: 0,
                 y: band_first as u32,
                 width: job.size.x,
                 height,
             };
-            let fragments = self.layers.grid.fragments(band);
-            // **The clear is skipped where nothing is missing**, which is what
-            // keeps the fully-backed case — every mask, every float's layer,
-            // every band of a densely painted layer — at exactly the traffic it
-            // was. The buffer is a whole band, up to `readback_limit`, so a fill
-            // of it on every band of every layer would be real work added to a
-            // path whose whole budget is a millisecond a frame.
-            let gaps = fragments
-                .iter()
-                .any(|f| !self.layers.entry(slot, f.tile).is_backed());
-            if gaps {
-                encoder.clear_buffer(&buffer, 0, None);
-            }
-            for fragment in fragments {
+            for fragment in self.layers.grid.fragments(band) {
                 let entry = self.layers.entry(slot, fragment.tile);
                 if !entry.is_backed() {
                     continue;
@@ -10064,32 +10165,51 @@ impl EffectCache {
     /// parking and no undo-budget arithmetic, because no `PixelPatch` can ever
     /// name one. The working set goes too — 400 MB at 10000² is not something to
     /// hold in case somebody switches a shadow back on.
-    fn forget_all(&mut self) {
-        self.forget_entries();
+    ///
+    /// **It answers with the slots it gave up, and the caller has to hand their
+    /// pages back.** This type cannot: it holds no `LayerStore`. Before the tile
+    /// atlas that did not matter — an effect slice was a slice of an array that
+    /// never shrank either way — but a slice is a *page* now, and one left
+    /// `Owned` by a slot nothing names is a whole canvas held for the session:
+    /// 395 MB on the 20000×5000 document, per effect, until a resize. The
+    /// comment here used to claim these methods were where the release happened,
+    /// which was the one sentence a later reader would have trusted.
+    #[must_use]
+    fn forget_all(&mut self) -> Vec<u32> {
+        let released = self.forget_entries();
         self.scratch = None;
         self.dropped = 0;
+        released
     }
 
     /// Give up every slice but keep the working set, for a bake that is about to
-    /// re-run from a different `base`.
-    fn forget_entries(&mut self) {
+    /// re-run from a different `base`. See [`Self::forget_all`] for the return.
+    #[must_use]
+    fn forget_entries(&mut self) -> Vec<u32> {
+        let released = self.entries.iter().map(|e| e.slot).collect();
         self.entries.clear();
         self.free.clear();
         self.next = 0;
+        released
     }
 
-    /// Release every entry whose key nothing wants any more.
-    fn retain_only(&mut self, keys: &[(u32, Option<u32>, EffectKind)]) {
+    /// Release every entry whose key nothing wants any more. See
+    /// [`Self::forget_all`] for the return.
+    #[must_use]
+    fn retain_only(&mut self, keys: &[(u32, Option<u32>, EffectKind)]) -> Vec<u32> {
         let base = self.base;
         let free = &mut self.free;
+        let mut released = Vec::new();
         self.entries.retain(|e| {
             if keys.contains(&(e.source, e.mask, e.kind)) {
                 return true;
             }
             free.push(e.slot - base);
+            released.push(e.slot);
             false
         });
         self.free.sort_unstable();
+        released
     }
 
     /// The slice this key holds, allocating one if it does not hold any.

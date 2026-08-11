@@ -8798,3 +8798,261 @@ fn a_growth_part_way_through_an_encoder_keeps_what_was_recorded_before_it() {
         "a resident layer was lost"
     );
 }
+
+/// Every atlas cell is held by exactly one slot or is free, through a session
+/// that exercises every path which moves one.
+///
+/// **The property whose failure is silent and total**, which is why it is
+/// checked as a set rather than looked for in a pixel: a cell issued twice is
+/// one layer's paint appearing in another's, and a cell leaked is storage
+/// nothing can ever take back. Neither shows up until the two slots happen to be
+/// drawn together.
+///
+/// It is checked after *every* step rather than at the end, because the step
+/// that broke it is the whole of what a failure has to say.
+#[test]
+fn every_atlas_cell_is_held_by_one_slot_or_is_free() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+    let check = |canvas: &CanvasRenderer, step: &str| {
+        if let Err(e) = canvas.atlas_invariant() {
+            panic!("after {step}: {e}");
+        }
+    };
+    check(&canvas, "a fresh store");
+
+    write_flat(gpu, &mut canvas, 0, in_tile(0, 0), [255, 0, 0, 255]);
+    write_flat(gpu, &mut canvas, 0, in_tile(2, 1), [255, 0, 0, 255]);
+    check(&canvas, "two writes");
+
+    fill_tiled_slot(gpu, &mut canvas, 1, [0, 255, 0, 255]);
+    check(&canvas, "a full slot");
+
+    canvas.fill_layer_white(&gpu.queue, 3);
+    check(&canvas, "a new mask");
+    write_flat(gpu, &mut canvas, 3, in_tile(1, 1), [0, 0, 0, 255]);
+    check(&canvas, "painting on the mask");
+
+    canvas.clear_layer(&gpu.queue, 1);
+    check(&canvas, "clearing the full slot");
+
+    // A commit, which backs through a different door.
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.begin_frame();
+    canvas.draw_dabs(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &[dab(256.0, 300.0, 24.0, 1.0)],
+        DabStyle::default(),
+    );
+    let damage = PixelRect {
+        x: 224,
+        y: 268,
+        width: 64,
+        height: 64,
+    };
+    canvas.commit_stroke(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        0,
+        damage,
+        &[damage],
+        StrokeStyle {
+            color: Color::WHITE,
+            opacity: 1.0,
+            ..StrokeStyle::default()
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+    check(&canvas, "a commit across a boundary");
+
+    // A lift, which is the one path that **promotes** a slot that already holds
+    // tiles — the cells it moves out of have to go back to the pool, and a
+    // promotion that leaked them would be invisible to every pixel assertion.
+    let lift = in_tile(0, 0);
+    let preview = canvas
+        .begin_float(
+            &gpu.device,
+            &gpu.queue,
+            5,
+            &FloatSource {
+                slot: 0,
+                rect: lift,
+                pixels: None,
+                mask: None,
+            },
+        )
+        .expect("no room for a preview");
+    check(&canvas, "a lift");
+    assert!(canvas.backed_tiles(0) >= 6, "the lifted slot owns a page");
+    assert!(canvas.backed_tiles(preview) >= 6, "the preview owns a page");
+    canvas.end_float(&gpu.queue);
+    check(&canvas, "putting the float down");
+    assert_eq!(
+        canvas.backed_tiles(preview),
+        0,
+        "the preview kept its page after the float ended"
+    );
+
+    canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Horizontal);
+    check(&canvas, "a horizontal flip");
+    canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Vertical);
+    check(&canvas, "a vertical flip");
+
+    canvas.resize(
+        &gpu.device,
+        &gpu.queue,
+        UVec2::new(900, 400),
+        Anchor::Centre,
+        4,
+    );
+    check(&canvas, "a shrinking resize");
+
+    canvas.clear_all_layers(&gpu.queue);
+    check(&canvas, "clearing everything");
+    assert_eq!(
+        canvas.free_tiles(),
+        canvas.page_count() as usize * 4 * 2,
+        "clearing everything did not give every cell back"
+    );
+}
+
+/// A capture of a **partly-painted mask** reads what the blocking path reads.
+///
+/// **This is the defect a critic found and the sentence that hid it.** The
+/// capture used to fill its band with `clear_buffer`'s zeroes, under a comment
+/// asserting that a partly-backed mask could not arise — "every mask a save or
+/// an autosave reads is fully backed, from an import's single canvas piece or
+/// from a stroke". That stopped being true in the same change that wrote it:
+/// `fill_layer_white` became a table write, so a mask stores nothing until
+/// somebody paints on it, and *add a mask, paint on part of it* is the ordinary
+/// workflow. Zeroes on `.r` are coverage 0, so the autosaved file hid the layer
+/// everywhere the artist had not painted on its mask — while the explicit Save,
+/// which goes through `read_layer_pieces` and synthesises properly, did not.
+/// Two writers of one document disagreeing.
+///
+/// Driven on the tiled fixture, because the harness's 64-square canvas is one
+/// tile and a mask there is either wholly backed or wholly absent.
+#[test]
+fn a_capture_of_a_partly_painted_mask_reveals_what_the_save_does() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+    fill_tiled_slot(gpu, &mut canvas, 0, [200, 40, 40, 255]);
+
+    // A mask, painted on in one tile of six. This is the state the old comment
+    // said was unreachable.
+    canvas.fill_layer_white(&gpu.queue, 1);
+    write_flat(gpu, &mut canvas, 1, in_tile(0, 0), [0, 0, 0, 255]);
+    assert_eq!(canvas.backed_tiles(1), 1, "the mask is partly stored");
+    assert!(
+        canvas.backed_tiles(1) < 6,
+        "the fixture stopped being partly backed"
+    );
+
+    let draws = vec![LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+        mask: Some(1),
+        clipped: false,
+    }];
+    let full = PixelRect {
+        x: 0,
+        y: 0,
+        width: TILED_W,
+        height: TILED_H,
+    };
+    let expected: Vec<Vec<u8>> = (0..2)
+        .map(|slot| canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, full))
+        .collect();
+    // The blocking path is the reference, and it has to be right for the
+    // *mask*: full reveal is `[255; 4]`, not zeroes.
+    assert!(
+        expected[1]
+            .chunks(4)
+            .filter(|p| *p == [255, 255, 255, 255])
+            .count()
+            > 0,
+        "the reference itself reports no revealed pixel"
+    );
+
+    let (captured, _, _) = run_capture(gpu, &mut canvas, &[0, 1], &draws);
+    assert_eq!(captured.layers.len(), 2);
+    assert_eq!(
+        captured.layers[0], expected[0],
+        "the layer came back differently"
+    );
+    assert_eq!(
+        captured.layers[1], expected[1],
+        "an autosaved mask hides what a saved one reveals"
+    );
+}
+
+/// An effect that has been switched off hands its **page** back.
+///
+/// **A defect a critic found, and the comment that hid it.** An effect slice is
+/// page-backed — its pixels are a whole canvas by construction — and the code
+/// beside `promote` claimed the page came back through `EffectCache::forget_all`
+/// and `retain_only`. Neither could: that type holds no `LayerStore` and cannot
+/// reach the pool. So a drop shadow enabled and then removed left its page
+/// `Owned` by a slot nothing named, for the life of the document — 395 MB on the
+/// 20000×5000 file, per effect, until a resize.
+///
+/// Measured on the pool rather than on a pixel, because a held page is invisible
+/// in the picture: that is the whole reason it went unnoticed.
+#[test]
+fn an_effect_switched_off_gives_its_page_back() {
+    let mut h = harness_or_skip!();
+    h.fill(0, Color::WHITE);
+    let plain = layer(0, 1.0, BlendMode::Normal);
+    let frame = EffectFrame {
+        active_index: u32::MAX,
+        stroke: StrokeStyle::default(),
+        stroke_live: false,
+    };
+
+    let free_before = h.canvas.free_tiles();
+    let cast = [shadow(Color::BLACK, 180.0, 12.0)];
+    let baked = h.bake_frame(&[effected(plain, &cast)], 1, frame);
+    assert_eq!(baked.draws.len(), 2, "the shadow produced no draw");
+    assert!(
+        h.canvas.free_tiles() < free_before,
+        "the effect took no page at all, so this proves nothing"
+    );
+
+    // Switched off: the same stack with no effects on it. This is the route
+    // through `release_effect_pages`.
+    h.bake_frame(&[effected(plain, &[])], 1, frame);
+    assert_eq!(
+        h.canvas.free_tiles(),
+        free_before,
+        "the effect's page was never handed back"
+    );
+    assert!(h.canvas.atlas_invariant().is_ok());
+
+    // **And the other route, which is a different method.** Two effects, then
+    // one: the entry that is dropped goes through `retain_only`, and a guard
+    // that drove only the empty case left that one silent — demonstrated by
+    // mutation, which is how this second half came to be here.
+    let both = [
+        shadow(Color::BLACK, 180.0, 12.0),
+        outline(Color::BLACK, 4.0, OutlinePosition::Outside),
+    ];
+    let baked = h.bake_frame(&[effected(plain, &both)], 1, frame);
+    assert_eq!(baked.draws.len(), 3, "two effects produced no two draws");
+    let free_with_two = h.canvas.free_tiles();
+    let baked = h.bake_frame(&[effected(plain, &both[..1])], 1, frame);
+    assert_eq!(baked.draws.len(), 2, "the second effect is still drawn");
+    assert!(
+        h.canvas.free_tiles() > free_with_two,
+        "dropping one effect of two handed no page back"
+    );
+    assert!(h.canvas.atlas_invariant().is_ok());
+}
