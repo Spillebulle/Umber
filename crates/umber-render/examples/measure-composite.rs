@@ -1461,17 +1461,7 @@ fn sweep_canvas(
     // four `textureLoad`s agree to within the last bit rather than exactly, so
     // this reports the largest deviation rather than asserting equality — but a
     // large one means the A/B is comparing two different pictures.
-    {
-        // Offset by a fraction of a pixel deliberately. `tiles.wgsl` records
-        // that a tap landing on a texel centre comes out with weights of
-        // exactly 0 and 1 and returns exactly one stored texel — so a check at
-        // a whole offset would compare two point samples and agree exactly
-        // while saying nothing whatever about the lerp. This puts a real weight
-        // on all four taps, which is the thing that could disagree.
-        let camera = Camera {
-            center: Vec2::new(doc.x as f32 / 2.0 + 0.371, doc.y as f32 / 2.0 + 0.629),
-            zoom: 1.0,
-        };
+    for (aim, camera) in check_cameras(doc, plan.output) {
         let pivot = Vec2::new(plan.output.x as f32 / 2.0, plan.output.y as f32 / 2.0);
         gpu.queue.write_buffer(
             &uniforms,
@@ -1507,7 +1497,7 @@ fn sweep_canvas(
             // reading different texels — a shifted picture, a wrong component
             // order, or the canvas-edge clamp not being reproduced.
             println!(
-                "  check: gather against tiled on the {} store, 4 layers at 1:1 — \
+                "  check: gather against tiled, {aim}, {} store — \
                  largest channel deviation {worst} of 255{}",
                 residency.label(),
                 if worst == 0 {
@@ -1530,7 +1520,7 @@ fn sweep_canvas(
                 plan.output,
             );
             println!(
-                "  check: hw-fast against tiled on the {} store, 4 layers at 1:1 — \
+                "  check: hw-fast against tiled, {aim}, {} store — \
                  largest channel deviation {} of 255  (not exact by construction)",
                 residency.label(),
                 worst_deviation(&a, &h),
@@ -1549,7 +1539,7 @@ fn sweep_canvas(
             );
             let worst = worst_deviation(&a, &b);
             println!(
-                "  check: tiled against sampled on the dense store, 4 layers at 1:1 — \
+                "  check: tiled against sampled, {aim}, dense store — \
                  largest channel deviation {worst} of 255{}",
                 if worst <= 2 {
                     ""
@@ -1671,6 +1661,63 @@ fn sweep_canvas(
 /// machine was quiet enough for the figure beside it to mean anything.
 fn spread_pct(s: &Summary) -> f64 {
     (s.high - s.low) / s.median * 100.0
+}
+
+/// Where the equality check aims the camera, and why one aim is not enough.
+///
+/// All three are at zoom 1, so a fragment centre steps exactly one document
+/// pixel and every offset below lands a fragment where it is meant to. All
+/// three are also at a **fractional** offset, deliberately: `tiles.wgsl` records
+/// that a tap on a texel centre comes out with weights of exactly 0 and 1 and
+/// returns one stored texel, so a whole offset would compare two point samples,
+/// agree exactly, and say nothing whatever about the lerp.
+///
+/// **The interior aim alone left the left and top canvas edges untested on
+/// every canvas at least as large as the viewport**, and that is the half of the
+/// clamp `gather` has to reproduce by hand — the shipped path spells it by
+/// collapsing two taps onto one texel, which a gather cannot do, so it zeroes
+/// the weight instead. Centred at 1:1 on a 1920x1080 canvas in a 1920x1080 view,
+/// document x runs 0.87 upwards and the band `[0, 0.5)` has no fragment centre
+/// in it; on 2048² *neither* edge is on screen at all and the check tested no
+/// clamping whatsoever. It caught the mutation that drops the collapse only
+/// because the smallest fixture happens to be smaller than the viewport.
+///
+/// So the corners are aimed at explicitly rather than hoped for. `doc = screen +
+/// offset` and `offset = centre - pivot` at zoom 1, so putting `offset.x` at
+/// `-(n + 0.25)` lands fragment `n + 0.5` on document `0.25` — inside `[0, 0.5)`,
+/// which is `base = -1` and therefore the low clamp — and putting it at
+/// `w - n - 0.75` lands that fragment on `w - 0.25`, inside `[w - 0.5, w)`, which
+/// is the high clamp. Both hold whatever the canvas and the output are, which is
+/// the property the centred aim did not have.
+fn check_cameras(doc: UVec2, output: UVec2) -> Vec<(&'static str, Camera)> {
+    let pivot = Vec2::new(output.x as f32 / 2.0, output.y as f32 / 2.0);
+    // Far enough in that the corner is comfortably on screen and there is a
+    // tile boundary between it and the far edge of the view.
+    let inset = Vec2::new(200.0, 100.0);
+    let (w, h) = (doc.x as f32, doc.y as f32);
+    vec![
+        (
+            "interior at 1:1",
+            Camera {
+                center: Vec2::new(w / 2.0 + 0.371, h / 2.0 + 0.629),
+                zoom: 1.0,
+            },
+        ),
+        (
+            "the top-left corner",
+            Camera {
+                center: pivot - inset - Vec2::new(0.25, 0.4),
+                zoom: 1.0,
+            },
+        ),
+        (
+            "the bottom-right corner",
+            Camera {
+                center: pivot + Vec2::new(w, h) - inset - Vec2::new(0.75, 0.6),
+                zoom: 1.0,
+            },
+        ),
+    ]
 }
 
 /// The largest channel difference between two renderings of one frame.
