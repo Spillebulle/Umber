@@ -303,6 +303,7 @@ mod tests {
         editor.doc = umber_core::Document::new(64, 64);
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
+            &gpu.queue,
             editor.doc.size,
             wgpu::TextureFormat::Rgba8Unorm,
             editor.layers.slot_capacity_needed(),
