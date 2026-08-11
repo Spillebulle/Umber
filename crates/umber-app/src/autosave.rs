@@ -4062,9 +4062,15 @@ mod tests {
     /// **active** one, so a Save of the document in front while a background
     /// tab is being captured is the common case rather than a contrived one.
     ///
-    /// Measured by whether the capture still completes, not by reading a flag
-    /// off the scheduler: a capture the interrupt half-cancelled would still
-    /// report `capturing()`.
+    /// **The reading of `capturing_id` is what catches it, and the run to a
+    /// written file is not** — said plainly rather than left to look like two
+    /// assertions of equal weight. Once `collect` settles every canvas, a
+    /// capture wrongly given up on is simply restarted a frame later and the
+    /// file appears anyway, so the outcome cannot tell the two apart. What the
+    /// second half is for is that nothing was *stranded* on the way through.
+    /// Demonstrated by mutation: `capturing_id() != Some(id)` weakened to
+    /// `capturing_id().is_none()` fails on the first assertion and would pass
+    /// the second.
     #[test]
     fn an_interrupt_naming_another_document_leaves_the_capture_alone() {
         let Some((gpu, _serial)) = crate::gputest::lock() else {
