@@ -828,6 +828,43 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   adds) and then `clear_all_layers` (which clears every slice), so seventeen of
   twenty-one were cleared twice on the frame a document opened. With nothing
   left to grow there is one clear.
+- **A document the card cannot hold is refused with a sentence, not a crash
+  box.** `CanvasRenderer::try_reserve` pushes an `OutOfMemory` scope, creates the
+  texture, and **pops before any view is built** — a view of a failed texture is
+  `CreateTextureViewError::InvalidResource`, which classifies as *Validation*,
+  which that scope does not catch, so it reaches `crash::device_error` and panics
+  one line after the check. `LayerStore::new` builds `1 + 2 × capacity` views
+  immediately, which is why the texture creation is split into `layer_texture`.
+  The mechanism only works because `gpu::instance_descriptor` sets
+  `memory_budget_thresholds` **after** `with_env`, which silently rebuilds the
+  struct with the defaults; `for_device_loss` stays unset, because setting it
+  makes the backend deliberately *lose* the device under pressure, which is the
+  outcome a refusal exists to avoid. The device survives a caught refusal
+  (`create_texture` uses `handle_hal_error_with_nonfatal_oom`) and does **not**
+  survive one on the upload (`StagingBuffer::new` uses the fatal
+  `handle_hal_error`, which calls `lose`) — so the gate covers the array and
+  nothing else, and enabling the threshold at all makes that uncatchable path
+  *slightly more likely to fire*, because it is charged on buffers too. That is a
+  trade, not a free win. Wired at `install_import`, `add_layer` and `add_mask`;
+  `begin_float`, `resize`, File → New and the effect cache are still fatal and
+  `try_reserve`'s docs enumerate them.
+- **A refusal names what the document needs and never what the card has**,
+  because wgpu exposes no total-memory query — `generate_allocator_report`
+  reports Umber's own allocations, and the only route to the card's capacity is
+  `Adapter::as_hal`. `umber-app::vram` is the wording and a test fails the build
+  on the words that would claim one. Two sentences, because an open and a growth
+  are different events: the array alone for the first, `c + n` for the second,
+  since a growth holds the array it replaces at the same instant. The remedy
+  leads with **closing other applications**, because what is refused is a share
+  of a budget every process on the machine draws from, and that is the only lever
+  that costs the artist nothing.
+- **Ask the stack's own limits before asking the device.** Reserving ahead of
+  them grows the array for a layer the model is about to decline, and where the
+  growth is what fails it answers a full stack with a sentence about graphics
+  memory — the refusal naming the wrong bound. `slot_capacity_after_one_claim` is
+  what a reservation asks for, and it is **not** `slot_capacity_needed() + 1`: a
+  delete parks its slice and an eviction gives the number back, so a claim that
+  fills a gap needs no storage and reserving for it wastes 400 MB at 10000².
 - **A mask is another slice of the *same* layer array, not a second
   `R8Unorm` one.** It costs 3 bytes a pixel on a texture most documents never
   allocate, and buys that a mask *is* a layer to `read_layer_pieces`,
@@ -3688,6 +3725,16 @@ method rather than as an anecdote:
   mutate the code it claims to cover.** Commit first, so `git checkout --`
   reverts the mutation and not your work — that collision is now routine enough
   to be worth the habit.
+- **A source-text guard must not match its own source.** The scan for "no view
+  is built before the scope is popped" found the function by
+  `l.contains("fn try_reserve(")` — a line that itself contains the sentinel, so
+  a rename stopped the scan at the test rather than exhausting the iterator, and
+  the rename detector was dead in exactly the case it existed for.
+  `concat!("fn ", "try_reserve(")` splits it. Two more rules came with it:
+  `include_str!` hands back the file **as it sits on disk**, so a scan slicing on
+  `"\n}\n"` is green on an LF checkout and red on a CRLF one; and the scan must
+  cover the *helper* as well as the function, because a `create_view` moved one
+  call deep puts the panic back with the scan still passing.
 
 `composite_pixel` runs the real composite pass into an offscreen target, which
 is the only way to test layer opacity and blend modes. Two things to copy when
