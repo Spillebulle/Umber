@@ -1458,6 +1458,7 @@ impl Capture {
     /// layer is actually re-read, because until then the pass has not composited
     /// it yet and marking it early would buy a second whole-canvas read of a
     /// preview that was going to be right anyway.
+    ///
     /// The test is against the **linear cursor** and not against
     /// [`Self::reading`]: once the pass is over `step` is `steps()`, so every
     /// index counts as read — including the ones a re-read of some lower step
