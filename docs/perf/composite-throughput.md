@@ -1233,10 +1233,18 @@ that finds out the hard way.
 
 ### 8.5 Where the numbers go
 
-Back into §1 and §2 of this document, replacing the arithmetic. Re-run before
-quoting any of them, on a machine that is not building six other things — which
-is `measure-clipboard.rs`'s recorded lesson and is why the first figures written
-into these docs were three times too slow.
+**§11 now holds them**, and this paragraph's instruction was not followed
+exactly: they went into a section of their own rather than back into §1 and §2,
+because the sweep that has been run answers a different question from the one §2
+asks. §2 prices the composite in taps and bandwidth; §11 prices the *atlas
+against the dense slice it replaced*, which is the question the tile atlas
+landing made urgent and which §2 predates. Overwriting §2's arithmetic with it
+would have replaced an unverified claim with an answer to something else.
+
+The rest stands. Re-run before quoting any of them, on a machine that is not
+building six other things — which is `measure-clipboard.rs`'s recorded lesson,
+why the first figures written into these docs were three times too slow, and
+what the first pass of this very sweep reproduced.
 
 ---
 
@@ -1328,3 +1336,170 @@ recommendation may and may not do:
   not knowable by reading. The `measure-composite.rs` of §8 is the harness that
   would price it, and it should be written in a shape that can take a second
   pipeline as another column.
+
+---
+
+## 11. What the measurement said
+
+§8 was written before `measure-composite.rs` existed. It exists now, and this
+section is its output. **Everything in §1 and §2 above is still arithmetic** —
+this section does not rewrite it, because the two ask different questions: §2
+counts taps and bandwidth, and what follows is wall clock on one machine. Where
+they disagree, the run wins.
+
+Re-run before quoting any of it. `measure-clipboard.rs`'s recorded lesson is
+that the first figures written into these documents were three times too slow
+because the machine was building six other things at the time, and the first
+pass of this sweep reproduced exactly that: spreads of ±100% to ±289% on cells
+that read ±2% on a quiet machine.
+
+```sh
+cargo run --release -p umber-render --example measure-composite -- \
+    --sizes 1920x1080,2048x2048,4096x4096 --layers 1,8,16,32,54 \
+    --zooms fit,0.25,1 --budget 8 --repeat 2
+```
+
+**The machine.** RTX 3080, Vulkan, output 1920x1080, 32 passes per submit,
+median of 25 samples after 5. The noise floor — an empty submit and fence — is
+0.080 ms, which over 32 passes is 0.0025 ms per pass, so every figure below is
+two to three orders of magnitude above what the instrument can resolve. Two
+rounds; the figures quoted are round 2, and round 1 agrees to within 0.03 ms
+wherever its own spread was under 10%.
+
+### 11.1 The answer depends on zoom, and the crossover is about 0.75
+
+Ratios are **tiled ÷ sampled**, so below 1.0 the atlas is faster. 54 layers,
+which is the artist's document. "Realistic" is 13.5% of tiles backed, the
+corpus figure, in a genuinely packed atlas.
+
+| canvas | zoom | dense | realistic (blob) | realistic (scatter) |
+|---|---|---|---|---|
+| 1920x1080 | 1.0 | **1.98x** | 1.25x | 1.21x |
+| 1920x1080 | 0.25 | 1.04x | **0.30x** | 0.29x |
+| 2048² | 1.0 | 2.11x | 1.29x | 1.27x |
+| 2048² | fit (0.527) | 1.06x | 0.53x | 0.53x |
+| 2048² | 0.25 | 1.02x | 0.25x | 0.22x |
+| 4096² | 1.0 | 1.98x | 1.36x | 1.23x |
+| 4096² | fit (0.264) | 1.03x | **0.24x** | 0.24x |
+| 4096² | 0.25 | 1.02x | 0.19x | 0.17x |
+
+Swept continuously at 2048² and 54 layers, the realistic ratio is 0.25x at
+zoom 0.125, 0.37x at 0.25, 0.60x at 0.5, **0.96x at 0.75**, 1.29x at 1.0, and
+flat above that. So **the atlas is a loss at working zoom and a large win
+zoomed out, and the two swap at about 0.75.**
+
+Note the one confound, so nobody re-derives it: at a 1920x1080 canvas in a
+1920x1080 view "fit" *is* 1.0, so that row's fit and 1.0 entries are the same
+measurement and neither contains any minification.
+
+### 11.2 In milliseconds, which is what a frame is spent in
+
+54 layers, 1920x1080 output. A 60 Hz frame is 16.7 ms and a 144 Hz frame 6.9 ms.
+
+| case | sampled | tiled | the atlas costs |
+|---|---|---|---|
+| 1920x1080 at 1:1, dense | 1.26 ms | 2.49 ms | **+1.23 ms** (7.4% of 60 Hz) |
+| 1920x1080 at 1:1, realistic | 1.27 ms | 1.60 ms | +0.33 ms (2.0%) |
+| 4096² at fit, dense | 4.54 ms | 4.65 ms | +0.11 ms |
+| 4096² at fit, realistic | 4.54 ms | 1.08 ms | **−3.46 ms** |
+
+**A mask on every layer doubles the taps and moves the loss the wrong way**: at
+1:1 the dense ratio goes to 2.16x (1920x1080) and 2.38x (4096²), the realistic
+to 1.34–1.38x. At 4096² fit it goes the other way, to 0.16x, because the mask's
+tiles are unbacked too.
+
+The ratio also **grows with layer count**, because the per-fragment work the
+loop does not repeat — the checkerboard, the sRGB encode, the backdrop — dilutes
+it: at 1920x1080 and 1:1 it is 1.23x at one layer, 1.33x at 8, 1.77x at 16,
+1.88x at 32 and 1.98x at 54.
+
+### 11.3 It is not the page table. It is the four loads.
+
+This is the finding that should decide what happens next, and the `table`
+variant is what isolates it: it does the page-table read and the unbacked branch
+and returns without touching the atlas. At 1920x1080, 1:1, 54 layers, dense:
+
+| | ms | what it adds |
+|---|---|---|
+| `table` — loop, ALU, page-table read | 1.18 | — |
+| `sampled` — the above plus one hardware bilinear tap | 1.26 | **+0.08 ms** |
+| `tiled` — the above plus four `textureLoad`s and the lerp | 2.49 | **+1.31 ms** |
+
+**The dependent page-table read is nearly free** — a slot's table slice is
+`tiles.x × tiles.y × 4` bytes, 6.4 KB for this canvas, so the whole table for 54
+slots is cache-resident and the latency the design worried about never
+materialises. What costs is the hand-reconstructed tap: four scalar
+`textureLoad`s and a lerp against one TMU instruction, and the ratio between
+them is about **16x**.
+
+That is indicative rather than exact — `table` returns a tile-uniform value and
+so is not a perfect "everything but the fetch" control — but the gap is an order
+of magnitude and no plausible correction closes it.
+
+**So `tiles.wgsl`'s refusal of the apron is what this costs**, and that refusal
+is now priced rather than argued. The apron was rejected because a *stale* one
+is "the real risk in the whole design" — a one-texel seam appearing only at some
+zooms on some layers because one writer forgot to refresh it — and because
+dropping it makes a tile's pitch equal its size, which is what lets a page be the
+canvas rounded up and never larger than a limit the canvas was already inside.
+Both arguments stand. What has changed is that the bill is a number: **+1.31 ms
+per frame at 54 layers on a fully painted 1920x1080 document, and +0.33 ms on a
+realistic one.**
+
+`textureGather` is the obvious cheaper middle and is **unmeasured**: it fetches
+the four texels of a bilinear footprint in one instruction per channel, and
+inside `tile_bilinear`'s existing single-tile fast path — 99.2% of samples — the
+addressing could be clamped by hand first, so no apron is needed. Whether four
+gathers beat sixteen scalar loads on this hardware is a question for the next run
+of this example, not a recommendation.
+
+### 11.4 Why the zoomed-out win is a residency win, not a tiling win
+
+At 4096² and fit the *dense* tiled column is 4.65 ms against the sampled
+4.54 ms — parity. The realistic one is 1.08 ms. So nothing about tiling is making
+the zoomed-out case fast; what makes it fast is that 86% of tiles are unbacked
+and issue **no fetch at all**, where a dense slice is sampled whatever it holds.
+The composite loop has no alpha early-out — that is R1's territory, §3.1 — so the
+sampled path cannot have this win at any residency.
+
+Two consequences. A dense store could never have been made fast here by elision
+at the *layer* level, because these layers are all visible and all contribute.
+And the win is proportional to sparsity, which `survey-residency` measures as
+**6.4% to 25% for every document over 1 GB dense** — so it is the large
+documents, the ones that motivated the whole programme, that get it.
+
+### 11.5 What this says about Stage 6
+
+`docs/perf/roadmap.md` Stage 6 parks R7 (the proxy), R5 (the screen cache), R6
+(dirty regions) and `layer-residency.md` behind this measurement.
+
+- **R7, the proxy array: do not build it.** It exists for the zoomed-out case,
+  and the zoomed-out case is now the one the atlas is 4–6x *faster* in on a
+  realistic document and at parity in on a dense one. §10 already listed "whether
+  R1, R2 and R5 together put fit-to-view inside a frame without the proxy" as the
+  condition that would retire it; residency answered it instead. It is also the
+  only item in the programme that can make the picture worse — the unfiltered
+  band of §4.5a, the pop of §4.0, the seam of §4.5b — so retiring it on evidence
+  is the best available outcome. **The revival condition is narrow and should be
+  written down**: a large, *densely* painted document that is slow at fit. 4096²
+  fully painted at 54 layers is 4.65 ms at fit, which is real; the corpus says
+  documents that large are 6.4–25% covered, so nobody has one.
+- **R6, dirty-region compositing: now the best-value item in the programme, and
+  the atlas raised its value rather than lowering it.** Everything R6 helps is at
+  working zoom, which is exactly where the atlas costs 1.25x to 2.1x. It also has
+  a live consumer this document did not have when it was written: the selection
+  marquee now animates at `ANT_SPEED`'s sixteen frames a second for as long as
+  anything is selected, so a 54-layer document with a selection standing spends
+  16 × 1.6 ms every second recompositing nothing that changed.
+- **R5, the screen-space cache: keep it designed, below R6.** Same argument — it
+  hits at a still camera at working zoom, where the composite just got about
+  twice as expensive — but its miss path is a pan, which is the gesture a painter
+  spends most of their navigation in, and R6 covers the still-camera case too
+  without that failure mode.
+- **`layer-residency.md`'s remaining stages**: the composite side of it is what
+  has just been measured and it is doing its job. Nothing here argues for or
+  against the host-memory half.
+
+The ranking that comes out of this is therefore **R6, then the apron or
+`textureGather` question, then R5, and not R7.** The middle one is new and is not
+in the roadmap at all, which is what a measurement is for.
