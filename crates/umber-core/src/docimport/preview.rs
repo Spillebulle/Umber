@@ -384,6 +384,60 @@ mod tests {
         assert_eq!(panorama.fit_within(64).size, UVec2::new(64, 1));
     }
 
+    /// **A page is taller than it is wide, and every case above is not.**
+    ///
+    /// "Neither edge is past `max_edge`" is a claim about both edges, and every
+    /// preview the test above drives is landscape — so the scale could have
+    /// been divided by the *width* rather than by the longer edge and nothing
+    /// would have said so. Mutating `w.max(h)` to `w` left all 1,127 tests in
+    /// this crate green, and would have given every A4-shaped document a
+    /// thumbnail overflowing the box Explorer asked for: 181x256 into a 256
+    /// box becomes 256x362.
+    ///
+    /// So this is portrait, and it asserts the bound rather than only the
+    /// arithmetic — the same rule read the way a caller reads it. The square
+    /// case is here for the same reason: it is the one shape under which the
+    /// two readings agree, so its presence beside the others is what shows the
+    /// others are doing work.
+    #[test]
+    fn a_page_taller_than_it_is_wide_still_fits_the_box() {
+        // A4 at 181x256 is the proportion of the documents this is most often
+        // asked for, and 256 is what a file manager asks for.
+        let page = Preview::new(1810, 2560, vec![0; 1810 * 2560 * 4]).expect("a preview");
+        assert_eq!(page.fit_within(256).size, UVec2::new(181, 256));
+
+        // The mirror of the panorama above: a column, whose *width* would round
+        // away to nothing.
+        let column = Preview::new(5, 10000, vec![0; 5 * 10000 * 4]).expect("a preview");
+        assert_eq!(column.fit_within(64).size, UVec2::new(1, 64));
+
+        // Square is where dividing by the width and dividing by the longer edge
+        // cannot be told apart, which is exactly why it is not on its own.
+        let square = Preview::new(1000, 1000, vec![0; 1000 * 1000 * 4]).expect("a preview");
+        assert_eq!(square.fit_within(64).size, UVec2::new(64, 64));
+
+        // The property the caller actually depends on, over both orientations
+        // and a box each side of the awkward ratios.
+        for (w, h) in [(1810, 2560), (2560, 1810), (5, 10000), (10000, 5), (7, 9)] {
+            for box_edge in [1, 16, 64, 256] {
+                let fitted = Preview::new(w, h, vec![0; (w * h * 4) as usize])
+                    .expect("a preview")
+                    .fit_within(box_edge);
+                assert!(
+                    fitted.size.x <= box_edge && fitted.size.y <= box_edge,
+                    "{w}x{h} into {box_edge} came back {}x{}, which is past the \
+                     box a thumbnail host asked it to fit inside",
+                    fitted.size.x,
+                    fitted.size.y
+                );
+                assert!(
+                    fitted.size.x >= 1 && fitted.size.y >= 1,
+                    "{w}x{h} into {box_edge} lost an axis"
+                );
+            }
+        }
+    }
+
     /// A buffer that does not match the size it claims is refused rather than
     /// handed on to whatever draws it.
     #[test]
