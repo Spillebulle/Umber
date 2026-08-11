@@ -6412,8 +6412,9 @@ fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
 ///
 /// **The list of routes is the point, and this test used to drive three of
 /// them.** There are two mechanisms and eleven routes a document can reach:
-/// `touch_slot`, called from nine places, and `touch_all_slots`, called from
-/// `resize` and `clear_all_layers`. The guard covered `commit_stroke`'s
+/// `touch_slot`, whose ten call sites include nine a document reaches, and
+/// `touch_all_slots`, called from `resize` and `clear_all_layers`. The guard
+/// covered `commit_stroke`'s
 /// ordinary arm, `clear_layer` and `write_layer_rect` — while its own first
 /// sentence, and `thumbs.rs`'s module docs, both said "every". Deleting the
 /// increment in `flip_layers`, in `fill_layer_white`, in `commit_float`, or in
@@ -6429,8 +6430,9 @@ fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
 /// sites would have left the sentence "every route" false again, for a route
 /// that costs *every* slice at once.
 ///
-/// So the routes are enumerated here rather than described. The three that are
-/// *not* driven are named with the reason:
+/// So the routes are enumerated here rather than described. This test drives
+/// nine of the eleven; the other two are named with the reason, and so is the
+/// one call site that is not among the eleven at all:
 ///
 /// * `draw_float`, which writes the float's **preview** slice every frame of a
 ///   drag. It is covered, by `a_dragged_float_carries_the_effect_derived_from_
@@ -6440,9 +6442,10 @@ fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
 /// * `clear_all_layers`, `touch_all_slots`'s other caller. It runs when a
 ///   document is first built, before any thumbnail of it exists, so there is no
 ///   cached picture for it to invalidate; the resize below drives the same line.
-/// * `write_entry`, which is reachable only from `unback_tile_for_test` and
-///   `borrow_tile_for_test`. No document reaches it, so a thumbnail cannot go
-///   stale through it.
+/// * `write_entry` is `touch_slot`'s **tenth** call site and is deliberately
+///   not one of the eleven: it is reachable only from `unback_tile_for_test`
+///   and `borrow_tile_for_test`, so no document reaches it and no thumbnail can
+///   go stale through it.
 #[test]
 fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
     let Some(mut h) = Harness::new() else { return };
