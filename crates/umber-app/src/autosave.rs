@@ -3058,6 +3058,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&documents);
     }
 
+    /// A capture that was given up on leaves nothing behind for the next one.
+    ///
+    /// The slices are encoded on the writer thread as they arrive, so between
+    /// captures that thread is holding state — and a capture can end two ways:
+    /// [`Autosave::finish`], which consumes it, and [`Autosave::abandon`], which
+    /// is a resize, a close or an explicit Save. Missing the second half leaves
+    /// one capture's images standing while the next fills in around them, and
+    /// the sharp end of that is `Encoded::failed`: a slice that would not encode
+    /// refuses the *whole* document, so a good document would be refused
+    /// afterwards for a reason belonging to one nobody kept.
+    ///
+    /// **What this can and cannot discriminate, said rather than implied.**
+    /// Both `abandon` and `begin` clear the writer, so it fails only when both
+    /// are taken away — it cannot single out either. That is deliberate rather
+    /// than a gap in the fixture: `begin`'s clear is what makes the invariant
+    /// *local*, so a third way of ending a capture cannot leak, and `abandon`'s
+    /// is what makes the release *prompt* — without it an abandoned capture's
+    /// PNGs stand until the next one begins, which is five minutes, or for ever
+    /// if the document was closed. **The promptness is covered by nothing**,
+    /// because the state lives in the thread and nothing here can see it.
+    ///
+    /// It drives the real writer, because the accumulator it is about is that
+    /// thread's own.
+    #[test]
+    fn a_capture_given_up_on_leaves_nothing_behind_for_the_next() {
+        let internal = scratch("abandon-internal");
+        let session = session_of(1);
+        let id = session.active_id();
+
+        let mut autosave = Autosave {
+            interval: Duration::ZERO,
+            expiry: None,
+            // Never the real one: a test must not write a marker into somebody's
+            // data folder, where their next start of Umber would find it.
+            marks_dir: Some(scratch("abandon-sessions")),
+            ..Autosave::default()
+        };
+        autosave.next_due(Instant::now(), true, &session);
+        let ours = internal.join("Untitled 1-3333333333333333.ora");
+        autosave.docs.get_mut(&id).expect("a record").internal = Some(ours.clone());
+
+        let mut doc = candidate(id, "Untitled 1");
+        doc.size = UVec2::ONE;
+
+        // A capture that comes home with a slice the encoder refuses — a
+        // wrong-sized buffer is the reachable shape of it — and is then given
+        // up on rather than finished.
+        autosave.begin(doc.clone());
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 0,
+            size: UVec2::splat(4),
+            pixels: vec![0; 7],
+        });
+        autosave.abandon();
+
+        // And a perfectly ordinary one behind it.
+        autosave.begin(doc);
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 0,
+            size: UVec2::ONE,
+            pixels: vec![200, 40, 40, 255],
+        });
+        autosave.finish(
+            DocumentCapture {
+                size: UVec2::ONE,
+                merged: vec![200, 40, 40, 255],
+            },
+            Instant::now(),
+        );
+
+        let mut reports = Vec::new();
+        for _ in 0..4000 {
+            reports.extend(autosave.poll());
+            if !reports.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "a document was refused for a reason belonging to a capture nobody kept: {reports:?}"
+        );
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Written { .. })),
+            "nothing was written at all: {reports:?}"
+        );
+        assert!(ours.exists(), "the internal copy was never written");
+
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
     /// Every slice lands on the layer it came off, mask and all.
     ///
     /// **What a byte comparison cannot see is the *mapping*.** The slices are
