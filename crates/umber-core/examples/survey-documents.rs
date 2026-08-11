@@ -19,11 +19,14 @@
 //! re-derive is a figure that goes stale, and this class of report will arrive
 //! again. The next import refusal gets diagnosed in one command.
 //!
-//! **This decodes.** [`docimport::import`] is the only public way in and it
-//! reads every layer into a canvas-sized buffer, so a large stack is many
-//! gigabytes of host memory — 12.3 GB for one file in the folder this was
-//! written against. Rows are printed as they finish and each document is freed
-//! before the next is read, so a run that dies names the file that killed it.
+//! **This decodes**, and the two memory columns are what it is now worth
+//! running for. [`docimport::import`] used to read every layer into a
+//! canvas-sized buffer — 12.3 GB for one file in the folder this was written
+//! against — and the piece contract made it read the rectangles the file
+//! actually holds instead. `dense` is the old figure, `held` is the new one,
+//! and the ratio between them is the whole of Stage 2 measured on real work.
+//! Rows are printed as they finish and each document is freed before the next
+//! is read, so a run that dies names the file that killed it.
 //! `--only <substring>` is how one suspect file gets read on its own.
 //!
 //! One reading to be careful with: the entry count is what *loaded*, not what
@@ -39,13 +42,24 @@ fn gigabytes(bytes: u64) -> String {
     format!("{:.1}GB", bytes as f64 / 1e9)
 }
 
-/// What a document costs to hold, which is what the byte bound is about.
+/// What a document *would* have cost when every reader densified: one canvas
+/// per painted layer.
 ///
 /// Folders are excluded deliberately: one holds no slot and no buffer, so
-/// charging it a canvas is the bug this example was written to expose.
-fn painted_bytes(doc: &ImportedDocument) -> u64 {
+/// charging it a canvas is the bug this example was written to expose. Kept as
+/// a column rather than deleted, because it is the figure `check_bounds` used
+/// to compare and the one every refusal anybody remembers was stated in.
+fn dense_bytes(doc: &ImportedDocument) -> u64 {
     let painted = doc.layers.iter().filter(|l| !l.folder).count();
     u64::from(doc.size.x) * u64::from(doc.size.y) * 4 * painted.max(1) as u64
+}
+
+/// What the document actually holds: the sum of every layer's pieces.
+///
+/// This is what `MAX_TOTAL_BYTES` is now compared against, and what the host
+/// really allocates.
+fn held_bytes(doc: &ImportedDocument) -> u64 {
+    doc.layers.iter().map(|l| l.pixel_bytes()).sum()
 }
 
 fn main() {
@@ -70,12 +84,13 @@ fn main() {
     files.sort();
 
     println!(
-        "{:<44} {:>11} {:>4} {:>4} {:>4} {:>8}  verdict",
-        "file", "canvas", "ent", "fld", "pix", "mem"
+        "{:<44} {:>11} {:>4} {:>4} {:>4} {:>8} {:>8} {:>6}  verdict",
+        "file", "canvas", "ent", "fld", "pix", "dense", "held", "held%"
     );
-    println!("{}", "-".repeat(112));
+    println!("{}", "-".repeat(128));
 
     let mut refused = 0usize;
+    let (mut dense_total, mut held_total) = (0u64, 0u64);
     for path in &files {
         let name = short(path);
         // Printed before the read, so a document that takes the process down
@@ -86,26 +101,37 @@ fn main() {
             Ok(doc) => {
                 let entries = doc.layers.len();
                 let folders = doc.layers.iter().filter(|l| l.folder).count();
+                let (dense, held) = (dense_bytes(&doc), held_bytes(&doc));
+                dense_total += dense;
+                held_total += held;
                 println!(
-                    "{:>5}x{:<5} {entries:>4} {folders:>4} {:>4} {:>8}  opens{}",
+                    "{:>5}x{:<5} {entries:>4} {folders:>4} {:>4} {:>8} {:>8} {:>5.1}%  opens{}",
                     doc.size.x,
                     doc.size.y,
                     entries - folders,
-                    gigabytes(painted_bytes(&doc)),
+                    gigabytes(dense),
+                    gigabytes(held),
+                    100.0 * held as f64 / dense.max(1) as f64,
                     note(&doc, only.is_some()),
                 );
             }
             Err(e) => {
                 refused += 1;
                 println!(
-                    "{:>11} {:>4} {:>4} {:>4} {:>8}  REFUSED: {e}",
-                    "-", "-", "-", "-", "-"
+                    "{:>11} {:>4} {:>4} {:>4} {:>8} {:>8} {:>6}  REFUSED: {e}",
+                    "-", "-", "-", "-", "-", "-", "-"
                 );
             }
         }
     }
-    println!("{}", "-".repeat(112));
-    println!("{} files; {refused} refused", files.len());
+    println!("{}", "-".repeat(128));
+    println!(
+        "{} files; {refused} refused; {} dense, {} held ({:.1}%)",
+        files.len(),
+        gigabytes(dense_total),
+        gigabytes(held_total),
+        100.0 * held_total as f64 / dense_total.max(1) as f64,
+    );
 }
 
 /// Warnings summarised rather than listed: a forty-layer document with a mask
