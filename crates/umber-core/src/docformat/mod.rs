@@ -220,6 +220,12 @@ pub const EXTENSION: &str = "ora";
 /// case this attribute exists for. An older build now refuses the document
 /// instead, and says which version it would need.
 ///
+/// **A mask no longer declares 2, and this paragraph is history rather than the
+/// rule.** Its coverage became linear at 4 and [`required_version`] answers 4
+/// for one; what still declares 2 is clipping alone. Left standing because 2 is
+/// what the *bar* was set by and the reasoning is still the reasoning — a file
+/// somebody wrote at 2 is still out there and still read.
+///
 /// A lock and a link did **not** earn it and ride along on the same revision.
 /// An older build that drops them shows the identical picture; what it loses is
 /// a promise about what the artist can do to it next, which is recoverable by
@@ -238,12 +244,42 @@ pub const EXTENSION: &str = "ora";
 /// nothing but open and save. That is exactly the property masks and clipping
 /// were refused for.
 ///
+/// **4 is a mask's coverage becoming linear**, and it is the one revision here
+/// that is not about something an older build would *drop*. It is about
+/// something an older build would **show wrongly**, which is a worse failure and
+/// therefore an easier call. A mask slice used to hold sRGB-encoded coverage,
+/// inherited from the layer array it borrows a slice of rather than chosen for
+/// it, and it now holds the linear multiplier every source format and every
+/// consumer already meant — 256 reachable states against 183. The byte in
+/// `umber/masks/` goes in raw at both ends, so its *meaning* moved with it: a
+/// build reading revision 3 would take the new byte for the old form and
+/// decode it through the transfer function, putting every mask in the document
+/// a full gamma curve out. A layer the artist hid by half would come back hidden
+/// by four fifths — visibly, silently, on a picture that opened without a word.
+/// So an older build refuses the file instead.
+///
+/// The other direction is handled rather than refused: this build reads a
+/// revision-3 mask and converts it, in `docimport::srgb::decode_v3_mask_buffer`,
+/// which states what that costs. It is **not** a lossless round trip and is not
+/// claimed to be.
+///
 /// **`docs/group-compositing.md` §4.3 also proposes 3, for a folder with an
-/// opacity or a blend mode of its own. Effects landed first and took 3, so
-/// group compositing takes 4.** Only one feature can have a number, and the
-/// decision belongs in whichever lands second rather than to
-/// [`required_version`] to reconcile.
-pub const VERSION: u32 = 3;
+/// opacity or a blend mode of its own. Effects landed first and took 3; this
+/// took 4, so group compositing takes 5.** Only one feature can have a number,
+/// and the decision belongs in whichever lands next rather than to
+/// [`required_version`] to reconcile. That document still says 4 and has not
+/// been rewritten here, because it is somebody's design and this is a comment.
+pub const VERSION: u32 = 4;
+
+/// The first revision whose mask bytes are the linear multiplier.
+///
+/// Named rather than written as a literal because **two** readers have to agree
+/// about it and they are in different modules: a layer's mask entry under
+/// `umber/masks/`, and a mask patch inside a saved undo history. A document that
+/// declares less than this holds the sRGB form in both, and one that declares
+/// this or more holds the linear form in both — there is no file in which they
+/// differ, because they are written by the same save.
+pub const LINEAR_MASK_VERSION: u32 = 4;
 
 /// The lowest revision that describes `layers`.
 ///
@@ -282,10 +318,18 @@ fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
     let layers = || layers.iter().filter(|l| !l.folder);
 
     // Highest first: a version number is a statement about what a file
-    // contains, and effects are the newest thing it can contain.
-    if layers().any(|l| !l.effects.is_empty()) {
+    // contains, and a linear mask is the newest thing it can contain.
+    //
+    // **A mask now decides 4 rather than 2**, and it is the same test either
+    // way because the bytes are the same bytes — what moved is what they mean.
+    // Clipping keeps 2 on its own: a clipped layer with no mask carries nothing
+    // whose meaning changed, and pushing it to 4 would shut it out of every
+    // older Umber for a flag those builds read correctly.
+    if layers().any(|l| l.mask.is_some()) {
+        4
+    } else if layers().any(|l| !l.effects.is_empty()) {
         3
-    } else if layers().any(|l| l.mask.is_some() || l.clipped) {
+    } else if layers().any(|l| l.clipped) {
         2
     } else {
         1
@@ -2696,6 +2740,131 @@ mod tests {
         );
     }
 
+    /// **A mask patch answers to the document's revision, in both directions.**
+    ///
+    /// A mask slice used to hold sRGB-encoded coverage and now holds the linear
+    /// multiplier, so a patch of one means something different either side of
+    /// [`VERSION`] 4 — and the bytes go in raw at both ends, which is what makes
+    /// this a real claim rather than a tautology: the reader has a branch that
+    /// converts, and it must fire for a revision-3 file and not for this one.
+    ///
+    /// **The v3 half was missing and the gap was proved by mutation.** Turning
+    /// `docimport::history`'s condition off left all 1,122 tests green, because
+    /// the only guard was this one's first half — which drives the *absence* of
+    /// the conversion — and
+    /// `a_mask_written_before_the_bump_is_converted_and_a_current_one_is_not`,
+    /// which drives `openraster::load_mask`: a different function, at a
+    /// different call site, keyed off a different flag, that never enters
+    /// `history.rs` at all. A doc comment here claimed the second covered the
+    /// first. It did not. That is "a guard on a model is not a guard on the
+    /// panel" one module over, and the cost of it is a *document damaged by an
+    /// undo*: open a pre-4 file whose history holds a mask stroke, press Ctrl+Z,
+    /// and the mask goes back a full gamma curve out.
+    ///
+    /// One archive is built and read twice, with nothing between the two but the
+    /// version attribute, so neither reading can be explained by the fixture.
+    /// The coverage is a partial for the reason it is everywhere else here: 0
+    /// and 255 are the transfer function's fixed points and survive either way.
+    #[test]
+    fn a_mask_patch_is_converted_or_not_by_the_revision_the_document_declares() {
+        use crate::history::{Edit, EditBody, EditKind, History, PixelPatch};
+
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [9, 9, 9, 255]);
+        let mask = solid(size, [128, 128, 128, 255]);
+
+        let mut stack = LayerStack::empty();
+        stack.push_imported(false, 0, "Ink".into());
+        let slot = stack.get(0).unwrap().slot().unwrap();
+        // The patch names the *mask's* slice, which is what makes the entry
+        // record `mask: true` and reach the branch under test.
+        let mask_slot = stack.add_mask(0).expect("a mask slice");
+        assert_ne!(slot, mask_slot, "the fixture is not testing anything");
+
+        let rect = crate::geom::PixelRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        // 188 is what the old form stored for a half, so the conversion has
+        // somewhere unambiguous to land and the direction is legible in the
+        // assertion: 128 is right and 229 is the mirrored bug.
+        //
+        // **An ordinary patch rides beside it, carrying the same byte**, and it
+        // is what makes `entry.mask` load-bearing rather than decorative. With a
+        // mask patch alone, dropping that half of the condition converts the one
+        // patch that wanted converting and nothing objects — so the guard would
+        // hold the *version* test and not the *which slice* test. A layer's
+        // pixels are premultiplied sRGB colour and the mask table means nothing
+        // to them; put them through it and every pre-4 document's history comes
+        // back darker.
+        let mut history = History::default();
+        history.record(Edit::new(
+            EditKind::Paint,
+            EditBody::Pixels(PixelPatch::new(rect, mask_slot, vec![188; 2 * 2 * 4])),
+        ));
+        history.record(Edit::new(
+            EditKind::Paint,
+            EditBody::Pixels(PixelPatch::new(rect, slot, vec![188; 2 * 2 * 4])),
+        ));
+        let saved = super::history::SaveHistory::new(&history, &stack)
+            .expect("every patch names a live slice");
+
+        let layers = vec![SaveLayer {
+            mask: Some(Canvas::Held(&mask)),
+            ..layer("Ink", &px)
+        }];
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(&px),
+            history: Some(saved),
+        })
+        .expect("encode");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // `(the mask patch's byte, the ordinary patch's byte)`, in the order
+        // they were recorded.
+        let patch_bytes = |bytes: &[u8]| {
+            let doc = docimport::read_openraster(bytes).expect("read back");
+            assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+            let opened = doc.open();
+            assert_eq!(opened.history.len(), 2, "both entries came back");
+            let at =
+                |i: usize| opened.history.entry_at(i).unwrap().patches()[0].pieces()[0].bytes()[0];
+            (at(0), at(1))
+        };
+
+        assert_eq!(
+            patch_bytes(&bytes),
+            (188, 188),
+            "nothing this build wrote may be converted on the way back in"
+        );
+
+        // The same archive, saying it was written before the bump. Everything
+        // else about it — the manifest, the PNGs, the rectangles — is identical.
+        let older = with_stack_xml(&bytes, |xml| {
+            let from = format!("{VERSION_ATTR}=\"4\"");
+            assert!(xml.contains(&from), "the fixture did not declare 4: {xml}");
+            xml.replace(&from, &format!("{VERSION_ATTR}=\"3\""))
+        });
+        let (converted, untouched) = patch_bytes(&older);
+        assert!(
+            (i32::from(converted) - 128).abs() <= 1,
+            "a revision-3 mask patch must be converted; 188 meant a half, got \
+             {converted}, and 229 would be the mirrored direction"
+        );
+        assert_eq!(
+            untouched, 188,
+            "a patch of a layer's own pixels is colour, and the mask table means \
+             nothing to it"
+        );
+    }
+
     /// Write a document and read it straight back through the importer, which
     /// is the only round trip that matters: the file is only worth anything if
     /// Umber's own reader gets the document back out of it.
@@ -2802,17 +2971,24 @@ mod tests {
 
         // A document that carries a mask needs the revision that was raised
         // for one, so an older build refuses it rather than opening a picture
-        // with the mask silently gone.
+        // whose masks are all a gamma curve out.
         //
-        // **2 as a literal, not `VERSION`.** It read `VERSION` until effects
+        // **4 as a literal, not `VERSION`.** It read `VERSION` until effects
         // took that to 3, at which point this assertion said "the newest
         // revision this build knows about" rather than "the revision a mask
         // needs" — and it would then have passed for a writer that declared
         // every file at the newest number, which is exactly what
-        // `required_version` exists to prevent.
+        // `required_version` exists to prevent. The two coincide again today,
+        // and the literal is what keeps that a coincidence.
+        //
+        // It said 2 until a mask's coverage became linear. That is a different
+        // *kind* of bump from the one 2 was: 2 was about what an older build
+        // would drop, and 4 is about what it would show — the same bytes read
+        // through the transfer function, so a layer hidden by half comes back
+        // hidden by four fifths. See `VERSION`.
         assert!(
-            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"2\"")),
-            "a masked document must declare revision 2 and no higher"
+            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"4\"")),
+            "a masked document must declare revision 4 and no higher"
         );
         // And the mask lives outside the ORA stack, so no other reader shows it
         // as a layer nobody made.
@@ -3013,13 +3189,23 @@ mod tests {
             ..effected()
         };
 
+        // **Clipping and a mask took the same revision and no longer do**, and
+        // the pair below is what holds them apart. A mask's bytes changed
+        // meaning at 4; a clipped layer's did not, and pushing it up with them
+        // would shut a document out of every older Umber for a flag those builds
+        // read perfectly well.
         for (expected, layers) in [
             (1, vec![plain()]),
-            (2, vec![masked()]),
+            (4, vec![masked()]),
             (2, vec![clipped()]),
             (3, vec![effected()]),
-            (3, vec![both()]),
+            (4, vec![both()]),
             (3, vec![plain(), effected()]),
+            // The highest wins whichever order the stack is in, which is the
+            // half a single-layer sweep cannot see.
+            (4, vec![effected(), masked()]),
+            (4, vec![masked(), effected()]),
+            (2, vec![plain(), clipped()]),
         ] {
             assert_eq!(
                 required_version(&layers),

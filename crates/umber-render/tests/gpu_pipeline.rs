@@ -2969,9 +2969,12 @@ fn a_mask_hides_what_it_covers() {
 
     fill_slot(&mut h, 0, [255, 255, 255, 255]);
     // The mask: opaque, and grey where the layer should be dimmed. The
-    // composite reads the red channel, and the slice is sRGB-typed, so
-    // sRGB 188 is linear ~0.5.
+    // composite reads the red channel through the array's **raw** view, so the
+    // byte over 255 is the multiplier and 128 is a half. It used to read
+    // through the sRGB view, where the same half was 188 — which is what this
+    // fixture carried, and 73 of the 256 multipliers were unreachable.
     fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    h.canvas.mark_mask_slot(1);
     h.canvas.write_layer_rect(
         &h.gpu.device,
         &h.gpu.queue,
@@ -2994,7 +2997,7 @@ fn a_mask_hides_what_it_covers() {
             width: 20,
             height: DOC,
         },
-        &[188u8, 188, 188, 255].repeat((20 * DOC) as usize),
+        &[128u8, 128, 128, 255].repeat((20 * DOC) as usize),
     );
 
     let mut masked = layer(0, 1.0, BlendMode::Normal);
@@ -3019,6 +3022,81 @@ fn a_mask_hides_what_it_covers() {
     assert!(
         half[0] > 220 && half[0] < 252,
         "a grey mask must be a partial, got {half:?}"
+    );
+}
+
+#[test]
+fn every_level_a_mask_can_hold_moves_the_picture() {
+    // **The guard that was missing, at the far end.** `umber_core::docimport::
+    // srgb` counts the states a mask slice can hold; this counts the ones that
+    // reach the screen, which is the claim that actually matters and the one no
+    // CPU test can make.
+    //
+    // **Measured on the alpha, and that is not a convenience.** A mask
+    // multiplies the layer's alpha, which is linear 8-bit; the *colour* the
+    // composite hands the screen has been through the sRGB encode, whose slope
+    // at the reveal end is about a sixth, so 56 near-white greys are 27 pixels
+    // there whatever the mask holds. Reading the colour would measure the
+    // display encode and call it a mask defect. `export_rgba` is the one path
+    // that hands back straight alpha, and it reuses this very composite pass.
+    //
+    // **The *hide* end is what is swept, and the first draft swept the reveal
+    // end on a figure that was made up.** It said the old storage "could express
+    // 22 of the 56" over 200..=255; measured, it expresses all 56 there, because
+    // `srgb_to_linear` is *steep* at the top — high stored bytes spread out and
+    // collide nowhere. Its toe is where alpha states collapse: over stored
+    // 0..=55 linear reaches 56 distinct alphas and sRGB reaches **11**. So the
+    // count below only means something down here, and up there it would have
+    // been a tautology dressed as a measurement — which is this file's own rule
+    // about a figure in a comment being what the next change gets argued
+    // against, with the figure invented.
+    //
+    // See `umber_core::docimport::srgb` for the half of this that goes the other
+    // way: at the hide end over an *opaque* backdrop the colour granularity gets
+    // worse, and the change is a trade rather than a free win.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+    fill_slot(&mut h, 0, [255, 255, 255, 255]);
+    fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    h.canvas.mark_mask_slot(1);
+
+    let mut masked = layer(0, 1.0, BlendMode::Normal);
+    masked.mask = Some(1);
+
+    let mut seen = std::collections::BTreeSet::new();
+    for level in 0..=55u8 {
+        h.canvas.write_layer_rect(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: DOC,
+                height: DOC,
+            },
+            &[level, level, level, 255].repeat((DOC * DOC) as usize),
+        );
+        let px = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &[masked]);
+        let at = ((32 * DOC + 32) * 4) as usize;
+        // The layer is opaque, so the alpha *is* the multiplier back again.
+        assert_eq!(
+            px[at + 3],
+            level,
+            "mask level {level} did not reach the alpha"
+        );
+        seen.insert(px[at + 3]);
+    }
+    // Every one of the 56 lands somewhere of its own, against 11 for the storage
+    // this replaced. A regression here is a *shortfall* rather than a wrong
+    // pixel, which is exactly why counting is what catches it and why the spot
+    // check this file already had could not.
+    assert_eq!(
+        seen.len(),
+        56,
+        "levels 0..=55 collapsed into {} distinct alphas; the sRGB storage this \
+         replaced reaches 11 here",
+        seen.len()
     );
 }
 
@@ -3184,6 +3262,16 @@ fn a_stroke_on_a_mask_previews_exactly_as_it_commits() {
 
     fill_slot(&mut h, 0, [255, 255, 255, 255]);
     fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    // **Slot 1 is a mask and has to say so.** The class is the store's own
+    // record of it and is already load-bearing without this: `back_tiles` clears
+    // a fresh cell to the class's empty value, so a mask that had not declared
+    // itself would clear *transparent* and hide the layer wherever the stroke
+    // reached a tile nobody had painted. It now decides which view of the page
+    // the commit renders through as well, because a mask slice holds linear
+    // coverage where a layer's holds sRGB colour — so leaving it out here made
+    // the commit write the old form under a composite reading the new one, and
+    // the mask jumped at pointer-up by eight levels.
+    h.canvas.mark_mask_slot(1);
 
     let mut masked = layer(0, 1.0, BlendMode::Normal);
     masked.mask = Some(1);
@@ -3237,6 +3325,35 @@ fn a_stroke_on_a_mask_previews_exactly_as_it_commits() {
             "the mask jumped at pointer-up: previewed {previewed:?}, committed {committed:?}"
         );
     }
+
+    // **And the byte in the slice is the multiplier itself.** The agreement
+    // above is a comparison of two composites, and it would hold just as well if
+    // both sides used the old sRGB form — which is exactly what it did before
+    // the class was declared, in the direction where they happened to agree. So
+    // read the slice.
+    //
+    // The stroke is black at 0.75 opacity over full coverage on a white mask, so
+    // the multiplier is 0.25 and the byte is 64. Under the sRGB form the same
+    // multiplier is stored as 137, which is nowhere near the slack here — the
+    // two readings are 73 levels apart at this coverage, which is why a partial
+    // is the case to drive and 0 or 255 would see nothing at all.
+    let slice = h.canvas.read_layer_rect(
+        &h.gpu.device,
+        &h.gpu.queue,
+        1,
+        PixelRect {
+            x: 32,
+            y: 32,
+            width: 1,
+            height: 1,
+        },
+    );
+    assert!(
+        slice[0].abs_diff(64) <= 2,
+        "a mask slice holds the linear multiplier; got {} where 64 is 0.25 and \
+         137 would be the sRGB form this replaced",
+        slice[0]
+    );
 }
 
 #[test]
@@ -6257,6 +6374,53 @@ fn shadow(color: Color, angle: f32, distance: f32) -> Effect {
         distance,
         ..Effect::drop_shadow()
     }
+}
+
+/// **The extract must read a mask the way the composite does.**
+///
+/// An effect is derived from the layer's alpha *after* its mask, so the extract
+/// takes a mask tap of its own — a second reader of the same slice, in a second
+/// shader. If the two disagree about what a stored byte means, a shadow is
+/// derived from a coverage the picture never had, and the symptom is a shadow
+/// that is merely the wrong strength: plausible, and attributable to any of half
+/// a dozen parameters.
+///
+/// The mask is a **partial**, and that is the whole of what makes this a test.
+/// Under the raw reading 128 is a multiplier of 0.502; under the sRGB reading
+/// the same byte is 0.216, so the shadow comes back at 55 where it should be
+/// 128. At 0 or 255 the two readings agree exactly and this sees nothing —
+/// the same reason every mask fixture in this change carries a partial.
+///
+/// The shadow is inert apart from its distance: no spread, no softness, so the
+/// slice holds the coverage itself rather than something a kernel has been over.
+#[test]
+fn an_effect_reads_a_mask_the_way_the_composite_does() {
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    // A mask over the whole canvas, so the shadow's own displaced position is
+    // masked by the same value the shape is and there is one number in play.
+    h.write_block(1, WHOLE, [128, 128, 128, 255]);
+    h.canvas.mark_mask_slot(1);
+
+    let mut draw = layer(0, 1.0, BlendMode::Normal);
+    draw.mask = Some(1);
+    // Angle 180 puts the offset at +x, the convention
+    // `a_drop_shadow_at_multiply_multiplies_against_the_backdrop` already
+    // relies on, and 20 clears `SHAPE`'s 16-wide square entirely — so the point
+    // read below is solid shadow with none of the layer over it and none of the
+    // knockout taken out of it.
+    let effects = [shadow(Color::new(1.0, 0.0, 0.0, 1.0), 180.0, 20.0)];
+    let baked = h.bake(&[effected(draw, &effects)], 2);
+    let slot = baked.draws[0].slot;
+
+    // The middle of the shape displaced by 20 in x.
+    let a = slice_alpha(&h, slot, 52, 32);
+    assert!(
+        a.abs_diff(128) <= 3,
+        "the shadow of a half-masked layer came back at {a}; 128 is the mask \
+         read as the composite reads it and 55 is the sRGB reading this replaced"
+    );
 }
 
 /// An outline of `spread`, hard-edged, at `position`.

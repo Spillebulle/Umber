@@ -276,6 +276,51 @@ range.** The suite already knows the shape of this — the guard is
 it simply has never been asked to count. The exact figure is a three-line check
 over `coverage_table()` and should be run before anybody acts on the estimate.
 
+**Run, and the estimate was close: 183 survive and 73 are unreachable, with the
+slope falling through 1 at input 75 rather than 62.** The same 73 falls out from
+the far end: sweeping every stored byte through `srgb_to_linear` and quantising
+to the 8-bit alpha a mask multiplies gives **183** distinct multipliers the
+composite can show, against 256 stored linearly.
+
+**And the paragraph above is one column of a two-column table, which is the part
+this section got wrong.** A mask scales premultiplied RGBA; alpha is linear
+8-bit and colour is sRGB 8-bit, so there are two destinations and the counts are
+exactly *mirrored*:
+
+| destination | linear storage | sRGB storage |
+|---|---|---|
+| 8-bit linear alpha | **256** | 183 |
+| 8-bit sRGB colour | 183 | **256** |
+
+They have to be mirrored — the two storages differ by the transfer function and
+so do the two destinations. So "not a quality regression, a quality
+**improvement**" above is true of the channel a mask actually multiplies and
+false of the other one, and the honest statement is that this is a **trade**:
+what it costs is the hide end over an *opaque* backdrop, where the first
+non-zero mask level takes the output from sRGB 0 to sRGB 13 where it used to
+step 0, 1, 2, so a light layer masked down over dark artwork bands there where
+it did not before. What decides it in favour of linear is that alpha is the
+channel a mask scales, it is what a transparent-background document exports, and
+it is the form every source format already states — plus the two things the
+colour column cannot answer for at all: the file byte becomes honest, and an
+imported mask stops losing 73 of its states.
+
+All four cells are a test rather than a note —
+`a_mask_multiplier_reaches_every_level_the_composite_can_show` in
+`docimport::srgb`, and `every_level_a_mask_can_hold_moves_the_picture` in
+`gpu_pipeline.rs` for the alpha row on the GPU. **A guard taking one column reads
+as proof of something only half true**, which is what the first draft of both
+did.
+
+**And this section's recommendation was built, with one change: there is no
+dedicated array.** The mask stayed in the layer array and took a second *view*
+of it, `LAYER_FORMAT_LINEAR` — the raw view `flip.wgsl` already used, and for
+the same reason. That reaches every word of the quality argument above at the
+cost of one binding and one pipeline pair, and costs nothing threaded through
+the atlas, the page table, the flip, `resize` or the capture. See
+`docs/perf/roadmap.md` §2.3 for the three places the built change diverged from
+what was planned, including why `history::VERSION` did not move.
+
 So the honest position, which is the opposite of the first draft's:
 
 > A dedicated `R8Unorm` mask array holding **linear** coverage is not a quality
