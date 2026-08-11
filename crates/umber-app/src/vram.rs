@@ -42,6 +42,16 @@
 //! trade rather than a free win. So a document that passes this gate can still
 //! die on its pixels, and no sentence here may imply otherwise.
 
+//! **What is tested here is the wording, not that anything says it.** The three
+//! call sites — `install_import`, `add_layer` and `add_mask` — are guarded by
+//! nothing: delete the reservation from any one of them and the whole suite
+//! stays green while that path goes back to producing the crash box. That is the
+//! "a guard on a model is not a guard on the panel" failure this project records
+//! three times over, and it is recorded rather than closed because reaching
+//! those call sites means building an `UmberApp` — a window, a device, a
+//! surface — which nothing in this crate does today. The honest statement is
+//! that the sentences are right and their reachability rests on review.
+
 use umber_core::docimport::gigabytes;
 use umber_render::Vram;
 

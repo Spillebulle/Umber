@@ -3523,6 +3523,17 @@ impl CanvasRenderer {
         };
         // The array this one replaces is still resident while it is made — the
         // copy is recorded against both — so it is what `Vram::peak_bytes` adds.
+        //
+        // **Untested, and structural instead**, which is the honest reading:
+        // passing `None` here compiles, reads plausibly, and leaves every test
+        // in the workspace green while every growth refusal understates by the
+        // whole of the document already on the card. Nothing can observe it
+        // without provoking a real refusal, which is the thing this file cannot
+        // do on a runner with no card — see
+        // `a_reservation_builds_no_view_before_it_has_checked`. What the
+        // `Option<&LayerStore>` buys over the `u32` this used to take is that
+        // the wrong answer is now *deleting an argument that is plainly there*
+        // rather than writing a `0` that looks like a sensible default.
         let texture = try_reserve(device, self.doc_size, capacity, Some(&self.layers))?;
         let grown = LayerStore::from_texture(texture, capacity);
         self.adopt(device, queue, grown);
