@@ -31,6 +31,18 @@
 //!   the point of an autosave, and the internal copy is what survives the file
 //!   being overwritten by something else, or a drive going away.
 //!
+//! One archive still reaches both, and it is no longer one `Vec<u8>` doing it.
+//! `docformat::save_from` *streams* the archive into the internal copy as it is
+//! built — the whole thing in memory was every layer's PNG at once plus the
+//! doubling a growing `Vec` pays, which on the documents
+//! `docs/perf/formats-and-host-memory.md` argues from is gigabytes every five
+//! minutes — and the painter's own file is a copy of that finished file, made
+//! through the same `docformat::write_with` so there is still exactly one
+//! temp-and-rename. Where the internal copy could not be written there is
+//! nothing to copy from, so the document is encoded a second time straight into
+//! the painter's file; that is only possible because [`CaptureSource`] borrows
+//! the capture rather than consuming it.
+//!
 //! Autosaving to the document's own path **overwrites it without asking**. That
 //! is deliberate and it is what was asked for; it is also why the tab's dot is
 //! cleared when — and only when — the document has not moved since the capture

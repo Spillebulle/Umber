@@ -906,23 +906,23 @@ pub fn save_from(
     Ok(warnings)
 }
 
-/// Put an already-[`encode`]d archive at `path`, whole or not at all.
+/// Put bytes somebody already has at `path`, whole or not at all.
 ///
-/// The file is written to a temporary neighbour and renamed into place. A write
-/// that fails halfway — a full disk, a pulled USB stick — would otherwise leave
-/// a truncated archive where the artist's last good version used to be, which
-/// is the one failure a save must not have. That matters more for an autosave
-/// than for a save, because nobody is watching it happen.
+/// [`write_with`] with the simplest possible `fill`, which is all it is now.
+/// The guarantee is that one's: written to a temporary neighbour and renamed
+/// into place, so a write that fails halfway — a full disk, a pulled USB
+/// stick — cannot leave a truncated file where the artist's last good version
+/// used to be.
 ///
-/// Separate from [`save`] because the autosave writes one archive to *two*
-/// places — the document's own file and an internal copy — and encoding a
-/// document twice to do it would double the only expensive part. Having the
-/// atomic write in one place is what stops the second caller reinventing it
-/// slightly differently. [`crate::export`] is the third caller, which is why
-/// the temporary is named after the *target's* extension rather than after
-/// `.ora`: for a document that is the same `sketch.ora.saving` it always was,
-/// and for an exported `sketch.png` it is `sketch.png.saving` rather than a
-/// name that would collide with the save of a document beside it.
+/// **This paragraph used to say it was separate from [`save`] because the
+/// autosave writes one archive to two places, and that is no longer why.** The
+/// autosave streams its archive into the internal copy and *copies the finished
+/// file* to the painter's own, so nothing holds a whole archive as a `&[u8]`
+/// any more. What is left for this are the callers that genuinely have one:
+/// [`crate::export`], which encodes a picture in one piece, and the keymap
+/// writer. It is also why the temporary takes the *target's* extension rather
+/// than `.ora` — an exported `sketch.png` becomes `sketch.png.saving` rather
+/// than a name that would collide with the save of a document beside it.
 pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     write_with(path, |file| {
         file.write_all(bytes)?;
