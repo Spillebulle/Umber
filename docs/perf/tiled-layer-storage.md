@@ -15,6 +15,84 @@ the measurements that have to happen before any of it is written.
 
 ---
 
+## 0a. What was built, and where it departs from this document
+
+Stage 1 is in (`umber_core::tile`, `shaders/tiles.wgsl`, `LayerStore`). **Stage 2
+is not**, so nothing is saved yet and the artist's document still does not open.
+Read this section before the rest of the file: three of the decisions below are
+deliberate departures, and taking the design's own wording for the code is the
+"stale instructions" failure `CLAUDE.md` records.
+
+- **There is no apron, and `A` does not exist.** §8.1's fallback — refusal 7, the
+  hand-reconstructed bilinear tap — is what shipped, and §8.3's mark-and-refresh
+  is therefore not built and not needed. What decided it was not the ranking in
+  §8.1 but §3.5's consequence: an apron makes a tile's pitch 258, and a page
+  whose pitch is not the tile cannot be the canvas rounded up, which is the next
+  bullet. `a_tap_across_a_tile_boundary_blends_the_logical_neighbour` is the
+  guard, and it needs the page table deliberately rearranged to say anything at
+  all — under the identity, adjacent logical tiles are adjacent in the atlas too.
+- **A page is the canvas rounded up to whole tiles, not a fixed 16×16 grid.**
+  §3.1's free parameter is gone: a page holds exactly one layer's worth of tiles,
+  so a page *is* what a slice was and §3.1's growth correction, `try_reserve`,
+  `Vram`, `resize` and every `MAX_SLOTS` figure are unchanged rather than
+  re-derived. The ceiling is therefore today's ceiling and not 17.18 GB. The
+  costs: the dense-layer penalty is 3.5% at 20000×5000 rather than §4.2's 5.2%
+  (there is no apron to pay for), and the page-side sweep §10 asks
+  `measure-atlas.rs` for is not a question any more.
+  **It rests on one property**: rounding a canvas up to a multiple of 256 cannot
+  cross `max_texture_dimension_2d`, because every value that limit takes is
+  itself a multiple of 256. That is true of every adapter anybody has measured
+  and it is not something the specification promises.
+  `rounding_a_canvas_up_to_tiles_never_passes_the_device_limit` sweeps the real
+  figures; the residual is a device reporting, say, 5000, where a 4900 canvas
+  would want a 5120 page and `create_texture` would refuse it *fatally*. The fix
+  if one ever appears is to round `CanvasLimit::of_device` **down** to a whole
+  tile — and to route `install_import`'s own direct check through the same
+  function, which today keeps a second copy of that comparison.
+- **Vertex shaders were not taught about pages.** A page is larger than the
+  canvas and every vertex shader that writes a layer maps document pixels to clip
+  space through `doc_size`, so `aim_at_document` sets a viewport instead. Three
+  passes take it; the effect passes already set their own. Under stage 2 a pass
+  targets a *tile*, and a viewport cannot express that — the offset can be
+  negative — so that is where the uniform field §5.3 describes has to arrive.
+- **`transform.wgsl`'s `fs_mask` reads with `textureLoad`.** It sampled the layer
+  at `doc / doc_size`, which stopped being where the texel was. Integer is what
+  a 1:1 quad wanted anyway, and it is the same argument `fs_blend` and
+  `flip.wgsl` already make.
+
+What stage 2 still has to do, in the order the risk runs:
+
+1. **A tile allocator over pages**, plus **page-backed slots** — a slot that owns
+   a whole page, identity-mapped. That is what keeps the float, the effect slices
+   and the flip on today's code, and it is not in this document at all: §7 and
+   §9.4 assume every slot is tiled and then have to invent a residency rule for
+   the float's preview that changes every frame of a drag.
+2. **`write_layer_rect` backing the tiles it writes.** §3.6's floor — the
+   emptiness scan — is **not needed and must not be built**, and the roadmap's
+   §2.1 is why. Stage 2 of the programme already made `ImportedLayer::pixels` a
+   sequence of `PixelPiece`s and `install_import` upload them one at a time, so
+   the residency signal *is* the piece set. For a `.clip` that is block presence,
+   which is exactly what §3.3 recommends.
+3. **The commit, per (page, tile).** The one hot path that may not fall back on
+   promoting a slot to a whole page; a stroke on an imported layer must not cost
+   it 400 MB. Needs the uniform of (3) above and a dynamic offset per fragment,
+   which `commit_blended` already has.
+4. **The readbacks and the capture**, synthesising an unbacked tile rather than
+   copying it. §6.2, unchanged.
+5. **`clear_layer`, `fill_layer_white`, `clear_all_layers` as table writes.**
+   §3.4, unchanged, and free.
+6. **`upload_table` per slot.** Whole-table is affordable only because nothing on
+   the drawing path writes it today; at the largest canvas it is 16.8 MB, which
+   at every pointer-up is worse than the readback beside it.
+7. **`resize`**, gathering each slot into one dense scratch of the old canvas and
+   scattering it into the new atlas at the offset. §7 already says a scratch is
+   the answer; what it does not say is that the scratch must be cleared per slot,
+   because a shifted destination tile reaches outside what was gathered.
+8. **§9.5's refusal**, which is unchanged and is still the thing with no good
+   answer.
+
+---
+
 ## 0. The recommendation, in short
 
 Replace `LayerStore`'s `texture_2d_array` of canvas-sized slices with an
