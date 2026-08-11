@@ -882,8 +882,12 @@ impl ImportedDocument {
         // A document of nothing but folders has nothing to show and nowhere to
         // paint, so it is as empty as one with no entries at all.
         if !self.layers.iter().any(|l| !l.folder) {
+            // This one *has* a document, so its warnings are to hand and the
+            // refusal can carry them — the case the field exists for, reached
+            // from the one site that could always have said why.
             return Err(ImportError::Empty {
                 format: self.format,
+                because: ImportError::reasons_from(&self.warnings),
             });
         }
         if self.layers.len() > LayerStack::MAX {
@@ -1237,7 +1241,65 @@ pub enum ImportError {
     /// A well-formed file with nothing to paint on.
     Empty {
         format: SourceFormat,
+        /// Why each layer was passed over, where the reader knows.
+        ///
+        /// **An import that refuses everything knows exactly why and used to
+        /// throw all of it away.** Every reason a layer is dropped goes into
+        /// [`ImportedDocument::warnings`], and warnings ride on the *document*
+        /// — so on the one path where no document is built, the whole
+        /// diagnosis is discarded and what reaches the artist is "contains no
+        /// layers". That reads as a corrupt file, which is exactly the
+        /// complaint the per-layer vector-layer sentence was written to answer;
+        /// this is the same failure one level up, where it is worse, because
+        /// there is no document for the warnings list to be shown beside.
+        ///
+        /// One entry per *distinct* reason rather than per layer, with a count,
+        /// because a document of sixty-four placed images is one sentence and
+        /// not sixty-four — the rule `EffectsNotPortable` already keeps.
+        /// Readers with nothing to say pass an empty vector, and the sentence
+        /// is then exactly what it always was.
+        because: Vec<(usize, String)>,
     },
+}
+
+/// A reason as its own sentence: the first letter raised, nothing else touched.
+///
+/// The reasons are written to follow a colon, so they begin lower case. Lifted
+/// out of that frame and stood on their own they need a capital, and only the
+/// first character is looked at — a reason opening "Umber could not read…"
+/// already has one, and one opening with anything that is not an ASCII letter
+/// is left exactly as it is rather than being guessed at.
+fn sentence_case(reason: &str) -> String {
+    let mut chars = reason.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+impl ImportError {
+    /// Reduce a reader's warnings to the distinct reasons layers were dropped.
+    ///
+    /// In `ImportError` rather than in one reader because nothing about it is
+    /// Clip Studio's: any reader that can refuse every layer wants the same
+    /// reduction, and a second copy of it is the drift this codebase refuses.
+    /// Ordered by first appearance rather than by whatever order a map happened
+    /// to hold — which for a `.clip` is **bottom of the stack first**, since
+    /// that is the order `tree` walks, and is the opposite of the order the
+    /// layers panel draws.
+    pub fn reasons_from(warnings: &[ImportWarning]) -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = Vec::new();
+        for warning in warnings {
+            let ImportWarning::LayerSkipped { reason, .. } = warning else {
+                continue;
+            };
+            match out.iter_mut().find(|(_, seen)| seen == reason) {
+                Some((count, _)) => *count += 1,
+                None => out.push((1, reason.clone())),
+            }
+        }
+        out
+    }
 }
 
 impl From<std::io::Error> for ImportError {
@@ -1301,8 +1363,53 @@ impl fmt::Display for ImportError {
                 held = gigabytes(*bytes),
                 max = gigabytes(ImportedDocument::MAX_TOTAL_BYTES),
             ),
-            Self::Empty { format } => {
+            Self::Empty {
+                format,
+                because: reasons,
+            } if reasons.is_empty() => {
                 write!(f, "The {} file contains no layers.", format.label())
+            }
+            Self::Empty {
+                format,
+                because: reasons,
+            } => {
+                // "contains no layers" on its own is what an artist reads as a
+                // damaged file. Saying that the file *was* read and naming what
+                // stopped each layer is the difference between going looking
+                // for a corrupt file and using one menu item.
+                //
+                // **It says the file was read and does not say it is
+                // undamaged**, and the distinction is not pedantry: the reasons
+                // below are whatever refused each layer, and some of them —
+                // "Umber could not read the shape of its bitmap", "its bitmap
+                // does not say how its channels are packed" — mean the file may
+                // be damaged after all. A heading claiming otherwise would be
+                // this module's own rule broken at the top of its own sentence.
+                // The reassurance an intact document deserves is carried by its
+                // reasons, which say what Clip Studio does and what to do about
+                // it; a damaged one keeps the alarm its reasons raise.
+                write!(
+                    f,
+                    "Umber read this {} file and found no layer in it that it can open.",
+                    format.label()
+                )?;
+                // **The count goes after the reason, not in front of it.** A
+                // reason is written to follow `Layer "X" could not be
+                // imported:`, so every one of them opens "it is …" or "its …" —
+                // and "2 layers: it is an image placed into the document" is a
+                // plural subject with a singular clause hanging off it. As an
+                // aside at the end the reason keeps the frame it was written
+                // for and the count is what it is. One is spelled out, which is
+                // the rule `editor::text_layers` already keeps.
+                for (count, reason) in reasons {
+                    let tally = if *count == 1 {
+                        "one layer".to_string()
+                    } else {
+                        format!("{count} layers")
+                    };
+                    write!(f, "\n\n{}. ({tally}.)", sentence_case(reason))?;
+                }
+                Ok(())
             }
         }
     }

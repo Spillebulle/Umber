@@ -1100,6 +1100,16 @@ pub struct ClipLayer {
     /// Write the mipmap bookkeeping and withhold the pixels, which is what a
     /// vector layer in a real `.clip` looks like.
     pub withhold_chunk: bool,
+    /// The **source** picture of a placed image, written as a second mipmap
+    /// chain named by `ResizableOriginalMipmap`.
+    ///
+    /// Its chunk is **present**, and that asymmetry is the whole point: the
+    /// real document this was built from has a full render chain whose every
+    /// level's chunk is absent, beside a resizable-original chain whose base
+    /// level's chunk holds 11 MB of the artist's picture. A fixture that
+    /// withheld both would be a vector layer wearing a different column, and
+    /// would pass a reader that never looked at the column at all.
+    pub resizable_pixels: Option<Vec<u8>>,
     /// The flat colour a Paper layer draws, as ordinary sRGB bytes. Stored
     /// scaled up to `u32` by [`scale_channel`], which is what a real file does.
     pub draw_colour: [u8; 3],
@@ -1131,21 +1141,73 @@ impl ClipLayer {
             mask_visible: true,
             special_render: 0,
             withhold_chunk: false,
+            resizable_pixels: None,
             draw_colour: [0, 0, 0],
             children: Vec::new(),
         }
     }
 
-    /// A **vector** layer: `LayerType` 0, and no pixels anywhere.
+    /// A **vector** layer: `LayerType` 0, and no pixels in the file.
     ///
     /// That is what a real one is. Clip Studio keeps the strokes and rasterises
-    /// them on demand, so no level of the mipmap chain holds a bitmap — which
-    /// is exactly what `pixels: None` produces here, and is why the reader has
-    /// to name the *kind* rather than report a file with something missing.
+    /// them on demand, so it writes the whole mipmap chain and never fills the
+    /// external chunks the chain points at — which is `withhold_chunk`, and is
+    /// why the layer fails at the reader's **second** drop site rather than its
+    /// first. That distinction is the whole point of the fixture: guarding only
+    /// the first site left every real vector layer still reporting damage.
+    ///
+    /// **This comment used to say "no pixels anywhere … which is exactly what
+    /// `pixels: None` produces here", and both halves were false**: `flat`
+    /// gives it a buffer, and it is the chunk rather than the bitmap that is
+    /// withheld. The property it misdescribed is precisely the one the fixture
+    /// exists to have, so the wrong sentence was worse than none.
+    /// [`Self::no_render_bitmap`] is the other half of the pair.
     pub fn vector(name: &'static str, width: u32, height: u32) -> Self {
         let mut layer = Self::flat(name, width, height, [0, 0, 0, 0]);
         layer.kind = 0;
         layer.withhold_chunk = true;
+        layer
+    }
+
+    /// A layer naming **no render mipmap at all**, which is the reader's
+    /// *first* drop site.
+    ///
+    /// Every other fixture here writes a chain and withholds its chunk, so all
+    /// of them fail at the second site — which left the first one reachable by
+    /// no test at all. Demonstrated by mutation: replacing that site's whole
+    /// sentence with a marker left 1,120 tests green.
+    ///
+    /// A real file does this for a layer Clip Studio has never rendered.
+    /// `pixels: None` is what produces it: [`ClipBuild::chain`] writes
+    /// `LayerRenderMipmap` 0 when there is no bitmap to build a chain around.
+    pub fn no_render_bitmap(name: &'static str, kind: i64) -> Self {
+        let mut layer = Self::flat(name, 1, 1, [0, 0, 0, 0]);
+        layer.kind = kind;
+        layer.pixels = None;
+        layer
+    }
+
+    /// A **placed image**: an image imported into the document and left
+    /// resizable rather than rasterised.
+    ///
+    /// Built to the shape of the real document that provoked it, because a
+    /// convenient fixture would have proved nothing. `LayerType` is 0, exactly
+    /// as a vector layer's is — that collision is the bug — and the render
+    /// chain is written whole with its chunk **withheld**, which is what makes
+    /// the layer fail at the second drop site rather than the first, as a real
+    /// one does. What distinguishes it is `ResizableOriginalMipmap`, naming a
+    /// second chain whose pixels are really there.
+    ///
+    /// Those pixels are deliberately **not** the picture the layer would show:
+    /// the source is placed by a transform this reader does not read, so a test
+    /// that expected them on the canvas would be asserting the wrong thing.
+    pub fn placed_image(name: &'static str, width: u32, height: u32) -> Self {
+        let mut layer = Self::vector(name, width, height);
+        layer.resizable_pixels = Some(
+            std::iter::repeat_n([200u8, 40, 60, 255], width as usize * height as usize)
+                .flatten()
+                .collect(),
+        );
         layer
     }
 
@@ -1185,6 +1247,7 @@ impl ClipLayer {
             mask_visible: true,
             special_render: 0,
             withhold_chunk: false,
+            resizable_pixels: None,
             draw_colour: [0, 0, 0],
             children,
         }
@@ -1406,6 +1469,13 @@ impl ClipBuild {
                 Some(coverage) => self.bitmap(coverage, size, CLIP_MASK, layer.mask_fill, false),
                 None => 0,
             };
+            // `withhold_chunk: false` — the source picture of a placed image is
+            // in the file, which is exactly what makes it different from a
+            // vector layer and what the real document shows.
+            let resizable = match &layer.resizable_pixels {
+                Some(pixels) => self.bitmap(pixels, size, CLIP_COLOUR, layer.pixel_fill, false),
+                None => 0,
+            };
             self.layers.push(vec![
                 Value::Integer(ids[i]),
                 Value::Text(layer.name.to_string()),
@@ -1444,6 +1514,7 @@ impl ClipBuild {
                 Value::Integer(scale_channel(layer.draw_colour[0])),
                 Value::Integer(scale_channel(layer.draw_colour[1])),
                 Value::Integer(scale_channel(layer.draw_colour[2])),
+                Value::Integer(resizable),
             ]);
         }
         ids.first().copied().unwrap_or(0)
@@ -1463,7 +1534,7 @@ fn scale_channel(byte: u8) -> i64 {
 pub const CLIP_PREVIEW: (u32, u32) = (12, 6);
 pub const CLIP_PREVIEW_PIXEL: [u8; 4] = [7, 200, 111, 255];
 
-const CLIP_LAYER_COLUMNS: [&str; 25] = [
+const CLIP_LAYER_COLUMNS: [&str; 26] = [
     "MainId",
     "LayerName",
     "LayerType",
@@ -1490,6 +1561,9 @@ const CLIP_LAYER_COLUMNS: [&str; 25] = [
     "DrawColorMainRed",
     "DrawColorMainGreen",
     "DrawColorMainBlue",
+    // What tells a placed image from a vector layer, both of which carry
+    // `LayerType` 0 and neither of which has a rendered bitmap.
+    "ResizableOriginalMipmap",
 ];
 
 /// A whole `.clip`: the database, its external chunks and the chunk stream.
