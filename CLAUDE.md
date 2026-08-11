@@ -793,11 +793,41 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   the highest slice ever *claimed* and `ensure_slots` never shrinks, so enough
   delete-then-add cycles take the layer array to its ceiling and leave it there
   — at `MAX_SLOTS`'s 256 that is 4.29 GB at 2048² and **102.4 GB at 10000²**,
-  with the budget reporting kilobytes.
+  with the budget reporting kilobytes. **The 10000² half of that is fixed** —
+  see the `resize` bullet below — but the growth ratchet itself is real and the
+  budget still cannot see it.
   `StackShape::byte_len` puts a parked slice in the same currency as a patch,
   which is what makes eviction able to reach it.
 - **A recycled slot still holds the old layer's pixels** — clear it on the GPU
   when a new layer takes it.
+- **`resize` rebuilds at the *live* slice count, and `built_capacity` is the one
+  statement of how deep an array built from nothing is.** `ensure_slots` never
+  shrinks, so a delete-then-add session leaves the array at its high-water mark;
+  a 512² document legitimately holding 256 slices is 256 MiB and the same
+  capacity carried onto a 10000² canvas was **102.4 GB**, arrived at through a
+  dialog rather than through the growth rule, where nothing in `grown_capacity`
+  could see it. The renderer cannot work the count out for itself — which slices
+  hold pixels is `LayerStack`'s — so it is a parameter, `slot_capacity_needed()`,
+  from `App::apply_canvas`. **`slot_capacity_needed()` does not describe the
+  array in general and does here**, because both things above it are gone:
+  effect slices are released by `forget_all`, and the float's slice is not
+  released at all — it is simply not carried, which is safe because
+  `apply_canvas` puts the float down first *and* `end_float` sits above the
+  rebuild. Both, not one. `built_capacity` keeps `initial_slots`' floor in both
+  places: `resize` had a bare `grown_capacity` and a resized one-layer document
+  came out with room for one slice where a freshly opened one got four, so the
+  next layer paid a whole reallocate-and-copy.
+- **A document's array is built at its slot count, not grown into it.** A growth
+  holds the old array and the new one at once — the copy is recorded against
+  both and wgpu keeps a texture alive for any submission naming it — so the peak
+  of one growth is `old + new` slices and a document arriving a slice at a time
+  pays it at every step. At 400 MB a slice a twenty-one-layer import walked from
+  1 to 21 through every quantum, and a `create_texture` failure there is an
+  uncaptured device error and therefore fatal. That also retires a duplicated
+  clear: `add_canvas` used to call `ensure_slots` (which clears every slice it
+  adds) and then `clear_all_layers` (which clears every slice), so seventeen of
+  twenty-one were cleared twice on the frame a document opened. With nothing
+  left to grow there is one clear.
 - **A mask is another slice of the *same* layer array, not a second
   `R8Unorm` one.** It costs 3 bytes a pixel on a texture most documents never
   allocate, and buys that a mask *is* a layer to `read_layer_pieces`,
@@ -1195,6 +1225,40 @@ are the contiguous run immediately below it whose `depth` is greater.
   layer's opacity is. `docs/layer-rename.md` is the standing design for the
   `EditBody` arm that would make a layer's *values* undoable; if it is built,
   effects join it.
+- **An effect on a layer the composite discards is not baked, not given a slice
+  and not drawn.** The predicate is `composite.wgsl`'s own,
+  `!visible || opacity <= 0.0`, read off the *layer*: an effect draw takes its
+  `visible` from its layer and its opacity is the effect's times the layer's, so
+  the two agree by construction, and a layer inside a hidden folder needs no
+  second rule because `effective_visible` has already ANDed its ancestors in.
+  **Dropping the draws is safe and is not the unconditional elision
+  `docs/perf/layer-residency.md` §2.2 warns about**, which is about removing an
+  invisible *layer* draw — the one that may write `clip_alpha` for a clipped run
+  above it. An effect draw never is: an inner one is always `clipped`, and an
+  outer one sits immediately before its own layer's draw with the same flag and
+  nothing but its siblings between, so the layer's draw writes the same zero a
+  moment later. **The filter runs after the budget arithmetic**, or `dropped`
+  and which effects an over-budget document draws would both move.
+- **`speculation_limit` is `GROWTH_DOUBLING_BUDGET_BYTES` asked in a second
+  currency.** A canvas nobody should speculate a *slice* on is one nobody should
+  hold a per-dab colour scratch (800 MB at 100 Mpx) or a distance-field working
+  set (up to 1.3 GB) on either. Above it `clear_stroke` gives the colour scratch
+  back — the one place every path that ends a stroke passes through, which is
+  what makes it a property of one function rather than of three call sites — and
+  `trim_effect_scratch` gives the working set back once nothing wants it.
+  **Asked over what the *document* wants, never over what this frame's bake
+  wants**: `run_effect_steps` sees only the effects that happen to be stale, so
+  a document with one flooding effect and one plain one would drop 800 MB on
+  every frame that rebaked only the plain one. It is a field with a
+  `set_speculation_limit` hook, for the reason `readback_limit` is one — the
+  real threshold is first met at 8192².
+- **`ensure_stroke_color` clears what it allocates**, and that is a pixel
+  argument rather than hygiene. The composite samples the colour plane
+  **bilinearly**, so a tap at a stroke's rim can reach a texel no fragment ever
+  wrote, and what that held was undefined on an adapter that does not zero fresh
+  allocations. It could happen once a session before; once the scratch is given
+  back per stroke it would be once a stroke. Clearing can only make a pixel
+  defined, never move a defined one.
 
 ### Documents
 
