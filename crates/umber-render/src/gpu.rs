@@ -15,6 +15,60 @@ pub struct Gpu {
     pub queue: Arc<wgpu::Queue>,
 }
 
+/// The share of the driver's reported memory budget past which a texture or a
+/// buffer is refused rather than attempted.
+///
+/// **This is what makes an out-of-memory allocation reportable at all.** Without
+/// it a Vulkan or D3D12 driver may satisfy an allocation it has no room for by
+/// paging to system memory — the canvas becomes a slideshow with nothing said —
+/// or fail in a way that arrives too late to act on. With it, an allocation the
+/// device cannot comfortably hold comes back as an ordinary `Error::OutOfMemory`
+/// on the exact call that asked, which [`crate::CanvasRenderer::try_reserve`]
+/// catches in an error scope and turns into a sentence.
+///
+/// Three things to know before changing it:
+///
+/// * **It is best effort and never a guarantee.** Vulkan honours it only where
+///   `VK_EXT_memory_budget` is present and returns `Ok` where it is not; Metal
+///   and GL support none of it. So a refusal proves the card said no; the
+///   absence of one proves nothing.
+/// * **Ninety rather than ninety-nine**, because `create_texture` has a fatal
+///   sub-step of its own: wgpu builds an internal clear view per array slice for
+///   a `RENDER_ATTACHMENT` texture, through the error path that *loses* the
+///   device. Those objects are small, and headroom is what keeps them out of the
+///   pressure the threshold is measuring.
+/// * **It is charged on every allocation**, including the per-frame ones — the
+///   smudge probe's target, the thumbnail's uniform buffer, a blended commit's
+///   backdrop. Each becomes one `vkGetPhysicalDeviceMemoryProperties2`. Believed
+///   to be noise and **not measured**.
+const MEMORY_BUDGET_PERCENT: u8 = 90;
+
+/// The descriptor [`Gpu::create_instance`] builds, split out so the one thing
+/// that is easy to get wrong about it can be tested.
+///
+/// **`InstanceDescriptor::with_env` silently discards
+/// `memory_budget_thresholds`** — it rebuilds the struct with
+/// `MemoryBudgetThresholds::default()` — and
+/// `new_without_display_handle_from_env()` *is* `new_without_display_handle()`
+/// followed by `with_env()`. So the threshold has to be written after that call
+/// and not before it, or the whole refusal path above is inert with nothing
+/// saying so. `the_memory_budget_threshold_survives_the_environment` is the
+/// guard.
+///
+/// **`for_device_loss` stays unset, and that is the more important half.**
+/// Setting it makes the backend deliberately *lose* the device on the next poll
+/// under memory pressure, which is precisely the unrecoverable outcome the
+/// refusal exists to avoid: a refused allocation is a sentence, a lost device is
+/// the crash box.
+fn instance_descriptor() -> wgpu::InstanceDescriptor {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    desc.memory_budget_thresholds = wgpu::MemoryBudgetThresholds {
+        for_resource_creation: Some(MEMORY_BUDGET_PERCENT),
+        for_device_loss: None,
+    };
+    desc
+}
+
 /// Which adapter to ask the instance for.
 ///
 /// Umber itself always wants [`Choice::Best`]. [`Choice::Fallback`] exists for
@@ -99,7 +153,7 @@ impl Gpu {
     /// Vulkan/D3D12/Metal backends we actually run on. A Wayland + GLES
     /// fallback would need the display-handle variant instead.
     pub fn create_instance() -> wgpu::Instance {
-        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env())
+        wgpu::Instance::new(instance_descriptor())
     }
 
     /// Pick a surface configuration.
@@ -149,5 +203,49 @@ impl Gpu {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The threshold must survive the environment sweep, not be reset by it.
+    ///
+    /// This measures the descriptor Umber actually builds rather than restating
+    /// the rule: writing the field and *then* calling `with_env` compiles, reads
+    /// correctly, and leaves `for_resource_creation` at `None` — at which point
+    /// nothing refuses an allocation, `try_reserve` catches nothing, and the
+    /// artist gets the crash box the whole path exists to replace. Demonstrated
+    /// by mutation: build the descriptor as
+    /// `new_without_display_handle()` + field + `.with_env()` and this fails.
+    ///
+    /// It needs no adapter and no device: `InstanceDescriptor` is plain data
+    /// until `Instance::new` is handed it.
+    #[test]
+    fn the_memory_budget_threshold_survives_the_environment() {
+        let desc = instance_descriptor();
+        assert_eq!(
+            desc.memory_budget_thresholds.for_resource_creation,
+            Some(MEMORY_BUDGET_PERCENT),
+            "with_env resets memory_budget_thresholds; the write has to come after it"
+        );
+        assert_eq!(
+            desc.memory_budget_thresholds.for_device_loss, None,
+            "setting this loses the device under pressure, which a refusal exists to avoid"
+        );
+    }
+
+    /// Headroom, not the last percent. See [`MEMORY_BUDGET_PERCENT`] for why:
+    /// `create_texture` builds one internal clear view per slice through wgpu's
+    /// *fatal* error path, so a threshold sitting on the budget refuses nothing
+    /// before those are attempted.
+    #[test]
+    fn the_memory_budget_threshold_leaves_headroom() {
+        assert!(
+            (50..=95).contains(&MEMORY_BUDGET_PERCENT),
+            "{MEMORY_BUDGET_PERCENT} is not a share that both refuses in time and lets a \
+             document use the card"
+        );
     }
 }
