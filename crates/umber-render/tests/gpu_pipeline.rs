@@ -7445,6 +7445,111 @@ fn an_effect_over_budget_is_dropped_from_the_bottom_and_counted() {
     }
 }
 
+/// A bake that cannot be given a page draws the layer plain and says so once.
+///
+/// **The one canvas-sized allocation the artist did not ask for by name.** An
+/// open follows a command, a layer follows a command, and a bake follows a
+/// *frame* — so `promote` reaching the infallible `ensure_pages` meant an
+/// out-of-memory could take Umber down while somebody was painting. What this
+/// drives is everything a caller does about the refusal, from the far side:
+/// the picture, the draw list, the count the panel reads, and the notice.
+///
+/// The refusal is provoked with `set_page_ceiling_for_test`, because a runner
+/// has no card to put under memory pressure. Both ways of being refused arrive
+/// at the same `Err` out of `take_whole_page`, so the ceiling is the reachable
+/// one and it exercises the whole of the response.
+#[test]
+fn a_bake_refused_its_page_draws_the_layer_and_reports_once() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 3.0, OutlinePosition::Outside)];
+    let stack = [effected(draw, &ring)];
+
+    // The baseline, so the case is not vacuous: with room, this document draws
+    // its layer *and* its outline, and reports nothing.
+    let ok = h.bake(&stack, 8);
+    assert_eq!(ok.draws.len(), 2, "the fixture drew no effect at all");
+    assert_eq!(h.canvas.effects_dropped(), 0);
+    assert!(h.canvas.take_effect_refusal().is_none());
+
+    // Now take the effect's page back and fill the atlas. At this canvas a page
+    // holds exactly one tile, so painting a slot spends a page; the loop stops
+    // when nothing is free, which is when `take_whole_page` has nowhere to go.
+    let empty: [LayerEffects<'_>; 1] = [effected(draw, &[])];
+    h.bake(&empty, 8);
+    let mut slot = 1;
+    while h.canvas.free_tiles() > 0 && slot < 40 {
+        h.write_block(slot, SHAPE, [255, 255, 255, 255]);
+        slot += 1;
+    }
+    assert_eq!(h.canvas.free_tiles(), 0, "the atlas still has room");
+    h.canvas.set_page_ceiling_for_test(h.canvas.page_count());
+
+    let before = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, SHAPE);
+    let refused = h.bake(&stack, 8);
+
+    // The layer is drawn, without its effect, and the count says so.
+    assert_eq!(
+        refused.draws.len(),
+        1,
+        "a refused bake spliced an effect draw in anyway: {:?}",
+        refused.draws
+    );
+    assert_eq!(refused.draws[0].slot, 0);
+    assert_eq!(refused.dropped, 1);
+    assert_eq!(h.canvas.effects_dropped(), 1);
+
+    // And nothing moved. A refusal that damaged the layer would be far worse
+    // than a picture with no outline on it.
+    let after = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, SHAPE);
+    assert_eq!(after, before, "a refused bake changed the layer's pixels");
+    assert!(
+        h.canvas.atlas_invariant().is_ok(),
+        "{:?}",
+        h.canvas.atlas_invariant()
+    );
+
+    // **Once.** A bake runs on every frame an effect is stale, so a refusal
+    // reported per bake would be a dialog at the frame rate — which is the
+    // whole reason the renderer latches it rather than the caller.
+    assert!(
+        h.canvas.take_effect_refusal().is_some(),
+        "the refusal was never offered, so nothing could tell the artist"
+    );
+    for _ in 0..3 {
+        h.bake(&stack, 8);
+        assert!(
+            h.canvas.take_effect_refusal().is_none(),
+            "the same refusal was offered again"
+        );
+    }
+
+    // Room again re-arms it, so an artist who closed something else and carried
+    // on is told again if it happens again.
+    h.canvas
+        .set_page_ceiling_for_test(h.canvas.page_count() + 4);
+    let back = h.bake(&stack, 8);
+    assert_eq!(back.draws.len(), 2, "the effect did not come back");
+    assert!(h.canvas.take_effect_refusal().is_none());
+    h.canvas.set_page_ceiling_for_test(h.canvas.page_count());
+    h.bake(&empty, 8);
+    while h.canvas.free_tiles() > 0 && slot < 60 {
+        h.write_block(slot, SHAPE, [255, 255, 255, 255]);
+        slot += 1;
+    }
+    h.bake(&stack, 8);
+    assert!(
+        h.canvas.take_effect_refusal().is_some(),
+        "a bake that ran did not re-arm the notice"
+    );
+}
+
 /// A shadow baked mid-stroke is the shadow the commit produces.
 ///
 /// The bake extracts the layer's coverage after its mask **and after the wet
