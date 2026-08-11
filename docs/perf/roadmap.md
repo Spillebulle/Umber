@@ -117,6 +117,38 @@ Files: `crates/umber-core/src/docformat/mod.rs`, `umber-app/src/autosave.rs`,
 `app.rs`'s save path. Needs a critic — `docformat::encode` gaining an
 entry-at-a-time form is a real interface change.
 
+**Landed, in part, and the part that did not is worth being precise about.**
+`docformat::Canvas`/`Canvases` are the entry-at-a-time form; the archive is
+streamed into the temporary rather than assembled; `write_with` is the one
+temp-and-rename and `write_encoded` is one line of it. Measured with
+`crates/umber-core/tests/save_peak.rs`, which counts allocations rather than
+arguing: the deferred peak grows by **27 KB per extra layer** — a `<layer>`
+element and a ZIP central-directory record, nothing canvas-sized — against
+1.2 MB per layer plus the caller's whole stack before.
+
+* **§10.2, the explicit Save, is done.** `SaveSource` reads one slice off the
+  GPU as the archive reaches it, so the peak no longer follows the stack.
+* **§10.1's fix (2) is done** for the autosave: the accumulated PNGs and the
+  whole-archive `Vec<u8>` are gone, and the painter's own file is a byte copy
+  of the internal one rather than a second encode.
+* **§10.1's fix (1) is not.** `DocumentCapture` still arrives whole from
+  `CanvasRenderer::take_capture`, so the N canvases are resident before the
+  writer thread starts and the 10 GB figure in §10.1's table stands for the
+  autosave. Encoding each slice *as it comes home* needs the renderer to hand
+  finished slices over one at a time — a change to `canvas.rs`, which Stage 3
+  owns. It belongs with Stage 3 or immediately after it.
+* **§10.1's fix (3), masks at one byte, is not** and is §5's, which is handed
+  to the atlas.
+
+Two things the critic found that are worth carrying forward rather than
+leaving in a commit message. `ZipWriter` **may not be shown an I/O error**:
+zip 8.6.0 unwinds into its own `Drop`, finalises the entry it was in the middle
+of, and trips a debug assertion, so a full disk during a streamed save was a
+panic; `docformat::Watched` absorbs. And the temporary's name had to become
+unique — the window it is held for went from one `fs::write` to the whole
+encode, and two writers of one document sharing `<path>.saving` truncate each
+other.
+
 ### Stage 5 — the exact composite wins. After 3.
 
 R1 (elide draws that contribute nothing, on `layer-residency` §2.2's merged

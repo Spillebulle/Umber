@@ -5655,8 +5655,14 @@ fn save_layer<'a>(
 /// One at a time, off the GPU, in the order the archive wants them. That is the
 /// whole of why a save no longer holds the stack: at
 /// `docs/perf/formats-and-host-memory.md`'s reference canvas a layer is 400 MB,
-/// so twenty-four of them held at once was ten gigabytes and one at a time is
-/// four hundred megabytes.
+/// so twenty-four of them held at once was ten gigabytes and what is resident
+/// now does not follow the layer count at all.
+///
+/// **Not "one canvas" — about two.** `docformat`'s `trim` crops each layer to
+/// its content rectangle and owns what it produces, so the fetched buffer and
+/// the trimmed copy are both alive for a moment, and §10.1 lists that copy as a
+/// row of its own. `crates/umber-core/tests/save_peak.rs` measures the whole of
+/// it rather than reasoning about it, and is the figure to quote.
 ///
 /// **It changes nothing about the readback itself.** `read_layer_rect` still
 /// blocks and is still called once per slice — that is the price of a format

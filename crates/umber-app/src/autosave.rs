@@ -271,8 +271,11 @@ pub struct Expired {
 ///   plain file" before it is even resolved.
 /// * The comparison is *parent equals root*, not "starts with", so the reaper
 ///   cannot descend. It never recurses either.
-/// * Only names an autosave writes are candidates: a `.ora`, or the
-///   `.ora.saving` temporary a write that died halfway leaves behind.
+/// * Only names an autosave writes are candidates: a `.ora`, or one of the
+///   `.ora.saving-<pid>-<n>` temporaries a write that died halfway leaves
+///   behind. That is now the *only* thing that clears one — the name is unique
+///   per writer, so the next save no longer overwrites it. See
+///   [`is_autosave_name`].
 ///
 /// `a_reaper_refuses_a_path_outside_its_root` and
 /// `a_documents_own_file_survives_its_internal_copy_expiring` pin the two that
