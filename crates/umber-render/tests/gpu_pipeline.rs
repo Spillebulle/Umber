@@ -6171,7 +6171,9 @@ fn a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly() {
         .collect();
 
     for axis in [FlipAxis::Horizontal, FlipAxis::Vertical] {
-        canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis);
+        canvas
+            .flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis)
+            .expect("a flip on a device with room for it");
 
         for slot in 0..2 {
             let after = canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE));
@@ -6184,7 +6186,9 @@ fn a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly() {
 
         // And back. This is the assertion the design rests on: not "close
         // enough", but the same bytes.
-        canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis);
+        canvas
+            .flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis)
+            .expect("a flip on a device with room for it");
         for slot in 0..2 {
             assert_eq!(
                 canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE)),
@@ -8922,7 +8926,9 @@ fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
     };
     let before = read_all(&canvas);
 
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal)
+        .expect("a flip on a device with room for it");
     let once = read_all(&canvas);
     assert_ne!(once, before, "the flip did nothing");
 
@@ -8943,7 +8949,9 @@ fn a_flip_mirrors_a_sparse_layer_and_flipping_twice_restores_it_exactly() {
         "the mark is still where it was as well"
     );
 
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0], FlipAxis::Horizontal)
+        .expect("a flip on a device with room for it");
     assert_eq!(
         read_all(&canvas),
         before,
@@ -9384,9 +9392,13 @@ fn every_atlas_cell_is_held_by_one_slot_or_is_free() {
         "the preview kept its page after the float ended"
     );
 
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Horizontal);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Horizontal)
+        .expect("a flip on a device with room for it");
     check(&canvas, "a horizontal flip");
-    canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Vertical);
+    canvas
+        .flip_layers(&gpu.device, &gpu.queue, &[0, 3], FlipAxis::Vertical)
+        .expect("a flip on a device with room for it");
     check(&canvas, "a vertical flip");
 
     canvas.resize(

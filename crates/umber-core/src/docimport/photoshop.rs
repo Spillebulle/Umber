@@ -293,7 +293,18 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
 /// indexes slices unchecked in several places, so a truncated or merely unusual
 /// file can panic. Opening a file the user chose must not be able to end the
 /// process.
-fn catch<T>(f: impl FnOnce() -> T, detail: &str) -> Result<T, ImportError> {
+///
+/// **`pub(super)` because [`super::preview`] is the other entry point into this
+/// crate**, and it was the one that had no `catch` around it. One function
+/// rather than a second `catch_unwind` over there: the sentence a refusal
+/// carries and the format it names are as much part of this as the
+/// `catch_unwind` is, and two copies would drift.
+///
+/// **It only works because panics unwind.** `panic = "abort"` is set in no
+/// manifest in this workspace — see `CLAUDE.md`'s Crash reporting section, which
+/// asserted the opposite for a long time — and setting it would turn every
+/// refusal here into the process dying.
+pub(super) fn catch<T>(f: impl FnOnce() -> T, detail: &str) -> Result<T, ImportError> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|_| ImportError::Malformed {
         format: FORMAT,
         detail: if detail.is_empty() {

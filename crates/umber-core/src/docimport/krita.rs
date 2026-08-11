@@ -117,7 +117,14 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let mut zip = container::open(bytes, FORMAT)?;
     container::check_mimetype(&mut zip, "application/x-krita", FORMAT)?;
 
-    let maindoc = container::read_entry(&mut zip, "maindoc.xml", FORMAT)?;
+    // `maindoc.xml` is `stack.xml`'s twin and takes the same bound, which is not
+    // the canvas one — see `container::MAX_STRUCTURE_BYTES`.
+    let maindoc = container::read_entry_bounded(
+        &mut zip,
+        "maindoc.xml",
+        FORMAT,
+        container::MAX_STRUCTURE_BYTES,
+    )?;
     let mut warnings = Vec::new();
     let doc = parse_maindoc(&maindoc, &mut warnings)?;
     let mut budget = check_bounds(
@@ -806,10 +813,19 @@ fn assemble_tiles(
             body[..tile_bytes].to_vec()
         };
 
+        // **Saturating, and it is the third instance of this pattern.** Both
+        // terms come out of the file — `x` and `y` off the tile's own header
+        // line, `offset` off the layer element in `maindoc.xml` — so a `.kra`
+        // naming `i64::MAX` for both panics a debug build here and wraps in a
+        // release one. The wrapped value is then contained by `visible_rect`'s
+        // saturating clamps, so the release build is a no-op and the debug build
+        // is a crash on a file somebody was handed; `container::crop` was fixed
+        // the same way and its comment names `blit` as the sibling left alone
+        // because both its call sites pass `(0, 0)`. This one does not.
         place(
             &tile,
             (tile_w as usize, tile_h as usize),
-            (x + offset.0, y + offset.1),
+            (x.saturating_add(offset.0), y.saturating_add(offset.1)),
         );
     }
     Ok(())

@@ -42,10 +42,11 @@
 //! trade rather than a free win. So a document that passes this gate can still
 //! die on its pixels, and no sentence here may imply otherwise.
 
-//! **What is tested here is the wording, not that anything says it.** The three
-//! call sites — `install_import`, `add_layer` and `add_mask` — are guarded by
-//! nothing: delete the reservation from any one of them and the whole suite
-//! stays green while that path goes back to producing the crash box. That is the
+//! **What is tested here is the wording, not that anything says it.** The call
+//! sites — `install_import`, `add_layer`, `add_mask`, the effect bake and
+//! `mirror_document` — are guarded by nothing: delete the reservation from any
+//! one of them and the whole suite stays green while that path goes back to
+//! producing the crash box. That is the
 //! "a guard on a model is not a guard on the panel" failure this project records
 //! three times over, and it is recorded rather than closed because reaching
 //! those call sites means building an `UmberApp` — a window, a device, a
@@ -153,6 +154,41 @@ pub fn effect_refused(refused: &Vram) -> Notice {
     }
 }
 
+/// A canvas flip the card could not make room for.
+///
+/// **A fourth sentence, because it is a fourth event and the others would each
+/// be wrong.** Nothing failed to open, no layer failed to appear, and unlike a
+/// bake this *was* asked for by name — so it leads with the command that was
+/// refused rather than with what is still true. What it shares with
+/// [`effect_refused`] is the reassurance, and here it is load-bearing rather
+/// than polite: a half-mirrored picture is not a state a flip's pixel-less undo
+/// entry can describe, so `flip_layers` refuses before it touches anything and
+/// `mirror_document` records no entry. The artist's picture is exactly what it
+/// was.
+///
+/// The figure is [`Vram::peak_bytes`], because both of a flip's allocations are
+/// held beside the atlas already resident: the growth holds the atlas it
+/// replaces, and the scratch is one page on top of it.
+///
+/// It says nothing about flattening, which is the one lever [`REMEDY`] offers
+/// that a flip cannot use — it mirrors every layer whether they are merged or
+/// not — but the shared sentence is kept rather than forked, because two
+/// wordings of one cause is exactly what that constant exists to prevent, and
+/// fewer layers genuinely does mean fewer tiles to mirror.
+pub fn flip_refused(refused: &Vram) -> Notice {
+    Notice {
+        title: "Could not flip the canvas".to_string(),
+        lines: vec![format!(
+            "Your picture is unchanged and nothing was mirrored. Mirroring it needs \
+             {needed} of graphics memory at {w} × {h}, and this graphics card could not \
+             provide it. {REMEDY}",
+            needed = gigabytes(refused.peak_bytes()),
+            w = refused.doc_size.x,
+            h = refused.doc_size.y,
+        )],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +255,7 @@ mod tests {
             slice_refused("a layer", &reported(21)),
             slice_refused("a mask", &reported(21)),
             effect_refused(&reported(21)),
+            flip_refused(&reported(21)),
         ];
         for notice in &notices {
             for text in std::iter::once(&notice.title).chain(&notice.lines) {
@@ -280,6 +317,22 @@ mod tests {
             "a refused bake reads as a loss: {}",
             bake.lines[0]
         );
+
+        // A flip holds the atlas it grows *and* a page-sized scratch, so it
+        // names the peak too — and it has to say nothing was mirrored, because
+        // its undo entry is another flip and a half-applied one is the state
+        // that cannot be described.
+        let flip = flip_refused(&reported(21));
+        assert!(
+            flip.lines[0].contains("17.4 GB") && flip.lines[0].contains("20000 × 5000"),
+            "a refused flip names the transient and the canvas: {}",
+            flip.lines[0]
+        );
+        assert!(
+            flip.lines[0].contains("nothing was mirrored"),
+            "a refused flip has to say the picture did not move: {}",
+            flip.lines[0]
+        );
     }
 
     /// Both refusals end on something to do. A sentence saying only that the
@@ -291,6 +344,7 @@ mod tests {
             open_refused("sketch.clip", 21, &reported(0)),
             slice_refused("a layer", &reported(21)),
             effect_refused(&reported(21)),
+            flip_refused(&reported(21)),
         ] {
             let line = notice.lines[0].to_lowercase();
             // All three, and the first is the one that costs nothing: what was

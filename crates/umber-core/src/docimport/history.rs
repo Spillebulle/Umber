@@ -24,6 +24,34 @@ use crate::geom::PixelRect;
 use crate::history::EditKind;
 use crate::time::Timestamp;
 
+/// Largest history manifest this reader will decompress.
+///
+/// **The manifest is an *index*, and the thing it indexes already has a
+/// bound.** Every entry it can honestly describe names PNGs in the archive, and
+/// [`fmt::BUDGET_BYTES`] is what the writer will spend on those — encoded,
+/// oldest dropped first. So the manifest and the patches take the same figure:
+/// an index larger than everything it indexes is not a history, and this is the
+/// only constant in the file that already means "how much of an undo history one
+/// document may carry". Deriving a per-entry JSON size instead would be a second
+/// statement of the serialised form, which changes whenever a field is added —
+/// the reason [`super::openraster::MAX_EFFECTS_BYTES`] refuses the same shape.
+///
+/// **It is a count and not a canvas, which is the whole reason it needs one.**
+/// `container::read_optional_entry` bounds an entry at
+/// [`super::ImportedDocument::MAX_TOTAL_BYTES`], and this was read there: sixteen
+/// gigabytes of JSON, materialised by `read_to_end` and then handed whole to
+/// `serde_json::from_slice`, which builds every entry before
+/// `manifest.entries.len()` is looked at. Nothing in the format bounds the entry
+/// count.
+///
+/// **Where it stops is a flip.** A canvas flip writes no PNG — that is what
+/// makes it free of the budget above — so a session of nothing but flips is a
+/// manifest with no patches beside it, and about a hundred bytes an entry puts
+/// three hundred thousand consecutive flips at this figure. That is not a
+/// session anybody has, and it is the one case where this is stricter than the
+/// writer; saying so is better than a derivation that pretends otherwise.
+const MAX_MANIFEST_BYTES: u64 = fmt::BUDGET_BYTES as u64;
+
 /// One recorded edit as it came out of a file.
 #[derive(Clone, Debug)]
 pub struct ImportedEdit {
@@ -113,9 +141,10 @@ fn load(
     doc_version: u32,
 ) -> Result<ImportedHistory, String> {
     let format = SourceFormat::OpenRaster;
-    let bytes = container::read_optional_entry(zip, manifest_path, format)
-        .map_err(|e| e.to_string())?
-        .ok_or("the document says it has one, but the record is not in the file")?;
+    let bytes =
+        container::read_optional_entry_bounded(zip, manifest_path, format, MAX_MANIFEST_BYTES)
+            .map_err(|e| e.to_string())?
+            .ok_or("the document says it has one, but the record is not in the file")?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .map_err(|e| format!("the record of it could not be read ({e})"))?;
 

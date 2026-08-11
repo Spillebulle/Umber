@@ -35,7 +35,7 @@ use std::path::Path;
 use glam::UVec2;
 
 use super::container;
-use super::{ImportError, SourceFormat};
+use super::{ImportError, SourceFormat, check_image_size};
 use crate::sqlite::{Database, Value};
 
 /// A flattened picture, straight-alpha sRGB RGBA8.
@@ -223,12 +223,35 @@ fn clip_preview(bytes: &[u8]) -> Result<Preview, ImportError> {
 /// `Psd::rgba` is it — the same flattened picture Explorer would show if
 /// Photoshop's own handler were installed. A file saved without it has no
 /// layers either and this is then the only picture in it.
+///
+/// **Both calls run inside [`super::photoshop::catch`], and this was the one
+/// entry point into that crate without it.** `photoshop.rs`'s module docs list
+/// what makes it panic on real files — an `unimplemented!()` on a ZIP-compressed
+/// channel, an unchecked slice in the major-section split, and its own shipped
+/// `negative-top-left-layer.psd` panicking inside `rgba()` — and both of the
+/// named sources are here. `umber-shellext`'s own `guard` caught it, which is
+/// work belonging one layer down; `umber-app::thumbnail::run` did not, and died
+/// with a panic on stderr rather than refusing the file. It is the crate's own
+/// `catch` rather than a second `catch_unwind` beside it, for the reason
+/// everything else in this module is shared.
+///
+/// **The composite's size is checked before `rgba()` and that is not
+/// belt-and-braces**: `generate_rgba` is `vec![0; (w * h * 4) as usize]` read
+/// straight off the header, so a 26-byte header in a tiny file asks for
+/// gigabytes. See [`check_image_size`]. The check has to be *before*, because
+/// the allocation is inside the call.
 fn psd_composite(bytes: &[u8]) -> Result<Preview, ImportError> {
-    let psd = psd::Psd::from_bytes(bytes).map_err(|e| ImportError::Malformed {
+    let psd = super::photoshop::catch(
+        || psd::Psd::from_bytes(bytes),
+        "its Photoshop header could not be parsed",
+    )?
+    .map_err(|e| ImportError::Malformed {
         format: SourceFormat::Photoshop,
         detail: e.to_string(),
     })?;
-    Preview::new(psd.width(), psd.height(), psd.rgba())
+    check_image_size(psd.width(), psd.height())?;
+    let rgba = super::photoshop::catch(|| psd.rgba(), "its flattened image could not be decoded")?;
+    Preview::new(psd.width(), psd.height(), rgba)
 }
 
 /// Decode a PNG to straight-alpha RGBA8.
@@ -247,6 +270,14 @@ fn decode_png(bytes: &[u8], format: SourceFormat) -> Result<Preview, ImportError
     let mut reader = decoder
         .read_info()
         .map_err(|e| malformed(format!("its preview is not a readable PNG ({e})")))?;
+    // **Off the header, before a byte is allocated**, and it is the same rule
+    // `flat::decode_png` keeps because it is the same hazard: this decoder never
+    // called `set_limits` at all, and it would not have mattered if it had —
+    // `png::Limits` bounds the decoder's own allocations and not the caller's
+    // buffer. This one runs inside Explorer, where an abort is not ours to
+    // spend. See [`check_image_size`].
+    let (width, height) = reader.info().size();
+    check_image_size(width, height)?;
     // `None` where the frame's size does not fit a `usize`, which on a 32-bit
     // build is a preview too large to hold rather than a malformed one.
     let size = reader

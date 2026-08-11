@@ -19,18 +19,62 @@ pub fn open(bytes: &[u8], format: SourceFormat) -> Result<Zip<'_>, ImportError> 
     })
 }
 
-/// Read one entry whole.
+/// Largest `stack.xml` or `maindoc.xml` either ZIP reader will decompress.
 ///
-/// Refuses anything whose declared size is beyond what an import could use.
+/// **A document's structure entry is the third of the shape
+/// [`read_optional_entry_bounded`] exists for**, and it arrived by the same
+/// reasoning as the first two: its size follows a *count* the format does not
+/// bound, so [`ImportedDocument::MAX_TOTAL_BYTES`]' sixteen gigabytes is the
+/// wrong instrument. XML deflates around 1000:1, so at that figure a sixteen
+/// megabyte archive entry is a `read_to_end` growing a `Vec` to 16 GiB — an
+/// abort, from a small file, before quick-xml has seen a byte.
+///
+/// **The figure has to be generous, and that is not laziness.** Umber refuses a
+/// stack past [`LayerStack::MAX`] and it must be *that* refusal an over-tall
+/// document meets, not this one: a bound tight enough to catch a thousand-layer
+/// file would tell an artist their file was unreadable when it merely has too
+/// many layers, which is the wrong-bound failure `CanvasTooLarge`'s own docs
+/// record. Nor can the honest size be derived, because a layer's *name* is
+/// unbounded — it comes out of whatever wrote the file — so sixty-four legal
+/// layers can carry an arbitrarily long `stack.xml`.
+///
+/// So it is stated as headroom rather than as a derivation, and the two ends are
+/// what make it defensible. A full sixty-four-layer document Umber writes is
+/// about fifteen kilobytes of `stack.xml`, so this is a thousand times what the
+/// writer produces — `a_full_stacks_own_structure_is_far_inside_the_bound` is
+/// the measurement rather than the claim. And a stack tall enough to be refused
+/// for its layer count is roughly two hundred bytes an element, so this admits
+/// tens of thousands of them: `TooManyLayers` is what such a file meets.
+///
+/// **What it does not bound is what the parse then builds.** A `stack.xml` of
+/// nested `<stack>` elements pushes a `LayerSpec` and possibly a warning per
+/// element before the count is checked, which is perhaps twenty times the text.
+/// Sixteen mebibytes of that is a few hundred megabytes rather than sixteen
+/// gigabytes; it is bounded and survivable where it was neither, and it is not
+/// zero. Said out loud rather than left for the next reader to find.
+///
+/// [`LayerStack::MAX`]: crate::layer::LayerStack::MAX
+pub const MAX_STRUCTURE_BYTES: u64 = 16 << 20;
+
+/// Read one entry whole, at a bound the caller states.
+///
+/// Refuses anything whose declared size is beyond what its own content can be.
 /// Both ORA and KRA are ZIPs supplied by strangers, and a 20 KB file that
 /// claims to expand to 40 GB is a well-known way to knock over a program that
 /// reads to the end without looking.
-pub fn read_entry(
+///
+/// **The limit is a parameter and there is no unbounded form**, which is the
+/// half that was missing: this used to read every required entry at
+/// [`ImportedDocument::MAX_TOTAL_BYTES`], and both of its call sites are a
+/// document's structure XML rather than a canvas. See [`MAX_STRUCTURE_BYTES`],
+/// and [`read_optional_entry_bounded`] for the rule.
+pub fn read_entry_bounded(
     zip: &mut Zip<'_>,
     name: &str,
     format: SourceFormat,
+    limit: u64,
 ) -> Result<Vec<u8>, ImportError> {
-    read_optional_entry(zip, name, format)?.ok_or_else(|| ImportError::Malformed {
+    read_optional_entry_bounded(zip, name, format, limit)?.ok_or_else(|| ImportError::Malformed {
         format,
         detail: format!("the archive has no `{name}`"),
     })
@@ -69,6 +113,13 @@ pub fn read_optional_entry(
 /// is what the parameter is for — [`crate::textobj::MAX_RECORD_BYTES`] is the
 /// other one — and the fact that the second case reached this signature without
 /// changing it is the check on the first.
+///
+/// **There are four now**, and the two that arrived last are the ones this
+/// module read at the canvas bound for as long as it existed: a document's
+/// structure XML ([`MAX_STRUCTURE_BYTES`]) and the undo history's manifest
+/// (`docimport::history::MAX_MANIFEST_BYTES`). Both are counts rather than
+/// canvases and neither had a figure of its own, which is the failure the first
+/// two paragraphs describe arriving in the entries somebody would think of last.
 ///
 /// So the caller states what its own content can be, and the check happens
 /// against the *declared* size before a byte is decompressed as well as against

@@ -1210,6 +1210,24 @@ pub enum ImportError {
         width: u32,
         height: u32,
     },
+    /// One *picture inside* the file declares an edge past
+    /// [`ImportedDocument::MAX_DIMENSION`] — see [`check_image_size`].
+    ///
+    /// **Separate from [`ImportError::CanvasTooLarge`] for that variant's own
+    /// reason.** A layer's PNG, a `mergedimage.png` and a `.psd`'s composite are
+    /// not the canvas: an ORA layer is stored at its own bounding box and may
+    /// legitimately be larger than the page it sits on, so a file whose canvas
+    /// is 2000 × 2000 can carry an image claiming 60000 × 60000. Reporting that
+    /// as the canvas would send the artist to shrink a canvas that is nowhere
+    /// near the bound, which is the failure `CanvasTooLarge`'s own docs record.
+    ///
+    /// It is stated against the same figure, because the same reasoning applies:
+    /// nothing Umber can *write* holds a picture wider than the widest canvas it
+    /// will make, so this can never refuse a document Umber produced.
+    ImageTooLarge {
+        width: u32,
+        height: u32,
+    },
     /// The canvas is fine and the *stack* is not: the pixels its layers
     /// actually hold are past [`ImportedDocument::MAX_TOTAL_BYTES`].
     ///
@@ -1346,6 +1364,12 @@ impl fmt::Display for ImportError {
                 f,
                 "The canvas is {width}×{height}, which is larger than Umber can open. \
                  Umber opens canvases up to {max} pixels on a side.",
+                max = ImportedDocument::MAX_DIMENSION,
+            ),
+            Self::ImageTooLarge { width, height } => write!(
+                f,
+                "A picture inside this file is {width}×{height}, which is larger than Umber \
+                 can decode. Umber reads pictures up to {max} pixels on a side.",
                 max = ImportedDocument::MAX_DIMENSION,
             ),
             Self::StackTooLarge {
@@ -1609,6 +1633,46 @@ fn check_bounds(
         spent: 0,
         limit: ImportedDocument::MAX_TOTAL_BYTES,
     })
+}
+
+/// Refuse a picture whose *header* would otherwise choose the allocation.
+///
+/// **A decoder is handed a size and told to fill a buffer, and the size comes
+/// out of somebody else's file.** `png`'s `output_buffer_size` is a pure
+/// overflow check — it answers `None` only where `width × height × bytes` does
+/// not fit an `isize`, so a 60000 × 60000 RGBA header answers
+/// `Some(14_400_000_000)` from a file a few hundred bytes long. `psd` 0.3.5's
+/// `generate_rgba` is worse: `vec![0; (w * h * 4) as usize]` straight off the
+/// header, with the multiplication in `u32`. Neither `png::Limits::bytes` nor
+/// the archive entry bound reaches either — the first bounds the *decoder's own*
+/// allocations (one output row, the ICC profile, a few ancillary chunks) and the
+/// second bounds the compressed entry, not what its header claims.
+///
+/// That matters more than an ordinary refusal for two reasons. `Vec`'s
+/// allocation failure calls `handle_alloc_error`, which **aborts** — so the
+/// panic hook never runs, there is no crash report and no autosave. And this
+/// code runs inside Explorer's surrogate process through `umber-shellext`,
+/// where an abort is somebody else's process dying.
+///
+/// **The bound is [`ImportedDocument::MAX_DIMENSION`] on each edge and is
+/// deliberately not a figure of its own.** It is the ceiling [`check_bounds`]
+/// already holds a canvas to, so nothing Umber can write can meet it: a saved
+/// layer is trimmed to its content inside a canvas that is already under the
+/// bound, and a `mergedimage.png` *is* the canvas. The rule that a reader must
+/// never be stricter than the writer therefore holds by construction rather than
+/// by measurement.
+///
+/// **What it does not do is make the allocation small.** At the ceiling a
+/// picture is 32768² × 4 = 4 GiB, which is exactly what a canvas at
+/// `MAX_DIMENSION` costs and what `MAX_TOTAL_BYTES` already admits three of. The
+/// change is from a figure the file chooses without limit to the figure the rest
+/// of this module is already stated in; a tighter one would refuse thumbnails of
+/// documents Umber can open, and would need a survey nobody has run.
+fn check_image_size(width: u32, height: u32) -> Result<(), ImportError> {
+    if width > ImportedDocument::MAX_DIMENSION || height > ImportedDocument::MAX_DIMENSION {
+        return Err(ImportError::ImageTooLarge { width, height });
+    }
+    Ok(())
 }
 
 /// What a document's layers actually hold, against

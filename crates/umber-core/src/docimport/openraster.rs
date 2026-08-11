@@ -152,7 +152,14 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let mut zip = container::open(bytes, FORMAT)?;
     container::check_mimetype(&mut zip, "image/openraster", FORMAT)?;
 
-    let stack_xml = container::read_entry(&mut zip, "stack.xml", FORMAT)?;
+    // Bounded at what a *structure* entry can be rather than at the canvas
+    // figure every other entry answers to — see `container::MAX_STRUCTURE_BYTES`.
+    let stack_xml = container::read_entry_bounded(
+        &mut zip,
+        "stack.xml",
+        FORMAT,
+        container::MAX_STRUCTURE_BYTES,
+    )?;
     let mut warnings = Vec::new();
     let Stack {
         size,

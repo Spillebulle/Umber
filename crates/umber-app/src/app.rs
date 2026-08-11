@@ -851,7 +851,18 @@ impl UmberApp {
         let Some(canvas) = gfx.canvases.get_mut(&id) else {
             return false;
         };
-        canvas.flip_layers(&gfx.gpu.device, &gfx.gpu.queue, &slots, axis);
+        // **The one place a flip can be refused, and it must answer `false`.**
+        // A flip stores no pixels: its undo entry *is* another flip, so an entry
+        // recorded for a flip that did not happen would mirror the picture the
+        // first time somebody stepped over it. `flip_layers` guarantees a
+        // refusal changed nothing, so returning here leaves the document exactly
+        // as it was — and both undo directions come through this function, so a
+        // refusal while stepping back leaves the history where it is rather than
+        // half applied.
+        if let Err(refused) = canvas.flip_layers(&gfx.gpu.device, &gfx.gpu.queue, &slots, axis) {
+            self.editor.notice = Some(vram::flip_refused(&refused));
+            return false;
+        }
         self.editor.flip_canvas(axis);
         true
     }

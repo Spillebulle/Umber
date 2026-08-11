@@ -804,7 +804,20 @@ impl Vram {
 ///
 /// **Most of what allocates a canvas-sized texture still does not come through
 /// here**, and the list is written out because the next reader will otherwise
-/// take this function's existence for coverage:
+/// take this function's existence for coverage.
+///
+/// **It was stale in both directions and that is the thing to expect of it.** It
+/// named `take_whole_page`'s effect page as its "worst entry" after that path had
+/// been moved onto the fallible `try_ensure_pages`, and it said nothing about
+/// `flip_layers`, which grew the atlas through the infallible `ensure_pages` and
+/// then made an unguarded page-sized scratch — so Image ▸ Flip, an ordinary
+/// command, was the crash box while the list a reader would consult said
+/// otherwise. Both are now guarded and the entries are gone. **A list of what is
+/// unguarded goes out of date every time something is guarded**, in the
+/// direction that reads as reassurance; `no_shipped_code_grows_the_atlas_
+/// infallibly` is the half of it a test can hold.
+///
+/// What is still fatal:
 ///
 /// * `begin_float`'s preview slice — `ensure_slots(preview_slot + 1)`. One slice
 ///   off this same array, which is exactly the question `add_layer` and
@@ -812,12 +825,9 @@ impl Vram {
 /// * `resize` — rebuilds the whole array from the Canvas settings dialog.
 /// * A blank document — `Graphics::add_canvas`, reached by File → New, which
 ///   offers up to `max_texture_dimension_2d`; one slice at 32768² is 4.3 GB.
-/// * **An effect slice's page, which is on the frame path.** `run_effect_steps`
-///   promotes every slice it targets, a promotion takes a whole page, and
-///   `take_whole_page` reaches the infallible `ensure_pages` where the pool has
-///   none. So a bake can ask the device for a canvas-sized texture on an
-///   ordinary frame and be refused fatally. It is the *worst* entry on this list
-///   because it is the only one the artist did not ask for by name.
+///   Note the tab is created *before* the allocation in `create_document`, so
+///   there is no "a refusal leaves the session as it was" available on that path
+///   even if one were added.
 /// * The **page table and its first upload**, which `LayerStore::from_texture`
 ///   makes *after* this function has popped its scope. It is small — kilobytes
 ///   for an ordinary canvas, 16.8 MB for a full stack at 32768² — and it is
@@ -828,9 +838,17 @@ impl Vram {
 /// * Every canvas-sized texture that is not a slice at all: the stroke scratch,
 ///   the per-dab colour plane, a float's two copies, an effect working set,
 ///   `upload_coverage`'s selection mask.
+/// * **A device lost between two of Umber's own calls.** `Device::lose` is also
+///   reached from wgpu's `lose_if_oom`, which runs after *every* `Queue::submit`
+///   and every `Device::poll` — so a driver reset or another process exhausting
+///   the card loses the device with no allocation of Umber's involved. Umber
+///   sets no `device_lost_callback`, so it surfaces as the next operation's
+///   uncaptured error, and nothing in the report distinguishes it from an Umber
+///   bug.
 ///
 /// Each of those is still an uncaptured device error and therefore still the
-/// crash box. Stage 1 covers opening a document and adding a layer or a mask.
+/// crash box. Stage 1 covers opening a document, adding a layer or a mask, an
+/// effect bake and a canvas flip.
 ///
 /// **The device survives this**, which is what makes reporting it worth
 /// anything: `create_texture` maps its hal error through
@@ -869,6 +887,68 @@ fn try_reserve(
         return Err(Vram {
             slices: capacity,
             held: replacing.map_or(0, |old| old.pages),
+            slice_bytes: slice_bytes(doc_size),
+            doc_size,
+        });
+    }
+    Ok(texture)
+}
+
+/// The one page-sized target [`CanvasRenderer::flip_layers`] mirrors into.
+///
+/// Split out of the flip for the reason [`layer_texture`] is split out of
+/// [`try_reserve`]: it is what runs between the error scope's push and its pop,
+/// so it must build **no view**. The flip's raw view is created by
+/// [`try_reserve_flip_scratch`]'s caller, after the check.
+fn flip_scratch_texture(device: &wgpu::Device, page: UVec2) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("umber-flip"),
+        size: wgpu::Extent3d {
+            width: page.x,
+            height: page.y,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: LAYER_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[LAYER_FORMAT_LINEAR],
+    })
+}
+
+/// [`try_reserve`] for the flip's scratch page, reporting rather than dying.
+///
+/// **The flip is Image ▸ Flip, an ordinary command, and it was fatal.** It grows
+/// the atlas — a mirrored 256-wide tile lands across two destination tiles
+/// wherever the canvas is not a whole number of them, so residency can double —
+/// and then makes a page-sized target of its own, and neither was guarded.
+/// `try_reserve`'s own enumeration of what remains fatal did not name it either,
+/// so a reader trusting that list would have skipped it: on a card with room for
+/// the document and not for one more page plus a scratch, flipping the canvas
+/// was the crash box.
+///
+/// Three things in the fixed order [`try_reserve`]'s docs set out, and for its
+/// reasons: push an `OutOfMemory` scope and only that filter, create the texture
+/// and nothing else, pop and check before any view exists.
+///
+/// The figure is [`Vram::peak_bytes`] — one page against the atlas already
+/// resident — because that is what the device was holding when it declined.
+fn try_reserve_flip_scratch(
+    device: &wgpu::Device,
+    doc_size: UVec2,
+    page: UVec2,
+    held: u32,
+) -> Result<wgpu::Texture, Vram> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let texture = flip_scratch_texture(device, page);
+    let caught = pollster::block_on(scope.pop());
+    if let Some(error) = caught {
+        drop(texture);
+        log::warn!("refused a {page} flip scratch at {doc_size}: {error}");
+        return Err(Vram {
+            slices: 1,
+            held,
             slice_bytes: slice_bytes(doc_size),
             doc_size,
         });
@@ -4422,6 +4502,13 @@ impl CanvasRenderer {
     /// but a gigabyte. At 10000² a quantum is a single slice, so growth there is
     /// exact. [`grown_capacity`] is the whole policy and has the argument.
     ///
+    /// **Nothing shipped calls this any more** — `flip_layers` was the last, and
+    /// its two allocations are refusals now. It survives because the GPU tests
+    /// want an atlas grown without a refusal to unwrap, and
+    /// `no_shipped_code_grows_the_atlas_infallibly` is what keeps a new caller
+    /// from appearing: the whole point of `try_ensure_pages` is lost the moment
+    /// one does.
+    ///
     /// **The `.min` below fails open and the assertion is what stops it.**
     /// Asked for more than [`MAX_SLOTS`], this allocates the ceiling, logs a
     /// growth line naming it, and returns as though it had done what it was
@@ -6493,31 +6580,42 @@ impl CanvasRenderer {
     /// surface and the floating copy are not mirrored, so a stroke would commit
     /// unmirrored over the flipped picture and a preview would put its pixels
     /// down in the place they were dragged to before the flip.
+    ///
+    /// # Both of its allocations are refusals rather than deaths, and neither was
+    ///
+    /// A flip asks the device for two things: the atlas grows, because a
+    /// mirrored tile straddles two destination tiles wherever the canvas is not
+    /// a whole number of them, and then a page-sized scratch. Both went through
+    /// the infallible path — `ensure_pages` and a bare `create_texture` — so on a
+    /// card with room for the document and not for one more page beside it,
+    /// Image ▸ Flip was the crash box. `try_reserve`'s enumeration of what is
+    /// still fatal named neither, which is worse than the hole: a reader
+    /// trusting that list would have looked elsewhere.
+    ///
+    /// **A refusal changes nothing at all.** Both reservations happen before the
+    /// probes are reset, before the capture is cancelled and before a slot is
+    /// touched, so an `Err` means the document is exactly as it was and the
+    /// caller must not record an entry saying otherwise. That is the rule
+    /// `try_ensure_pages` and `plan_set_effect` already keep, and here it decides
+    /// whether an undo would put back a picture that was never flipped.
     pub fn flip_layers(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         slots: &[u32],
         axis: FlipAxis,
-    ) {
+    ) -> Result<(), Vram> {
         if slots.is_empty() {
-            return;
+            return Ok(());
         }
-        // A sample recorded against the picture as it was would be read back as
-        // though it belonged to the picture as it is.
-        self.reset_probes();
-        // And a capture part-way through would assemble a file out of layers
-        // that were mirrored and layers that were not. The scheduler's half of
-        // this is the caller's — see `app.rs`'s `stop_autosave_of`.
-        self.cancel_capture();
-        for &slot in slots {
-            self.touch_slot(slot);
-        }
-
         // What each slot's residency becomes, worked out before anything moves —
         // and the atlas grown for all of it at once, because a growth
         // reallocates the texture and cannot happen part-way through an encoder
         // that names it.
+        //
+        // **Every read, and that is what makes a refusal free.** Nothing below
+        // this point up to the second reservation mutates the renderer, so an
+        // `Err` out of either leaves the document untouched.
         let plans: Vec<(u32, Vec<(u32, u32)>)> = slots
             .iter()
             .filter(|s| (**s as usize) < MAX_SLOTS && self.layers.owned_page(**s).is_none())
@@ -6532,6 +6630,13 @@ impl CanvasRenderer {
                     .count()
             })
             .sum();
+
+        // The scratch first, so a refusal of it costs no growth. It is the same
+        // size whether or not the atlas grows, and the atlas is what a growth
+        // would then be holding twice.
+        let page = self.layers.grid.page_size();
+        let scratch = try_reserve_flip_scratch(device, self.doc_size, page, self.layers.pages)?;
+
         if self.layers.free.len() < wanted {
             let per = self.layers.grid.tiles_per_page() as usize;
             let short = (wanted - self.layers.free.len()).div_ceil(per.max(1)) as u32;
@@ -6539,24 +6644,22 @@ impl CanvasRenderer {
             // No encoder yet, and deliberately: the flip's own is created below,
             // so there is nothing recorded for a separately submitted copy to
             // lose. See `ensure_pages`.
-            self.ensure_pages(device, queue, None, pages);
+            self.try_ensure_pages(device, queue, None, pages)?;
         }
 
-        let page = self.layers.grid.page_size();
-        let scratch = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("umber-flip"),
-            size: wgpu::Extent3d {
-                width: page.x,
-                height: page.y,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: LAYER_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[LAYER_FORMAT_LINEAR],
-        });
+        // Past both refusals, so from here the flip happens.
+        //
+        // A sample recorded against the picture as it was would be read back as
+        // though it belonged to the picture as it is.
+        self.reset_probes();
+        // And a capture part-way through would assemble a file out of layers
+        // that were mirrored and layers that were not. The scheduler's half of
+        // this is the caller's — see `app.rs`'s `stop_autosave_of`.
+        self.cancel_capture();
+        for &slot in slots {
+            self.touch_slot(slot);
+        }
+
         let scratch_view = scratch.create_view(&wgpu::TextureViewDescriptor {
             label: Some("umber-flip-raw"),
             format: Some(LAYER_FORMAT_LINEAR),
@@ -6761,6 +6864,7 @@ impl CanvasRenderer {
             }
             self.layers.upload_slot(queue, slot);
         }
+        Ok(())
     }
 
     /// Which tiles a slot needs once the canvas is mirrored.
