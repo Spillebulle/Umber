@@ -1099,31 +1099,13 @@ mod tests {
             let output = ctx.run_ui(input.clone(), |ui| {
                 show(ui, &palette, ed, &mut out);
             });
-            words.clear();
-            collect_text(&output.shapes, &mut words);
+            words = crate::paneltest::text_of(&output.shapes);
         }
         let tall = ctx
             .memory(|m| m.area_rect(modal_id()))
             .map(|r| r.height())
             .unwrap_or_default();
         (tall, words)
-    }
-
-    fn collect_text(shapes: &[egui::epaint::ClippedShape], into: &mut Vec<String>) {
-        fn walk(shape: &egui::Shape, into: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(text) => into.push(text.galley.text().to_owned()),
-                egui::Shape::Vec(inner) => {
-                    for shape in inner {
-                        walk(shape, into);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for clipped in shapes {
-            walk(&clipped.shape, into);
-        }
     }
 
     fn drawn_height(ed: &mut Editor, height: f32) -> f32 {

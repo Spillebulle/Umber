@@ -7989,6 +7989,23 @@ impl CanvasRenderer {
     ///   as it is — a document that never existed, written silently. It is not
     ///   thrown away: see [`Capture::stale`] for why one layer is re-read rather
     ///   than the whole document restarted.
+    ///
+    /// **"Every method" is a claim about a set somebody has to have counted**,
+    /// and it has been wrong three times. The first was `render_float`, which
+    /// wrote the float's preview slice every frame of a drag and bumped
+    /// nothing. The second was a guard that said it drove every route and drove
+    /// three of nine, so `flip_layers`, `fill_layer_white`, `commit_float` and
+    /// both of `commit_stroke`'s early-return arms could each have their
+    /// increment deleted with all 170 GPU tests still green. The third was the
+    /// count itself: [`Self::touch_all_slots`] is a *second* mechanism, reached
+    /// from `resize` and `clear_all_layers`, and enumerating this one's call
+    /// sites alone left it out.
+    ///
+    /// The set is enumerated in `writing_a_slice_moves_its_revision_and_leaves_
+    /// the_others_alone`, which names the three it does not drive and why.
+    /// Adding a method that writes a slice means adding a case there — a rule
+    /// enforced inside N methods still needs somebody to check that N is all of
+    /// them, and that the methods are the only mechanism.
     fn touch_slot(&mut self, slot: u32) {
         if let Some(rev) = self.slot_revisions.get_mut(slot as usize) {
             *rev += 1;
@@ -8035,7 +8052,15 @@ impl CanvasRenderer {
         self.touch_slot(slot);
     }
 
-    /// Note that every slice has changed — a flip, a resize, a fresh document.
+    /// Note that every slice has changed — a resize, or a fresh document.
+    ///
+    /// **Not a flip**, and this comment said it was. `flip_layers` moves the
+    /// counters of the slots it was *given*, through the per-slot loop, because
+    /// a flip of two layers in a stack of ten leaves the other eight alone, and
+    /// it cancels by hand because its pixels move rather than go. The wrong
+    /// sentence here is what let the gap below stay hidden: it reads as though
+    /// the flip and the resize shared a mechanism, so enumerating
+    /// [`Self::touch_slot`]'s callers looked like enumerating everything.
     ///
     /// A capture is **given up on** rather than marked. The two callers are
     /// `resize`, which changes the canvas out from under it, and
@@ -8043,9 +8068,7 @@ impl CanvasRenderer {
     /// anything worth re-reading. `resize` cancelled by hand already and
     /// `clear_all_layers` did not, so putting it here is what covers the second
     /// and whatever a third turns out to be — the rule this file applies to
-    /// `slot_revision` itself. (`flip_layers` is *not* one of them: it touches
-    /// each slot in turn and cancels by hand, because its pixels move rather
-    /// than go.)
+    /// `slot_revision` itself.
     fn touch_all_slots(&mut self) {
         for rev in &mut self.slot_revisions {
             *rev += 1;

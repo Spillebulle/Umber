@@ -1532,6 +1532,311 @@ mod tests {
         assert_eq!(doc.open().history.len(), 0);
     }
 
+    // ------------------------------------------------- the reader's own bounds
+    //
+    // `docimport::history::load` refuses a file in **thirteen** distinct
+    // sentences — counted, because this comment said eleven until somebody
+    // counted — and four of them are reached from the round trips above, where
+    // every assertion is
+    // `matches!(w, HistoryDropped { .. })`, so **no `reason` is ever read** and
+    // any refusal stands in for any other. The bounds checks are reached by
+    // none of them, and they are the ones between a malformed `.ora` somebody
+    // was sent and a `write_layer_rect` past the edge of the texture.
+    //
+    // The canvas here is **70 × 50**, not [`CANVAS`]'s square 64. On a square
+    // canvas the x half and the y half of a bounds check are the same test, so
+    // the whole pair could be transposed and every case would agree; this is
+    // the fixture-shape trap CLAUDE.md records for the page table, and a
+    // reader of files a stranger wrote is where it costs most.
+
+    const ODD: UVec2 = UVec2::new(70, 50);
+
+    /// A document of [`ODD`] carrying one Paint entry, its patch **in two
+    /// pieces**, and the manifest passed through `doctor`.
+    ///
+    /// Returns what the reader made of it: whether it kept a history, and
+    /// whatever it said.
+    ///
+    /// The entry is `(0, 0, 45, 44)`; piece A is `(0, 0, 44, 22)` and piece B
+    /// is `(5, 22, 30, 21)`. Three properties of those numbers are load-bearing
+    /// and each was arrived at by mutating rather than by choosing:
+    ///
+    /// * **Two pieces, the second smaller than the entry's own rectangle.** The
+    ///   reader bounds the entry and *then* each piece, and the first draft of
+    ///   this carried one piece — so the entry's `"w"` and the piece's `"w"`
+    ///   were the same number, doctoring hit both, the entry check refused
+    ///   first, and the per-piece check never ran. Transposing it left all 21
+    ///   tests here green.
+    /// * **Every field's value appears exactly once**, so doctoring names one
+    ///   rectangle rather than three. [`once`] enforces it.
+    /// * **Both `x + w` figures are under 50**, the canvas's *shorter* edge.
+    ///   That is what lets a too-tall case be legal on the other axis, and so
+    ///   tell a transposed check from a working one.
+    fn read_doctored(doctor: impl Fn(String) -> String) -> (bool, Vec<ImportWarning>) {
+        let rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: 45,
+            height: 44,
+        };
+        let piece = |x, y, w: u32, h: u32| {
+            PatchPiece::new(
+                PixelRect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+                // Deliberately not one repeated byte: `PatchPiece` stores a flat
+                // piece as a single pixel, so a fixture of one value would be
+                // driving that compression rather than the rectangle.
+                (0..w * h * 4).map(|i| (i % 251) as u8).collect(),
+            )
+        };
+        let stack = stack(&["Paper", "Ink"]);
+        let slot = stack.get(1).unwrap().slot().unwrap();
+        let mut history = History::default();
+        history.record(Edit::new(
+            EditKind::Paint,
+            PixelPatch::from_pieces(rect, slot, vec![piece(0, 0, 44, 22), piece(5, 22, 30, 21)]),
+        ));
+
+        let pixels = vec![0u8; (ODD.x * ODD.y * 4) as usize];
+        let layers: Vec<SaveLayer<'_>> = stack
+            .layers()
+            .iter()
+            .map(|l| SaveLayer::new(&l.name, BlendMode::Normal, &pixels))
+            .collect();
+        let (bytes, _) = encode(&SaveDocument {
+            size: ODD,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(&pixels),
+            history: SaveHistory::new(&history, &stack),
+        })
+        .expect("encode");
+
+        // The fixture has to have written a history with both pieces in it, or
+        // every case below is vacuous — the reader would refuse nothing because
+        // there is nothing to refuse.
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        assert!(archive.by_name(MANIFEST).is_ok(), "no history was written");
+        assert_eq!(
+            archive
+                .file_names()
+                .filter(|n| n.starts_with("umber/history/") && n.ends_with(".png"))
+                .count(),
+            2,
+            "the fixture stopped writing the two pieces it is about"
+        );
+
+        let doctored = with_entry(&bytes, MANIFEST, doctor);
+        let doc = docimport::read_openraster(&doctored).expect("the picture still opens");
+        assert_eq!(
+            doc.layers.len(),
+            2,
+            "a dropped history costs only the history"
+        );
+        (doc.history.is_some(), doc.warnings)
+    }
+
+    /// Whichever sentence the reader gave for dropping the history.
+    fn dropped_for(warnings: &[ImportWarning]) -> Option<&str> {
+        warnings.iter().find_map(|w| match w {
+            ImportWarning::HistoryDropped { reason } => Some(reason.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Replace `from` with `to`, having checked `from` names exactly one whole
+    /// value.
+    ///
+    /// A `replace` matching nothing doctors nothing, the reader accepts the
+    /// file, and the case reads as the bound having been enforced. A `replace`
+    /// matching *twice* is worse: it is what made the per-piece bound
+    /// unreachable in the first draft of these tests.
+    ///
+    /// **A count alone is not enough, because a match may be a prefix.**
+    /// `"h":21` occurs once inside `"h":213` and rewriting it there would move
+    /// a rectangle nobody named — the same failure the count exists to prevent,
+    /// wearing a different shape. No fixture value stands in that relation
+    /// today, which is exactly why it would go unnoticed later, so the digit
+    /// after the match is checked rather than assumed.
+    ///
+    /// **That check covers the numeric patterns and the callers cover the
+    /// rest**, which is worth saying rather than leaving the promise to look
+    /// wider than it is. A number cannot be extended leftwards, because every
+    /// numeric pattern opens with the key's own quote; it cannot be confused
+    /// with a longer *key* for the same reason, nor with a key it is a prefix
+    /// of, because the closing quote is in the pattern too. What none of that
+    /// reaches is a **textual** value: bare `Paper` matches inside `Paperwork`
+    /// and the byte after it is a letter. So the one textual caller passes its
+    /// value quoted, and this is where that is written down.
+    fn once(json: &str, from: &str, to: &str) -> String {
+        let at: Vec<usize> = json.match_indices(from).map(|(i, _)| i).collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "`{from}` is not a unique field of this manifest, so doctoring it \
+             does not name one rectangle: {json}"
+        );
+        let after = json[at[0] + from.len()..].bytes().next();
+        assert!(
+            !after.is_some_and(|b| b.is_ascii_digit()),
+            "`{from}` is a prefix of a longer number here, so replacing it \
+             rewrites a value nobody named: {json}"
+        );
+        json.replace(from, to)
+    }
+
+    /// **A rectangle reaching past the canvas is refused, on each axis and at
+    /// both levels.**
+    ///
+    /// The reason is read rather than the drop merely counted: a bounds failure
+    /// and a missing PNG are both `HistoryDropped`, so a test that could not
+    /// tell them apart would pass while the bound it names had stopped running.
+    #[test]
+    fn a_saved_patch_reaching_past_the_canvas_is_refused_on_either_axis() {
+        let (kept, warnings) = read_doctored(|json| json);
+        assert!(kept, "the undoctored fixture must open: {warnings:?}");
+
+        // `axis_blind` marks the cases a *transposed* check would refuse
+        // anyway. They still say the axis runs at all, and it is worth saying
+        // out loud which half of the pair each case is doing — and counting,
+        // because "this table catches a transposition" is a claim about the
+        // rows that are **not** blind, and a fixture edited later could leave
+        // none of them.
+        let mut discriminating = 0;
+        for (what, from, to, axis_blind) in [
+            // --- the piece bound, which nothing reached before ---
+            //
+            // Piece B is (5, 22, 30, 21). At h = 39 it reaches y = 61, past a
+            // canvas 50 tall, while x + w stays at 35 — so a check with its
+            // axes transposed asks `35 > 50` and `61 > 70` and admits it. This
+            // is the case that tells the two apart.
+            ("a piece too tall", "\"h\":21", "\"h\":39", false),
+            // 5 + 66 is past 70, and is over 50 as well, so a transposed check
+            // refuses this one too.
+            ("a piece too wide", "\"w\":30", "\"w\":66", true),
+            // In range on its own and past the edge once the origin is added,
+            // which is the case a bare `h <= canvas.y` admits: 30 + 21 = 51.
+            (
+                "a piece pushed off the bottom",
+                "\"y\":22",
+                "\"y\":30",
+                false,
+            ),
+            // --- the entry bound, which the round trips reach by accident ---
+            //
+            // The entry is (0, 0, 45, 44), so x + w is 45 and under 50 here too.
+            ("an entry too tall", "\"h\":44", "\"h\":60", false),
+            ("an entry too wide", "\"w\":45", "\"w\":71", true),
+        ] {
+            let (kept, warnings) = read_doctored(|json| once(&json, from, to));
+            assert!(!kept, "{what}: a patch past the canvas was trusted");
+            let reason = dropped_for(&warnings).unwrap_or_else(|| panic!("{what}: no reason"));
+            assert!(
+                reason.contains("outside the canvas"),
+                "{what}: dropped for the wrong reason, so the bound did not run: {reason}"
+            );
+            discriminating += usize::from(!axis_blind);
+        }
+        assert_eq!(
+            discriminating, 3,
+            "the fixture stopped being able to tell a transposed bound from a \
+             working one, which is the whole reason its canvas is not square"
+        );
+    }
+
+    /// A rectangle of no area is refused, at both levels.
+    ///
+    /// Zero reads as harmless and is not: it is what a manifest with a field
+    /// missing decodes to, and at the entry level it is exactly what the writer
+    /// puts there for a **flip** — so an entry that named no pixels and was
+    /// read as one would go looking for a PNG nobody can produce.
+    #[test]
+    fn a_saved_patch_of_no_area_is_refused() {
+        for (what, from) in [
+            ("a piece with no width", "\"w\":30"),
+            ("a piece with no height", "\"h\":21"),
+            ("an entry with no width", "\"w\":45"),
+            ("an entry with no height", "\"h\":44"),
+        ] {
+            let zeroed = format!("{}0", &from[..4]);
+            let (kept, warnings) = read_doctored(|json| once(&json, from, &zeroed));
+            assert!(!kept, "{what}: an empty patch was trusted");
+            let reason = dropped_for(&warnings).unwrap_or_else(|| panic!("{what}: no reason"));
+            assert!(reason.contains("outside the canvas"), "{what}: {reason}");
+        }
+    }
+
+    /// The refusals the round trips above already reach, now read by their
+    /// *reason* rather than by the fact that something was dropped.
+    ///
+    /// `a_history_that_cannot_be_placed_is_dropped_rather_than_replayed` drives
+    /// four of these and asserts `matches!(w, HistoryDropped { .. })` on each,
+    /// so all four would pass if the reader answered any one of its thirteen
+    /// sentences for all of them — including one that named the wrong cause and
+    /// sent somebody looking for a damaged file, which is the failure that
+    /// module's own docs record for a dropped *layer*. These pin which is which.
+    #[test]
+    fn each_refusal_says_which_one_it_was() {
+        for (what, doctor, wanted) in [
+            (
+                "a newer revision",
+                // Off [`VERSION`] rather than the literal 3. When that moves to
+                // 4 the literal would make `once` report "`\"version\":3` is
+                // not a unique field of this manifest" — a diagnosis of the
+                // wrong thing entirely, for a fixture that has merely gone
+                // stale.
+                Box::new(|j: String| once(&j, &format!("\"version\":{VERSION}"), "\"version\":99"))
+                    as Box<dyn Fn(String) -> String>,
+                "newer form than this build reads",
+            ),
+            (
+                "a resized canvas",
+                Box::new(|j: String| once(&j, "\"canvas\":[70,50]", "\"canvas\":[70,51]")),
+                // **Not "canvas".** Two of the reader's thirteen sentences
+                // carry that word — this one and "covers an area outside the
+                // canvas" — so matching on it would reopen, for the very pair
+                // the two tests above are about, exactly the hole this test
+                // exists to close.
+                "it was recorded on a",
+            ),
+            (
+                "renamed layers",
+                // **Quoted**, which is what makes `once`'s promise true of this
+                // call as well as of the numeric ones: bare `Paper` would match
+                // once inside a layer called `Paperwork` and rewrite it
+                // mid-word, and the digit check below cannot see that because
+                // the character after it is a letter.
+                Box::new(|j: String| once(&j, "\"Paper\"", "\"Card\"")),
+                "no longer the ones it was recorded against",
+            ),
+            (
+                "a position past the end",
+                Box::new(|j: String| once(&j, "\"position\":1", "\"position\":9")),
+                "out of range",
+            ),
+            (
+                "a layer that is not there",
+                Box::new(|j: String| once(&j, "\"layer\":1", "\"layer\":7")),
+                "names a layer this document does not have",
+            ),
+        ] {
+            let (kept, warnings) = read_doctored(doctor);
+            assert!(!kept, "{what}: trusted");
+            let reason = dropped_for(&warnings).unwrap_or_else(|| panic!("{what}: no reason"));
+            assert!(
+                reason.contains(wanted),
+                "{what}: refused for something else, so this case is not the one \
+                 being driven: {reason}"
+            );
+        }
+    }
+
     fn without_entry(bytes: &[u8], name: &str) -> Vec<u8> {
         rebuild(bytes, |entry, body| (entry != name).then(|| body.to_vec()))
     }
