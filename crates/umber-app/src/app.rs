@@ -3085,20 +3085,14 @@ impl UmberApp {
     /// about to stop being what the document holds.
     ///
     /// Called wherever an autosave could otherwise finish *after* something
-    /// that supersedes it: an explicit Save, a resize, a document closing. The
-    /// renderer half and the scheduler half both have to be told — the first
-    /// gives the staging buffer back, the second stops waiting for pixels that
-    /// are not coming.
+    /// that supersedes it: an explicit Save, a resize, a document closing.
+    ///
+    /// The rule itself is [`autosave::interrupt`]'s, in the module that owns
+    /// both halves of it and can be driven by a test; all this does is find the
+    /// canvas, which is the one thing that needs `self`.
     fn stop_autosave_of(&mut self, id: DocId) {
-        if self.editor.autosave.capturing_id() != Some(id) {
-            return;
-        }
-        if let Some(gfx) = self.gfx.as_mut()
-            && let Some(canvas) = gfx.canvases.get_mut(&id)
-        {
-            canvas.cancel_capture();
-        }
-        self.editor.autosave.abandon();
+        let canvas = self.gfx.as_mut().and_then(|gfx| gfx.canvases.get_mut(&id));
+        crate::autosave::interrupt(&mut self.editor.autosave, canvas, id);
     }
 
     fn save_document(&mut self, always_ask: bool) -> bool {

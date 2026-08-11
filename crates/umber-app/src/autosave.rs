@@ -1939,6 +1939,28 @@ pub fn drive(
     }
 }
 
+/// Give up on the capture reading `id`, because what it is reading is about to
+/// stop being what the document holds — an explicit Save, a canvas flip, a
+/// resize, a document closing.
+///
+/// **Both halves have to be told.** The renderer gives its staging buffer back
+/// and the scheduler stops waiting for pixels that are not coming; telling one
+/// and not the other is a whole capture stranded. Here rather than in `app.rs`
+/// so the rule can be driven by a test — `app.rs`'s `stop_autosave_of` is the
+/// call site and does nothing but find the canvas.
+///
+/// `canvas` is an `Option` because a document may have no renderer: the resume
+/// path rebuilds them, and a document without one has no capture to cancel.
+pub fn interrupt(autosave: &mut Autosave, canvas: Option<&mut CanvasRenderer>, id: DocId) {
+    if autosave.capturing_id() != Some(id) {
+        return;
+    }
+    if let Some(canvas) = canvas {
+        canvas.cancel_capture();
+    }
+    autosave.abandon();
+}
+
 /// Everything the autosave does *after* the frame has been presented: map what
 /// was recorded, collect what has come home, and apply whatever the writer
 /// thread has finished.
