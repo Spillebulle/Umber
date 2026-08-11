@@ -881,9 +881,22 @@ impl UmberApp {
     /// direction — a flip is its own inverse, so a second implementation for
     /// the undo would be a second thing to keep exact.
     ///
-    /// Returns false when the document has no GPU storage, in which case
-    /// nothing at all was mirrored and the caller must not record an entry
-    /// saying otherwise.
+    /// Returns false when nothing at all was mirrored — a locked layer, no GPU
+    /// storage, or a card that would not find room — in which case the caller
+    /// must not record an entry saying otherwise, and must not step over one.
+    ///
+    /// **`#[must_use]` is the guard, because no test in this crate can be.**
+    /// Driving this needs an `UmberApp`, which needs a window; the critic that
+    /// found the defect said so and it is true. What is available instead is the
+    /// compiler: `reverse` discarded this answer for as long as it existed, and
+    /// under CI's `-D warnings` that line is now a build failure rather than a
+    /// document quietly damaged by the next undo. Demonstrated by mutation —
+    /// write `self.mirror_document(axis);` on its own and the build stops.
+    ///
+    /// This is the `#[must_use] fn forget_all` idiom one crate over, applied to
+    /// the case where the value being given up is a *refusal* rather than a
+    /// resource.
+    #[must_use]
     fn mirror_document(&mut self, axis: umber_core::FlipAxis) -> bool {
         // **The one gate a lock has on the flip**, on the way out as well as on
         // the way back, since undoing a flip comes through here too. Refused
