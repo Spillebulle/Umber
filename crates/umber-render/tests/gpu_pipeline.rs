@@ -7939,14 +7939,87 @@ fn a_tap_across_a_tile_boundary_blends_the_logical_neighbour() {
         "and inside the borrowed tile it reads what the table points at"
     );
 
+    // The weights are computable exactly: document 255.75, so texel 255 takes
+    // 0.75 and texel 256 takes 0.25. Both operands are flat and opaque, so the
+    // answer is `0.75 * red + 0.25 * blue` — **in linear light**, because that
+    // is where the blend happens, with the encode on the way out. Three quarters
+    // of linear one is sRGB 225 and a quarter is 137, not 191 and 64, which is
+    // the same trap `composite_pixel`'s own note records: 50% white over black
+    // is sRGB 188 rather than 128.
+    //
+    // Asserted as a value rather than as a threshold, because a threshold
+    // survives the two weights being swapped (which here would blend *down* the
+    // page, within one tile, and give pure red) or complemented (which would
+    // give [137, 0, 225]). Two levels of slack for the store's rounding, which
+    // is what the testing rules allow where a tap is not on a texel centre.
     let straddling = tiled_composite(gpu, &canvas, &draws, zoom, centre, 31, 32);
+    let near = |got: u8, want: u8| (i32::from(got) - i32::from(want)).abs() <= 2;
     assert!(
-        straddling[2] > 8,
-        "the tap must reach the logical neighbour: got {straddling:?}, which is \
-         what reading the physically adjacent tile would give"
+        near(straddling[0], 225) && straddling[1] == 0 && near(straddling[2], 137),
+        "expected three quarters red and a quarter of the *logical* neighbour, \
+         about [225, 0, 137, 255]; got {straddling:?}. Pure red is what reading \
+         the physically adjacent tile gives."
     );
+    assert_eq!(straddling[3], 255);
+}
+
+/// The thumbnail pass substitutes for an unbacked tile too, and it is a
+/// *different* shader from the composite.
+///
+/// `thumbnail.wgsl` and `effect.wgsl` take the same page table and the same
+/// prelude, and until this existed only the composite had ever resolved one —
+/// so two of the three consumers carried a branch nobody had run. This is the
+/// cheap half of that gap; the bake is still uncovered.
+#[test]
+fn a_thumbnail_reads_an_unbacked_tile_as_nothing_too() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 1);
+    fill_tiled_slot(gpu, &mut canvas, 0, [255, 0, 0, 255]);
+
+    let thumb_of = |canvas: &mut CanvasRenderer| -> Thumbnail {
+        assert!(canvas.begin_thumb(0));
+        // Bounds pass, then picture pass, then the map.
+        for _ in 0..2 {
+            let mut enc = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            canvas.drive_thumb(&gpu.device, &mut enc);
+            gpu.queue.submit(Some(enc.finish()));
+            canvas.submit_thumb();
+            let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            if let Some(t) = canvas.take_thumb(&gpu.device) {
+                return t;
+            }
+        }
+        panic!("the thumbnail never settled");
+    };
+
+    let whole = thumb_of(&mut canvas);
     assert!(
-        straddling[0] > 8 && straddling[0] < 255,
-        "and it must still be a blend rather than the neighbour alone: {straddling:?}"
+        !whole.is_empty(),
+        "a layer filled edge to edge is not empty"
+    );
+
+    // Take the right-hand half off. The content box is then the left half, so
+    // the frame is narrower and the picture is still solid where it draws —
+    // what would say the substitution failed is the *bounds* pass having found
+    // paint in a tile that stores none.
+    canvas.unback_tile_for_test(&gpu.queue, 0, (1, 0));
+    canvas.unback_tile_for_test(&gpu.queue, 0, (1, 1));
+    let half = thumb_of(&mut canvas);
+    assert!(!half.is_empty());
+    assert_ne!(
+        half.rgba, whole.rgba,
+        "half the layer stopped being stored and the thumbnail did not notice"
+    );
+
+    // And with nothing stored at all the layer reads as empty, which is the
+    // answer a cleared layer will give once `clear_layer` is a table write.
+    canvas.unback_tile_for_test(&gpu.queue, 0, (0, 0));
+    canvas.unback_tile_for_test(&gpu.queue, 0, (0, 1));
+    assert!(
+        thumb_of(&mut canvas).is_empty(),
+        "a slot storing no tile at all has nothing on it"
     );
 }

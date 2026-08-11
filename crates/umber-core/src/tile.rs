@@ -155,14 +155,20 @@ impl Entry {
         self.0 >> 16
     }
 
-    /// The tile's position within its page, in tiles.
+    /// The tile's position within its page, in tiles, as **`(x, y)`**.
+    ///
+    /// The order is stated because it was the other way round once and nothing
+    /// would have caught it: `origin` compensated, every other tuple in this
+    /// module is `(x, y)`, and the first caller to write `let (x, y) =
+    /// entry.cell()` would have got a silent transpose — in the one place a
+    /// transpose produces a picture assembled out of the wrong tiles.
     pub fn cell(self) -> (u32, u32) {
-        ((self.0 >> 8) & 0xff, self.0 & 0xff)
+        (self.0 & 0xff, (self.0 >> 8) & 0xff)
     }
 
     /// The tile's top-left corner within its page, in texels.
     pub fn origin(self) -> (u32, u32) {
-        let (y, x) = self.cell();
+        let (x, y) = self.cell();
         (x * TILE, y * TILE)
     }
 }
@@ -337,9 +343,12 @@ mod tests {
         let e = Entry::at(3, 5, 7);
         assert_eq!(e.0, (3 << 16) | (7 << 8) | 5);
         assert_eq!(e.page(), 3);
-        assert_eq!(e.cell(), (7, 5));
+        // `(x, y)`, in that order, which is every other tuple in this module.
+        assert_eq!(e.cell(), (5, 7));
         assert_eq!(e.origin(), (5 * TILE, 7 * TILE));
         assert!(e.is_backed());
+        // The two axes are told apart, so a transposed unpack cannot pass.
+        assert_ne!(Entry::at(3, 5, 7), Entry::at(3, 7, 5));
     }
 
     /// Zero is a real entry — page 0, tile (0, 0), which is where the very first

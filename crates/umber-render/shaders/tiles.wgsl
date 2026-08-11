@@ -51,15 +51,17 @@ const TILE: i32 = 256;
 const TILE_UNBACKED: u32 = 4294967295u;
 
 // The packing an entry uses: `page << 16 | y << 8 | x`. MUST match
-// `umber_core::tile::Entry::PACKING`.
+// `umber_core::tile::Entry::PACKING`, and all three are named — the x field's
+// shift is zero and would be the one nobody pinned.
 const TILE_PAGE_SHIFT: u32 = 16u;
 const TILE_Y_SHIFT: u32 = 8u;
+const TILE_X_SHIFT: u32 = 0u;
 
 // Where in the atlas one document texel of one slot lives, given its tile's
 // entry. `p` is the document texel and `t` is its tile.
 fn tile_atlas_texel(entry: u32, p: vec2<i32>, t: vec2<i32>) -> vec2<i32> {
     let cell = vec2<i32>(
-        i32(entry & 255u),
+        i32((entry >> TILE_X_SHIFT) & 255u),
         i32((entry >> TILE_Y_SHIFT) & 255u),
     );
     return cell * TILE + (p - t * TILE);
@@ -92,16 +94,50 @@ fn tile_load(
     return textureLoad(atlas, tile_atlas_texel(entry, p, t), i32(entry >> TILE_PAGE_SHIFT), 0);
 }
 
+// One texel of an atlas tile whose entry has already been resolved.
+//
+// The four-taps-one-entry half of `tile_bilinear`, split out because that is the
+// path 99.2% of samples take and it must not pay for the page table four times.
+fn tile_texel(
+    atlas: texture_2d_array<f32>,
+    entry: u32,
+    p: vec2<i32>,
+    t: vec2<i32>,
+) -> vec4<f32> {
+    return textureLoad(
+        atlas,
+        tile_atlas_texel(entry, p, t),
+        i32(entry >> TILE_PAGE_SHIFT),
+        0,
+    );
+}
+
 // What `textureSampleLevel(layer, clamping_sampler, doc / doc_size, slot, 0)`
 // used to answer, computed from four loads.
 //
 // `doc` is in document pixels, so the texel centre of texel `n` is `n + 0.5` --
-// which is why this subtracts a half before flooring, and why at zoom 1 the
-// weights come out exactly 0 and 1 and the answer is exactly one stored texel.
+// which is why this subtracts a half before flooring, and why a tap that lands
+// on a texel centre comes out with weights of exactly 0 and 1 and returns
+// exactly one stored texel. **That is a statement about the tap, not about the
+// zoom**: at zoom 1 the offset is `camera.center - pivot`, and neither is
+// constrained to be whole, so an ordinary pan puts a fractional weight on every
+// sample. What is exact is the export, the two picks and the autosave preview,
+// which composite at zoom 1 with the centre and the pivot both at the middle of
+// their own target.
 //
 // The clamp reproduces the sampler's `ClampToEdge`, and it is what a tap at the
 // canvas's own border needs: without it the two outer taps would resolve tiles
-// that do not exist.
+// that do not exist. It is also what makes the integer divide below safe --
+// nothing negative reaches it.
+//
+// **The common path is one page-table read, not four.** A tap straddles a tile
+// boundary only when the sample sits within half a texel of one, which is
+// `1 - (255/256)^2` -- about 0.78% -- of interior samples; the other 99.2%
+// resolve through a single entry. This loop runs per layer per fragment on the
+// pass that is already the frame's dominant cost, so the difference is four
+// dependent fetches against one, doubled again wherever a layer carries a mask.
+// `docs/perf/tiled-layer-storage.md` §8.1 is where the hand lerp is argued for
+// against the apron, and this is the count that argument turns on.
 fn tile_bilinear(
     atlas: texture_2d_array<f32>,
     table: texture_2d_array<u32>,
@@ -117,6 +153,24 @@ fn tile_bilinear(
     let lo = clamp(vec2<i32>(base), vec2<i32>(0), hi);
     let up = clamp(vec2<i32>(base) + vec2<i32>(1), vec2<i32>(0), hi);
 
+    let t_lo = lo / TILE;
+    let t_up = up / TILE;
+    if (t_lo.x == t_up.x && t_lo.y == t_up.y) {
+        // All four taps are in one tile, so one entry answers for all of them --
+        // including "not stored", which makes the whole tap the empty value.
+        let entry = textureLoad(table, t_lo, slot, 0).r;
+        if (entry == TILE_UNBACKED) {
+            return empty;
+        }
+        let c00 = tile_texel(atlas, entry, vec2<i32>(lo.x, lo.y), t_lo);
+        let c10 = tile_texel(atlas, entry, vec2<i32>(up.x, lo.y), t_lo);
+        let c01 = tile_texel(atlas, entry, vec2<i32>(lo.x, up.y), t_lo);
+        let c11 = tile_texel(atlas, entry, vec2<i32>(up.x, up.y), t_lo);
+        return mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
+    }
+
+    // Straddling: up to four tiles, resolved one at a time. This is the case an
+    // apron exists to avoid and the case that makes a seam if it is got wrong.
     let c00 = tile_load(atlas, table, slot, vec2<i32>(lo.x, lo.y), empty);
     let c10 = tile_load(atlas, table, slot, vec2<i32>(up.x, lo.y), empty);
     let c01 = tile_load(atlas, table, slot, vec2<i32>(lo.x, up.y), empty);

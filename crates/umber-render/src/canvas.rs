@@ -487,9 +487,27 @@ const INITIAL_SLOTS: u32 = 4;
 fn slice_bytes(doc_size: UVec2) -> u64 {
     // The *page*, not the canvas: a slice of the layer array is a page of the
     // tile atlas, and a page is the canvas rounded up to whole tiles so that
-    // every tile slot in it is a full 256 square. On a 20000×5000 canvas that is
-    // 3.5% more than the document; on a canvas already a multiple of the tile it
-    // is exactly the document. See `umber_core::tile::Grid::page_size`.
+    // every tile slot in it is a full 256 square, which is what lets any tile go
+    // in any free slot. See `umber_core::tile::Grid::page_size`.
+    //
+    // **The rounding is per axis, so the overhead is worst on a small dimension
+    // and the large-canvas figure is the flattering one.** Measured:
+    //
+    // | canvas | page | overhead |
+    // |---|---|---|
+    // | 20000×5000 | 20224×5120 | +3.5% |
+    // | A4 at 600 dpi, 4961×7016 | 5120×7168 | +5.4% |
+    // | 2560×1440 | 2560×1536 | +6.7% |
+    // | **1920×1080** | **2048×1280** | **+26.4%** |
+    // | 800×600 | 1024×768 | +63.8% |
+    //
+    // 1080 is 4.22 tiles, which is why the most ordinary canvas anybody paints
+    // on is the worst realistic entry. It is a real cost and not a reporting
+    // one: it is the VRAM a slice takes, and `growth_quantum` reads it, so a
+    // 1920×1080 document's quantum falls from 32 slices to 25. What pays for it
+    // is that the sparse stage takes a layer's cost to what it covers, which is
+    // an order of magnitude the other way; until that lands this is a straight
+    // loss, and it is the reason phase 1 alone is worth keeping only as a step.
     let page = Grid::new(doc_size).page_size();
     u64::from(page.x)
         .saturating_mul(u64::from(page.y))
@@ -723,7 +741,9 @@ pub struct Vram {
     /// recorded against both textures and wgpu keeps a texture alive for any
     /// submission naming it, so both are resident at the moment of the refusal.
     pub held: u32,
-    /// What one slice costs at this canvas size.
+    /// What one slice costs at this canvas size — which is a **page**, the
+    /// canvas rounded up to whole tiles, and not `width × height × 4`. See
+    /// [`slice_bytes`], which has the overhead table.
     pub slice_bytes: u64,
     /// The canvas those slices are sized to.
     pub doc_size: UVec2,
@@ -779,6 +799,13 @@ impl Vram {
 /// * A blank document — `Graphics::add_canvas`, reached by File → New, which
 ///   offers up to `max_texture_dimension_2d`; one slice at 32768² is 4.3 GB.
 /// * The effect cache's `ensure_slots(highest + 1)`, which is on the frame path.
+/// * The **page table and its first upload**, which `LayerStore::from_texture`
+///   makes *after* this function has popped its scope. It is small — kilobytes
+///   for an ordinary canvas, 16.8 MB for a full stack at 32768² — and it is
+///   still outside the guarantee, and the upload is the worse half: a
+///   `Queue::write_texture` stages through wgpu's **fatal** error path, so an
+///   out-of-memory there loses the device with nothing able to catch it, one
+///   line after an array allocation that was accepted.
 /// * Every canvas-sized texture that is not a slice at all: the stroke scratch,
 ///   the per-dab colour plane, a float's two copies, an effect working set,
 ///   `upload_coverage`'s selection mask.
@@ -3773,7 +3800,7 @@ impl CanvasRenderer {
     /// decides the figure but runs before the allocation is attempted. Logged
     /// there, a refused growth announced a growth that did not happen and was
     /// then immediately contradicted by `try_reserve`'s own refusal line.
-    fn adopt(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, grown: LayerStore) {
+    fn adopt(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut grown: LayerStore) {
         let capacity = grown.capacity;
         log::info!(
             "growing layer storage {} -> {} slots",
@@ -3811,6 +3838,17 @@ impl CanvasRenderer {
                 depth_or_array_layers: self.layers.capacity,
             },
         );
+        // **And carry the table the copy above is for.** `grown` was built with
+        // a fresh identity table, which agrees with the old one entry for entry
+        // while residency *is* the identity — so this is a no-op today and is
+        // the difference between the copy meaning something and not the day it
+        // stops being one. A page index does not move across a growth: page `n`
+        // of the old array is page `n` of the new, which is exactly what the
+        // whole-page copy above establishes.
+        let carried = self.layers.entries.len().min(grown.entries.len());
+        grown.entries[..carried].copy_from_slice(&self.layers.entries[..carried]);
+        grown.upload_table(queue);
+
         // Slices beyond the old capacity are freshly allocated and hold
         // whatever the driver left behind.
         for slot in self.layers.capacity..capacity {
@@ -7852,6 +7890,15 @@ impl CanvasRenderer {
     /// reason: the real figure is first met at 8192², where a layer slice is
     /// exactly the budget's 256 MiB and the colour scratch — eight bytes a pixel
     /// — is 537 MB. See [`Self::speculation_limit`].
+    ///
+    /// **8192² is exact only because it is a whole number of tiles.** What
+    /// [`Self::may_speculate`] compares is [`slice_bytes`], which is now the
+    /// *page*, against a limit gating two textures that are canvas-sized — so
+    /// the threshold is met slightly earlier than the canvas arithmetic says
+    /// wherever a dimension is not a multiple of 256. Always in the direction of
+    /// speculating less, so it is a shift and not a defect; a page figure
+    /// standing in for a canvas one is worth saying out loud rather than
+    /// discovering.
     pub fn set_speculation_limit(&mut self, bytes: u64) {
         self.speculation_limit = bytes;
     }
@@ -8338,9 +8385,13 @@ fn write_rect(
 /// rectangle. The viewport is what makes those shaders correct against a
 /// larger attachment without any of them learning that pages exist.
 ///
-/// Three passes take it: the two commits and the float's draw. The effect
-/// passes already set their own from [`EffectStep::viewport`], and every other
-/// pass in this file draws into a document-sized target of its own.
+/// **The enumeration is over passes that draw.** Three take it: the two commits
+/// and the float's draw. The effect resolve step targeting a slice sets its own
+/// from [`EffectStep::viewport`], which is the document. Four more passes attach
+/// a page and are pure `LoadOp::Clear` with no draw at all — `clear_layer`,
+/// `fill_layer_white`, and the new-slot and resized-slot clears — so they
+/// correctly clear the whole page, padding included, and want no viewport.
+/// Everything else in this file draws into a document-sized target of its own.
 fn aim_at_document(pass: &mut wgpu::RenderPass<'_>, doc_size: UVec2) {
     pass.set_viewport(0.0, 0.0, doc_size.x as f32, doc_size.y as f32, 0.0, 1.0);
 }
@@ -9453,7 +9504,7 @@ mod tests {
             format!("{}u", tile::Entry::UNBACKED.0),
             "the not-stored sentinel"
         );
-        let (page, y, _x) = tile::Entry::PACKING;
+        let (page, y, x) = tile::Entry::PACKING;
         assert_eq!(
             shader_const(TILES_WGSL, "const TILE_PAGE_SHIFT: u32"),
             format!("{page}u"),
@@ -9462,18 +9513,35 @@ mod tests {
             shader_const(TILES_WGSL, "const TILE_Y_SHIFT: u32"),
             format!("{y}u"),
         );
+        // The x field's shift is zero, so it is the one a shader would spell as
+        // a bare mask and nobody would pin. Named in the WGSL for that reason.
+        assert_eq!(
+            shader_const(TILES_WGSL, "const TILE_X_SHIFT: u32"),
+            format!("{x}u"),
+        );
     }
 
-    /// Every shader that reads the layer array reads it through the page table,
-    /// and there are exactly three of them.
+    /// Nothing samples the layer array outside `tiles.wgsl`.
     ///
-    /// The array is a tile atlas, so a bare `textureLoad(layers, …)` or a
-    /// `textureSampleLevel(layer_tex, …)` is a read of whatever page happens to
-    /// sit at that slot index — a picture made of other layers. This is a text
-    /// scan for the reason the packaging scans here are: what it covers is that
-    /// nobody added a fourth reader without routing it, and what it cannot see
-    /// is whether the routing is *right*, which
-    /// `a_tiled_layer_composites_byte_for_byte_as_a_dense_one_did` is for.
+    /// The array is a tile atlas, so a read at a document coordinate is a read
+    /// of whatever page happens to sit at that slot index — a picture made of
+    /// other layers.
+    ///
+    /// **Three shaders take the page table and two more read layer texels
+    /// without it**, and that is the honest count rather than the tidy one:
+    /// `flip.wgsl` and `transform.wgsl` bind a *per-slice 2D view*, which a page
+    /// table cannot express at all, and both are correct only while residency is
+    /// the identity. `docs/perf/tiled-layer-storage.md` §7 already names them as
+    /// the sparse stage's work; they are excluded here by binding shape rather
+    /// than passed over, so this scan is about the three that took the array.
+    ///
+    /// A text scan, for the reason the packaging scans here are. What it covers
+    /// is that nobody put a direct read back into one of the three; what it
+    /// cannot see is whether the routing is *right* — that is
+    /// `a_tap_across_a_tile_boundary_blends_the_logical_neighbour`'s — and it
+    /// **cannot see a fourth shader file**, because nothing in Rust can
+    /// enumerate a directory at compile time. Adding one that binds the atlas
+    /// means adding it to this list.
     #[test]
     fn nothing_reads_the_layer_array_except_through_the_page_table() {
         for (name, src) in [
@@ -9483,12 +9551,21 @@ mod tests {
         ] {
             for line in src.lines() {
                 let code = line.split("//").next().unwrap_or("");
-                for call in ["textureLoad(layers", "textureSampleLevel(layer_tex"] {
-                    assert!(
-                        !code.contains(call),
-                        "{name} reads the atlas directly: {}",
-                        line.trim()
-                    );
+                // Whitespace stripped, so a wrapped or spaced call cannot slip
+                // past; and **both** function spellings against **both** binding
+                // names, because the composite calls its binding `layer_tex` and
+                // the other two call theirs `layers` — checking one pairing each
+                // is two of the four ways in.
+                let tight: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+                for f in ["textureLoad(", "textureSampleLevel(", "textureSample("] {
+                    for binding in ["layers,", "layer_tex,"] {
+                        let call = format!("{f}{binding}");
+                        assert!(
+                            !tight.contains(&call),
+                            "{name} reads the atlas directly: {}",
+                            line.trim()
+                        );
+                    }
                 }
             }
         }
@@ -9820,18 +9897,36 @@ mod tests {
         );
     }
 
-    /// One slice of a square canvas, in bytes.
+    /// A byte figure for a square canvas of `side`.
+    ///
+    /// **Not [`slice_bytes`]**, which rounds a canvas up to whole tiles. What
+    /// the growth rule is being swept over is a byte count, and these are byte
+    /// counts chosen to reach its rounding cases. The two agree for every side
+    /// here that is a multiple of the tile and **not for `10_000`**, whose real
+    /// page is 10240 square and 419.4 MB against this function's 400 — the
+    /// assertions that use it turn on the quantum being 1, which both figures
+    /// give. Named rather than left to the reader, because "a slice of a square
+    /// canvas" is what this used to be and is what it has stopped being.
     fn slice_of(side: u64) -> u64 {
         side * side * LAYER_BYTES_PER_PIXEL
     }
 
     /// Canvases to sweep the growth rule over.
     ///
+    /// **These are canvas sizes and the sweep is over byte figures**, and the
+    /// two stopped being the same thing when a slice became a *page*: three of
+    /// the entries below (1500×1500, 1920×1080, 2560×1440) are no longer figures
+    /// [`slice_bytes`] can produce, because a page is rounded up to whole tiles.
+    /// The sweep is still a sweep — `grown_capacity` and `growth_quantum` are
+    /// pure functions of a byte count and the rounding cases these were chosen
+    /// for are byte-count cases — but it is no longer a claim about which
+    /// canvases a painter can reach. Say the second before deleting an entry.
+    ///
     /// **Squares alone are not a sweep of canvas sizes, and powers of two alone
     /// are not a sweep of slice sizes.** Both were true of the first draft and
-    /// each hid something. `slice_bytes` is `x * y * 4` and nothing makes a
-    /// canvas square, so `1024x512` — an ordinary shape — reaches a waste no
-    /// square canvas does. And every power-of-two side divides the budget
+    /// each hid something. Nothing makes a canvas square, so `1024x512` — an
+    /// ordinary shape — reaches a waste no square canvas does. And every
+    /// power-of-two side divides the budget
     /// *exactly*, so `budget / slice` and `budget.div_ceil(slice)` agree at
     /// every one of them: two rounding mutations in [`growth_quantum`] passed
     /// the entire suite until `1920x1080` and `1500x1500` were added, where the
