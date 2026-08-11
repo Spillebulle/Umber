@@ -1473,18 +1473,35 @@ Taking the tap from `hw-fast − prologue = 0.27 ms`, the arithmetic is:
 - **four `textureLoad`s and the hand lerp** 0.47 ms
 - and the atlas's +1.23 ms is `1.03 + 0.47 − 0.27`, which checks out.
 
-So the split is **84% addressing and 16% the tap upgrade**, not 62/38 — the
-first draft of this correction made the same misnomer one level down, which is
-worth leaving visible. The honest ratio of "four scalar loads and a lerp" to
-"one TMU instruction" *inside the same shader structure* is **1.7:1, not 16:1**,
-and the difference between them costs **0.20 ms**, which is `tiled − hw-fast` and
-needs no control at all. Four adjacent texels are close to the cost of one, which
+So the split is **84% the addressing and 16% the hand-reconstructed tap**, not
+62/38 — the first draft of this correction made the same misnomer one level down,
+which is worth leaving visible. The 16% is `tiled − hw-fast`, **0.20 ms**, and it
+is the strongest figure in the table because it is a difference between two whole
+pipelines and needs no control at all: it is what four scalar loads and a hand
+lerp cost *over* one TMU instruction in the same shader structure, a ratio of
+**1.7:1 and not 16:1**. Four adjacent texels are close to the cost of one, which
 is what a texture cache is for; what is not free is arriving at the address.
 
-The one assumption in that is that the two taps cost the same — `sampled`'s is
-independent and `hw-fast`'s hangs off the page-table read. On the dense store the
-layout is the identity, so they touch the same texels in the same order, which is
-the closest the harness can come to holding it.
+Two things that figure rests on, both stated rather than buried. The first is
+that the two taps cost the same — `sampled`'s is independent and `hw-fast`'s
+hangs off the page-table read; on the dense store the layout is the identity, so
+they touch the same texels in the same order, which is the closest this harness
+can come to holding it. The second is that `prologue` is a fair stand-in for the
+addressing, and it is a stand-in rather than a measurement of any one thing.
+
+**And "the addressing" is not the arithmetic, which is the part still open.**
+A floor, two integer conversions, two clamps, two divides by 256 and a comparison
+cannot cost 0.83 ms more than `table`'s one clamp and one divide: at 54 layers
+over a 1920x1080 frame that is 112 million invocations, so 0.83 ms is of the
+order of **two hundred fp32 operations each** on a card that does about 30
+TFLOP/s. The listed arithmetic is under twenty. Something structural is being
+paid for, and the obvious candidate is the one thing `prologue` and `tiled` have
+that `table` does not: **the straddling branch**. Straddling is 0.78% of
+*samples* and it is spatially coherent — a one-texel band along every tile
+edge — so the fraction of *warps* that contain one, and therefore execute both
+sides, is far higher. Nothing here measures that; a `fast-only` variant that
+returns the empty value on a straddle instead of taking the branch would, in one
+more column, and it is the cheapest next experiment in this section.
 
 **So `tiles.wgsl`'s refusal of the apron is what this costs**, and that refusal
 is now priced rather than argued — but the price is *not* what an apron would
@@ -1631,14 +1648,19 @@ middle item down rather than off, and the reasons are worth separating.
   as this one does, is one sample of where a rounding falls rather than evidence
   it cannot fall the other way.
 - **What is actually left is the addressing, and nothing in the programme
-  targets it.** About **1.03 ms of the 1.23** is the prologue — see §11.3 for why
-  it is 1.03 and not the 0.76 the obvious subtraction gives: a floor, two clamps,
-  two integer divides by 256, a tile comparison and a branch, per layer per
-  fragment.
-  Two divides by a power of two ought to be shifts, and `lo / TILE` and
-  `up / TILE` are recomputed where `t_lo` plus a comparison of the *offset within
-  the tile* would do. Whether any of that survives the compiler is unknown and is
-  a smaller question than an apron; it is also the only one of these that cannot
-  make a picture worse. **It should be tried before the apron is reconsidered.**
+  targets it.** About **1.03 ms of the 1.23** is it — see §11.3 for why that is
+  1.03 and not the 0.76 the obvious subtraction gives, and for why it cannot all
+  be the arithmetic. Two candidates, in the order they should be tried, and both
+  are cheaper than an apron and neither can make a picture worse:
+  - **The straddling branch.** §11.3's arithmetic says the addressing costs about
+    ten times what a floor, two clamps and two divides could, and the branch is
+    the one structural thing `prologue` and `tiled` have that `table` does not.
+    Measure it first — one more column, a variant that returns the empty value on
+    a straddle instead of taking the branch — because if that is where the time
+    is then the arithmetic below is not worth touching.
+  - **The arithmetic.** Two divides by a power of two ought to be shifts, and
+    `lo / TILE` and `up / TILE` are recomputed where `t_lo` plus a comparison of
+    the *offset within the tile* would do. Whether any of that survives the
+    compiler is unknown.
 - **R6 is unaffected and is still first.** Everything above is a constant factor
   on a pass R6 stops running at all.
