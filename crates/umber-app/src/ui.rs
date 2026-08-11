@@ -17,7 +17,7 @@
 //! outlived it: both were worse versions of "put the panels where you want
 //! them".
 
-use crate::editor::{self, BrushTab, Editor, StepGate, Tool};
+use crate::editor::{self, BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::loupe;
 use crate::panels;
@@ -1593,10 +1593,15 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         };
         if menu_item(ui, action, !flip_locked)
             .on_hover_text(hint)
-            .on_disabled_hover_text(
-                "A layer is locked. A flip mirrors every layer at once, so it \
-                 cannot skip one. Unlock it first.",
-            )
+            // The reason is `editor::FLIP_LOCKED_REASON`, shared with the Edit
+            // menu's two history rows and with the notice a refused keystroke
+            // raises. Three hand-written near-copies of one sentence is the
+            // drift `flip_refused_by_lock` was introduced to stop for the
+            // *reading*, left standing for the wording.
+            .on_disabled_hover_text(format!(
+                "A layer is locked. {} first.",
+                editor::FLIP_LOCKED_REASON
+            ))
             .clicked()
         {
             actions.flip_canvas = Some(axis);
@@ -1683,26 +1688,36 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // `App::settle_step` raises is left catching the keystroke alone. Each
     // reason gets its own sentence, because "nothing to undo" over a document
     // twenty strokes deep sends somebody looking for the wrong problem.
-    let undo_locked = ed.undo_gate() == StepGate::FlipLocked;
+    // `StepGate::refuses` and never `== StepGate::FlipLocked`: a control asks
+    // whether it may offer the command, which is a question about the *set* of
+    // refusing answers, and an equality test answers it only while that set has
+    // one member. An equality test is what stood here first, and it is
+    // `matches!` wearing an operator — a fourth variant would have been a
+    // compile error in `App::settle_step` and a silent `false` here.
+    let undo_locked = ed.undo_gate().refuses();
     if menu_item(ui, Action::Undo, ed.history.can_undo() && !undo_locked)
         .on_disabled_hover_text(if undo_locked {
-            "The next step back is a canvas flip, and a layer is locked. A flip \
-             mirrors every layer at once, so it cannot skip one. Unlock it first."
+            format!(
+                "The next step back is a canvas flip, and a layer is locked. {} first.",
+                editor::FLIP_LOCKED_REASON
+            )
         } else {
-            "Nothing in the history to undo."
+            "Nothing in the history to undo.".to_owned()
         })
         .clicked()
     {
         actions.undo = true;
         ui.close();
     }
-    let redo_locked = ed.redo_gate() == StepGate::FlipLocked;
+    let redo_locked = ed.redo_gate().refuses();
     if menu_item(ui, Action::Redo, ed.history.can_redo() && !redo_locked)
         .on_disabled_hover_text(if redo_locked {
-            "The next step forward is a canvas flip, and a layer is locked. A flip \
-             mirrors every layer at once, so it cannot skip one. Unlock it first."
+            format!(
+                "The next step forward is a canvas flip, and a layer is locked. {} first.",
+                editor::FLIP_LOCKED_REASON
+            )
         } else {
-            "Nothing undone to put back."
+            "Nothing undone to put back.".to_owned()
         })
         .clicked()
     {

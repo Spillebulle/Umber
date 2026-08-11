@@ -320,9 +320,15 @@ pub enum BrushTab {
 /// *leave the entry where it is*. A caller that collapsed them would either
 /// refuse every flip or quiet the document for a refusal it is about to make.
 ///
-/// Exhaustively matched at its one call site in `App`, deliberately: a fourth
-/// answer must be a compile error there rather than a silent `_ => carry on`.
-/// See CLAUDE.md's "Partial exhaustiveness is worse than none".
+/// **Every reader of it matches exhaustively**, and that took a correction: the
+/// two menu rows read `gate == StepGate::FlipLocked`, which is `matches!`
+/// wearing an operator. A fourth answer would have been a compile error in
+/// `App::settle_step` and a silent `false` in both rows — the menu going on
+/// offering a command the model had just learned to decline, in a change whose
+/// whole purpose is stopping exactly that. They go through
+/// [`StepGate::refuses`] now. See CLAUDE.md's "Partial exhaustiveness is worse
+/// than none"; this is the shape it describes, found by a critic in the diff
+/// that cited that section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepGate {
     /// Nothing in the way. Every entry that swaps pixels or stack shape, and
@@ -338,6 +344,38 @@ pub enum StepGate {
     /// flipping again.
     FlipLocked,
 }
+
+impl StepGate {
+    /// Does this answer refuse the step outright?
+    ///
+    /// **Exhaustive, and that is the whole reason it exists** rather than the
+    /// two call sites comparing against [`StepGate::FlipLocked`]. A control asks
+    /// "may I offer this", which is a question about the *set* of refusing
+    /// answers, and an equality test answers it only for as long as that set has
+    /// one member. See the type's own docs.
+    pub fn refuses(self) -> bool {
+        match self {
+            Self::Clear | Self::SettleForFlip => false,
+            Self::FlipLocked => true,
+        }
+    }
+}
+
+/// Why a locked layer refuses a canvas flip, in one clause.
+///
+/// **Three controls have to say this**: the Image menu's two flip rows, the Edit
+/// menu's Undo and Redo rows, and the notice a refused keystroke raises. They
+/// were three hand-written near-copies, which is the drift
+/// [`Editor::flip_refused_by_lock`] was introduced two commits earlier to stop
+/// for the *reading* — the sentence deserves the same treatment and a critic
+/// pointed out that it had not had it.
+///
+/// Written so it is true whether one layer is locked or twenty: `any_locked` is
+/// an `iter().any()`, so a sentence saying "the layer" is wrong for a stack with
+/// three locked in it, and a plural-agreement dance is not worth the alternative.
+/// No em-dash, like everything else the interface draws.
+pub const FLIP_LOCKED_REASON: &str = "A flip mirrors every layer at once, so it cannot skip a locked one. Unlock \
+     every locked layer in the Layers panel";
 
 impl Default for UiState {
     fn default() -> Self {
@@ -2672,6 +2710,48 @@ mod tests {
         ed.layers.active_mut().locked = true;
         assert_eq!(ed.undo_gate(), StepGate::Clear, "nothing to undo");
         assert_eq!(ed.redo_gate(), StepGate::Clear, "nothing to redo");
+
+        // **Which end of the stack the gate reads**, which every case above is
+        // blind to because none of them holds more than one entry. A critic
+        // pointed this out and the mutation was run: turning
+        // `History::next_undo` into `self.undo.first()` left every assertion
+        // above green, and reproduces the original bug exactly — the gate would
+        // read the Paint at the bottom, answer `Clear`, and let the flip through
+        // unmirrored.
+        //
+        // **The two stacks are loaded with opposite contents on purpose.** Made
+        // symmetric they were, and a `redo_gate` that read the undo stack passed
+        // every assertion in this test and in the menu's. Here each direction
+        // is asked over a stack whose top disagrees with the other's, so the two
+        // cannot be swapped without one of the four answers moving.
+        let mut ed = Editor::default();
+        ed.layers.active_mut().locked = true;
+        // Undo: [Paint, Flip] with the flip on top. Redo: [Flip, Paint], paint
+        // on top. So undo must refuse and redo must not.
+        for kind in [
+            umber_core::EditKind::Paint,
+            umber_core::EditKind::FlipVertical,
+        ] {
+            ed.history
+                .record(umber_core::Edit::new(kind, umber_core::EditBody::Flip));
+        }
+        for kind in [
+            umber_core::EditKind::FlipVertical,
+            umber_core::EditKind::Paint,
+        ] {
+            ed.history
+                .push_redo(umber_core::Edit::new(kind, umber_core::EditBody::Flip));
+        }
+        assert_eq!(
+            ed.undo_gate(),
+            StepGate::FlipLocked,
+            "the gate read past the flip on top of the undo stack"
+        );
+        assert_eq!(
+            ed.redo_gate(),
+            StepGate::Clear,
+            "the gate read past the paint on top of the redo stack"
+        );
     }
 
     /// The gate every route to a stroke passes through. Checked here rather
