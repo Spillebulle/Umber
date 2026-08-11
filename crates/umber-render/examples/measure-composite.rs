@@ -120,7 +120,7 @@
 //! are paths the dense store never takes.
 //!
 //! **What that check catches, demonstrated by mutation rather than claimed.**
-//! Dropping the canvas-edge weight collapse is 15 of 255; permuting the gather's
+//! Dropping the canvas-edge weight collapse is 16 of 255; permuting the gather's
 //! component order is 22; aiming the gather one texel over is 23. What it does
 //! **not** catch is aiming at the texel corner (`+ 0.5`) instead of its centre
 //! (`+ 1.0`) — that came back exact. That is the honest reading and it is the
@@ -129,6 +129,10 @@
 //! this driver's rounding, so a variant that happens to agree here could step
 //! into the neighbouring tile on another. [`GATHER_BODY`] argues that from the
 //! arithmetic, because no check available from this machine can.
+//!
+//! The frame is rendered from **three** aims and not one — see
+//! [`check_cameras`], which is also where the first of those mutations walked
+//! straight through the centred aim the check originally had.
 //!
 //! It is an example rather than a test because it asserts wall-clock time,
 //! which CLAUDE.md forbids on CI, and because it wants gigabytes of a real card.
@@ -1689,6 +1693,23 @@ fn spread_pct(s: &Summary) -> f64 {
 /// `w - n - 0.75` lands that fragment on `w - 0.25`, inside `[w - 0.5, w)`, which
 /// is the high clamp. Both hold whatever the canvas and the output are, which is
 /// the property the centred aim did not have.
+///
+/// **The bottom-right aim reaches the high clamp and cannot fail on it, and
+/// saying which is the honest move.** Demonstrated by mutation on 2048²:
+/// dropping the weight collapse leaves the interior aim at 0 (it never clamps),
+/// takes the top-left aim to **16 of 255**, and leaves the bottom-right aim at
+/// **0**. The reason is [`page_bytes`]: the padding outside the canvas
+/// *replicates the edge texel*, so at the high end the texel a gather wrongly
+/// reads beside `w - 1` is equal to `w - 1` and the error cancels. That
+/// replication is not incidental and cannot be removed — it is what makes the
+/// `sampled` baseline faithful to the canvas-sized slice the atlas replaced,
+/// whose `ClampToEdge` had nothing beyond the canvas to reach, and without it
+/// the two disagreed by 9 of 255 along the last half-texel band.
+///
+/// So the two aims are not symmetric: one is a live guard and one exercises the
+/// path without being able to judge it. What makes that acceptable rather than a
+/// hole is that both ends and both axes go through **one** `select`, so the rule
+/// has a guard even though one of its four cases does not.
 fn check_cameras(doc: UVec2, output: UVec2) -> Vec<(&'static str, Camera)> {
     let pivot = Vec2::new(output.x as f32 / 2.0, output.y as f32 / 2.0);
     // Far enough in that the corner is comfortably on screen and there is a
