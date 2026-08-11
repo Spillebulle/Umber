@@ -41,7 +41,7 @@ on an RLE mask channel, so reading one means a second parser beside the crate's.
 | `.psd` Photoshop | **Landed, lossy** | 8-bit RGB only. Groups flatten and masks are dropped; clipping arrives. A file with an RLE-compressed mask channel is refused outright, because the `psd` crate panics on one. Every loss is reported. |
 | `.png` | **Landed, exact** | A single layer. Also the decoder ORA uses. |
 | `.psb` Photoshop large | Declined | Header version 2; the `psd` crate reads version 1 only. |
-| `.clip` Clip Studio | **Landed, layer-aware** | Layers, folders, masks, blend modes, opacity and locks arrive out of the embedded SQLite database. Correction layers are refused; text and vector layers arrive rasterised. Every loss is reported. |
+| `.clip` Clip Studio | **Landed, layer-aware** | Layers, folders, masks, blend modes, opacity and locks arrive out of the embedded SQLite database. Correction layers are refused; text and vector layers arrive rasterised. A placed image is refused and named, because the file holds the picture that was imported rather than what Clip Studio drew from it. Every loss is reported. |
 | `.procreate` | Declined | Undocumented LZ4 tile layout behind a binary plist. |
 | `.mdp` MediBang | Declined for now | Specified, and there are real samples — but nothing available settles whether the layer list runs top first or bottom first, and two of its three tile codecs are unwritten. |
 | `.xcf` GIMP | Declined for now | Documented but large; several precisions and a colour model of its own. GIMP exports ORA. |
@@ -289,6 +289,7 @@ keeps one.
 |---|---|---|
 | A correction layer (brightness, tone curve, level correction, gradient map) | `LayerSkipped` | It is an operation on the layers below rather than a picture. Its `Offscreen` exists and holds a stated fill, so importing it would put a flat sheet over the drawing. |
 | A layer that was not made of pixels (text, vector, frame border, 3D) | `LayerRasterised` | It arrives as the pixels Clip Studio rendered for it — which is what Clip Studio's own PSD export does — and can no longer be edited as what it was. |
+| A **placed image** (an image file imported and left resizable) | `LayerSkipped` | Its pixels *are* in the file, in a `ResizableOriginalMipmap` chain, and where they go is a 184-byte `ResizableImageInfo` transform that is not the identity. Taking them needs a resampler `umber-core` does not have and a reading of that blob nobody has evidence for. See below. |
 | A bitmap whose absent blocks carry a stated colour fill | `LayerSkipped` | `InitColor` is readable as a *flag* and as one channel, which is all a mask needs; a colour fill is four more values nothing has checked against a file that paints with one. |
 | A bitmap packed some other way (1-bit, 16-bit) | `LayerSkipped` | One alpha plane then four interleaved bytes is colour, one is greyscale, none is a mask. Anything else would be sliced by a byte count that does not describe it. |
 | A blend mode Umber lacks | `BlendApproximated` / `BlendDropped` | The same table every other reader uses. |
@@ -297,6 +298,55 @@ keeps one.
 An **alpha lock** is deliberately not reported, for the reason a resolution is
 not: it changes no pixel. A full lock does come across, as does clipping, a
 folder's eye, an opacity out of 256, and a layer mask.
+
+### A placed image, and why its pixels are left where they are
+
+Worth writing down because the pixels genuinely *are* in the file, so this
+question will be asked again. `docimport::clipstudio`'s module docs carry the
+same argument at the code.
+
+An artist's 45 MB document was refused whole as "contains no layers". It is an
+A4 page at 600 dpi holding a Paper sheet and four placed images, and it is not
+damaged in any way. Each of the four has:
+
+- a seven-level render mipmap chain (100%, 50%, … 1%) whose **every** level
+  names an external chunk the container does not hold, because Clip Studio
+  redraws a placed image on demand rather than storing what it drew; and
+- a `ResizableOriginalMipmap` chain whose base level names a chunk it **does**
+  hold: 11,103,575 bytes, a 4961×7016 bitmap, exactly the canvas. 44.4 MB of
+  the 45.4 MB file is those four source images.
+
+`LayerType` is 0, which is also what a vector layer carries — so reading the
+type alone reported all four as vector layers, which is false about the artist's
+document and sends them looking for the wrong remedy. `ResizableOriginalMipmap`
+is the discriminator. Across the 33 real `.clip` documents, 5 of the 28 layers
+previously called vector are placed images, and 4 of those 5 are every painted
+layer of the refused file.
+
+**Why the pixels are not taken.** `ResizableImageInfo` is 184 bytes carrying,
+among six fields nothing here can explain, a scale, a centre, a half-extent and
+a destination quad. On that document the four images are scaled by 0.4434 into
+the four quadrants of the page — a four-up contact sheet. Blitting them where
+the layer offsets say (all zero) would stack four full-page copies on top of one
+another. Two things would be needed and neither is available:
+
+1. **A resampler.** The map is affine into a quad, so the source has to be
+   filtered into canvas space. Filtering in Umber is the hardware sampler's and
+   an importer cannot reach it; a CPU resampler in `umber-core` is a new
+   implementation with nothing to check it against.
+2. **A reading of that blob that is not a guess.** The layout above is inferred
+   from five layers in two documents, every one at zero rotation with a uniform
+   positive scale. A wrong reading puts somebody's picture in the wrong place at
+   the wrong size and says nothing — the failure that keeps the MediaBang reader
+   unwritten and makes an unrecognised `CanvasUnit` a refusal rather than a
+   guess.
+
+**Whoever builds it has an instrument already in the file.** `CanvasPreview` is
+a flattened PNG of what the document actually looks like, so a candidate
+placement can be compared against it rather than argued about. Note that it can
+only verify the cases the samples contain, and none of them is rotated or
+flipped. The per-layer `LayerThumbnail` rasters are 528 to 3,616 bytes and are
+not a substitute for anything.
 
 ### What was and was not checked against a real file
 
