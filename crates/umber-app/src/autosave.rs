@@ -2955,6 +2955,7 @@ mod tests {
             &gpu.device,
             editor.doc.size,
             wgpu::TextureFormat::Rgba8Unorm,
+            editor.layers.slot_capacity_needed(),
         );
         let mut enc = gpu
             .device

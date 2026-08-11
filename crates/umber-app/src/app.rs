@@ -175,11 +175,14 @@ impl Graphics {
     /// index the texture array does not have.
     fn add_canvas(&mut self, id: DocId, doc: &Document, slots: u32) {
         let size = doc.size;
+        // Built at the count rather than grown to it. A growth holds the old
+        // array and the new one at once, so an import that arrived a slice at a
+        // time paid that peak at every step — see
+        // [`CanvasRenderer::for_document`].
         let mut canvas = match self.canvases.values().next() {
-            Some(existing) => existing.for_document(&self.gpu.device, size),
-            None => CanvasRenderer::new(&self.gpu.device, size, self.config.format),
+            Some(existing) => existing.for_document(&self.gpu.device, size, slots),
+            None => CanvasRenderer::new(&self.gpu.device, size, self.config.format, slots),
         };
-        canvas.ensure_slots(&self.gpu.device, &self.gpu.queue, slots);
         // The background belongs to this document, not to whichever one the
         // pipelines were cloned out of.
         canvas.set_background(doc.background);
@@ -4932,18 +4935,16 @@ impl ApplicationHandler<Wake> for UmberApp {
         splash.show(splash::Stage::Shaders);
         // Compiled once here; every further document clones the pipeline
         // handles out of this one. See `Graphics::add_canvas`.
+        // At start-up the slot count is one and the speculative floor decides.
+        // It matters on the Android path, where `resumed` runs again with a
+        // session already open: the live document can have any number of
+        // layers, and its slots have to exist before the first stroke commits
+        // into one. Stated to the constructor rather than grown into
+        // afterwards, for the reason `CanvasRenderer::for_document` gives.
         let mut canvas = CanvasRenderer::new(
             &gpu.device,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
             config.format,
-        );
-        // At start-up this is one layer and does nothing. It matters on the
-        // Android path, where `resumed` runs again with a session already open:
-        // the live document can have any number of layers, and its slots have
-        // to exist before the first stroke commits into one.
-        canvas.ensure_slots(
-            &gpu.device,
-            &gpu.queue,
             self.editor.layers.slot_capacity_needed(),
         );
         // This one renderer is built here rather than by `add_canvas`, so it

@@ -2950,12 +2950,16 @@ impl Shared {
 }
 
 impl CanvasRenderer {
+    /// `slots` is how many slices this document is known to need — a blank
+    /// canvas's 1, an import's `LayerStack::slot_capacity_needed()`. See
+    /// [`CanvasRenderer::for_document`] for why it is worth stating up front.
     pub fn new(
         device: &wgpu::Device,
         doc_size: UVec2,
         surface_format: wgpu::TextureFormat,
+        slots: u32,
     ) -> Self {
-        Self::with_shared(device, doc_size, Shared::new(device, surface_format))
+        Self::with_shared(device, doc_size, Shared::new(device, surface_format), slots)
     }
 
     /// A renderer for a second document, reusing this one's compiled pipelines.
@@ -2969,12 +2973,39 @@ impl CanvasRenderer {
     /// the caller must clear them before the first composite, exactly as it
     /// does after [`CanvasRenderer::new`] — and set the new document's
     /// background, which is its own and not this one's.
-    pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2) -> Self {
-        Self::with_shared(device, doc_size, self.shared.clone())
+    ///
+    /// # Why `slots` is a parameter rather than a growth the caller drives
+    ///
+    /// A renderer used to start at [`initial_slots`] and be grown to what the
+    /// document needed, one [`CanvasRenderer::ensure_slots`] call at a time.
+    /// Growth **holds the old array and the new one at once** — the copy is
+    /// recorded against both and wgpu keeps a texture alive for any submission
+    /// naming it — so the peak of one growth is `old + new` slices, and a
+    /// document that arrives a slice at a time pays that peak repeatedly. At
+    /// 400 MB a slice a twenty-one-layer import walked from 1 to 21 through
+    /// every quantum on the way, allocating a fresh multi-gigabyte texture each
+    /// time; a `create_texture` failure there is an uncaptured device error and
+    /// therefore fatal. Allocating once at the size the document needs removes
+    /// every one of those steps.
+    ///
+    /// It does not remove the speculation an ordinary document wants:
+    /// [`initial_slots`] is still the floor, so a blank canvas gets room for a
+    /// handful of layers and does not reallocate on its second one.
+    pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2, slots: u32) -> Self {
+        Self::with_shared(device, doc_size, self.shared.clone(), slots)
     }
 
-    fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared) -> Self {
-        let layers = LayerStore::new(device, doc_size, initial_slots(slice_bytes(doc_size)));
+    fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared, slots: u32) -> Self {
+        let bytes = slice_bytes(doc_size);
+        // The document's own count where it is the larger, the speculative
+        // handful where it is not — then through the same growth rule every
+        // later `ensure_slots` answers to, so a renderer built here and one
+        // grown into the same shape land on the same capacity. `initial_slots`
+        // already consults the byte budget, so a large canvas speculates on
+        // nothing and this is exactly `slots`.
+        let capacity =
+            grown_capacity(0, slots.max(initial_slots(bytes)), bytes).min(MAX_SLOTS as u32);
+        let layers = LayerStore::new(device, doc_size, capacity);
 
         let stroke = make_stroke_texture(device, doc_size);
         let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
