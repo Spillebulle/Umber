@@ -2026,17 +2026,35 @@ reporter's own window.
   reader-level guard beside it**, because `all_painted(nodes.len())` is still
   writable. Structure narrows the mistake; only a test at the call site catches
   it.
-- **`MAX_TOTAL_BYTES` does not fully meet "a reader must never be stricter than
-  the writer", and its docs say where it stops.** At the old 2 GiB Umber could
-  save a document it then refused to reopen — 15000×5000 broke at eight layers.
-  It is 16 GiB, which admits every real document and still refuses a full stack
-  past 8192². The gap is not closable by tuning: every figure admitting a real
-  25.6 GB document also admits a malformed header asking for 25.6 GB, because
-  they are the same header and a layer's buffer is allocated canvas-sized
-  whatever the source data weighs.
-  `a_document_umber_could_save_can_be_reopened` pins both the range where the
-  rule holds and the case where it does not, so closing it is a deliberate
-  change rather than a silent one.
+- **`check_bounds` charges what a file holds, not what it claims.** It used to
+  compare `canvas × 4 × painted` off the header — what a densifying reader spent,
+  and a number no part of the file contains. It now checks the canvas ceiling and
+  the entry count and hands back a `PieceBudget` each reader charges per decoded
+  layer, with `validate` charging the whole document.
+  - **`MAX_TOTAL_BYTES` did not move and its argument did.** "Not closable by
+    tuning" rested on "a layer's buffer is allocated canvas-sized whatever the
+    source data weighs"; that premise is gone. What the figure still does is
+    bound the *accumulation*.
+  - **A folder is uncharged by construction** — it holds no pieces — so
+    `StackSize::painted` decides only what the refusal *says*.
+  - **`docformat` trims, so an Umber document is charged for its paint.** The
+    stated gap where the reader was stricter than the writer — a 64-layer 10000²
+    document — is closed.
+  - **`.psd` is the exception and must be reserved for up front.** `psd` 0.3.5's
+    `Layer::rgba()` hands back a canvas-sized buffer, so a claim *is* a cost
+    there; charging it per layer refuses only once the gigabytes are resident.
+  - **Masks are still not counted, and what that costs went up.** The old
+    "roughly twice the figure" was true when a layer was a canvas; the ratio is
+    now the layers' occupancy — **15×** on the motivating document. Not counting
+    them is still right. Saying two was not.
+  - **The refusal names both levers** — the stack *and* the canvas, since halving
+    each edge quarters the figure — drops "Umber holds at most" (a promise about
+    the machine), and says "at least", because a reader that stopped partway has
+    not measured the rest.
+  - **What holds the fifth reader is a compiler check and a source scan, not a
+    behavioural test.** Deleting a `budget.charge` leaves every test green;
+    demonstrated by mutation, and the docs say which rather than claiming a test
+    covers it.
 - **An import that loses something must say so.** Every loss appends an
   `ImportWarning` and the UI shows them; the rule is that subtly wrong pixels
   are worse than a refusal, because a refusal sends the artist to export an ORA
@@ -2047,10 +2065,40 @@ reporter's own window.
   an author's name should paint unlike their brush. An interactive import
   approximates instead and names what it dropped, via
   `brushimport::dropped_features`. Do not make either behave like the other.
-- **`ImportedLayer::pixels` is canvas-sized RGBA8, sRGB-encoded with alpha
-  premultiplied in linear space** — exactly what a layer texture holds, so it
-  goes straight to `write_texture`. Premultiplying in sRGB is the classic way to
-  get haloed edges here.
+- **`ImportedLayer::pixels` is a sequence of *pieces*, not a canvas**, each RGBA8
+  sRGB-encoded with alpha premultiplied in linear space — exactly what a layer
+  texture holds, so a piece goes straight to `write_layer_rect`. (Premultiplying
+  in sRGB is still the classic way to get haloed edges here.) Every format Umber
+  reads stores layers sparsely and all four used to be densified on the way in:
+  the 124 MB Clip Studio document that provoked `docs/perf/` was materialised as
+  21.6 GB of host buffers while holding 1.4 GB of paint, and then refused for
+  being too big. Measured over the artist's 33 real files: **59.3 GB dense
+  against 9.3 GB held, 15.6%.** A `PixelPiece` is a `PixelRect` and its bytes,
+  byte for byte the shape `swap_patch` already uses. Three rules:
+  - **Every piece lies inside the canvas**, and **pieces do not overlap**. The
+    second is *not* asserted in `validate`: a duplicate tile in somebody else's
+    malformed archive would panic a debug build, where the writes are
+    deterministic and the last one wins exactly as a dense blit's did. Driven per
+    reader through `check_piece_rules`.
+  - **A pixel covered by no piece is the slot's empty value**, and there is
+    deliberately **no completion signal** — `install_canvas` clears the array
+    before the upload loop, so an unwritten region already *is* that value.
+  - **A mask may not go sparse yet and every reader yields one canvas piece for
+    one.** Its empty value is *white* and the clear delivers transparent black;
+    `srgb::encode_coverage(0)` is `[0,0,0,255]` rather than four zeroes. Two
+    independent blockers, both gone only when a store gives a slot *class* its
+    own empty value. The rule readers are actually held to today is the narrower
+    **"a region omitted must be genuinely zero"**, which `srgb::encode_pixel`'s
+    all-zero alpha-0 row is what makes byte-identical — and is why a `.kra` layer
+    with a coloured `.defaultpixel` keeps the dense path.
+- **The piece count is a cost and is unmeasured on the GPU.** 53 submissions
+  became **5,412** on the motivating document, while bytes submitted fell from
+  21.2 GB to 1.4 GB. Batching is `umber-render`'s.
+- **`examples/hash-layers` is how "did a reader change move a pixel" is
+  answered**, and it is an example rather than a test because the comparison is
+  against a *different build*. It fingerprints every layer's assembled canvas and
+  every warning verbatim; the piece contract's diff over 453 hashes and 33
+  warnings in 33 files was one line.
 - **A `.clip` is a SQLite database in a chunk wrapper, and both halves were
   already here.** `umber-core::sqlite` exists because a `.sut` brush is one too,
   and `csblocks` is the 256-square zlib block stream a brush *material* stores
@@ -3776,6 +3824,12 @@ method rather than as an anecdote:
   mutate the code it claims to cover.** Commit first, so `git checkout --`
   reverts the mutation and not your work — that collision is now routine enough
   to be worth the habit.
+- **A guard that a sparse path did not move a pixel cannot live inside one
+  build.** `examples/hash-layers` is the shape: fingerprint every layer and every
+  warning, build the other side in a scratch tree **with its own target
+  directory**, and diff. What *can* live in the suite is the property the picture
+  is not enough to catch — that the reader is still sparse — and a reader quietly
+  going back to densifying fails that assertion and no other.
 - **A memory claim needs an allocator, and nothing else in a suite can see
   one.** `save_peak.rs` installs a counting `#[global_allocator]` in that binary
   alone, because a save that quietly allocated the whole stack would still write
