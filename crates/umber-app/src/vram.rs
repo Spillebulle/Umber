@@ -26,28 +26,47 @@
 //! that was not the problem once, and a refusal that names the wrong bound is
 //! worse than a vague one.
 //!
-//! **It does not cover the upload.** The gate this wording belongs to is the
-//! layer array allocation alone. `Queue::write_texture`'s staging buffer goes
-//! through wgpu's *fatal* error path, so an out-of-memory there loses the device
-//! before any error scope sees it; banding and the per-layer submit in
-//! `install_import` bound how much can stand at once but do not make it
-//! catchable. So a document that passes this gate can still die on its pixels,
-//! and no sentence here may imply otherwise.
+//! **It does not cover the upload, and it makes the upload slightly more likely
+//! to fail.** Both halves, because the first on its own reads as a neutral gap
+//! and it is not one. The gate this wording belongs to is the layer array
+//! allocation alone: `Queue::write_texture`'s staging buffer goes through wgpu's
+//! *fatal* error path, so an out-of-memory there loses the device before any
+//! error scope sees it, and banding and the per-layer submit in `install_import`
+//! bound how much can stand at once without making it catchable. What the
+//! second half adds is that `gpu::MEMORY_BUDGET_PERCENT` is charged on
+//! **buffers as well as textures**, so a staging allocation that the driver
+//! would previously have attempted is now refused at ninety percent of the
+//! reported budget — and refused there means the device is gone. The window is
+//! narrow, since a band is at most `readback_limit` and a budget too full for
+//! that is one the array reservation would already have declined, but it is a
+//! trade rather than a free win. So a document that passes this gate can still
+//! die on its pixels, and no sentence here may imply otherwise.
 
 use umber_core::docimport::gigabytes;
 use umber_render::Vram;
 
 use crate::tabs::Notice;
 
-/// What both sentences end on: two levers, in the order they cost the artist.
+/// What both sentences end on: three levers, cheapest first.
 ///
 /// One statement of it rather than two, because it is the only part an artist
 /// can act on and the two refusals would otherwise drift into offering
-/// different advice for the same cause. "Flattening or removing" first, because
-/// it keeps the canvas; the canvas second, because each halving of the width and
-/// height quarters the figure and that is the larger lever.
-const REMEDY: &str = "Flattening or removing some layers, or working at a smaller canvas, will bring it \
-     within reach.";
+/// different advice for the same cause.
+///
+/// **Closing other applications leads, and it was missing from the first
+/// draft.** What is being refused is a share of the *budget the driver reports*,
+/// which on both Vulkan and D3D12 is what is left after everything else running
+/// on the machine — so a browser or a game is a common cause, and it is the only
+/// remedy here that costs the artist nothing. Offering flattening first told
+/// somebody to take their document apart when quitting something else would have
+/// done, which is the refusal naming the wrong bound this module exists to
+/// avoid. It states no figure, because a lever is not a measurement.
+///
+/// Then flattening, which keeps the canvas, and then the canvas, where each
+/// halving of the width and the height quarters the figure.
+const REMEDY: &str = "Closing other applications that use the graphics card may be enough. \
+     Otherwise, flattening or removing some layers, or working at a smaller canvas, will \
+     bring it within reach.";
 
 /// A document that could not be given its layer storage.
 ///
@@ -119,18 +138,28 @@ mod tests {
     /// word rather than a rule somebody has to remember.
     ///
     /// The forbidden words are the ways a capacity gets stated: a figure the
-    /// card "has", how much is "available", "free", "left" or "remaining", and
-    /// the claim that it is "out of" memory (which names a state rather than
-    /// this allocation). It sweeps both sentences and the title as well as the
-    /// body, since a title is where a figure would be most tempting.
+    /// card "has" or "holds", a "total", how much is "available", "free",
+    /// "left" or "remaining", "only" this much, and the claim that it is "out
+    /// of" memory (which names a state rather than this allocation). It sweeps
+    /// both sentences and the title as well as the body, since a title is where
+    /// a figure would be most tempting.
+    ///
+    /// **"holds" and "only" were missing from the first list**, and "holds" is
+    /// the word the module's own first paragraph uses for the thing being
+    /// refused — so "this card holds only 10.0 GB" would have walked straight
+    /// through the guard written to refuse it. A word list is only as good as
+    /// the words somebody would actually reach for.
     #[test]
     fn no_refusal_states_what_the_card_holds() {
         let forbidden = [
             "has ",
+            "holds",
+            "total",
             "available",
             "free",
             " left",
             "remaining",
+            "only",
             "out of memory",
             " of vram",
             "capacity",
@@ -193,12 +222,16 @@ mod tests {
             open_refused("sketch.clip", 21, &reported(0)),
             slice_refused("a layer", &reported(21)),
         ] {
-            assert!(
-                notice.lines[0].contains("Flattening")
-                    && notice.lines[0].contains("smaller canvas"),
-                "no lever in: {}",
-                notice.lines[0]
-            );
+            let line = notice.lines[0].to_lowercase();
+            // All three, and the first is the one that costs nothing: what was
+            // refused is a share of a budget shared with everything else on the
+            // machine, so another application is a common cause and quitting it
+            // is a remedy the artist need not take their picture apart for.
+            // Dropping it and keeping the other two would still pass a guard
+            // that only asked whether *a* lever was offered.
+            for lever in ["other applications", "flattening", "smaller canvas"] {
+                assert!(line.contains(lever), "no “{lever}” in: {line}");
+            }
         }
     }
 }

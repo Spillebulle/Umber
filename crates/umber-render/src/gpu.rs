@@ -23,20 +23,36 @@ pub struct Gpu {
 /// paging to system memory — the canvas becomes a slideshow with nothing said —
 /// or fail in a way that arrives too late to act on. With it, an allocation the
 /// device cannot comfortably hold comes back as an ordinary `Error::OutOfMemory`
-/// on the exact call that asked, which [`crate::CanvasRenderer::try_reserve`]
-/// catches in an error scope and turns into a sentence.
+/// on the exact call that asked, which `canvas::try_reserve` catches in an error
+/// scope and turns into a sentence.
 ///
 /// Three things to know before changing it:
 ///
 /// * **It is best effort and never a guarantee.** Vulkan honours it only where
 ///   `VK_EXT_memory_budget` is present and returns `Ok` where it is not; Metal
-///   and GL support none of it. So a refusal proves the card said no; the
-///   absence of one proves nothing.
-/// * **Ninety rather than ninety-nine**, because `create_texture` has a fatal
-///   sub-step of its own: wgpu builds an internal clear view per array slice for
-///   a `RENDER_ATTACHMENT` texture, through the error path that *loses* the
-///   device. Those objects are small, and headroom is what keeps them out of the
-///   pressure the threshold is measuring.
+///   and GL support none of it, and D3D12 applies it unconditionally through its
+///   sub-allocator. So a refusal proves the card said no; the absence of one
+///   proves nothing.
+/// * **It cuts both ways, and the other edge is sharp.** The threshold is
+///   charged on **buffers as well as textures** — `create_buffer` asks it too —
+///   and `Queue::write_texture`'s staging buffer is allocated through wgpu's
+///   *fatal* error path, which calls `lose` on an out-of-memory. So this makes
+///   an upload that would previously have been attempted refusable, and a
+///   refused staging allocation is the lost device rather than a sentence. The
+///   window is narrow — `write_layer_rect` bands and waits, so a band is at most
+///   `readback_limit`, and a budget too full for that is one the array
+///   reservation would already have been refused at — but it is a real trade and
+///   not a free win. **`docs/perf/` §4.4's submit fix is what bounds it; nothing
+///   makes it catchable.**
+/// * **Ninety rather than ninety-nine**, for headroom against everything else a
+///   frame allocates beside the array: the stroke scratch, an effect working
+///   set, a blended commit's backdrop, and the staging above. An earlier draft
+///   of this comment gave the reason as `create_texture`'s internal clear
+///   views — that is **wrong** and is recorded rather than deleted, because it
+///   is the plausible-sounding reason somebody will reach for again.
+///   `vkCreateImageView` allocates no device memory through the sub-allocator
+///   and is not budget-checked at all; those views are fatal on failure and this
+///   threshold has no bearing on them.
 /// * **It is charged on every allocation**, including the per-frame ones — the
 ///   smudge probe's target, the thumbnail's uniform buffer, a blended commit's
 ///   backdrop. Each becomes one `vkGetPhysicalDeviceMemoryProperties2`. Believed
@@ -236,16 +252,42 @@ mod tests {
         );
     }
 
-    /// Headroom, not the last percent. See [`MEMORY_BUDGET_PERCENT`] for why:
-    /// `create_texture` builds one internal clear view per slice through wgpu's
-    /// *fatal* error path, so a threshold sitting on the budget refuses nothing
-    /// before those are attempted.
+    /// **A guard on the descriptor is not a guard on the instance**, and this is
+    /// the half that decides whether any of it runs.
+    ///
+    /// [`Gpu::create_instance`] is the only `Instance::new` in the workspace —
+    /// `app.rs`, `docshot.rs`, `gputest.rs`, `shell.rs`, `gpu_pipeline.rs` and
+    /// the examples all route through it — so reverting that one line to
+    /// `wgpu::Instance::new(InstanceDescriptor::new_without_display_handle_from_env())`
+    /// leaves every threshold `None` on every real instance, refuses no
+    /// allocation early, and `the_memory_budget_threshold_survives_the_
+    /// environment` stays green while the whole refusal path is inert. That is
+    /// the "a guard on a model is not a guard on the panel" failure this project
+    /// records three times over; the remedy it prescribes is to enumerate the
+    /// call site rather than the rule.
+    ///
+    /// The reading is the source, because an `Instance` exposes nothing about
+    /// the descriptor it was built from and building one needs a backend. What
+    /// it therefore cannot see: whether some *other* module grows a second
+    /// `Instance::new`. Demonstrated by mutation.
     #[test]
-    fn the_memory_budget_threshold_leaves_headroom() {
+    fn the_instance_is_built_from_that_descriptor() {
+        const SRC: &str = include_str!("gpu.rs");
+        // The sentinel is split so this scan does not match its own source, the
+        // trap the sibling guard in `canvas.rs` records at length.
+        const NEEDLE: &str = concat!("pub fn ", "create_instance()");
+        let body: String = SRC
+            .lines()
+            .skip_while(|l| !l.contains(NEEDLE))
+            .skip(1)
+            .take_while(|l| !l.contains("    }"))
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            (50..=95).contains(&MEMORY_BUDGET_PERCENT),
-            "{MEMORY_BUDGET_PERCENT} is not a share that both refuses in time and lets a \
-             document use the card"
+            body.contains("instance_descriptor()"),
+            "`create_instance` builds its own descriptor, so the threshold never reaches a real \
+             instance: {body}"
         );
     }
 }

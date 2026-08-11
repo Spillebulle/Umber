@@ -4544,15 +4544,20 @@ impl UmberApp {
         let size = doc.size;
         let slots = layers.slot_capacity_needed();
 
-        // **The layer array is asked for before the document is opened**, which
-        // is the whole of how a card that cannot hold it produces a sentence
-        // rather than the crash box. `create_texture` failing is an uncaptured
-        // device error and `crash::device_error` panics on purpose, so until
-        // this existed a document merely too large for the machine was reported
-        // as a crash — with the tab already on the strip and the stack already
-        // in the editor. Here nothing has happened yet, so a refusal leaves the
-        // session exactly as it was, exactly as the device-limit check above
-        // does.
+        // **The layer array is asked for before `open_document`**, which is the
+        // whole of how a card that cannot hold it produces a sentence rather
+        // than the crash box. `create_texture` failing is an uncaptured device
+        // error and `crash::device_error` panics on purpose, so until this
+        // existed a document merely too large for the machine was reported as a
+        // crash — with the tab already on the strip and the stack already in the
+        // editor. Here nothing has touched the *session*, so a refusal leaves it
+        // exactly as it was, exactly as the device-limit check above does.
+        //
+        // Not before `imported.open()`, which has already run three lines up:
+        // the slice count is not the layer count — a mask is a slice too — so
+        // there is nothing to ask the device for until the stack exists. That
+        // call has therefore already built this document's host-side buffers,
+        // and a refusal here frees them rather than never allocating them.
         //
         // **It does not cover the uploads below.** Those go through
         // `Queue::write_texture`, whose staging buffer is allocated by wgpu's
