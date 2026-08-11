@@ -793,9 +793,12 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   the highest slice ever *claimed* and `ensure_slots` never shrinks, so enough
   delete-then-add cycles take the layer array to its ceiling and leave it there
   — at `MAX_SLOTS`'s 256 that is 4.29 GB at 2048² and **102.4 GB at 10000²**,
-  with the budget reporting kilobytes. **The 10000² half of that is fixed** —
-  see the `resize` bullet below — but the growth ratchet itself is real and the
-  budget still cannot see it.
+  with the budget reporting kilobytes. **Both figures and the ratchet are now
+  gone** — see "The tile atlas": `ensure_slots` allocates nothing at all, because
+  a slot is a slice of a page table that is `MAX_SLOTS` deep from the start, so a
+  delete-then-add cycle takes no storage. The bullet's conclusion survives in a
+  much smaller form: a parked layer is charged **whatever tiles it held**, which
+  are not released because the undo entry may put the layer back.
   `StackShape::byte_len` puts a parked slice in the same currency as a patch,
   which is what makes eviction able to reach it.
 - **A recycled slot still holds the old layer's pixels** — clear it on the GPU
@@ -847,7 +850,11 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   *slightly more likely to fire*, because it is charged on buffers too. That is a
   trade, not a free win. Wired at `install_import`, `add_layer` and `add_mask`;
   `begin_float`, `resize`, File → New and the effect cache are still fatal and
-  `try_reserve`'s docs enumerate them.
+  `try_reserve`'s docs enumerate them. **The atlas added one more to the fatal
+  side and it is the worst entry on the list: an effect bake.** A bake promotes
+  every slice it targets and a promotion reaches the infallible `ensure_pages`,
+  so a canvas-sized allocation can now be asked for on an ordinary frame — the
+  only entry there the artist did not ask for by name.
 - **A refusal names what the document needs and never what the card has**,
   because wgpu exposes no total-memory query — `generate_allocator_report`
   reports Umber's own allocations, and the only route to the card's capacity is
@@ -952,6 +959,96 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
 - **The in-progress stroke blends inside the stack**, at the active layer's
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
+
+#### The tile atlas
+
+A layer's texels live in **256-square tiles scattered through an atlas of
+pages**, and a **page table** — a `texture_2d_array<u32>` indexed by (tile, slot)
+— says where each of a slot's tiles is, or that it is stored nowhere.
+`umber-core::tile` is the arithmetic, `shaders/tiles.wgsl` is the one statement
+of the unpack, and `docs/perf/tiled-layer-storage.md` is the design; §0a of it is
+the record of what was built against what was planned, and is the section to read
+first.
+
+Measured over the artist's 33 real documents by `measure-atlas` (the reservation
+arithmetic, no device) and `measure-vram` (the real renderer, the real upload):
+**55.26 GB dense against 10.44 GB, 18.9%.** The 20000×5000 Clip Studio document
+Umber refused at 19.74 GB opens in **four pages, 1.54 GB**, 5,412 tiles of a
+dense 83,740. Re-run both before quoting any of it.
+
+- **A page is the canvas rounded up to whole tiles, and that costs a fully
+  painted layer real money.** There are no padding *tiles* — every tile slot in a
+  page is a real tile of the canvas grid — only padding inside the edge ones, so
+  residency retires the padding in proportion to *sparsity* and not at all for a
+  layer that covers its canvas. It follows the distance from a multiple of 256:
+  4.9% at 3000 square, **26.4% at 1920×1080**, which makes the most ordinary
+  canvas anybody paints on the worst realistic entry. `slice_bytes` carries the
+  table. Do not repeat the claim that the padding becomes free.
+- **The page table is `MAX_SLOTS` deep from the moment the store exists and is
+  never grown; the atlas is what grows.** That is what keeps the two capacities
+  from being confused — only one of them is ever grown — and it is cheap because
+  a slot's table slice is `tiles.x × tiles.y × 4` bytes: 65 KB for a whole stack
+  at 2048², 16.8 MB at the largest canvas, against a single page there of 4.3 GB.
+- **A blank layer costs nothing, so `try_ensure_slots` reserves *headroom*.**
+  There is no slice left to refuse when a layer is added, and refusing nothing is
+  worse than not asking — the gate would go quiet exactly when the card is full.
+  What it guarantees instead is a page of free cells, so the first stroke on the
+  new layer cannot be the thing that meets the ceiling; and it is idempotent, so
+  sixty-four blank layers grow the atlas once.
+- **The commit is per (piece ∩ tile), and letting a stroke promote its layer is
+  the shortcut that must not be taken.** Promotion is one line, keeps four call
+  sites untouched, and *would* open the artist's document — an imported layer
+  nobody has painted on stays sparse. It puts an ordinary 1920×1080 session back
+  on a dense array plus 26.4%, which is a regression for everybody not opening a
+  20 GB file. `CommitUniforms` carries `atlas_delta` and `target_size`,
+  `out.doc` stays in **document** space so `fs` and `fs_blend` are untouched —
+  which is also what keeps `fs_blend`'s `rect_min` backdrop lookup right by
+  construction — and `aim_at_document` is off both commits, because a viewport
+  cannot express a negative offset.
+- **A page-backed slot is one that owns a whole page, identity-mapped**, and it
+  is not in the design at all. It is what keeps the float, `transform.wgsl` and
+  the effect slices on exactly the code they had: an owned page means a document
+  origin *is* an atlas origin. Right for a transient or rare whole-canvas write,
+  wrong for a stroke. `end_float` hands the preview's page back; the layer's own
+  page stays, because demoting would need to know which tiles are empty and that
+  is a readback.
+- **`fill_layer_white` is a table write and a new mask therefore costs nothing.**
+  Full reveal *is* a mask slot's empty value. `SlotClass` is what carries the two
+  empty values into the three places that need them in Rust and cannot ask a
+  shader: initialising a recycled cell, synthesising an unbacked tile on a
+  readback, and the flip's `tile_load`.
+- **A recycled cell must be cleared to its new slot's empty value before
+  anything reads it.** An atlas cell holds whatever the last slot that held it
+  left there, and a commit loads and blends — so a stroke into a fresh tile would
+  blend over another layer's paint, which is not a wrong picture so much as
+  somebody else's. `back_tiles` does it in the caller's own encoder.
+  `a_recycled_atlas_cell_carries_none_of_the_last_layers_paint` is the guard and
+  it needs a fill-then-clear to make a cell dirty *and* free, which no ordinary
+  sequence does.
+- **`resize` needs no scratch and the flip cannot manage without one.** Both
+  atlases are live during a rebuild and every move a resize makes is a
+  translation, so it is clip, shift, `copy_texture_to_texture`. A mirror is not a
+  translation and `copy_texture_to_texture` cannot mirror, so `flip.wgsl` reads
+  the page table — through a **raw** non-sRGB `D2Array` view, since its exactness
+  argument rests on that — into a page-sized scratch laid out at identity
+  positions, which is what lets one pass do a whole slot.
+- **A flip coarsens residency and an undo never shrinks it.** All that is known
+  about a source tile is that it is backed, so a mirrored 256-wide tile lands
+  across two destination tiles on a canvas that is not a whole number of them:
+  the picture is exact and the storage at most doubles per flip, bounded by the
+  grid. And a patch captured over unbacked tiles holds the empty value, so
+  undoing writes it back and backs the tile to store nothing — a layer ends up
+  holding the union of everywhere it has ever been painted. An emptiness scan is
+  what would avoid the second and is exactly what `write_layer_rect` must not
+  have: `app.rs`'s text tool writes a union rectangle of zeroes *deliberately* to
+  take the old text off, so a skip-if-empty would leave it on the canvas.
+- **There is no apron.** `composite.wgsl` reconstructs the bilinear tap from four
+  `textureLoad`s. See `umber_core::tile`'s module docs.
+- **The undo budget did not get deeper.** A patch is CPU-side and follows the
+  rectangle a stroke covered, not the residency, so a full-canvas stroke on a
+  10000² document is still 400 MB and the budget still holds exactly one. The
+  natural reading of "a layer costs what it covers" is that this improved, and it
+  did not.
 
 #### Folders
 
@@ -2887,6 +2984,17 @@ The rules, and they are cheap:
   assumed, and the comment names the hole instead of claiming the array cannot
   be forgotten. The only complete fix is a macro deriving the enum and `ALL`
   from one list, judged against this codebase's taste for per-variant rustdoc.
+- **A rule enforced by threading a parameter is enforced at the call sites that
+  thread it, and the compiler will not tell you which those are.** A growth
+  replaces the atlas texture, so its old-to-new copy has to be recorded into
+  whatever encoder is already open rather than submitted on its own — otherwise
+  everything already in that encoder lands in a texture nothing will read again.
+  `ensure_pages` took an `Option<&mut CommandEncoder>` for exactly that, the
+  commit message named `run_effect_steps` as the reachable case, and
+  `run_effect_steps` was then left passing an encoder of its own. The guard could
+  not see it: it drives `commit_stroke`, which reaches the growth by a different
+  door. This is `slot_revision`'s "exhaustive by construction" failure arriving
+  through a parameter instead of a method.
 - **A guard's inputs must span the domain the *code* sees, not the one the
   constants describe.** The effect pass budget took its canvas dimension from
   `downlevel_defaults()`, which is what a canvas is guaranteed to *reach* —
@@ -3824,6 +3932,48 @@ method rather than as an anecdote:
   mutate the code it claims to cover.** Commit first, so `git checkout --`
   reverts the mutation and not your work — that collision is now routine enough
   to be worth the habit.
+- **A fixture's *shape* can hide a whole class of bug, and squareness is the one
+  to check first.** Two guards over the page table passed with the WGSL's x/y
+  unpack **transposed**, because every fixture had a square tile grid and the
+  transposed tile existed and held the same thing. A guard for the sampler's edge
+  clamp passed with the clamp **deleted**, because the fixture's canvas filled its
+  page exactly and the unclamped tap read a sentinel that happened to be
+  legitimate — the page table's out-of-bounds `textureLoad` answers **zero, which
+  is a valid entry** (page 0, tile 0,0), so it returned plausible content instead
+  of nothing. 700×500 is the fixture: non-square, and not a whole number of tiles.
+  Neither was found by re-reading the assertion; both were found by mutating the
+  code and watching nothing fail.
+- **A comment asserting that a state is unreachable is a claim about the whole
+  program, and the change that writes it is the likeliest thing to have made it
+  false.** `drive_capture` filled its band with zeroes under a `debug_assert`
+  saying a partly-backed mask could not arise — "every mask a save or an autosave
+  reads is fully backed" — in the same commit that made `fill_layer_white` a
+  table write and so made *add a mask, paint on part of it* exactly that state.
+  The autosaved file hid the layer everywhere the artist had not painted on its
+  mask, while the explicit Save revealed. **Where two writers produce one
+  document, a guard has to compare them**, which is what
+  `a_capture_of_a_partly_painted_mask_reveals_what_the_save_does` does and what
+  `a_capture_reads_back_exactly_what_the_blocking_path_does` could not: that one
+  drives two ordinary layers on a canvas that is a single tile.
+- **A property whose failure is invisible in a pixel has to be checked as a
+  set.** `CanvasRenderer::atlas_invariant` asks whether every atlas cell is held
+  by exactly one slot or is free, with none duplicated and none leaked, and it is
+  what caught a promotion leaking the cells it moved out of and a flip freeing a
+  cell it had reused. A cell issued twice is one layer's paint appearing in
+  another's and a leaked one is storage nothing can take back — and neither shows
+  up until the two slots happen to be drawn together, which is why an effect
+  slice holding a whole page for the life of a document survived a
+  critic-reviewed branch and two rounds of mutation testing.
+- **A `#[must_use]` on a method that gives something up is how a release becomes
+  the caller's problem out loud.** `EffectCache::forget_all` and its two siblings
+  hand back the slots they dropped, because that type holds no `LayerStore` and
+  cannot free their pages — and the comment beside the code that promoted them
+  claimed it did. A sentence saying a release happens is the one thing a later
+  reader will not check.
+- **Mutate every guard, and mutate the path the guard actually takes.**
+  `an_effect_switched_off_gives_its_page_back` passed a mutation of `retain_only`
+  because the case it drove went through `forget_all`; it drives both now. That
+  is the same failure as a guard agreeing for the wrong reason, one level along.
 - **A guard that a sparse path did not move a pixel cannot live inside one
   build.** `examples/hash-layers` is the shape: fingerprint every layer and every
   warning, build the other side in a scratch tree **with its own target
