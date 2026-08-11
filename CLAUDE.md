@@ -1644,9 +1644,45 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   the drawing loop. The autosave does *not* use it — see "Autosave".
 - **Save must close a tab only when a file was actually written.** A cancelled
   file dialog is not permission to discard a document.
-- **`docformat::write_encoded` is the one atomic write.** `save` is `encode`
-  plus that; the autosave needs the halves apart because it puts one archive in
-  two places. A second temp-and-rename would be a second thing to get right.
+- **`docformat::write_with` is the one temp-and-rename a document goes through,
+  and `write_encoded` is one line of it.** This bullet used to name
+  `write_encoded`, say `save` was `encode` plus it, and give "the autosave puts
+  one archive in two places" as the reason the halves are apart. All three are
+  gone. A save *streams* the archive into the temporary as it builds —
+  `SaveDocument` borrowing every layer and `encode` assembling the whole ZIP in a
+  `Vec<u8>` is N+1 canvases plus every layer's PNG plus the archive plus a
+  growing `Vec`'s doubling — so there is no `&[u8]` to hand a temp-and-rename,
+  and a second one is what that rule refuses. `encode` still exists for the
+  round-trip tests and shares one `write_archive`, so the two cannot produce
+  different bytes; `a_streamed_save_is_byte_for_byte_the_archive_encode_builds`
+  compares the whole file. It is not the only temp-and-rename in Umber —
+  `themelib` and `palette` each keep one, correctly, because theirs is a single
+  `fs::write`.
+- **A canvas-sized buffer may be fetched rather than held, and "one at a time"
+  is the borrow checker's.** `Canvas` is `Held` or `Deferred`; `Canvases` is what
+  the writer asks. Its methods take `&mut self` and return `Cow<'_, [u8]>`, so a
+  writer holding one while asking for the next does not compile. `encode` and
+  `save` are handed no source, so a `Deferred` reaching them is
+  `SaveError::NotSupplied` rather than a layer written blank. **What no byte
+  comparison can see is the order** — fetching early and holding is
+  byte-identical — so the fixture records what it was asked for.
+- **`ZipWriter` may not be shown an I/O error.** Handed one part-way through an
+  entry, zip 8.6.0 finalises the entry it was in the middle of and trips
+  `debug_assert!(file_end >= self.stats.start)` — a *panic* wherever debug
+  assertions are on, a wrapped subtraction where they are not. **It reaches that
+  from `finish()` as well as from `Drop`**, which is why `mem::forget` on the
+  error path would not have worked: absorbing is the only option, not the tidier
+  of two. `docformat::Watched` keeps the first failure and reports success into a
+  temporary about to be deleted, tracking the stream position itself because zip
+  seeks back to patch every local header.
+- **The temporary's name is unique per writer**, `<path>.saving-<pid>-<n>`,
+  forced by the window: one `fs::write` before, the whole encode now. An explicit
+  Save and an already-dispatched autosave — which `stop_autosave_of` cannot
+  reach — sharing one name means the second `File::create` truncates the first's
+  live temporary. The price is that the shared name was **self-cleaning** and
+  this is not: one stray per interrupted save, indefinitely. `Reaper` clears them
+  inside the autosave folder; beside the artist's own document nothing does,
+  deliberately.
 
 ### Exporting
 
@@ -1675,9 +1711,10 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   — report it, never let a filename overrule the choice. Same division
   `CanvasCopy::plan` and `Clip::place` keep, and it is what makes the whole of
   it testable without a device.
-- **`write_encoded` is still the one atomic write**, and its temporary now takes
-  the *target's* extension so an exported `a.png` cannot collide with a
-  concurrent autosave of `a.ora` beside it.
+- **The atomic write is `write_with`'s now and `write_encoded` is one line of
+  it**, and nothing here changed: an export still hands over bytes it already
+  has, and its temporary still takes the *target's* extension so an exported
+  `a.png` cannot collide with a concurrent autosave of `a.ora` beside it.
 - **Not threaded, deliberately.** The file dialog above it already blocks, no
   stroke can be live, and a threaded encode would hold the whole picture and
   report failure into what may by then be a different document. The autosave
@@ -1751,6 +1788,20 @@ when nobody asked for it.
 - **The undo history is not written.** Up to 32 MB of PNG-encoded patches, every
   five minutes, unattended. An autosave exists so the painting is not lost, not
   so the afternoon can be replayed.
+- **The archive is streamed into the internal copy and the painter's own file is
+  a byte copy of it**, through the same `write_with`. Where the internal copy
+  could not be written there is nothing to copy from, so the document is encoded
+  a second time — only possible because `CaptureSource` **borrows** the capture
+  rather than consuming it.
+- **`Report::Written` is a claim that a file exists**, and the gate that enforces
+  that must sit *below* the expiry sweep. They answer different questions, and
+  the case where neither destination lands is overwhelmingly the full disk —
+  exactly where clearing what has expired might let the next attempt through.
+- **What is left of the ten gigabytes is the capture itself, and it is
+  `canvas.rs`'s.** `DocumentCapture` arrives whole from
+  `CanvasRenderer::take_capture`, so every canvas is resident before the writer
+  thread starts. Releasing finished slices one at a time is the remaining half;
+  `docs/perf/formats-and-host-memory.md` §10.1 has it.
 - **Expiry can only reach inside one directory, structurally.** `Reaper` is the
   only thing in Umber that deletes a document, and "the callers only pass
   internal paths" is not good enough — a later change makes that false in
@@ -3725,6 +3776,24 @@ method rather than as an anecdote:
   mutate the code it claims to cover.** Commit first, so `git checkout --`
   reverts the mutation and not your work — that collision is now routine enough
   to be worth the habit.
+- **A memory claim needs an allocator, and nothing else in a suite can see
+  one.** `save_peak.rs` installs a counting `#[global_allocator]` in that binary
+  alone, because a save that quietly allocated the whole stack would still write
+  a byte-perfect archive. It asserts a *shape*, never a figure, and **both**
+  readings, because without the held one a save that had stopped allocating
+  anything would pass against nothing. Its process-globals are unlocked and that
+  is safe only while the binary holds exactly one test.
+- **A fixture that gives every element the same bytes cannot see an index bug** —
+  the byte-identity guard's first fixture handed one buffer to every layer, so a
+  wrong *index* wrote an identical archive.
+- **A sampled sweep is a coin toss wearing a guard's clothes.** The sink test's
+  failing positions are 12-byte windows, about 3% of the range; a 24-sample
+  stride met one by luck and would re-roll silently whenever the fixture
+  changed. Sweep the domain when it is cheap enough to.
+- **Inserting a `#[test]` between a doc comment and its function steals it.** Six
+  lines about `effects: &[]` and a mutation in both directions ended up on a test
+  that had never been mutated that way, and the test they described was left with
+  no rationale at all.
 - **A source-text guard must not match its own source.** The scan for "no view
   is built before the scope is popped" found the function by
   `l.contains("fn try_reserve(")` — a line that itself contains the sentinel, so
