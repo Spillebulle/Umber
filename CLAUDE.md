@@ -1068,12 +1068,26 @@ dense 83,740. Re-run both before quoting any of it.
   a mask on every layer takes the first to 2.16×. **Zoomed out it reverses**: at
   fit-to-view on a 4096² canvas it is at parity on a dense document and **4.2×
   faster** on a realistic one, and the crossover is at about zoom 0.75. The
-  decomposition is the part to know — a `table`-only variant shows the dependent
-  page-table read is nearly free, because a slot's table slice is 160 bytes and a
-  54-slot table is 8.4 KB and cache-resident, while four scalar `textureLoad`s
-  against one TMU instruction is about **16:1**. So the staleness argument for
-  refusing the apron stands and now has a bill attached; **`textureGather` inside
-  the existing single-tile fast path is the unmeasured middle.** And the
+  decomposition needed a control nothing had, and **the first reading of it was
+  backwards.** `table` does a much shorter prologue than the real fast path and
+  `sampled` does none at all, so "everything but the fetch" had never been
+  measured and the difference was charged to the taps by elimination. With a
+  `prologue` variant in place the +1.23 ms is **84% the prologue and the
+  page-table read and 16% the hand-reconstructed tap**, and four scalar
+  `textureLoad`s and a lerp against one TMU instruction is **1.7:1 — the "about
+  16:1" this file used to quote was wrong.** Four adjacent texels cost close to
+  one, which is what a texture cache is for; what is not free is arriving at the
+  address, and that is not the arithmetic either — 0.83 ms over `table` is of the
+  order of two hundred fp32 operations per invocation where a floor, two clamps
+  and two divides is under twenty, so something structural (the straddling branch
+  is the candidate) is being paid for and nothing has measured it.
+  **`textureGather` is measured and refused**: 8–11% *slower*, because four
+  gathers are four texture instructions covering the same sixteen values as four
+  loads. It is byte-exact with the shipped path — zero of 255 on Vulkan and on
+  WARP — which is what makes that a comparison of two costs rather than of two
+  pictures. **And an apron is worth 8% rather than the half a pass the old figure
+  implied**, which the `hw-fast` column prices; the staleness argument for
+  refusing one stands and the bill just got much smaller. And the
   zoomed-out win is a **residency** win rather than a tiling one: the dense tiled
   column is at parity there, and what makes the sparse one fast is that an
   unbacked tile issues no fetch at all — which a dense slice cannot do at any
@@ -4069,6 +4083,29 @@ method rather than as an anecdote:
   failing positions are 12-byte windows, about 3% of the range; a 24-sample
   stride met one by luck and would re-roll silently whenever the fixture
   changed. Sweep the domain when it is cheap enough to.
+- **A fixture whose layout is the identity cannot catch a bug about layout.**
+  `measure-composite`'s dense store puts slot `s`'s tile `(x, y)` at page `s`,
+  cell `(x, y)`, so a tap wrongly crossing a *horizontal* tile edge still lands
+  on the right texel: narrowing the fast-path test from `t_lo == t_up` to its x
+  half reads **0 of 255 on the dense store** and 24 and 15 on the packed ones.
+  Same shape as the squareness trap above — and the packed layout is the
+  production one.
+- **A parent that mutates its own tree while a critic is building from it will
+  have the mutation reported back as a defect in the change.** A critic returned
+  "gather is not exact and it is non-deterministic across processes", with real
+  numbers, from six runs that straddled a mutation the parent had on disk; the
+  signature reproduced line for line. This file records a critic clobbering its
+  parent's tree, which is the same collision the other way round. Either give the
+  critic its own worktree or do not mutate while one is running — and **verify a
+  critic's headline personally before acting on it**, which is what turned an
+  hour of alarm into one commit.
+- **A doc comment attaches to the next *item*, not the next comment block**, so
+  inserting a documented `const` between a doc comment and its constant silently
+  rehomes the whole run of `///`. Thirty-one lines arguing why a measurement
+  column is priced rather than proposed ended up on the wrong constant, taking
+  three cross-references with it — including the only sentence stopping a
+  deviation of 1 of 255 reading as evidence the thing was safe. Recorded below
+  for a `#[test]`; a `const` does it just as well.
 - **Inserting a `#[test]` between a doc comment and its function steals it.** Six
   lines about `effects: &[]` and a mutation in both directions ended up on a test
   that had never been mutated that way, and the test they described was left with
