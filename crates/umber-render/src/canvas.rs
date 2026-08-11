@@ -5659,7 +5659,22 @@ impl CanvasRenderer {
         // commit onto one would put colour into a mask. Guarding only the
         // eraser is the asymmetry that gets forgotten — a caller reaching
         // `commit_stroke` directly is all that stands between the two.
-        let blends = style.mode == BrushMode::Paint && !style.on_mask;
+        //
+        // **The mask half is asked twice, of both things that know**, and that
+        // is not belt and braces. `style.on_mask` is what the *caller* meant and
+        // `on_mask` below is what the *store* records, and they answer to
+        // different writers — `Editor::stroke_target` for the one, the two
+        // callers of `mark_mask_slot` for the other. The two agreeing is an
+        // invariant rather than a guarantee, and the cost of it failing went up
+        // when the slot's class started deciding the commit's target format:
+        // `commit_blended` has no linear variant, so a disagreement here would
+        // not merely put colour into a mask, it would put it there in the
+        // encoding the composite stopped reading. The `||` fails closed, which
+        // is the direction that matters — a slot either side calls a mask takes
+        // the plain path, which is right for a mask and merely unblended for a
+        // layer nothing should be sending here anyway.
+        let on_mask = self.class_of(slot) == SlotClass::Mask;
+        let blends = style.mode == BrushMode::Paint && !style.on_mask && !on_mask;
         if blends && style.blend != BlendMode::Normal {
             self.commit_blended(device, encoder, slot, pieces, style);
             self.clear_stroke(device, encoder);
@@ -5722,10 +5737,12 @@ impl CanvasRenderer {
         // made from and the target format the pipeline declares, which have to
         // agree or the pass is a validation error. Read off the slot's class
         // rather than off `style.on_mask`, because the class is what every other
-        // part of the store already answers to (`back_tiles`' clear, the
-        // readback's empty value, the flip's `tile_load`) and two sources for
-        // one fact is how they come to disagree.
-        let on_mask = self.class_of(slot) == SlotClass::Mask;
+        // part of the store already answers to — `back_tiles`' clear above, the
+        // readback's empty value, the flip's `tile_load` — and two sources for
+        // one fact is how they come to disagree. It is also the safer of the
+        // two: a wrong class already breaks a mask at `back_tiles`, by clearing
+        // a fresh tile transparent and hiding the layer where nobody painted, so
+        // this cannot be wrong on its own.
         let (pages, paint, erase) = if on_mask {
             (
                 &self.layers.raw_page_views,
