@@ -131,14 +131,23 @@ element and a ZIP central-directory record, nothing canvas-sized — against
 * **§10.1's fix (2) is done** for the autosave: the accumulated PNGs and the
   whole-archive `Vec<u8>` are gone, and the painter's own file is a byte copy
   of the internal one rather than a second encode.
-* **§10.1's fix (1) is not.** `DocumentCapture` still arrives whole from
-  `CanvasRenderer::take_capture`, so the N canvases are resident before the
-  writer thread starts and the 10 GB figure in §10.1's table stands for the
-  autosave. Encoding each slice *as it comes home* needs the renderer to hand
-  finished slices over one at a time — a change to `canvas.rs`, which Stage 3
-  owns. It belongs with Stage 3 or immediately after it.
-* **§10.1's fix (3), masks at one byte, is not** and is §5's, which is handed
-  to the atlas.
+* **§10.1's fix (1) is done**, after Stage 3, which is where it belonged.
+  `CanvasRenderer::take_capture_slice` hands each layer slice over as its last
+  band leaves the staging buffer, the writer thread encodes it into a
+  `docformat::LayerImage` and drops the canvas, and `take_capture` returns the
+  size and the flattened preview alone. The 10 GB row of §10.1's table is gone;
+  what is left is the preview, which is one canvas and has to be pixels because
+  the archive's thumbnail is averaged down from it.
+  **The interface change was larger than §10.1 predicted, in one way worth
+  recording.** Asking one at a time is not enough on its own: the archive is
+  written top of the stack first and the capture comes home bottom first, so a
+  source that could only produce *pixels* would hold every one of them until the
+  writer reached it whatever the protocol. `Canvases::layer_image`/`mask_image`
+  are the second half — a source may hand over an image it has already encoded —
+  and `LayerImage::of` is `write_archive`'s own `trim` and `write_png` with a
+  different sink, so the archive is byte for byte the one built from pixels.
+* **§10.1's fix (3), masks at one byte, rode in with the atlas's linear mask**,
+  which is §5's as predicted.
 
 Two things the critic found that are worth carrying forward rather than
 leaving in a commit message. `ZipWriter` **may not be shown an I/O error**:
