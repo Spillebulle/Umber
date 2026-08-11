@@ -1391,7 +1391,10 @@ impl Capture {
             .slice(..(self.padded as u64) * ((band_last - band_first) as u64))
             .get_mapped_range();
 
-        let (gaps, empty, tiles_x) = (&self.gaps, self.empty, self.size.x);
+        // `width` is the canvas in **pixels**, not in tiles, and it is bound
+        // here because the clamp below is what makes the rightmost gap stop at
+        // the canvas edge rather than at its tile'''s.
+        let (gaps, empty, width) = (&self.gaps, self.empty, self.size.x);
         let out = self
             .partial
             .get_or_insert_with(|| Vec::with_capacity(row * height));
@@ -1412,7 +1415,7 @@ impl Capture {
             let ty = y as u32 / TILE;
             for (gx, _) in gaps.iter().filter(|(_, gy)| *gy == ty) {
                 let x0 = (gx * TILE) as usize;
-                let x1 = ((gx + 1) * TILE).min(tiles_x) as usize;
+                let x1 = ((gx + 1) * TILE).min(width) as usize;
                 for px in out[at + x0 * 4..at + x1 * 4].chunks_exact_mut(4) {
                     px.copy_from_slice(&empty);
                 }
