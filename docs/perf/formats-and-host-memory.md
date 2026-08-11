@@ -792,10 +792,23 @@ and the accumulation.
    three quarters again, because a forked mask is read back at 1 B/px rather
    than 1.33. The figure is right; it was right for the wrong design.)*
 
-**All three are built, and the table above no longer stands.** Fix (2) landed
-with Stage 4 and fix (1) after Stage 3, once the renderer could release finished
-slices; fix (3) rode in with the atlas's linear mask, which reads and writes a
-mask through the array's raw view rather than at four bytes a pixel.
+**Fixes (1) and (2) are built and the table above no longer stands. Fix (3) is
+not, and a first draft of this paragraph said it was.** Fix (2) landed with
+Stage 4 and fix (1) after Stage 3, once the renderer could release finished
+slices.
+
+The retraction is worth stating rather than deleting, because the thing that
+made it plausible is still true and will make it plausible again. The atlas's
+linear mask changed how a mask is *encoded* and which view it is read through —
+so "the mask work landed" is a true sentence — and it changed nothing about
+bytes per pixel: a mask is still a slice of the same `Rgba8UnormSrgb` array
+(CLAUDE.md: "not a second `R8Unorm` one"), `begin_capture` still sizes every
+band at `doc_size.x * 4` whatever the slot's class, and `MaskImage::of` still
+reduces with the `chunks_exact(4).map(|px| px[0])` this section names by name.
+None of the promised three quarters of the readback is saved. Fix (3) needs the
+capture to read a mask slot at one byte, which needs a copy whose format is
+decided per slot — and that is a change to `Capture`, not to the mask's
+encoding.
 
 Fix (1) as built, because it diverged from the sketch above in one place that
 matters. `CanvasRenderer::take_capture_slice` hands over each layer slice as its

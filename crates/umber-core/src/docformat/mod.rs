@@ -1531,7 +1531,17 @@ fn write_archive<W: Write + std::io::Seek>(
         // The fingerprint and the placement are copied out here rather than read
         // later, because holding the borrow would keep `canvases` locked past
         // the mask below it.
-        let placed = match canvases.layer_image(at) {
+        // **Only where the caller deferred.** A `Canvas::Held` is the caller
+        // saying "here are the bytes", and asking the source for an encoded
+        // image first would silently write that image and ignore the ones it was
+        // handed. Unreachable today — the only implementor of `layer_image` is
+        // the autosave's, which defers everything — which is exactly why it is
+        // decided here rather than left to every future source to get right.
+        let offered = match layer.pixels {
+            Canvas::Deferred => canvases.layer_image(at),
+            Canvas::Held(_) => None,
+        };
+        let placed = match offered {
             Some(image) => {
                 let print = image.print;
                 zip.start_file(&src, stored())?;
@@ -1573,7 +1583,12 @@ fn write_archive<W: Write + std::io::Seek>(
         let mask_src = match layer.mask {
             Some(mask) => {
                 let src = mask_src(i);
-                match canvases.mask_image(at) {
+                // Deferred only, for the reason the layer's own is.
+                let offered = match mask {
+                    Canvas::Deferred => canvases.mask_image(at),
+                    Canvas::Held(_) => None,
+                };
+                match offered {
                     // Already encoded, for the reason the layer's own is.
                     Some(image) => {
                         zip.start_file(&src, stored())?;
@@ -4519,13 +4534,33 @@ mod tests {
                     })
                     .collect()
             };
+            // **One layer's content is a rectangle that is neither at the origin
+            // nor square**, and that is the fixture doing work. `trim` crops to
+            // the non-transparent box, so a canvas painted everywhere trims to
+            // `(0, 0)` and `x` and `y` are the same number — under which
+            // `Encoded::at` transposed writes a byte-identical archive.
+            // Demonstrated by mutation: swapping the two left all 1,933 tests
+            // green. 1..4 by 2..4 is offset on both axes and 3 by 2, so a
+            // transposition moves the layer and a shift moves it further.
+            let patch = |step: u32| -> Vec<u8> {
+                (0..size.x * size.y)
+                    .flat_map(|i| {
+                        let (x, y) = (i % size.x, i / size.x);
+                        let inside = (1..4).contains(&x) && (2..4).contains(&y);
+                        let v = (i * step % 251) as u8;
+                        [v, v / 2, 255 - v, if inside { 255 } else { 0 }]
+                    })
+                    .collect()
+            };
             Self {
                 size,
                 pixels: vec![
                     canvas(37, true),
                     Vec::new(),
                     canvas(53, false),
-                    canvas(71, true),
+                    // The text layer, so the fingerprint's rectangle is taken
+                    // over an off-origin box as well as `stack.xml`'s `x`/`y`.
+                    patch(71),
                 ],
                 // **No two channels alike**, and a real mask slice carries the
                 // same value in all three. That is the point: a mask is written

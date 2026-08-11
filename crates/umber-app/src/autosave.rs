@@ -3168,11 +3168,21 @@ mod tests {
     /// Three layers, **no two alike**, with the mask on the middle one — a
     /// fixture whose layers shared a colour would compare equal under a mix-up,
     /// which is the failure this exists for.
+    ///
+    /// **It goes through `Autosave::note_slice` rather than `Encoded::add`**,
+    /// because that is where the capture's ordering is reconciled with the
+    /// archive's: `Candidate::slots` reads every layer and *then* every mask, so
+    /// `index >= layers` is the only thing deciding which of the two a slice is.
+    /// Handing `Encoded::add` a flag worked out in the test would be the test
+    /// restating the rule — demonstrated by mutation, since `>=` to `>` left all
+    /// 806 tests green while that line was reached by nothing.
     #[test]
     fn every_encoded_slice_lands_on_the_layer_it_came_off() {
         let internal = scratch("mapping-internal");
         let size = UVec2::new(2, 1);
-        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        let session = session_of(1);
+        let id = session.active_id();
+        let mut doc = candidate(id, "Untitled 1");
         doc.size = size;
         doc.layers = (0..3)
             .map(|i| LayerMeta {
@@ -3191,25 +3201,50 @@ mod tests {
         let paint = |v: u8| vec![v, 0, 255 - v, 255, 255 - v, v, 0, 255];
         let coverage = vec![255, 255, 255, 255, 0, 0, 0, 255];
 
-        let mut images = Encoded::default();
-        for i in 0..3 {
-            images.add(i, false, size, &paint(40 + 60 * i as u8));
-        }
-        images.add(3, true, size, &coverage);
-
+        let mut autosave = Autosave {
+            interval: Duration::ZERO,
+            expiry: None,
+            // Never the real one: a marker left in somebody's data folder would
+            // be found by their next start of Umber.
+            marks_dir: Some(scratch("mapping-sessions")),
+            ..Autosave::default()
+        };
+        autosave.next_due(Instant::now(), true, &session);
         let ours = internal.join("mapping-1212121212121212.ora");
-        let reports = run_task(
-            Task {
-                doc,
-                internal: Some(ours.clone()),
-                pixels: DocumentCapture {
-                    size,
-                    merged: paint(200),
-                },
-                expiry: None,
+        autosave.docs.get_mut(&id).expect("a record").internal = Some(ours.clone());
+
+        // In the order the capture hands them over: every layer, bottom first,
+        // and then every mask. Which of the four is the mask is `note_slice`'s
+        // answer and not this test's.
+        autosave.begin(doc);
+        for i in 0..3usize {
+            autosave.note_slice(umber_render::CaptureSlice {
+                index: i,
+                size,
+                pixels: paint(40 + 60 * i as u8),
+            });
+        }
+        autosave.note_slice(umber_render::CaptureSlice {
+            index: 3,
+            size,
+            pixels: coverage.clone(),
+        });
+        autosave.finish(
+            DocumentCapture {
+                size,
+                merged: paint(200),
             },
-            &images,
+            Instant::now(),
         );
+
+        let mut reports = Vec::new();
+        for _ in 0..4000 {
+            reports.extend(autosave.poll());
+            if !reports.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
             "{reports:?}"

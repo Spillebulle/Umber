@@ -2435,18 +2435,61 @@ struct EffectCache {
     /// report", which is not the same as "nothing was refused" — see
     /// [`Self::refusing`].
     refused: Option<Vram>,
-    /// The last bake was refused.
+    /// The last bake was refused a page **by the device**.
     ///
     /// **The latch is what makes the refusal reportable at all.** A bake runs
     /// every frame an effect is stale, and a document the card cannot find a
     /// page for is refused on every one of them — so setting [`Self::refused`]
     /// each time would put a dialog over the canvas at sixty hertz. It is set on
-    /// the *transition* into the refused state and cleared by a bake that
-    /// completes, so an artist who closes something else and carries on is told
-    /// again if it happens again. Same shape as `Autosave::complained`, which
-    /// exists for exactly this on a five-minute timer rather than a per-frame
-    /// one.
+    /// the *transition* into the refused state, so an artist who closes
+    /// something else and carries on is told again if it happens again. Same
+    /// shape as `Autosave::complained`, which exists for exactly this on a
+    /// five-minute timer rather than a per-frame one.
+    ///
+    /// **`bake_effects` takes it at the top and puts it back only on that one
+    /// arm**, rather than clearing it at each path that does not refuse — there
+    /// are five returns and one of them is a document with no effects at all, so
+    /// switching an effect off and on again after a refusal would otherwise
+    /// produce no second notice and a silently plain picture.
     refusing: bool,
+}
+
+/// Why a slot could not be given a whole page of its own.
+///
+/// **Two arms because only one of them is the artist's to act on.** The device
+/// declining an allocation is a memory refusal with a figure and a remedy;
+/// running out of *pages* is [`MAX_SLOTS`], which is Umber's own ceiling and
+/// which no amount of closing other applications moves. Collapsing them into one
+/// `Vram` sends `vram::effect_refused` — "this graphics card could not provide
+/// it, close other applications" — to somebody whose card was never asked, which
+/// is the refusal naming the wrong bound that `check_bounds` was split apart to
+/// stop.
+/// **No test reaches `Ceiling`, and that is a property of the arithmetic rather
+/// than a gap somebody could close.** A page holds exactly one canvas's worth of
+/// tiles, so `MAX_SLOTS` pages need `MAX_SLOTS` slots' worth of paint — at which
+/// point `bake_effects`' `capacity == 0` has already refused the bake, because
+/// there is no slice left above the stack for an effect to use. `begin_float`
+/// refuses at `reserved >= MAX_SLOTS` for the same reason. It is written because
+/// the alternative is a synthesised `Vram`, which is wrong whether or not
+/// anything can produce it.
+enum PageRefusal {
+    /// The device would not allocate the grown atlas.
+    Device(Vram),
+    /// [`MAX_SLOTS`] pages already, and none of them whole and free.
+    Ceiling,
+}
+
+impl std::fmt::Display for PageRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Device(v) => write!(
+                f,
+                "the device refused {} page(s) of {} bytes",
+                v.slices, v.slice_bytes
+            ),
+            Self::Ceiling => write!(f, "the atlas is at its ceiling of {MAX_SLOTS} pages"),
+        }
+    }
 }
 
 /// Why a bake was abandoned part way.
@@ -2464,9 +2507,17 @@ enum BakeError {
     Wrong(String),
 }
 
-impl From<Vram> for BakeError {
-    fn from(refused: Vram) -> Self {
-        Self::Refused(refused)
+impl From<PageRefusal> for BakeError {
+    /// **The ceiling becomes a [`BakeError::Wrong`], deliberately.** It is a
+    /// bake that did not happen and is reported the same way — the plain draw
+    /// list, `dropped` counting what is not drawn — but it raises no notice,
+    /// because there is nothing an artist could do about `MAX_SLOTS` and the
+    /// remedies `vram::effect_refused` offers are all about the card.
+    fn from(refused: PageRefusal) -> Self {
+        match refused {
+            PageRefusal::Device(v) => Self::Refused(v),
+            PageRefusal::Ceiling => Self::Wrong(PageRefusal::Ceiling.to_string()),
+        }
     }
 }
 
@@ -4681,7 +4732,7 @@ impl CanvasRenderer {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         slot: u32,
-    ) -> Result<(), Vram> {
+    ) -> Result<(), PageRefusal> {
         if slot as usize >= MAX_SLOTS || self.layers.owned_page(slot).is_some() {
             return Ok(());
         }
@@ -4759,7 +4810,7 @@ impl CanvasRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         into: &mut wgpu::CommandEncoder,
-    ) -> Result<u32, Vram> {
+    ) -> Result<u32, PageRefusal> {
         let per = self.layers.grid.tiles_per_page() as usize;
         let whole = |store: &LayerStore| -> Option<u32> {
             (0..store.pages).find(|p| {
@@ -4772,22 +4823,22 @@ impl CanvasRenderer {
             return Ok(page);
         }
         let pages = self.layers.pages;
-        self.try_ensure_pages(device, queue, Some(into), pages + 1)?;
-        // Grew, or was already at a ceiling `growth_for` declines to pass. The
-        // second answers `Ok(())` — it is not an allocation failure — and there
-        // is still no page, so it becomes the same refusal with the figure the
-        // caller would have needed.
+        self.try_ensure_pages(device, queue, Some(into), pages + 1)
+            .map_err(PageRefusal::Device)?;
+        // Grew, or was already at [`MAX_SLOTS`], which `growth_for` declines to
+        // pass and reports as `Ok(())` — it is not an allocation failure and
+        // must not be dressed as one. **That distinction is the whole of this
+        // arm.** A synthesised `Vram` here would send `vram::effect_refused` to
+        // an artist whose card was never asked, telling them to close other
+        // applications about a ceiling `MAX_SLOTS` sets; a refusal naming the
+        // wrong bound is worse than a vague one, which is the rule
+        // `check_bounds` already lives by.
         match whole(&self.layers) {
             Some(page) => {
                 self.layers.free.retain(|c| c.page() != page);
                 Ok(page)
             }
-            None => Err(Vram {
-                slices: pages.saturating_add(1),
-                held: pages,
-                slice_bytes: slice_bytes(self.doc_size),
-                doc_size: self.doc_size,
-            }),
+            None => Err(PageRefusal::Ceiling),
         }
     }
 
@@ -6858,11 +6909,7 @@ impl CanvasRenderer {
                 .and_then(|()| self.promote(device, queue, &mut enc, preview_slot));
             queue.submit(Some(enc.finish()));
             if let Err(refused) = promoted {
-                log::error!(
-                    "no page for a transform preview: {} page(s) of {} bytes",
-                    refused.slices,
-                    refused.slice_bytes,
-                );
+                log::error!("no page for a transform preview: {refused}");
                 return None;
             }
         }
@@ -8312,6 +8359,16 @@ impl CanvasRenderer {
             active_index: frame.active_index,
         };
 
+        // **The refusal latch is cleared here and re-set below, which is what
+        // makes "the last bake was refused" true rather than sticky.** Clearing
+        // it at each of the paths that *do not* refuse is the tempting shape and
+        // is the "forgotten at the sixth" failure: `bake_effects` has five
+        // returns, and one of them is a document that simply has no effects —
+        // so switching an effect off and on again after a refusal would produce
+        // no second notice and a silently plain picture. Taking it at the top
+        // means every path but the one that re-sets it re-arms by construction.
+        let was_refusing = std::mem::replace(&mut self.effects.refusing, false);
+
         // Every effect the document would draw, bottom to top, as
         // (stack position, effect).
         //
@@ -8573,18 +8630,16 @@ impl CanvasRenderer {
             // latched rather than raised per bake: a bake runs every frame an
             // effect is stale, so raising it each time would be a dialog at the
             // frame rate. See `EffectCache::refusing`.
-            if let BakeError::Refused(refused) = what
-                && !std::mem::replace(&mut self.effects.refusing, true)
-            {
-                self.effects.refused = Some(refused);
+            if let BakeError::Refused(refused) = what {
+                self.effects.refusing = true;
+                if !was_refusing {
+                    self.effects.refused = Some(refused);
+                }
             }
             self.release_effect_pages(queue);
             self.effects.dropped = wanted.len();
             return plain(wanted.len());
         }
-        // A bake that ran is what re-arms the notice: an artist who closed
-        // something else and carried on is told again if it happens again.
-        self.effects.refusing = false;
         self.baked(stack, &drawn, &slots, frame)
     }
 
@@ -8998,6 +9053,8 @@ impl CanvasRenderer {
         for slot in slices {
             self.promote(device, queue, encoder, slot)?;
         }
+        // `?` above goes through `From<PageRefusal>`, which is where the device
+        // refusal and the ceiling stop being one thing.
         // **After the promotion, not before**, because a promotion may grow the
         // atlas and the working set's bind groups name the array view. Built
         // first, they would have the effect extract reading the atlas the growth
@@ -9572,11 +9629,20 @@ impl CanvasRenderer {
 
     /// The next layer slice that has come home, taken out of the capture.
     ///
-    /// Called every frame beside [`Self::take_capture`] and **before** it: each
+    /// Called in a **loop**, every frame, before [`Self::take_capture`]: each
     /// slice is handed over as soon as its last band is out of the staging
     /// buffer, so the capture holds the one it is assembling rather than the
     /// whole document. The caller is expected to encode it and drop the buffer —
     /// `docformat::LayerImage` is what for.
+    ///
+    /// **The loop is the contract and not a suggestion.** More than one slice
+    /// can land in a frame — a small document reads a whole slice per step and
+    /// several steps can complete between two calls — so a caller taking one per
+    /// frame strands the tail, and `take_capture` then hands back a document
+    /// whose layers it cannot supply. That is refused rather than written blank
+    /// (`CaptureSource::layer` answers `NotSupplied`), so the failure is a
+    /// reported autosave failure and not a damaged file; `take_capture` logs the
+    /// count as the diagnosis.
     ///
     /// In the order the caller asked for the slots, which is the order they are
     /// read back, and never the flattened preview: that one is the last step and

@@ -146,8 +146,13 @@ element and a ZIP central-directory record, nothing canvas-sized — against
   are the second half — a source may hand over an image it has already encoded —
   and `LayerImage::of` is `write_archive`'s own `trim` and `write_png` with a
   different sink, so the archive is byte for byte the one built from pixels.
-* **§10.1's fix (3), masks at one byte, rode in with the atlas's linear mask**,
-  which is §5's as predicted.
+* **§10.1's fix (3), masks at one byte, is still not built** — and a first draft
+  of this entry claimed it had ridden in with the atlas's linear mask. It did
+  not. That change moved a mask's *encoding* and the view it is read through and
+  left its width alone: `begin_capture` still sizes every band at
+  `doc_size.x * 4` whatever the slot's class, and the
+  `chunks_exact(4).map(|px| px[0])` §10.1 names by name is still in
+  `MaskImage::of`. See §10.1 for what it would actually take.
 
 Two things the critic found that are worth carrying forward rather than
 leaving in a commit message. `ZipWriter` **may not be shown an I/O error**:
