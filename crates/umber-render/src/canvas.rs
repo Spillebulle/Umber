@@ -1606,37 +1606,56 @@ impl Capture {
     /// By rows rather than by bytes, because the copy's rows are padded to the
     /// alignment: chunking by rows makes the padding fall out for free.
     ///
-    /// # A row is cut into runs, and that is what keeps the chunk under a
-    /// millisecond
+    /// # A row is cut into runs, and a gap is a `memcpy` rather than a store per
+    /// pixel
     ///
     /// The obvious spelling — copy the whole padded row out of the buffer, then
     /// go back over the gaps writing the empty value a pixel at a time — is what
-    /// this was, and it cost **4 to 12 ms a chunk against the 0.8 the same four
-    /// megabytes take with nothing missing**, measured on a 2048-square document
-    /// of eight cleared layers. Two separate wastes, and neither is visible
-    /// until a slot is mostly unstored, which the atlas made the ordinary case
-    /// rather than an exotic one: a freshly cleared layer stores *nothing*, so
-    /// every pixel of it took the slow path.
+    /// this was, and on `a_capture_of_a_large_document_never_costs_a_frame` it
+    /// took the worst frame from **1.6–2.1 ms to 4.2–4.7** and the whole capture
+    /// from 87–99 ms to 149–157. It is invisible until a slot is mostly
+    /// *unstored*, which the atlas made the ordinary case rather than an exotic
+    /// one: a freshly cleared layer stores nothing at all, so every pixel of it
+    /// took the slow path. That fixture clears eight layers, which is why the
+    /// guard caught this and a painted document would not have.
     ///
-    /// - **A store per pixel is not a `memcpy`.** A canvas-wide gap is a million
-    ///   four-byte writes per chunk where one 8 KB copy out of a prepared row
-    ///   would do. So the empty value is laid out once into `pattern` and a gap
-    ///   is a copy out of it.
-    /// - **The bytes that get overwritten were read out of *uncached* memory.**
-    ///   That is the 5 ms per 16 MB this function's bound is built on, and
-    ///   paying it for bytes about to be thrown away is the more expensive half
-    ///   of the two. A gap run therefore reads nothing at all.
+    /// **The decomposition was measured, and only one of the two halves is worth
+    /// anything.** Bracketed against the old body, three runs each, end to end:
+    /// the old 228/282/342 ms, runs-but-still-reading 78/90/94, and this
+    /// 68–89 — so
+    ///
+    /// - **a `memcpy` instead of a store per pixel is the whole of it.** A
+    ///   canvas-wide gap is a million four-byte writes per chunk where one 8 KB
+    ///   copy out of a prepared row will do, and taking that out is the factor
+    ///   of three.
+    /// - **not reading the bytes it is about to overwrite is worth about a
+    ///   tenth**, which is at the noise floor. It is kept because it is free —
+    ///   a gap run names `pattern` instead of `mapped` and that is the whole
+    ///   difference — and it is written down at its measured size rather than
+    ///   its plausible one. A first draft of this comment argued from "a mapped
+    ///   staging buffer is *uncached*" that it was the larger half; it is not,
+    ///   and a figure in a comment is what the next change gets argued against.
     ///
     /// Adjacent tiles of the same kind merge, so a slot storing nothing is one
     /// copy per row and a slot storing everything is one copy per row — which is
     /// exactly what the old code did in the second case and is why a fully
     /// painted document never showed this.
     ///
-    /// **What is deliberately not here is a fast path for the copies.** A band
-    /// of a slot is one `copy_texture_to_buffer` per stored tile — 64 of them on
-    /// this fixture — and collapsing an identity-mapped page into a single copy
-    /// is the tempting repair. Measured, recording those 64 costs **0.00 ms**;
-    /// the whole of the frame is here, on the CPU, after they come home.
+    /// **What is not here is a fast path for the copies, and the evidence for
+    /// leaving it out reaches less far than it looks.** A band of a slot is one
+    /// `copy_texture_to_buffer` per *stored* tile, and collapsing an
+    /// identity-mapped page into a single copy is the tempting repair. What was
+    /// measured is that this regression was not that: recording reads **0.00 ms**
+    /// both on the cleared fixture, where a layer step records *no* copies at
+    /// all, and on a variant of it whose every layer was written first, where a
+    /// band records 64 — and with the defect still in place that variant's worst
+    /// frame was 1.30 ms. What was **not** measured is the case the fast path is
+    /// actually for: 64 copies at 2048 square says nothing about the 20000×5000
+    /// reference, where a band is about thirteen tile rows of 5,412 stored tiles
+    /// and so thousands of copies, and a page-backed slot is a different shape
+    /// again from a slot that merely happens to store every tile. So the honest
+    /// claim is that the fast path would not have fixed *this*, not that it
+    /// would buy nothing.
     fn copy_chunk(&mut self) -> bool {
         let row = (self.size.x * 4) as usize;
         let height = self.size.y as usize;
@@ -1653,9 +1672,17 @@ impl Capture {
         // here because the clamp below is what makes the rightmost gap stop at
         // the canvas edge rather than at its tile's.
         let (gaps, empty, width) = (&self.gaps, self.empty, self.size.x);
+        // The tile columns the row is cut at. A gap naming one past this is
+        // ignored rather than indexed, and that is *right* rather than merely
+        // safe: those columns lie beyond the canvas edge and contribute no
+        // bytes to any row. (`drive_capture` builds `gaps` from the grid's own
+        // extent, so it does not arise; not indexing keeps a wrong one off the
+        // frame path either way.)
+        let tiles_x = width.div_ceil(TILE) as usize;
         // One canvas row of the slot's empty value. Built once per chunk, and
         // only where something is actually missing — a fully stored slot pays
-        // neither the allocation nor a byte of it.
+        // neither the allocation nor a byte of it. `row` is a multiple of four,
+        // so the fill lands exactly on it.
         let mut pattern = Vec::new();
         if !gaps.is_empty() {
             pattern.reserve_exact(row);
@@ -1676,6 +1703,7 @@ impl Capture {
         // bytes, covering `[0, row)` exactly. It follows the *tile* row, so it
         // is rebuilt once per [`TILE`] document rows rather than per row.
         let mut spans: Vec<(usize, usize, bool)> = Vec::new();
+        let mut missing = vec![false; tiles_x];
         let mut spans_of: Option<u32> = None;
         for y in from..to {
             // The tile row is the document row's, and a gap's columns are
@@ -1683,28 +1711,39 @@ impl Capture {
             let ty = y as u32 / TILE;
             if spans_of != Some(ty) {
                 spans_of = Some(ty);
-                spans.clear();
-                for tx in 0.. {
-                    let x0 = (tx * TILE) as usize * 4;
-                    if x0 >= row {
-                        break;
+                // This tile row's own columns, in **one** pass over the gap
+                // list. Asking `gaps` per tile column instead is a scan of the
+                // whole list per column: at the largest canvas Umber will make
+                // that is 128 columns against 16,384 entries, two million
+                // comparisons a chunk to answer what one pass settles.
+                missing.iter_mut().for_each(|m| *m = false);
+                for (gx, gy) in gaps.iter().filter(|(_, gy)| *gy == ty) {
+                    debug_assert_eq!(*gy, ty);
+                    if let Some(m) = missing.get_mut(*gx as usize) {
+                        *m = true;
                     }
+                }
+                spans.clear();
+                for tx in 0..tiles_x as u32 {
+                    let x0 = (tx * TILE) as usize * 4;
                     let x1 = ((tx + 1) * TILE).min(width) as usize * 4;
-                    let gap = gaps.contains(&(tx, ty));
+                    let gap = missing[tx as usize];
                     match spans.last_mut() {
                         Some(last) if last.2 == gap => last.1 = x1,
                         _ => spans.push((x0, x1, gap)),
                     }
                 }
-                debug_assert_eq!(
-                    spans.first().map(|s| s.0).unwrap_or(0),
-                    0,
-                    "the runs have to start at the left edge of the row"
-                );
-                debug_assert_eq!(
-                    spans.last().map(|s| s.1).unwrap_or(0),
-                    row,
-                    "the runs have to cover the row to its right edge"
+                // The runs have to tile `[0, row)` with no hole and no overlap:
+                // a hole leaves the row short and shears everything under it, an
+                // overlap leaves it long. Walked, rather than checked at the two
+                // ends — which is what this asserted first, and a middle run
+                // dropped or stretched passes any test of the ends alone.
+                debug_assert!(
+                    spans
+                        .iter()
+                        .try_fold(0usize, |at, s| (s.0 == at && s.1 > at).then_some(s.1))
+                        == Some(row),
+                    "the runs do not tile the row exactly"
                 );
             }
             // Band-relative: row `band_first` of the layer is row 0 of the
