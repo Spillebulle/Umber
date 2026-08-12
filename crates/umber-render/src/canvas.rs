@@ -1625,8 +1625,9 @@ impl Capture {
     /// 68–89 — so
     ///
     /// - **a `memcpy` instead of a store per pixel is the whole of it.** A
-    ///   canvas-wide gap is a million four-byte writes per chunk where one 8 KB
-    ///   copy out of a prepared row will do, and taking that out is the factor
+    ///   canvas-wide gap is a million four-byte writes per chunk — 512 rows of
+    ///   2048 pixels on that fixture — where 512 copies of 8 KB out of a
+    ///   prepared row will do, one per row, and taking that out is the factor
     ///   of three.
     /// - **not reading the bytes it is about to overwrite is worth about a
     ///   tenth**, which is at the noise floor. It is kept because it is free —
@@ -1645,11 +1646,14 @@ impl Capture {
     /// leaving it out reaches less far than it looks.** A band of a slot is one
     /// `copy_texture_to_buffer` per *stored* tile, and collapsing an
     /// identity-mapped page into a single copy is the tempting repair. What was
-    /// measured is that this regression was not that: recording reads **0.00 ms**
-    /// both on the cleared fixture, where a layer step records *no* copies at
-    /// all, and on a variant of it whose every layer was written first, where a
-    /// band records 64 — and with the defect still in place that variant's worst
-    /// frame was 1.30 ms. What was **not** measured is the case the fast path is
+    /// measured is that this regression was not that: recording a **layer** step
+    /// reads **0.00 ms** both on the cleared fixture, where such a step records
+    /// *no* copies at all, and on a variant of it whose every layer was written
+    /// first, where a band records 64 — and with the defect still in place that
+    /// variant's worst frame was 1.30 ms. (The 0.2 ms the harness prints as the
+    /// worst recording is not a layer step at all: it is the one frame that
+    /// records the flattened preview's whole composite pass.) What was **not**
+    /// measured is the case the fast path is
     /// actually for: 64 copies at 2048 square says nothing about the 20000×5000
     /// reference, where a band is about thirteen tile rows of 5,412 stored tiles
     /// and so thousands of copies, and a page-backed slot is a different shape
@@ -1679,15 +1683,29 @@ impl Capture {
         // extent, so it does not arise; not indexing keeps a wrong one off the
         // frame path either way.)
         let tiles_x = width.div_ceil(TILE) as usize;
-        // One canvas row of the slot's empty value. Built once per chunk, and
-        // only where something is actually missing — a fully stored slot pays
-        // neither the allocation nor a byte of it. `row` is a multiple of four,
-        // so the fill lands exactly on it.
+        // One canvas row of the slot's empty value, built by doubling rather
+        // than four bytes at a time — at the largest canvas the second spelling
+        // is twenty thousand calls per chunk to lay out a row that never
+        // changes. `row` is a multiple of four and so is every `take`, so the
+        // fill lands exactly on it.
+        //
+        // **The phase is load-bearing and no shipped test can see it.** Every
+        // `x0` is a multiple of four, so `pattern[x0..x1]` always starts at
+        // `empty[0]`, which is what makes this agree with `read_layer_pieces`'s
+        // cycle from a piece's own start. Both `SlotClass`es are a uniform byte
+        // today, so shifting this by one is invisible to the whole suite —
+        // measured, not assumed. A third class with an asymmetric empty value
+        // would arrive with that property untested.
+        //
+        // Only where something is actually missing: a fully stored slot pays
+        // neither this allocation nor a byte of it.
         let mut pattern = Vec::new();
         if !gaps.is_empty() {
             pattern.reserve_exact(row);
+            pattern.extend_from_slice(&empty);
             while pattern.len() < row {
-                pattern.extend_from_slice(&empty);
+                let take = (row - pattern.len()).min(pattern.len());
+                pattern.extend_from_within(..take);
             }
         }
 
@@ -1717,8 +1735,7 @@ impl Capture {
                 // that is 128 columns against 16,384 entries, two million
                 // comparisons a chunk to answer what one pass settles.
                 missing.iter_mut().for_each(|m| *m = false);
-                for (gx, gy) in gaps.iter().filter(|(_, gy)| *gy == ty) {
-                    debug_assert_eq!(*gy, ty);
+                for (gx, _) in gaps.iter().filter(|(_, gy)| *gy == ty) {
                     if let Some(m) = missing.get_mut(*gx as usize) {
                         *m = true;
                     }

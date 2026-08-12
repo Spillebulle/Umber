@@ -4558,14 +4558,18 @@ fn drive_to_completion(
     let mut slices: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut worst = std::time::Duration::ZERO;
     // **The two halves are reported apart, and that is the instrument rather
-    // than a nicety.** `worst` is their sum, which is the figure the guard
-    // asserts and is exactly the figure that cannot say *which* of them moved.
-    // Recording is the copies — one `copy_texture_to_buffer` per stored tile,
-    // so it follows the atlas — and collecting is `Capture::copy_chunk` on the
-    // CPU afterwards. The gap-fill regression that made this test fail read
-    // 0.00 ms against 4–12 ms on the split and was indistinguishable in the sum,
-    // and the ad-hoc instrumentation that found it was thrown away, which is
-    // what this line exists to stop happening twice.
+    // than a nicety.** Recording is the copies — one `copy_texture_to_buffer`
+    // per stored tile, so it follows the atlas — and collecting is
+    // `Capture::copy_chunk` on the CPU afterwards. The gap-fill regression that
+    // made this test fail read 0.00 ms against 4–12 ms on the split and was
+    // indistinguishable in `worst`, and the ad-hoc instrumentation that found it
+    // was thrown away, which is what these lines exist to stop happening twice.
+    //
+    // **They do not add up to `worst`, and expecting them to is the way to
+    // misread the print.** `worst` is the worst *frame*, so it is the largest
+    // sum of a matched pair; these two are independent maxima and are routinely
+    // taken from different frames. On the 2048-square guard the halves read
+    // 0.24 and 2.34 against a worst frame of 2.35.
     let (mut worst_record, mut worst_collect) = (worst, worst);
     let mut frames = 0usize;
     // **This loop is a wall-clock budget in disguise, and saying it was not is
@@ -9922,17 +9926,44 @@ fn a_banded_capture_of_a_partly_stored_slot_agrees_with_the_save() {
     let gpu = h.gpu;
     let mut canvas = tiled_canvas(gpu, 2);
 
-    // Two slots, each partly stored, and *differently* — so a band cannot come
-    // out right by inheriting the other slot's residency, and the tile rows
-    // above and below the 256th row hold different gaps.
+    // A fully stored layer under a partly stored mask, which is the pair that
+    // makes the two empty values different — transparent black against white —
+    // so a band that reached for the wrong one is a mismatch rather than a
+    // coincidence.
     fill_tiled_slot(gpu, &mut canvas, 0, [200, 40, 40, 255]);
-    write_flat(gpu, &mut canvas, 0, in_tile(2, 1), [9, 9, 9, 255]);
     canvas.fill_layer_white(&gpu.queue, 1);
+    // **The mask's two stored tiles are on different tile *rows* and in
+    // different tile *columns*.** That is what makes the row of runs actually
+    // change at row 256 — `[stored, gap, gap]` above it and `[gap, stored, gap]`
+    // below — so the rebuild that happens once per tile row has something to
+    // get wrong.
     write_flat(gpu, &mut canvas, 1, in_tile(0, 0), [0, 0, 0, 255]);
-    write_flat(gpu, &mut canvas, 1, in_tile(1, 1), [40, 40, 40, 255]);
-    assert!(
-        (1..6).contains(&canvas.backed_tiles(1)),
-        "the mask has to be partly stored for this to test anything"
+    // **Against the top of tile row 1, deliberately, and this is the whole of
+    // what makes the guard bite.** A second critic found that the obvious
+    // `in_tile(1, 1)` — sixteen pixels inset, so rows 264..280 — left the
+    // clearing of the per-tile-row gap map *untested*: the one chunk that
+    // straddles row 256 reaches only rows 252..258, and a mask cell that is
+    // backed but unpainted holds white, which is byte for byte the value a gap
+    // would have written there. The bug was invisible because the fixture never
+    // put a different colour where the mistake landed. Painting from row 256
+    // itself is an eight-pixel move and turns a mutation that survived into one
+    // that fails.
+    write_flat(
+        gpu,
+        &mut canvas,
+        1,
+        PixelRect {
+            x: 264,
+            y: 256,
+            width: 16,
+            height: 16,
+        },
+        [40, 40, 40, 255],
+    );
+    assert_eq!(
+        canvas.backed_tiles(1),
+        2,
+        "the mask has to store two tiles on two tile rows, or this tests nothing"
     );
 
     let draws = vec![LayerDraw {
