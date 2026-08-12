@@ -5035,9 +5035,20 @@ mod tests {
         // Spend frames until both layers have been read and the preview has not.
         // Two layers means three steps, so a linear cursor of 2 is exactly the
         // gap an edit has to land in for the halves to disagree.
+        // **The sleep is what makes the state reachable, not the bound.** A step
+        // advances only once its band's `map_async` has settled, which needs the
+        // device to have finished the copy — so a loop that spends frames as
+        // fast as it can asks a question the readback has not had time to answer
+        // and reads `step` at 0 every time. On this machine the maps settle
+        // between frames anyway and the guard passed at 64 iterations with no
+        // wait; on a CI runner's software adapter it never left step 0, and all
+        // four of these guards failed on their own vacuity assertions —
+        // correctly, since they had exercised nothing. `run_until_written`
+        // already sleeps for this reason and these were written without it.
         let mut between = false;
-        for _ in 0..64 {
+        for _ in 0..512 {
             loops.frame(gpu, true);
+            std::thread::sleep(Duration::from_millis(1));
             if loops
                 .canvases
                 .get(&loops.id)
@@ -5119,9 +5130,12 @@ mod tests {
 
         // Part-way through the layer's own step: some of its rows are out of the
         // staging buffer and the rest have not been copied yet.
+        // Sleeping for the reason the two-instants guard above gives: a band
+        // that has not settled leaves `row` at 0 however many frames are spent.
         let mut inside = false;
-        for _ in 0..128 {
+        for _ in 0..512 {
             loops.frame(gpu, true);
+            std::thread::sleep(Duration::from_millis(1));
             if matches!(
                 loops
                     .canvases
@@ -5194,6 +5208,9 @@ mod tests {
         // next step is recorded.
         for _ in 0..400 {
             loops.frame(gpu, true);
+            // As above: without this the capture never advances a step, so the
+            // storm has nothing to disturb and the re-read budget is never spent.
+            std::thread::sleep(Duration::from_millis(1));
             paint_slice(gpu, &mut loops, upper, AFTER);
         }
         assert!(
@@ -5270,6 +5287,9 @@ mod tests {
         let mut gave_up = false;
         for _ in 0..600 {
             loops.frame(gpu, true);
+            // As above: no capture can give up until one has advanced far
+            // enough to spend its budget, and none advances without the wait.
+            std::thread::sleep(Duration::from_millis(1));
             paint_slice(gpu, &mut loops, upper, [40, 160, 60, 255]);
             if loops
                 .canvases
