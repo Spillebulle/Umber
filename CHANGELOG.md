@@ -12,6 +12,77 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.3 — 2026-08-12
+
+Big documents open. A 124 MB Clip Studio file with 54 layers at 20000 x 5000
+used to be refused outright; it now opens and uses 1.54 GB of graphics memory
+where it would have asked for 19.7 GB. Across a folder of 33 real documents the
+saving is 55 GB down to 10 GB.
+
+### New
+
+- **A layer only pays for the parts of it you have painted on.** Layers are
+  stored in tiles now, and an empty tile costs nothing. Measured across 33 real
+  Clip Studio documents, about 13% of a layer holds paint, so this is most of
+  the memory back. The bigger the document, the more it saves.
+- **Opening a document no longer inflates it.** Every format Umber reads stores
+  layers sparsely and Umber used to expand them to full pages on the way in. The
+  same 33 documents went from 59 GB of memory while loading to 9 GB.
+- **A document too large for your graphics card is refused with a sentence.** It
+  used to stop Umber. The message says what the document needs and what you can
+  do about it, and leaves your other work open.
+- **Masks are more precise.** A layer mask used to lose about a quarter of its
+  levels, so a smooth gradient could band where it reveals. Masks brought in
+  from Krita and Clip Studio now arrive at exactly the strength their author
+  set.
+- **Saving and autosaving use far less memory**, and saving is a little quicker.
+  A 24 layer document used to build the whole archive in memory before writing
+  any of it.
+- **A placed image says what it is.** An image imported into a Clip Studio
+  document and left resizable used to be reported as a vector layer, which reads
+  as though the file were damaged. Umber now names it and tells you to rasterise
+  it.
+
+### Fixed
+
+- **Undoing a canvas flip could damage the document.** With any layer locked,
+  the undo was refused but the history moved anyway, and the next undo then
+  wrote part of the old picture back mirrored. That could not be undone.
+- **A document that failed to load froze Umber.** The loading box had no Cancel,
+  nothing else could be clicked through it, and the window could not be closed.
+  It now says what happened and lets you carry on.
+- **The autosave could stop for the rest of the session, silently.** Saving or
+  flipping the canvas while an autosave was running left it stuck; it kept
+  running every five minutes, and wrote nothing.
+- **An edit during an autosave could produce a file that never existed** — some
+  layers as they were, the rest as they are. Painting, undoing, clearing a layer
+  and placing text could all do it.
+- **A full disk while saving was a crash.** It is now reported and your existing
+  file is left alone.
+- **A malformed or hostile file could stop Umber before it read anything**, by
+  claiming an enormous size in its header.
+- **Layer thumbnails could show a painted layer as empty** on canvases wider
+  than about 13700 pixels.
+
+### Note
+
+- **Documents with masks saved by this version need 0.1.3 or newer to open.**
+  Older versions are refused rather than shown a mask that would be visibly
+  wrong. Documents without masks, and everything older, open as before.
+
+### Known limits
+
+- On a fully painted layer the new tile storage costs about a quarter more
+  memory than the old one, because a tile at the edge of the canvas is stored
+  whole. It is a large saving on ordinary artwork and a small cost on a
+  completely covered layer.
+- Vector layers and adjustment layers still arrive as a note rather than as
+  pixels. Both are named when the document opens.
+- A folder's own opacity is folded into its layers, which is exact unless the
+  layers inside it overlap.
+- macOS has neither thumbnails nor "Open with" yet. Both need Umber to ship as a
+  proper `.app` bundle first.
+
 ## 0.1.2 — 2026-08-10
 
 Clip Studio documents that used to be refused now open, your files show their
