@@ -1605,6 +1605,61 @@ impl Capture {
     ///
     /// By rows rather than by bytes, because the copy's rows are padded to the
     /// alignment: chunking by rows makes the padding fall out for free.
+    ///
+    /// # A row is cut into runs, and a gap is a `memcpy` rather than a store per
+    /// pixel
+    ///
+    /// The obvious spelling — copy the whole padded row out of the buffer, then
+    /// go back over the gaps writing the empty value a pixel at a time — is what
+    /// this was, and on `a_capture_of_a_large_document_never_costs_a_frame` it
+    /// took the worst frame from **1.6–2.1 ms to 4.2–4.7** and the whole capture
+    /// from 87–99 ms to 149–157. It is invisible until a slot is mostly
+    /// *unstored*, which the atlas made the ordinary case rather than an exotic
+    /// one: a freshly cleared layer stores nothing at all, so every pixel of it
+    /// took the slow path. That fixture clears eight layers, which is why the
+    /// guard caught this and a painted document would not have.
+    ///
+    /// **The decomposition was measured, and only one of the two halves is worth
+    /// anything.** Bracketed against the old body, three runs each, end to end:
+    /// the old 228/282/342 ms, runs-but-still-reading 78/90/94, and this
+    /// 68–89 — so
+    ///
+    /// - **a `memcpy` instead of a store per pixel is the whole of it.** A
+    ///   canvas-wide gap is a million four-byte writes per chunk — 512 rows of
+    ///   2048 pixels on that fixture — where 512 copies of 8 KB out of a
+    ///   prepared row will do, one per row, and taking that out is the factor
+    ///   of three.
+    /// - **not reading the bytes it is about to overwrite is worth about a
+    ///   tenth**, which is at the noise floor. It is kept because it is free —
+    ///   a gap run names `pattern` instead of `mapped` and that is the whole
+    ///   difference — and it is written down at its measured size rather than
+    ///   its plausible one. A first draft of this comment argued from "a mapped
+    ///   staging buffer is *uncached*" that it was the larger half; it is not,
+    ///   and a figure in a comment is what the next change gets argued against.
+    ///
+    /// Adjacent tiles of the same kind merge, so a slot storing nothing is one
+    /// copy per row and a slot storing everything is one copy per row — which is
+    /// exactly what the old code did in the second case and is why a fully
+    /// painted document never showed this.
+    ///
+    /// **What is not here is a fast path for the copies, and the evidence for
+    /// leaving it out reaches less far than it looks.** A band of a slot is one
+    /// `copy_texture_to_buffer` per *stored* tile, and collapsing an
+    /// identity-mapped page into a single copy is the tempting repair. What was
+    /// measured is that this regression was not that: recording a **layer** step
+    /// reads **0.00 ms** both on the cleared fixture, where such a step records
+    /// *no* copies at all, and on a variant of it whose every layer was written
+    /// first, where a band records 64 — and with the defect still in place that
+    /// variant's worst frame was 1.30 ms. (The 0.2 ms the harness prints as the
+    /// worst recording is not a layer step at all: it is the one frame that
+    /// records the flattened preview's whole composite pass.) What was **not**
+    /// measured is the case the fast path is
+    /// actually for: 64 copies at 2048 square says nothing about the 20000×5000
+    /// reference, where a band is about thirteen tile rows of 5,412 stored tiles
+    /// and so thousands of copies, and a page-backed slot is a different shape
+    /// again from a slot that merely happens to store every tile. So the honest
+    /// claim is that the fast path would not have fixed *this*, not that it
+    /// would buy nothing.
     fn copy_chunk(&mut self) -> bool {
         let row = (self.size.x * 4) as usize;
         let height = self.size.y as usize;
@@ -1619,8 +1674,41 @@ impl Capture {
 
         // `width` is the canvas in **pixels**, not in tiles, and it is bound
         // here because the clamp below is what makes the rightmost gap stop at
-        // the canvas edge rather than at its tile'''s.
+        // the canvas edge rather than at its tile's.
         let (gaps, empty, width) = (&self.gaps, self.empty, self.size.x);
+        // The tile columns the row is cut at. A gap naming one past this is
+        // ignored rather than indexed, and that is *right* rather than merely
+        // safe: those columns lie beyond the canvas edge and contribute no
+        // bytes to any row. (`drive_capture` builds `gaps` from the grid's own
+        // extent, so it does not arise; not indexing keeps a wrong one off the
+        // frame path either way.)
+        let tiles_x = width.div_ceil(TILE) as usize;
+        // One canvas row of the slot's empty value, built by doubling rather
+        // than four bytes at a time — at the largest canvas the second spelling
+        // is twenty thousand calls per chunk to lay out a row that never
+        // changes. `row` is a multiple of four and so is every `take`, so the
+        // fill lands exactly on it.
+        //
+        // **The phase is load-bearing and no shipped test can see it.** Every
+        // `x0` is a multiple of four, so `pattern[x0..x1]` always starts at
+        // `empty[0]`, which is what makes this agree with `read_layer_pieces`'s
+        // cycle from a piece's own start. Both `SlotClass`es are a uniform byte
+        // today, so shifting this by one is invisible to the whole suite —
+        // measured, not assumed. A third class with an asymmetric empty value
+        // would arrive with that property untested.
+        //
+        // Only where something is actually missing: a fully stored slot pays
+        // neither this allocation nor a byte of it.
+        let mut pattern = Vec::new();
+        if !gaps.is_empty() {
+            pattern.reserve_exact(row);
+            pattern.extend_from_slice(&empty);
+            while pattern.len() < row {
+                let take = (row - pattern.len()).min(pattern.len());
+                pattern.extend_from_within(..take);
+            }
+        }
+
         let out = self
             .partial
             .get_or_insert_with(|| Vec::with_capacity(row * height));
@@ -1628,23 +1716,65 @@ impl Capture {
         let from = out.len() / row;
         let rows = (CAPTURE_CHUNK_BYTES / self.padded as usize).max(1);
         let to = (from + rows).min(band_last);
+
+        // The row cut into runs of like with like, `(start, end, is_gap)` in
+        // bytes, covering `[0, row)` exactly. It follows the *tile* row, so it
+        // is rebuilt once per [`TILE`] document rows rather than per row.
+        let mut spans: Vec<(usize, usize, bool)> = Vec::new();
+        let mut missing = vec![false; tiles_x];
+        let mut spans_of: Option<u32> = None;
         for y in from..to {
+            // The tile row is the document row's, and a gap's columns are
+            // clipped to the canvas because the rightmost tile is partial.
+            let ty = y as u32 / TILE;
+            if spans_of != Some(ty) {
+                spans_of = Some(ty);
+                // This tile row's own columns, in **one** pass over the gap
+                // list. Asking `gaps` per tile column instead is a scan of the
+                // whole list per column: at the largest canvas Umber will make
+                // that is 128 columns against 16,384 entries, two million
+                // comparisons a chunk to answer what one pass settles.
+                missing.iter_mut().for_each(|m| *m = false);
+                for (gx, _) in gaps.iter().filter(|(_, gy)| *gy == ty) {
+                    if let Some(m) = missing.get_mut(*gx as usize) {
+                        *m = true;
+                    }
+                }
+                spans.clear();
+                for tx in 0..tiles_x as u32 {
+                    let x0 = (tx * TILE) as usize * 4;
+                    let x1 = ((tx + 1) * TILE).min(width) as usize * 4;
+                    let gap = missing[tx as usize];
+                    match spans.last_mut() {
+                        Some(last) if last.2 == gap => last.1 = x1,
+                        _ => spans.push((x0, x1, gap)),
+                    }
+                }
+                // The runs have to tile `[0, row)` with no hole and no overlap:
+                // a hole leaves the row short and shears everything under it, an
+                // overlap leaves it long. Walked, rather than checked at the two
+                // ends — which is what this asserted first, and a middle run
+                // dropped or stretched passes any test of the ends alone.
+                debug_assert!(
+                    spans
+                        .iter()
+                        .try_fold(0usize, |at, s| (s.0 == at && s.1 > at).then_some(s.1))
+                        == Some(row),
+                    "the runs do not tile the row exactly"
+                );
+            }
             // Band-relative: row `band_first` of the layer is row 0 of the
             // buffer.
             let start = (y - band_first) * self.padded as usize;
-            let at = out.len();
-            out.extend_from_slice(&mapped[start..start + row]);
-            // Whatever no fragment copied is undefined, so the slot's empty
-            // value goes over it — see [`Capture::gaps`]. The tile row is the
-            // document row's, and a gap's columns are clipped to the canvas
-            // because the rightmost tile is partial.
-            let ty = y as u32 / TILE;
-            for (gx, _) in gaps.iter().filter(|(_, gy)| *gy == ty) {
-                let x0 = (gx * TILE) as usize;
-                let x1 = ((gx + 1) * TILE).min(width) as usize;
-                for px in out[at + x0 * 4..at + x1 * 4].chunks_exact_mut(4) {
-                    px.copy_from_slice(&empty);
-                }
+            for &(x0, x1, gap) in &spans {
+                // Whatever no fragment copied is undefined, so the slot's empty
+                // value goes there — see [`Capture::gaps`] — and the buffer is
+                // not read for it at all.
+                out.extend_from_slice(if gap {
+                    &pattern[x0..x1]
+                } else {
+                    &mapped[start + x0..start + x1]
+                });
             }
         }
         to >= band_last

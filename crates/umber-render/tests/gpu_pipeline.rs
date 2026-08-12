@@ -4557,6 +4557,20 @@ fn drive_to_completion(
 ) -> (Captured, std::time::Duration, usize) {
     let mut slices: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut worst = std::time::Duration::ZERO;
+    // **The two halves are reported apart, and that is the instrument rather
+    // than a nicety.** Recording is the copies — one `copy_texture_to_buffer`
+    // per stored tile, so it follows the atlas — and collecting is
+    // `Capture::copy_chunk` on the CPU afterwards. The gap-fill regression that
+    // made this test fail read 0.00 ms against 4–12 ms on the split and was
+    // indistinguishable in `worst`, and the ad-hoc instrumentation that found it
+    // was thrown away, which is what these lines exist to stop happening twice.
+    //
+    // **They do not add up to `worst`, and expecting them to is the way to
+    // misread the print.** `worst` is the worst *frame*, so it is the largest
+    // sum of a matched pair; these two are independent maxima and are routinely
+    // taken from different frames. On the 2048-square guard the halves read
+    // 0.24 and 2.34 against a worst frame of 2.35.
+    let (mut worst_record, mut worst_collect) = (worst, worst);
     let mut frames = 0usize;
     // **This loop is a wall-clock budget in disguise, and saying it was not is
     // what made it flaky.** The comment here used to read "a capture that has
@@ -4596,10 +4610,18 @@ fn drive_to_completion(
             slices.push((slice.index, slice.pixels));
         }
         let taken = canvas.take_capture(&gpu.device);
-        worst = worst.max(recording + started.elapsed());
+        let collecting = started.elapsed();
+        worst_record = worst_record.max(recording);
+        worst_collect = worst_collect.max(collecting);
+        worst = worst.max(recording + collecting);
 
         if let Some(doc) = taken {
             slices.sort_by_key(|(at, _)| *at);
+            eprintln!(
+                "  worst recording {:.2} ms, worst collecting {:.2} ms",
+                worst_record.as_secs_f64() * 1000.0,
+                worst_collect.as_secs_f64() * 1000.0,
+            );
             return (
                 Captured {
                     size: doc.size,
@@ -9872,6 +9894,122 @@ fn a_capture_of_a_partly_painted_mask_reveals_what_the_save_does() {
     assert_eq!(
         captured.merged, expected_merged,
         "the flattened preview came back with holes"
+    );
+}
+
+/// A slot with unstored tiles read back **in bands**, which is the one cross
+/// nothing else drives.
+///
+/// Every other capture guard reads its document in a single band, so `copy_chunk`
+/// has only ever been run with `band_first == 0` while anything was missing —
+/// and the two things it has to get right there are exactly the two that a first
+/// band cannot distinguish. `ty` is taken off the **absolute** document row, so
+/// a band starting part way down a layer has to keep naming the tile row the
+/// document is in rather than the one the buffer starts at; and `start` is
+/// **band-relative**, so the rows it reads out of the staging buffer have to be
+/// offset by `band_first` where the gap columns are not. Get either the wrong way
+/// round and the picture is sheared by a band rather than merely wrong at an
+/// edge, which is a whole autosaved document quietly ruined.
+///
+/// A critic found that this was untested: the mask fixture is 1.4 MB and the
+/// timing one 16 MB, so neither reaches `readback_limit` and neither bands. It is
+/// driven here the way `CLAUDE.md` says to drive banding — by lowering the limit,
+/// because reaching the real one needs a canvas too large to ask a CI runner for.
+///
+/// The reference is the blocking `read_layer_rect`, for the reason the mask guard
+/// takes it: two writers of one document disagreeing is the failure that matters,
+/// and a banded capture agreeing with an unbanded capture would only say the
+/// capture is consistent with itself.
+#[test]
+fn a_banded_capture_of_a_partly_stored_slot_agrees_with_the_save() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 2);
+
+    // A fully stored layer under a partly stored mask, which is the pair that
+    // makes the two empty values different — transparent black against white —
+    // so a band that reached for the wrong one is a mismatch rather than a
+    // coincidence.
+    fill_tiled_slot(gpu, &mut canvas, 0, [200, 40, 40, 255]);
+    canvas.fill_layer_white(&gpu.queue, 1);
+    // **The mask's two stored tiles are on different tile *rows* and in
+    // different tile *columns*.** That is what makes the row of runs actually
+    // change at row 256 — `[stored, gap, gap]` above it and `[gap, stored, gap]`
+    // below — so the rebuild that happens once per tile row has something to
+    // get wrong.
+    write_flat(gpu, &mut canvas, 1, in_tile(0, 0), [0, 0, 0, 255]);
+    // **Against the top of tile row 1, deliberately, and this is the whole of
+    // what makes the guard bite.** A second critic found that the obvious
+    // `in_tile(1, 1)` — sixteen pixels inset, so rows 264..280 — left the
+    // clearing of the per-tile-row gap map *untested*: the one chunk that
+    // straddles row 256 reaches only rows 252..258, and a mask cell that is
+    // backed but unpainted holds white, which is byte for byte the value a gap
+    // would have written there. The bug was invisible because the fixture never
+    // put a different colour where the mistake landed. Painting from row 256
+    // itself is an eight-pixel move and turns a mutation that survived into one
+    // that fails.
+    write_flat(
+        gpu,
+        &mut canvas,
+        1,
+        PixelRect {
+            x: 264,
+            y: 256,
+            width: 16,
+            height: 16,
+        },
+        [40, 40, 40, 255],
+    );
+    assert_eq!(
+        canvas.backed_tiles(1),
+        2,
+        "the mask has to store two tiles on two tile rows, or this tests nothing"
+    );
+
+    let draws = vec![LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+        mask: Some(1),
+        clipped: false,
+    }];
+    let full = PixelRect {
+        x: 0,
+        y: 0,
+        width: TILED_W,
+        height: TILED_H,
+    };
+    let expected: Vec<Vec<u8>> = (0..2)
+        .map(|slot| canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, full))
+        .collect();
+
+    // Seven rows a band: not a divisor of 500 and not a divisor of 256, so the
+    // last band is short *and* the band boundaries fall inside tile rows rather
+    // than on them. A band that divided either would let a mistake about which
+    // tile row a band is in pass unnoticed.
+    let padded = (TILED_W * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let rows = 7;
+    assert!(
+        !TILED_H.is_multiple_of(rows) && !256u32.is_multiple_of(rows),
+        "the fixture has to band awkwardly or it tests nothing"
+    );
+    canvas.set_readback_limit((padded * rows) as u64);
+
+    let (captured, _, _) = run_capture(gpu, &mut canvas, &[0, 1], &draws);
+    assert_eq!(captured.layers.len(), 2);
+    assert_eq!(
+        captured.layers[0], expected[0],
+        "a banded capture of a partly stored layer disagrees with the save"
+    );
+    assert_eq!(
+        captured.layers[1], expected[1],
+        "a banded capture of a partly stored mask disagrees with the save"
+    );
+    assert_eq!(
+        captured.merged,
+        canvas.export_rgba(&gpu.device, &gpu.queue, &draws),
+        "the flattened preview came back sheared or holed"
     );
 }
 
