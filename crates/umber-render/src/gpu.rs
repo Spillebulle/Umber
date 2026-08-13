@@ -15,74 +15,75 @@ pub struct Gpu {
     pub queue: Arc<wgpu::Queue>,
 }
 
-/// The share of the driver's reported memory budget past which a texture or a
-/// buffer is refused rather than attempted.
-///
-/// **This is what makes an out-of-memory allocation reportable at all.** Without
-/// it a Vulkan or D3D12 driver may satisfy an allocation it has no room for by
-/// paging to system memory — the canvas becomes a slideshow with nothing said —
-/// or fail in a way that arrives too late to act on. With it, an allocation the
-/// device cannot comfortably hold comes back as an ordinary `Error::OutOfMemory`
-/// on the exact call that asked, which `canvas::try_reserve` catches in an error
-/// scope and turns into a sentence.
-///
-/// Three things to know before changing it:
-///
-/// * **It is best effort and never a guarantee.** Vulkan honours it only where
-///   `VK_EXT_memory_budget` is present and returns `Ok` where it is not; Metal
-///   and GL support none of it, and D3D12 applies it unconditionally through its
-///   sub-allocator. So a refusal proves the card said no; the absence of one
-///   proves nothing.
-/// * **It cuts both ways, and the other edge is sharp.** The threshold is
-///   charged on **buffers as well as textures** — `create_buffer` asks it too —
-///   and `Queue::write_texture`'s staging buffer is allocated through wgpu's
-///   *fatal* error path, which calls `lose` on an out-of-memory. So this makes
-///   an upload that would previously have been attempted refusable, and a
-///   refused staging allocation is the lost device rather than a sentence. The
-///   window is narrow — `write_layer_rect` bands and waits, so a band is at most
-///   `readback_limit`, and a budget too full for that is one the array
-///   reservation would already have been refused at — but it is a real trade and
-///   not a free win. **`docs/perf/` §4.4's submit fix is what bounds it; nothing
-///   makes it catchable.**
-/// * **Ninety rather than ninety-nine**, for headroom against everything else a
-///   frame allocates beside the array: the stroke scratch, an effect working
-///   set, a blended commit's backdrop, and the staging above. An earlier draft
-///   of this comment gave the reason as `create_texture`'s internal clear
-///   views — that is **wrong** and is recorded rather than deleted, because it
-///   is the plausible-sounding reason somebody will reach for again.
-///   `vkCreateImageView` allocates no device memory through the sub-allocator
-///   and is not budget-checked at all; those views are fatal on failure and this
-///   threshold has no bearing on them.
-/// * **It is charged on every allocation**, including the per-frame ones — the
-///   smudge probe's target, the thumbnail's uniform buffer, a blended commit's
-///   backdrop. Each becomes one `vkGetPhysicalDeviceMemoryProperties2`. Believed
-///   to be noise and **not measured**.
-const MEMORY_BUDGET_PERCENT: u8 = 90;
-
 /// The descriptor [`Gpu::create_instance`] builds, split out so the one thing
 /// that is easy to get wrong about it can be tested.
 ///
-/// **`InstanceDescriptor::with_env` silently discards
-/// `memory_budget_thresholds`** — it rebuilds the struct with
-/// `MemoryBudgetThresholds::default()` — and
-/// `new_without_display_handle_from_env()` *is* `new_without_display_handle()`
-/// followed by `with_env()`. So the threshold has to be written after that call
-/// and not before it, or the whole refusal path above is inert with nothing
-/// saying so. `the_memory_budget_threshold_survives_the_environment` is the
-/// guard.
+/// **Umber sets no `memory_budget_thresholds`, and 0.1.3 setting
+/// `for_resource_creation` to 90 is what made it refuse to start on an ordinary
+/// card.** The whole of that argument is retracted below rather than deleted,
+/// because the reasoning was good and only its premise about the hardware was
+/// false — somebody will reach for it again.
 ///
-/// **`for_device_loss` stays unset, and that is the more important half.**
-/// Setting it makes the backend deliberately *lose* the device on the next poll
-/// under memory pressure, which is precisely the unrecoverable outcome the
-/// refusal exists to avoid: a refused allocation is a sentence, a lost device is
-/// the crash box.
+/// The argument was: without a threshold a driver may satisfy an allocation it
+/// has no room for by paging to system memory — the canvas becomes a slideshow
+/// with nothing said — where with one, the allocation comes back as an ordinary
+/// `Error::OutOfMemory` on the call that asked, which [`super::canvas`]'s
+/// `try_reserve` catches in an error scope and turns into a sentence. That is
+/// still true of what the threshold *does*.
+///
+/// **What it rests on is that wgpu can tell which heap an allocation will land
+/// on, and on Vulkan it cannot.**
+/// `wgpu-hal`'s `error_if_would_oom_on_resource_allocation` (29.0.4,
+/// `src/vulkan/device.rs`) collects **every** heap that has any memory type with
+/// the relevant flag — `DEVICE_LOCAL` for a texture, `HOST_VISIBLE` for a
+/// buffer — and refuses if *any* of them is over the threshold, because
+/// `gpu-alloc` gives it no way to ask where the resource is going. So a heap the
+/// texture will never occupy can refuse it, and the check's own comment is what
+/// says how much that was thought to matter: "there is usually only one heap on
+/// integrated GPUs and two on dedicated GPUs".
+///
+/// **What is measured and what is inferred**, because the difference decides
+/// what a re-enable has to establish first. Measured: 0.1.3 refuses to start on
+/// an RTX 3070 under Windows on Vulkan, reporting `OutOfMemory` from
+/// `crash::device_error` with no document open and about 1 GB of 8 in use — and
+/// the threshold is the only thing in Umber that can produce an `OutOfMemory`
+/// the driver did not itself give, and shipped for the first time in that
+/// release. Measured on the development machine: two heaps, the device-local one
+/// covering the whole 10 GB and host-visible, which is a Resizable BAR layout
+/// and exactly the case wgpu's comment assumes. Inferred, and **not yet read off
+/// the affected machine**: that it publishes NVIDIA's non-BAR layout, where the
+/// ~246 MiB aperture is a *third* heap flagged `DEVICE_LOCAL`, so every texture
+/// is measured against 90% of 246 MiB instead of against the card. A heap
+/// reporting a budget of zero would produce the same symptom by the same route.
+/// The remedy does not turn on which it is; a re-enable does.
+///
+/// **The refusal path survives this and that is why turning it off is
+/// affordable.** A driver that genuinely cannot allocate still answers
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY`, wgpu still maps it through
+/// `handle_hal_error_with_nonfatal_oom`, and `try_reserve`'s scope still catches
+/// it and still produces `umber-app::vram`'s sentence. What is given up is the
+/// *early* refusal — the case where the driver would rather page than fail — and
+/// that costs a slow canvas where the threshold cost a dead application. Metal
+/// and GL never supported the threshold at all, so this is the behaviour macOS
+/// has always had rather than a new one.
+///
+/// **Two things to fix before re-enabling it**, in this order. The heap layout
+/// has to be read before the threshold is chosen — which means `Adapter::as_hal`
+/// and a direct `ash` dependency, the cost `Vram`'s docs already declined once —
+/// and `for_resource_creation` has to be written **after**
+/// `new_without_display_handle_from_env()`, because
+/// `InstanceDescriptor::with_env` silently rebuilds the field with
+/// `MemoryBudgetThresholds::default()` and that call *is*
+/// `new_without_display_handle()` followed by `with_env()`. Writing it before is
+/// a threshold that compiles, reads back correctly at the call site, and is
+/// inert.
+///
+/// **`for_device_loss` was never set and must never be.** It makes the backend
+/// deliberately *lose* the device on the next poll under memory pressure, which
+/// is the unrecoverable outcome the refusal existed to avoid — and it would have
+/// turned the bug above into a lost device rather than a catchable error.
 fn instance_descriptor() -> wgpu::InstanceDescriptor {
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-    desc.memory_budget_thresholds = wgpu::MemoryBudgetThresholds {
-        for_resource_creation: Some(MEMORY_BUDGET_PERCENT),
-        for_device_loss: None,
-    };
-    desc
+    wgpu::InstanceDescriptor::new_without_display_handle_from_env()
 }
 
 /// Which adapter to ask the instance for.
@@ -226,25 +227,27 @@ impl Gpu {
 mod tests {
     use super::*;
 
-    /// The threshold must survive the environment sweep, not be reset by it.
+    /// No allocation is refused against a budget the driver reported.
     ///
-    /// This measures the descriptor Umber actually builds rather than restating
-    /// the rule: writing the field and *then* calling `with_env` compiles, reads
-    /// correctly, and leaves `for_resource_creation` at `None` — at which point
-    /// nothing refuses an allocation, `try_reserve` catches nothing, and the
-    /// artist gets the crash box the whole path exists to replace. Demonstrated
-    /// by mutation: build the descriptor as
-    /// `new_without_display_handle()` + field + `.with_env()` and this fails.
+    /// **This one pins a decision rather than measuring a mechanism, and saying
+    /// which it is matters**, because the default for both fields is already
+    /// `None` — so it cannot fail for the reason a guard usually does, and
+    /// nothing here demonstrates by mutation. What it does is fail the build for
+    /// anybody who sets `for_resource_creation` again, and send them to
+    /// [`instance_descriptor`]'s docs for the two things that have to be true
+    /// first. 0.1.3 shipped it at 90 and would not start on an RTX 3070 with
+    /// 7 GB free; the reasoning that put it there was sound against a heap
+    /// layout that half the NVIDIA machines in the world do not have.
     ///
     /// It needs no adapter and no device: `InstanceDescriptor` is plain data
     /// until `Instance::new` is handed it.
     #[test]
-    fn the_memory_budget_threshold_survives_the_environment() {
+    fn no_allocation_is_refused_against_a_reported_budget() {
         let desc = instance_descriptor();
         assert_eq!(
-            desc.memory_budget_thresholds.for_resource_creation,
-            Some(MEMORY_BUDGET_PERCENT),
-            "with_env resets memory_budget_thresholds; the write has to come after it"
+            desc.memory_budget_thresholds.for_resource_creation, None,
+            "wgpu's Vulkan check measures every heap carrying the flag, including NVIDIA's \
+             246 MiB BAR aperture — see `instance_descriptor` before setting this again"
         );
         assert_eq!(
             desc.memory_budget_thresholds.for_device_loss, None,
@@ -257,14 +260,17 @@ mod tests {
     ///
     /// [`Gpu::create_instance`] is the only `Instance::new` in the workspace —
     /// `app.rs`, `docshot.rs`, `gputest.rs`, `shell.rs`, `gpu_pipeline.rs` and
-    /// the examples all route through it — so reverting that one line to
-    /// `wgpu::Instance::new(InstanceDescriptor::new_without_display_handle_from_env())`
-    /// leaves every threshold `None` on every real instance, refuses no
-    /// allocation early, and `the_memory_budget_threshold_survives_the_
-    /// environment` stays green while the whole refusal path is inert. That is
-    /// the "a guard on a model is not a guard on the panel" failure this project
-    /// records three times over; the remedy it prescribes is to enumerate the
-    /// call site rather than the rule.
+    /// the examples all route through it — so what this holds is that there is
+    /// one statement of the descriptor and every real instance is built from it.
+    ///
+    /// **It was written to protect a threshold that is now deliberately unset,
+    /// and it is kept rather than retired for the same reason
+    /// [`instance_descriptor`] is kept as a function.** That is where the
+    /// argument about `memory_budget_thresholds` lives and where a second
+    /// `Instance::new` would have to be reconciled with it; a call site built
+    /// from a descriptor of its own is one that would not be. Its sibling
+    /// records the failure this shape exists for: a guard on the descriptor is
+    /// not a guard on the instance.
     ///
     /// The reading is the source, because an `Instance` exposes nothing about
     /// the descriptor it was built from and building one needs a backend. What

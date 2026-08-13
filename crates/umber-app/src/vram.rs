@@ -26,21 +26,23 @@
 //! that was not the problem once, and a refusal that names the wrong bound is
 //! worse than a vague one.
 //!
-//! **It does not cover the upload, and it makes the upload slightly more likely
-//! to fail.** Both halves, because the first on its own reads as a neutral gap
-//! and it is not one. The gate this wording belongs to is the layer array
-//! allocation alone: `Queue::write_texture`'s staging buffer goes through wgpu's
-//! *fatal* error path, so an out-of-memory there loses the device before any
-//! error scope sees it, and banding and the per-layer submit in `install_import`
-//! bound how much can stand at once without making it catchable. What the
-//! second half adds is that `gpu::MEMORY_BUDGET_PERCENT` is charged on
-//! **buffers as well as textures**, so a staging allocation that the driver
-//! would previously have attempted is now refused at ninety percent of the
-//! reported budget — and refused there means the device is gone. The window is
-//! narrow, since a band is at most `readback_limit` and a budget too full for
-//! that is one the array reservation would already have declined, but it is a
-//! trade rather than a free win. So a document that passes this gate can still
-//! die on its pixels, and no sentence here may imply otherwise.
+//! **It does not cover the upload.** The gate this wording belongs to is the
+//! layer array allocation alone: `Queue::write_texture`'s staging buffer goes
+//! through wgpu's *fatal* error path, so an out-of-memory there loses the device
+//! before any error scope sees it, and banding and the per-layer submit in
+//! `install_import` bound how much can stand at once without making it
+//! catchable. So a document that passes this gate can still die on its pixels,
+//! and no sentence here may imply otherwise.
+//!
+//! **It used to make that upload slightly *more* likely to fail, and that is
+//! retracted along with its cause.** `gpu::MEMORY_BUDGET_PERCENT` was charged on
+//! buffers as well as textures, so a staging allocation the driver would have
+//! attempted was refused at ninety percent of the reported budget — and refused
+//! there means the device is gone. The threshold is unset now (see
+//! `gpu::instance_descriptor`), so nothing is refused ahead of the driver and
+//! that edge is gone with it. What is also gone is the early refusal this gate
+//! was written against: it now fires only where the driver itself answers
+//! `OutOfMemory`, which is later and less often.
 
 //! **What is tested here is the wording, not that anything says it.** The call
 //! sites — `install_import`, `add_layer`, `add_mask`, the effect bake and

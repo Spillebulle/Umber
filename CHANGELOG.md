@@ -12,6 +12,22 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.4 — 2026-08-13
+
+A fix for 0.1.3, which would not start on some machines.
+
+### Fixed
+
+- **Umber said it was out of graphics memory on cards with plenty free.** On
+  Windows with an NVIDIA card, Umber could refuse to open at all, reporting
+  "Out of Memory" on a card with several gigabytes free and almost nothing in
+  use. 0.1.3 started asking the driver in advance whether an allocation would
+  fit, so a card that was genuinely full could be told about in a sentence
+  instead of a crash. That question turns out to be answered against the wrong
+  pool of memory on NVIDIA machines without Resizable BAR, so Umber no longer
+  asks it. A card that really is full is still reported, just at the point the
+  driver says so.
+
 ## 0.1.3 — 2026-08-12
 
 Big documents open. A 124 MB Clip Studio file with 54 layers at 20000 x 5000

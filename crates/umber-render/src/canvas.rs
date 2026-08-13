@@ -876,8 +876,17 @@ impl Vram {
 /// `wgpu-core/src/device/resource.rs`. It is not unqualified — the same function
 /// builds one internal clear view per slice through the *fatal*
 /// `handle_hal_error`, so a device under enough pressure can still be lost
-/// inside a call this catches. That is a reason for
-/// `gpu::MEMORY_BUDGET_PERCENT`'s headroom rather than for setting it at 99.
+/// inside a call this catches.
+///
+/// **What this no longer rests on is an early refusal.** `gpu::
+/// instance_descriptor` set `memory_budget_thresholds.for_resource_creation` to
+/// 90 for one release, so an allocation past that share of the reported budget
+/// was refused before it was attempted; it is unset now, because wgpu's Vulkan
+/// check measured it against heaps the texture would never live in and refused
+/// the array at start-up on a card with 7 GB free. This still works — a driver
+/// that cannot allocate answers `OutOfMemory` and the scope still catches it —
+/// but only once the driver actually says no, so a card that would rather page
+/// than fail is no longer refused at all.
 ///
 /// **`replacing` is the array this one would take the place of, not a count**,
 /// and that is deliberate. [`Vram::held`] is the `c` of `c + n`, which for a
