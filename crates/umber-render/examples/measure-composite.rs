@@ -492,17 +492,32 @@ fn tile_bilinear(
 /// The check is the point. Taking a prefix of a file and appending a
 /// replacement silently drops anything the file grew after the marker, and the
 /// symptom would be a shader that no longer compiles — or worse, one that does.
-fn tiles_head() -> &'static str {
+/// **`tile_box` has to survive the substitution rather than be replaced by it**,
+/// and it has to come out *after* whichever body a variant supplies: it calls
+/// `tile_bilinear`, WGSL has no forward declarations, and the composite calls
+/// `tile_box`. So each variant's tap is measured through the filter as well as
+/// under it, which is the honest arrangement — `--minify` then prices the filter
+/// on whichever tap the variant is about rather than only on the shipped one.
+fn tiles_split() -> (usize, usize) {
     let cut = TILES
         .find("fn tile_bilinear(")
         .expect("tiles.wgsl no longer declares tile_bilinear; this example substitutes for it");
-    let after = &TILES[cut + 1..];
+    let tail = TILES
+        .find("fn tile_box(")
+        .expect("tiles.wgsl no longer declares tile_box; the composite calls it");
+    assert!(
+        tail > cut,
+        "tile_box must follow tile_bilinear, which it calls"
+    );
+    // Everything from `tile_box` on is `tile_box`, so the only `fn` left after
+    // it is its own. Anything else is a function this split would drop.
+    let after = &TILES[tail + 1..];
     assert!(
         !after.contains("\nfn "),
-        "tile_bilinear is no longer the last function in tiles.wgsl, so taking \
-         the text before it would drop whatever follows. Move the substitution."
+        "tile_box is no longer the last function in tiles.wgsl, so this split \
+         would drop whatever follows it. Move the substitution."
     );
-    &TILES[..cut]
+    (cut, tail)
 }
 
 /// The whole composite shader for one variant, at one page size.
@@ -513,8 +528,9 @@ fn tiles_head() -> &'static str {
 /// atlas's cost is the direction that would make this measurement worthless, so
 /// every choice here goes the other way.
 fn shader_source(variant: Variant, page: UVec2) -> String {
+    let (cut, tail) = tiles_split();
     let body = match variant {
-        Variant::Tiled => TILES[TILES.find("fn tile_bilinear(").unwrap()..].to_string(),
+        Variant::Tiled => TILES[cut..tail].to_string(),
         Variant::Sampled => format!(
             "fn tile_bilinear(\n\
              \x20   atlas: texture_2d_array<f32>,\n\
@@ -552,10 +568,12 @@ fn shader_source(variant: Variant, page: UVec2) -> String {
         Variant::Prologue => PROLOGUE_BODY.to_string(),
     };
     format!(
-        "{}{}{}{}{}",
-        tiles_head(),
+        "{}{}{}{}{}{}",
+        &TILES[..cut],
         EXTRA_BINDINGS,
         body,
+        // Unreplaced, and after the body so it can call it. See `tiles_split`.
+        &TILES[tail..],
         BLEND,
         COMPOSITE
     )
@@ -597,6 +615,13 @@ struct ViewUniforms {
     per_dab_color: u32,
     stroke_on_mask: u32,
     stroke_blend: u32,
+    /// The minification footprint. **Kept in step by nothing but this
+    /// comment**, exactly as the head of this struct already warns: a `View`
+    /// that grew and a `ViewUniforms` that did not is a validation error at the
+    /// first `create_bind_group` naming both sizes.
+    minify: [f32; 2],
+    _pad0: f32,
+    _pad1: f32,
     layers: [[f32; 4]; MAX_DRAWS],
     extra: [[f32; 4]; MAX_DRAWS],
 }
@@ -608,6 +633,7 @@ fn view_uniforms(
     pivot: Vec2,
     layers: u32,
     masks: bool,
+    minify: bool,
 ) -> ViewUniforms {
     let scale = 1.0 / camera.zoom;
     let offset = camera.center - pivot * scale;
@@ -648,6 +674,17 @@ fn view_uniforms(
         per_dab_color: 0,
         stroke_on_mask: 0,
         stroke_blend: 0,
+        // Off by default, so every figure in
+        // `docs/perf/composite-throughput.md` §11 goes on meaning what it meant:
+        // those priced the atlas against the dense slice, and a filter on one
+        // side of that comparison would be pricing two changes at once.
+        // `--minify` is what asks the other question.
+        minify: match minify {
+            true => [(scale - 1.0).max(0.0), (scale - 1.0).max(0.0)],
+            false => [0.0, 0.0],
+        },
+        _pad0: 0.0,
+        _pad1: 0.0,
         layers: packed,
         extra,
     }
@@ -1121,6 +1158,7 @@ struct Plan {
     warmup: usize,
     repeat: usize,
     masks: bool,
+    minify: bool,
     choice: Choice,
 }
 
@@ -1177,6 +1215,7 @@ fn plan_from_args() -> Plan {
         warmup: 5,
         repeat: 1,
         masks: false,
+        minify: false,
         choice: Choice::Best,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1194,6 +1233,10 @@ fn plan_from_args() -> Plan {
             }
             "--masks" => {
                 plan.masks = true;
+                ate = false;
+            }
+            "--minify" => {
+                plan.minify = true;
                 ate = false;
             }
             "--sizes" => plan.sizes = value.split(',').filter_map(parse_size).collect(),
@@ -1530,7 +1573,14 @@ fn sweep_canvas(
             gpu.queue.write_buffer(
                 &uniforms,
                 0,
-                bytemuck::bytes_of(&view_uniforms(doc, &camera, pivot, 4.min(slots), masks)),
+                bytemuck::bytes_of(&view_uniforms(
+                    doc,
+                    &camera,
+                    pivot,
+                    4.min(slots),
+                    masks,
+                    false,
+                )),
             );
             for &residency in &Residency::ALL {
                 let bg = find_bg(residency);
@@ -1626,7 +1676,14 @@ fn sweep_canvas(
                 gpu.queue.write_buffer(
                     &uniforms,
                     0,
-                    bytemuck::bytes_of(&view_uniforms(doc, &camera, pivot, layers, plan.masks)),
+                    bytemuck::bytes_of(&view_uniforms(
+                        doc,
+                        &camera,
+                        pivot,
+                        layers,
+                        plan.masks,
+                        plan.minify,
+                    )),
                 );
                 let bg = find_bg(residency);
                 let tiled = summarise(time_cell(

@@ -14,7 +14,16 @@ release cannot be cut without notes.
 
 ## 0.1.4 — 2026-08-13
 
-A fix for 0.1.3, which would not start on some machines.
+A fix for 0.1.3, which would not start on some machines, and smoother lines when
+you zoom out.
+
+### New
+
+- **The canvas is filtered when you zoom out.** Thin lines used to break up and
+  crawl as you panned, because each screen pixel showed one document pixel and
+  ignored the rest it covered. Each pixel now shows the average of what it
+  actually covers. Nothing changes at 100% and above, and nothing changes in what
+  gets saved or exported.
 
 ### Fixed
 

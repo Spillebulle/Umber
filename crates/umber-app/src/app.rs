@@ -4080,6 +4080,10 @@ impl UmberApp {
                 stroke: self.editor.stroke_style,
                 backdrop: self.editor.palette().backdrop_display(),
                 export: false,
+                // The one call that is the screen, and therefore the only one
+                // that filters. Free at zoom 1 and above, where the footprint
+                // is zero and the tap is the one it always was.
+                minify: true,
             },
         );
 

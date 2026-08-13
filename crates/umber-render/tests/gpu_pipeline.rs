@@ -351,6 +351,12 @@ impl Harness {
                 export: false,
                 active_index: 0,
                 stroke,
+                // The screen path, so the filter is live — and this helper
+                // composites at zoom 1, where it is the identity. That makes
+                // every test built on this one a guard on that identity: a
+                // filter engaging at zoom 1, or one that was not the same call
+                // it replaced, would move a pixel somewhere in the suite below.
+                minify: true,
             },
         );
 
@@ -8491,19 +8497,21 @@ fn fill_tiled_slot(gpu: &Gpu, canvas: &mut CanvasRenderer, slot: u32, rgba: [u8;
     );
 }
 
-/// Composite into an offscreen target and read one pixel.
+/// Composite into a 64-square offscreen target and hand back the whole frame,
+/// RGBA8 row-major.
 ///
 /// `zoom` above one is what makes a bilinear tap straddle anything at all: at
 /// zoom 1 every sample lands on a texel centre and the filter is the identity.
-fn tiled_composite(
+/// `minify` is [`CompositeParams::minify`] — off for every caller that is asking
+/// about the tile unpack, on for the one asking about the filter over it.
+fn tiled_frame(
     gpu: &Gpu,
     canvas: &CanvasRenderer,
     layers: &[LayerDraw],
     zoom: f32,
     center: Vec2,
-    x: u32,
-    y: u32,
-) -> [u8; 4] {
+    minify: bool,
+) -> Vec<u8> {
     const VIEW: u32 = 64;
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tiled-target"),
@@ -8537,6 +8545,11 @@ fn tiled_composite(
             // answerable only by knowing which square this pixel fell in.
             export: true,
             active_index: u32::MAX,
+            // The caller's. `tiled_composite` passes false, so every tile-unpack
+            // test below goes on measuring the unpack alone — one of them
+            // composites at zoom 1/12, where the filter would average away the
+            // very straddle it is asking about.
+            minify,
             stroke: StrokeStyle {
                 opacity: 0.0,
                 ..StrokeStyle::default()
@@ -8576,11 +8589,123 @@ fn tiled_composite(
     slice.map_async(wgpu::MapMode::Read, |_| {});
     let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
     let mapped = slice.get_mapped_range();
-    let at = (y * row + x * 4) as usize;
-    let out = [mapped[at], mapped[at + 1], mapped[at + 2], mapped[at + 3]];
+    let out = mapped.to_vec();
     drop(mapped);
     staging.unmap();
     out
+}
+
+/// [`tiled_frame`] with the filter off, reading one pixel.
+///
+/// Every tile-unpack test below goes through this, so none of them changed when
+/// the minification filter arrived: they ask what one tap resolves to, and a
+/// filter that averaged sixteen would be answering a different question.
+fn tiled_composite(
+    gpu: &Gpu,
+    canvas: &CanvasRenderer,
+    layers: &[LayerDraw],
+    zoom: f32,
+    center: Vec2,
+    x: u32,
+    y: u32,
+) -> [u8; 4] {
+    let frame = tiled_frame(gpu, canvas, layers, zoom, center, false);
+    let at = (y * 64 * 4 + x * 4) as usize;
+    [frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]
+}
+
+/// A pattern finer than the screen can hold comes back as its **average**
+/// rather than as whichever texel the sampling grid landed on.
+///
+/// This is the aliasing reported against 0.1.4, reduced to the case that shows
+/// it: one-texel lines every four texels, composited at zoom 1/4, so each screen
+/// pixel covers exactly one period. The right answer for every pixel is
+/// therefore the same — a quarter covered — and what a single tap gives instead
+/// depends entirely on where in the period it fell.
+///
+/// **It measures the frame, it does not restate the rule.** The assertion is
+/// about the *spread* across a row of output pixels, which is what "crawling"
+/// looks like when it is held still: unfiltered the row swings across most of
+/// the range, filtered it sits in a band. Demonstrated by mutation — make
+/// `tile_box` return `tile_bilinear` unconditionally and the second half fails
+/// with a spread of 255.
+///
+/// `export: true` inside the helper is what makes alpha readable as coverage
+/// with no checkerboard under it. That combination is not one the application
+/// ever composites with — an export never filters — but the two flags are
+/// independent in the shader and this drives the one it is asking about.
+#[test]
+fn a_pattern_finer_than_a_screen_pixel_comes_back_as_its_average() {
+    let h = harness_or_skip!();
+    let gpu = h.gpu;
+    let mut canvas = tiled_canvas(gpu, 1);
+
+    // Opaque white on every fourth column, transparent elsewhere.
+    let mut bytes = vec![0u8; (TILED_W as usize) * (TILED_H as usize) * 4];
+    for y in 0..TILED_H as usize {
+        for x in 0..TILED_W as usize {
+            if x % 4 == 0 {
+                let at = (y * TILED_W as usize + x) * 4;
+                bytes[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    canvas.write_layer_rect(
+        &gpu.device,
+        &gpu.queue,
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: TILED_W,
+            height: TILED_H,
+        },
+        &bytes,
+    );
+
+    let draws = [layer(0, 1.0, BlendMode::Normal)];
+
+    // **The measurement is across a pan, not across a row**, and the first
+    // draft of this test got that wrong in a way worth recording. At zoom 1/4
+    // one screen pixel is exactly one period, so stepping *along* a row steps a
+    // whole period and every pixel in it has the same phase — the unfiltered row
+    // came back thirty-two identical zeroes, the pattern gone rather than
+    // ragged. Which is aliasing in its worst form and says nothing about
+    // variance. Moving the camera a texel at a time is what changes the phase,
+    // and that is also what the artist is doing when they call it crawling.
+    let mean_alpha = |shift: f32, minify: bool| -> u32 {
+        let centre = Vec2::new(300.0 + shift, 250.0);
+        let frame = tiled_frame(gpu, &canvas, &draws, 0.25, centre, minify);
+        // One row across the middle, away from the view's own borders.
+        let row: Vec<u32> = (16..48)
+            .map(|x| frame[(32 * 64 + x) * 4 + 3] as u32)
+            .collect();
+        row.iter().sum::<u32>() / row.len() as u32
+    };
+
+    let phases = [0.0, 1.0, 2.0, 3.0];
+    let raw: Vec<u32> = phases.iter().map(|&s| mean_alpha(s, false)).collect();
+    let swing = raw.iter().max().unwrap() - raw.iter().min().unwrap();
+    assert!(
+        swing > 100,
+        "a single tap should make this pattern come and go as the camera moves \
+         one texel at a time, or this test is not looking at aliasing: {raw:?}"
+    );
+
+    let smooth: Vec<u32> = phases.iter().map(|&s| mean_alpha(s, true)).collect();
+    let swing = smooth.iter().max().unwrap() - smooth.iter().min().unwrap();
+    println!("unfiltered {raw:?}  filtered {smooth:?}  swing {swing}");
+    assert!(
+        swing < 4,
+        "the filtered picture should barely move as the camera pans: {smooth:?}"
+    );
+    for (shift, mean) in phases.iter().zip(&smooth) {
+        assert!(
+            (48..=80).contains(mean),
+            "one line in four is a quarter of 255, give or take the kernel's own \
+             width: {mean} at a shift of {shift}, {smooth:?}"
+        );
+    }
 }
 
 /// A tile nothing is stored for reads as the slot's **empty value**, and for a

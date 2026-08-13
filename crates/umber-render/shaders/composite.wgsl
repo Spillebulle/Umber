@@ -76,6 +76,19 @@ struct View {
     // This one took the place of the padding word that was already here, so
     // the block is the same size it always was.
     stroke_blend: u32,
+    // How far past one texel a screen pixel reaches, in document texels per
+    // axis — `max(scale - 1, 0)` for the screen and **zero for everything
+    // else**. See `tile_box`, which is the whole of what reads it, and
+    // `CompositeParams::minify` for who decides.
+    //
+    // Two scalars rather than a `vec2<f32>`: the arrays below are 16-aligned
+    // and this block ends on a 16-byte boundary, so the pair plus the two
+    // padding words keeps the layout the obvious one. The uniform-layout note
+    // in CLAUDE.md is why that is written out rather than trusted.
+    minify_x: f32,
+    minify_y: f32,
+    _pad0: f32,
+    _pad1: f32,
     // Per draw, bottom first: (opacity, blend mode, slot, visible). Packed as
     // floats to dodge std140's array-stride rules; every value is a small
     // integer or a 0..1 float, so the round trip is exact.
@@ -123,13 +136,64 @@ struct View {
 // the same argument `flip.wgsl` makes for reading raw.
 @group(0) @binding(6) var mask_tex: texture_2d_array<f32>;
 
+// `tile_box`'s stratified footprint over a plain canvas-sized texture.
+//
+// The stroke scratch and the per-dab colour are not in the atlas — they are
+// ordinary textures with an ordinary sampler — so they cannot use `tile_box`
+// and must not be left unfiltered beside it. **That is the pointer-up rule, not
+// tidiness.** `docs/perf/composite-throughput.md` §9 states it: two shaders can
+// implement identical arithmetic and the stroke still jumps, because the
+// preview and the commit sample the layer differently. Filter the layer and not
+// the wet stroke and a stroke drawn at zoom 0.25 is sharp and crawling while it
+// is wet and smooth the instant it commits, which is that bug exactly, arriving
+// through the sampling rather than through the blend.
+//
+// `samp` is clamp-to-edge, which is what an offset past the canvas border wants
+// and is the same thing `tile_bilinear` reproduces by hand for the atlas.
+fn scratch_box(tex: texture_2d<f32>, uv: vec2<f32>, spread: vec2<f32>) -> vec4<f32> {
+    let n = clamp(
+        vec2<i32>(ceil(spread)) + vec2<i32>(1),
+        vec2<i32>(1),
+        vec2<i32>(TILE_MINIFY_TAPS),
+    );
+    // The exact identity at zoom 1 and above — see `tile_box`, whose tap count
+    // this must agree with or the wet stroke is filtered differently from the
+    // layer under it.
+    if (n.x == 1 && n.y == 1) {
+        return textureSampleLevel(tex, samp, uv, 0.0);
+    }
+    let step = spread / v.doc_size;
+    var sum = vec4<f32>(0.0);
+    for (var j = 0; j < n.y; j = j + 1) {
+        for (var i = 0; i < n.x; i = i + 1) {
+            // End to end, exactly as `tile_box` does it and for the reason
+            // stated there. These two have to agree tap for tap or the wet
+            // stroke is filtered differently from the layer beneath it.
+            let at = vec2<f32>(f32(i), f32(j)) / vec2<f32>(n - vec2<i32>(1))
+                - vec2<f32>(0.5);
+            sum = sum + textureSampleLevel(tex, samp, uv + step * at, 0.0);
+        }
+    }
+    return sum / f32(n.x * n.y);
+}
+
 // The stroke's colour at this fragment.
 //
-// MUST stay identical to `stroke_rgb` in `commit.wgsl`. The preview and the
-// committed result are two renderings of the same thing, and any difference
-// between them shows up as the stroke visibly jumping at pointer-up.
-fn stroke_rgb(uv: vec2<f32>) -> vec3<f32> {
-    let picked = textureSampleLevel(stroke_color_tex, samp, uv, 0.0);
+// MUST stay identical to `stroke_rgb` in `commit.wgsl`, and the `spread`
+// parameter is how that survived this file gaining a minification filter. The
+// commit draws at **document** scale, one texel to one texel, where the spread
+// is identically zero and `scratch_box` is its own `n == 1` branch — so the
+// commit's copy is this function with the argument it would always have been
+// given, and the two go on agreeing. The preview and the committed result are
+// two renderings of the same thing, and any difference between them shows up as
+// the stroke visibly jumping at pointer-up.
+//
+// **Averaged premultiplied and un-premultiplied once**, which is the order that
+// matters: a mean of colours already divided by their own alphas weights a
+// nearly transparent tap as heavily as an opaque one, so the rim of a smudged
+// stroke would drag its own faint colour into the average.
+fn stroke_rgb(uv: vec2<f32>, spread: vec2<f32>) -> vec3<f32> {
+    let picked = scratch_box(stroke_color_tex, uv, spread);
     // Un-premultiply. Where a smudging stroke has laid nothing down yet the
     // sample is all zeroes, and dividing would be a NaN, so the uniform colour
     // stands in — which is also what a dab with no pickup deposits.
@@ -181,10 +245,17 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(v.backdrop.rgb, 1.0);
     }
 
+    // How far past one texel this screen pixel reaches. Zero at zoom 1 and
+    // above, and zero for every internal consumer of this pass whatever its
+    // zoom — see `CompositeParams::minify`.
+    let spread = vec2<f32>(v.minify_x, v.minify_y);
+
     // textureSampleLevel rather than textureSample: sampling inside a loop and
     // after a branch is non-uniform control flow, which implicit-derivative
-    // sampling forbids.
-    let coverage = textureSampleLevel(stroke_tex, samp, uv, 0.0).r;
+    // sampling forbids. That is also why the filter's tap count comes out of a
+    // uniform rather than out of `fwidth` — a derivative would be the natural
+    // way to get a footprint and cannot be asked for here.
+    let coverage = scratch_box(stroke_tex, uv, spread).r;
 
     // The layer array is a tile atlas, so its texels are not at `uv` and there
     // is nothing to hand a sampler. `tile_bilinear` is the tap, reconstructed
@@ -221,7 +292,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // A layer's empty value is transparent black, which is what a tile
         // nobody has painted into reads as — byte for byte what a dense slice
         // held there.
-        var lay = tile_bilinear(layer_tex, page_table, slot, doc, doc_texels, vec4<f32>(0.0));
+        var lay = tile_box(layer_tex, page_table, slot, doc, spread, doc_texels, vec4<f32>(0.0));
         let stroke_here = i == v.active_index;
         let cov = coverage * v.stroke_color.a;
 
@@ -249,8 +320,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // the linear multiplier, so this is the byte over 255 and nothing else.
         var m = 1.0;
         if (has_mask) {
-            m = tile_bilinear(
-                mask_tex, page_table, mask_slot, doc, doc_texels, vec4<f32>(1.0)
+            m = tile_box(
+                mask_tex, page_table, mask_slot, doc, spread, doc_texels, vec4<f32>(1.0)
             ).r;
         }
         // A stroke on the mask previews by blending into `m` here. THIS MUST
@@ -268,7 +339,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // otherwise painting under a Multiply layer would preview wrongly.
         if (stroke_here && v.stroke_on_mask == 0u) {
             if (v.stroke_mode == 0u) {
-                let s = vec4<f32>(stroke_rgb(uv) * cov, cov);
+                let s = vec4<f32>(stroke_rgb(uv, spread) * cov, cov);
                 // Normal is written out rather than passed to `composite_over`
                 // with mode 0, and that is not a duplicate of it. The general
                 // form reduces to exactly this line in exact arithmetic and not

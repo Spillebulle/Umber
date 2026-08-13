@@ -57,6 +57,31 @@ const TILE_PAGE_SHIFT: u32 = 16u;
 const TILE_Y_SHIFT: u32 = 8u;
 const TILE_X_SHIFT: u32 = 0u;
 
+// The most taps per axis a minified sample takes, so the worst is this squared.
+//
+// A cap rather than the exact footprint, because the exact one is unbounded: at
+// fit-to-view on a 20000-wide document one screen pixel covers about eleven
+// document texels per axis, and 121 taps a layer a fragment is not a frame. Four
+// leaves a document zoomed further out than 1:4 still undersampled — better,
+// never exact, and `tile_box`'s callers must not describe it as exact.
+//
+// **Up here with the other constants rather than beside `tile_box`, and that is
+// structural**: `measure-composite` builds its variants by replacing the span
+// of text that declares the bilinear tap, so a constant declared inside that
+// span is one every variant but the shipped one compiles without. It was, and
+// the harness stopped with "no definition in scope for `TILE_MINIFY_TAPS`".
+//
+// That file finds the span by searching for the two declarations as literal
+// text, so **no comment above them may quote either one**: writing the opening
+// of a function signature here moved the split into this paragraph. Which is
+// this codebase's own "a source-text guard must not match its own source", one
+// file along from where it was first recorded.
+//
+// **Four rather than more is a measurement, not a taste**, and the measurement
+// is `measure-composite --minify`'s: see
+// `docs/perf/composite-throughput.md` §12.
+const TILE_MINIFY_TAPS: i32 = 4;
+
 // Where in the atlas one document texel of one slot lives, given its tile's
 // entry. `p` is the document texel and `t` is its tile.
 fn tile_atlas_texel(entry: u32, p: vec2<i32>, t: vec2<i32>) -> vec2<i32> {
@@ -176,4 +201,90 @@ fn tile_bilinear(
     let c01 = tile_load(atlas, table, slot, vec2<i32>(lo.x, up.y), empty);
     let c11 = tile_load(atlas, table, slot, vec2<i32>(up.x, up.y), empty);
     return mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
+}
+
+// `tile_bilinear` averaged over the footprint one screen pixel covers.
+//
+// # Why this exists
+//
+// A single tap answers with the texels nearest one point. Magnified, that point
+// is what the artist is looking at. **Minified, it is one texel of the many the
+// pixel covers, and the others are simply not looked at** — so a one-texel line
+// in the artwork is drawn where the sampling grid happens to land on it and
+// missing where it does not, and it crawls as the camera moves. That is the
+// aliasing reported against 0.1.4 and it is a minification problem, not a
+// geometry one: the canvas is a fullscreen triangle sampling a texture, so
+// multisampling has no edges to work on and would cost four times the pass to
+// change nothing at all.
+//
+// `spread` is the extra width to cover **beyond the one texel a bilinear tap
+// already spans**, in document texels, which is what makes this continuous at
+// the boundary where it engages: `spread` is `max(scale - 1, 0)`, so at zoom 1
+// it is zero, the tap count is one, and this **is** `tile_bilinear` — the same
+// call, not an approximation of it. There is no threshold to pop across and no
+// band that is filtered differently from its neighbour, which are two of the
+// three defects `docs/perf/composite-throughput.md` §11.5 retired the mip proxy
+// over. The third, a seam at a level boundary, cannot arise either: nothing here
+// has levels.
+//
+// # What it is not
+//
+// It is a **box** filter over an axis-aligned footprint, which is exact only
+// because the camera does not rotate — `Camera` carries zoom and centre and no
+// angle, so a screen pixel's preimage really is an axis-aligned rectangle. A
+// rotating canvas would need the footprint's two axes, and this signature would
+// have to grow them rather than being reinterpreted.
+//
+// The taps are stratified across the footprint and each is itself bilinear, so
+// the kernel is a box convolved with a tent rather than a true box. That is
+// deliberate: point taps at the same count are cheaper and alias worse, because
+// between the strata they see nothing.
+fn tile_box(
+    atlas: texture_2d_array<f32>,
+    table: texture_2d_array<u32>,
+    slot: i32,
+    doc: vec2<f32>,
+    spread: vec2<f32>,
+    doc_size: vec2<i32>,
+    empty: vec4<f32>,
+) -> vec4<f32> {
+    let n = clamp(
+        vec2<i32>(ceil(spread)) + vec2<i32>(1),
+        vec2<i32>(1),
+        vec2<i32>(TILE_MINIFY_TAPS),
+    );
+    // The exact identity at zoom 1 and above, and it has to be this rather than
+    // a loop that happens to run once: the loop below offsets by
+    // `spread * (0.5/1 - 0.5)`, which is zero in exact arithmetic and is a
+    // multiply and a subtract in floating point. Every internal consumer of this
+    // pass — the export, both picks, the autosave preview — composites at zoom 1
+    // and must come back byte for byte what it did before this existed.
+    if (n.x == 1 && n.y == 1) {
+        return tile_bilinear(atlas, table, slot, doc, doc_size, empty);
+    }
+    var sum = vec4<f32>(0.0);
+    for (var j = 0; j < n.y; j = j + 1) {
+        for (var i = 0; i < n.x; i = i + 1) {
+            // End to end, not at stratum centres. Centres leave the outermost
+            // taps `spread/(2n)` short of the footprint's own edge, so the
+            // kernel is narrower than the pixel it stands for and the picture
+            // goes on moving as the camera pans. That is not a rounding
+            // detail: measured by
+            // `a_pattern_finer_than_a_screen_pixel_comes_back_as_its_average`,
+            // a one-in-four pattern at zoom 1/4 swings **48 of 255** across a
+            // one-texel pan with centres, and **0** with this spacing.
+            //
+            // Spread across the whole of `spread` instead and, because each tap
+            // is itself bilinear and so one texel wide, a whole-texel footprint
+            // tiles exactly: at `spread = 3` the four taps sit one texel apart
+            // and cover four texels with uniform weight. That is why the same
+            // test reads a mean of exactly 64, which is 255/4.
+            let at = vec2<f32>(f32(i), f32(j)) / vec2<f32>(n - vec2<i32>(1))
+                - vec2<f32>(0.5);
+            sum = sum + tile_bilinear(
+                atlas, table, slot, doc + spread * at, doc_size, empty
+            );
+        }
+    }
+    return sum / f32(n.x * n.y);
 }

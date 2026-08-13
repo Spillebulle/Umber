@@ -1072,6 +1072,44 @@ dense 83,740. Re-run both before quoting any of it.
   take the old text off, so a skip-if-empty would leave it on the canvas.
 - **There is no apron.** `composite.wgsl` reconstructs the bilinear tap from four
   `textureLoad`s. See `umber_core::tile`'s module docs.
+- **Zoomed out the composite averages the footprint, and `tile_box` is the one
+  statement of it.** A single tap shows one of the several texels a screen pixel
+  covers and ignores the rest, so thin lines drop out and crawl as the camera
+  moves — reported against 0.1.4. **MSAA is the wrong instrument**: the canvas is
+  a fullscreen triangle sampling a texture, so there are no edges to multisample.
+  The footprint is `spread = max(scale - 1, 0)` document texels, which is **zero
+  at zoom 1**, where `tile_box` is not an approximation of the old tap but
+  literally the old call — so there is no threshold to pop across, no band
+  filtered unlike its neighbour and no seam, which are the three defects
+  `docs/perf/composite-throughput.md` §11.5 retired the mip proxy over. Measured
+  in §12: **1.25–1.33× on a realistic document at fit, 1.88× on a fully painted
+  one, and nothing at zoom 1** — sixteen taps cost 1.88× rather than 16× for
+  §11.3's reason, that arriving at the address is what costs and four adjacent
+  texels are nearly one.
+  - **It is a property of the screen, which is why `CompositeParams::minify` is
+    a flag and not a reading of the zoom.** The export, both picks and the
+    autosave preview composite at zoom 1 and are byte-identical by construction.
+    `probe_canvas` does **not** — it composites at `PROBE_SIZE / diameter`, well
+    below 1 for a large brush — so a filter derived from the zoom would have
+    silently changed what every big smudging brush picks up, which
+    `docs/perf/composite-throughput.md` §9 forbids in as many words. A pickup
+    reads the document; the filter is about the display of it.
+  - **The wet stroke is filtered by the same footprint**, through
+    `scratch_box`, and that is the pointer-up rule rather than tidiness: filter
+    the layer and not the scratch and a stroke is sharp while wet and smooth the
+    instant it commits. §9 states it — two shaders can implement identical
+    arithmetic and the stroke still jumps, because the preview and the commit
+    *sample* differently.
+  - **The taps are spaced end to end, not at stratum centres**, and the
+    difference is not a rounding detail: centres leave the kernel narrower than
+    the pixel it stands for, measured at a swing of 48 of 255 across a one-texel
+    pan against **0** for this spacing.
+  - **`TILE_MINIFY_TAPS` lives with the other constants at the top of
+    `tiles.wgsl`**, because `measure-composite` replaces the span of text that
+    declares the bilinear tap and a constant inside that span is one every
+    variant but the shipped one compiles without. The comment saying so may not
+    quote either function's opening, or the harness's search finds the comment —
+    "a source-text guard must not match its own source", one file along.
 - **What the apron's absence costs is measured, and it is the four loads rather
   than the page table.** `measure-composite` builds a second pipeline from
   `tiles.wgsl` with `tile_bilinear` replaced by one `textureSampleLevel`, which

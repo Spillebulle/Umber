@@ -2204,6 +2204,25 @@ pub struct CompositeParams<'a> {
     pub backdrop: [f32; 3],
     /// Render for file output rather than for the screen.
     pub export: bool,
+    /// Average each pixel over the document footprint it covers, instead of
+    /// taking the one tap nearest its centre.
+    ///
+    /// **This is a property of the screen and only of the screen**, which is
+    /// what the flag is for rather than deriving it from the zoom in the
+    /// shader. `docs/perf/composite-throughput.md` §9 states the contract a
+    /// minification filter has to keep: it may change what is displayed and
+    /// nothing that reaches a file, a readback, an undo patch, a smudge pickup
+    /// or an eyedropper.
+    ///
+    /// Three of the five are free — [`Self::export`]'s path, both picks and the
+    /// autosave preview all composite at zoom 1, where the filter is its own
+    /// identity branch. **The smudge pickup is not**, and that is the whole
+    /// reason this is a field: [`CanvasRenderer::probe_canvas`] composites at
+    /// `PROBE_SIZE / brush diameter`, which is well below 1 for any large
+    /// brush, so a filter derived from the zoom would have engaged there and
+    /// quietly changed what every big smudging brush picks up. A pickup reads
+    /// the *document*; the filter is about the display of it.
+    pub minify: bool,
 }
 
 #[repr(C)]
@@ -2263,11 +2282,18 @@ impl DabUniforms {
 ///
 /// The arithmetic, because it is the one uniform here large enough for the
 /// answer to be in doubt. Four `vec2<f32>` (32) + three `vec4<f32>` (48) +
-/// eight scalars (32) = **112 bytes** of head, which is 16-aligned, so
+/// twelve scalars (48) = **128 bytes** of head, which is 16-aligned, so
 /// `layers` starts there with no padding inserted. Each array is
-/// `MAX_DRAWS × 16`, so the whole block is `112 + 2 × 191 × 16` = **6224
+/// `MAX_DRAWS × 16`, so the whole block is `128 + 2 × 191 × 16` = **6240
 /// bytes**, against `downlevel_defaults`' `max_uniform_buffer_binding_size` of
-/// 16 KiB. `the_view_uniform_fits_the_smallest_binding_a_device_must_offer`
+/// 16 KiB.
+///
+/// **The head was 112 until the minification footprint arrived**, and the four
+/// words it grew by are two more than it needs. The pair is eight bytes; the
+/// arrays after it are 16-aligned in WGSL and 4-aligned in Rust, so the
+/// remainder is written out as two named padding words rather than left for one
+/// language to insert and the other to skip. That is the uniform-layout note in
+/// CLAUDE.md applied to the one block here where it has ever mattered. `the_view_uniform_fits_the_smallest_binding_a_device_must_offer`
 /// measures all of it rather than trusting the sum written here.
 ///
 /// It was 2160 bytes while the arrays held 64; the growth is the effect-draw
@@ -2297,6 +2323,13 @@ struct ViewUniforms {
     /// place of the padding word that was here, so the block is the size it
     /// always was — see the WGSL struct.
     stroke_blend: u32,
+    /// The minification footprint, `max(scale - 1, 0)` per axis, in document
+    /// texels. Zero is the exact identity. See [`CompositeParams::minify`].
+    minify: [f32; 2],
+    /// Scalar padding, not folded into a vec: see the uniform-layout note in
+    /// CLAUDE.md, and the WGSL struct for why the pair sits here.
+    _pad0: f32,
+    _pad1: f32,
     /// (opacity, blend, slot, visible) per draw.
     layers: [[f32; 4]; MAX_DRAWS],
     /// (mask slot, has mask, clipped, unused) per draw. See the WGSL struct for
@@ -6128,6 +6161,19 @@ impl CanvasRenderer {
             0,
             bytemuck::bytes_of(&ViewUniforms {
                 scale: [scale, scale],
+                // What one screen pixel reaches *past* the single texel a
+                // bilinear tap already spans. Zero at zoom 1 and above, so the
+                // filter engages continuously as the camera pulls back rather
+                // than switching on at a threshold — there is no level to pop
+                // across, which is one of the three defects
+                // `docs/perf/composite-throughput.md` §11.5 retired the mip
+                // proxy over.
+                minify: match params.minify {
+                    true => [(scale - 1.0).max(0.0), (scale - 1.0).max(0.0)],
+                    false => [0.0, 0.0],
+                },
+                _pad0: 0.0,
+                _pad1: 0.0,
                 offset: [offset.x, offset.y],
                 doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
                 pivot: [params.pivot.x, params.pivot.y],
@@ -7927,6 +7973,12 @@ impl CanvasRenderer {
                 },
                 backdrop: [0.0, 0.0, 0.0],
                 export: true,
+                // A file, so never — and it composites at zoom 1, where the
+                // filter is its own identity branch anyway. Stated rather than
+                // left to that: "it happens to be at zoom 1" is a property of
+                // this function's callers, where `false` is a property of what
+                // the pixels are for.
+                minify: false,
             },
         );
     }
@@ -8095,6 +8147,9 @@ impl CanvasRenderer {
                 },
                 backdrop: [0.0, 0.0, 0.0],
                 export: true,
+                // A readback for the eyedropper, at zoom 1. Same reasoning as
+                // `render_export`'s: what this is for decides it, not the zoom.
+                minify: false,
             },
         );
         // Submitted before the readback rather than sharing its encoder, for
@@ -8199,6 +8254,13 @@ impl CanvasRenderer {
                 // colour with a meaningful alpha. Exactly what `pick_colour`
                 // relies on, for the same reason.
                 export: true,
+                // **The one call where this is load-bearing.** A probe
+                // composites at `PROBE_SIZE / diameter`, which is far below 1
+                // for a large brush — so a filter derived from the zoom would
+                // engage here and change what every big smudging brush picks
+                // up. A pickup reads the document; the filter is about the
+                // display of it. See `CompositeParams::minify`.
+                minify: false,
             },
         );
 
@@ -12706,8 +12768,8 @@ mod tests {
     /// **Reading the constant is not enough**, and this is the gap the first
     /// draft had. `shader_max_draws` proves what `MAX_DRAWS` *is*, not that the
     /// arrays use it: leave the constant at 191 and write
-    /// `array<vec4<f32>, 64>` and the WGSL struct is 2160 bytes against a
-    /// 6224-byte buffer. That direction **passes validation** — a binding may
+    /// `array<vec4<f32>, 64>` and the WGSL struct is 2176 bytes against a
+    /// 6240-byte buffer. That direction **passes validation** — a binding may
     /// be larger than the struct — and the composite then reads `extra` as
     /// `layers` for every draw past the 63rd. The reverse fails loudly, which
     /// is why only this one needed catching.
@@ -12838,8 +12900,16 @@ mod tests {
         // aligns an `array<vec4<f32>>` to 16 and would insert padding there
         // that `#[repr(C)]` does not — leaving the buffer short by however
         // much, and every draw after the gap reading the wrong entry.
+        //
+        // 128 since the minification footprint joined it: two floats and two
+        // padding words, which is a whole 16-byte row rather than the four
+        // bytes the pair needs. That is the alignment above being paid rather
+        // than dodged — put the pair in without the padding and `head` is 120,
+        // this assertion is what says so, and WGSL would quietly align the
+        // array to 128 and read every draw from eight bytes past where Rust
+        // wrote it.
         let head = std::mem::offset_of!(ViewUniforms, layers);
-        assert_eq!(head, 112, "the scalar head of the block changed size");
+        assert_eq!(head, 128, "the scalar head of the block changed size");
         assert_eq!(head % 16, 0, "WGSL would pad where Rust does not");
         assert_eq!(
             std::mem::offset_of!(ViewUniforms, extra),
@@ -12849,7 +12919,7 @@ mod tests {
 
         let size = std::mem::size_of::<ViewUniforms>();
         assert_eq!(size, head + MAX_DRAWS * 32);
-        assert_eq!(size, 6224, "the figure in the doc comment is stale");
+        assert_eq!(size, 6240, "the figure in the doc comment is stale");
         // The struct's own alignment in WGSL is 16, so its size rounds up to a
         // multiple of it. Rust's is 4, and a mismatch here would be tail
         // padding on one side only.

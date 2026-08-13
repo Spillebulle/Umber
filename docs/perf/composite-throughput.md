@@ -1666,3 +1666,108 @@ middle item down rather than off, and the reasons are worth separating.
     compiler is unknown.
 - **R6 is unaffected and is still first.** Everything above is a constant factor
   on a pass R6 stops running at all.
+
+---
+
+## 12. The minification filter, and what it cost
+
+Everything above prices the atlas against the dense slice it replaced. This
+section prices something else: the **quality** half §10 parked and §11.5 left
+behind.
+
+§10 listed, as not settled, "whether R1, R2 and R5 together put fit-to-view
+inside a frame without the proxy — if they do, R7 stops being urgent and becomes
+a quality feature (the aliasing) rather than a performance one, **which changes
+how it should be judged**." Residency answered it, §11.5 retired R7 on the
+strength of that, and the aliasing was then nobody's. It was reported against
+0.1.4 by an artist: thin lines in the artwork crawl and drop out when the canvas
+is zoomed out.
+
+### 12.1 It is not what a mip proxy would have fixed, and not what MSAA fixes
+
+The canvas is one fullscreen triangle sampling a texture. **MSAA has no edges to
+work on** — it would multiply the pass by the sample count and change nothing.
+
+The proxy would have worked, and §11.5's three objections to it stand: the
+unfiltered band of §4.5a, the pop of §4.0, the seam of §4.5b. `tiles.wgsl`'s
+`tile_box` has none of them, because it has no levels. It averages the footprint
+one screen pixel actually covers, with the tap count following the zoom
+continuously — `spread = max(scale - 1, 0)`, which is **zero at zoom 1**, where
+the function is not an approximation of the old tap but literally the old call.
+Every internal consumer of this pass composites at zoom 1, so the export, both
+picks and the autosave preview are byte-identical by construction rather than by
+audit. §9's contract holds.
+
+The one consumer that is *not* at zoom 1 is `probe_canvas`, which composites at
+`PROBE_SIZE / brush diameter` — well below 1 for any large brush. A filter
+derived from the zoom alone would have engaged there and quietly changed what
+every big smudging brush picks up, which §9 forbids in as many words. Hence
+`CompositeParams::minify`: the filter is a property of the screen, asked for by
+the one caller that is the screen.
+
+### 12.2 What it costs
+
+`measure-composite --minify`, same instrument and same run-to-run conditions as
+§11, A/B on one build. RTX 3080, Vulkan, 4096² canvas, 54 layers, fit-to-view
+into 1920×1080, `--samples 3 --warmup 1 --passes 4`.
+
+**Ratios only.** The absolute figures this harness prints are not the frame times
+§11.2 quotes and the normalisation was not chased down; both sides of every ratio
+below come from the same settings, which is what the comparison needs.
+
+| residency | filter off | filter on | cost |
+|---|---|---|---|
+| dense | 926.5 | 1746.0 | **1.88×** |
+| blob | 137.2 | 182.5 | **1.33×** |
+| scatter | 140.0 | 174.3 | **1.25×** |
+
+Three things follow.
+
+- **At zoom 1 and above it is free, and that is measured rather than argued.**
+  A no-`--minify` run of the changed build reproduced the unchanged build's whole
+  table within 1% — dense 926.5 against 936.8, blob 137.2 against 137.1, scatter
+  140.0 against 139.4. The dead branch costs nothing that this instrument can
+  resolve.
+- **On a realistic document the cost lands exactly where the headroom is.**
+  §11.1's finding is that zoomed out is the regime the atlas made 4–6× *faster*;
+  the filter spends 1.25–1.33× of that. Against the pre-atlas `sampled` column
+  (634 filter-off) the filtered sparse composite is 182.5, still **0.29× — about
+  three and a half times faster than the dense array it replaced.**
+- **On a fully painted document it is 1.88×, and that is the real trade.** Dense
+  at fit was already 1.47× the pre-atlas cost, so this takes it to about 2.8×.
+  §11.5's revival condition for R7 was "a large, *densely* painted document that
+  is slow at fit", and the corpus says nobody has one — every document over 1 GB
+  measures 6.4–25% covered. The same sentence is the condition for making this
+  filter optional.
+
+### 12.3 Sixteen taps do not cost sixteen times, and that is the whole reason this is affordable
+
+`TILE_MINIFY_TAPS` is 4 per axis, so the worst fragment takes 16 bilinear taps —
+64 `textureLoad`s — where it used to take one tap of four. The measured cost is
+1.88× at its worst and 1.25× where it matters, not 16×. That is the same finding
+§11.3 reports for the four loads: **four adjacent texels cost close to one,
+because that is what a texture cache is for**, and what is expensive is arriving
+at the address rather than fetching from it. The filter re-uses one page-table
+resolution's worth of locality sixteen times over.
+
+It also means raising the cap is cheaper than it looks and lowering it saves less
+than it looks. Four was chosen as the point where a 1:4 zoom is exactly covered;
+anything below 1:4 is still undersampled, which is **better, never exact**, and
+no comment or control may say otherwise.
+
+### 12.4 What it did to the harness
+
+Two things, both of which the harness caught itself and both worth knowing before
+the next variant is added.
+
+- `measure-composite` builds its variants by taking the text of `tiles.wgsl`
+  before the bilinear tap and appending a replacement. `tile_box` has to *survive*
+  that substitution and has to come out after the body, because it calls the tap
+  and WGSL has no forward declarations. `tiles_split` is the three-way cut, and
+  its assertion is what stopped the first attempt.
+- A constant declared between the two functions is inside the replaced span, so
+  every variant but the shipped one compiled without it. `TILE_MINIFY_TAPS` lives
+  at the top of the file with the other constants for that reason, and the
+  comment saying so **must not quote either function's opening**, or the search
+  finds the comment instead. That is this project's own "a source-text guard must
+  not match its own source", one file along.
