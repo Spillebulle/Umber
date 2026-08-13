@@ -838,17 +838,26 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   which that scope does not catch, so it reaches `crash::device_error` and panics
   one line after the check. `LayerStore::new` builds `1 + 2 × capacity` views
   immediately, which is why the texture creation is split into `layer_texture`.
-  The mechanism only works because `gpu::instance_descriptor` sets
-  `memory_budget_thresholds` **after** `with_env`, which silently rebuilds the
-  struct with the defaults; `for_device_loss` stays unset, because setting it
-  makes the backend deliberately *lose* the device under pressure, which is the
-  outcome a refusal exists to avoid. The device survives a caught refusal
-  (`create_texture` uses `handle_hal_error_with_nonfatal_oom`) and does **not**
-  survive one on the upload (`StagingBuffer::new` uses the fatal
-  `handle_hal_error`, which calls `lose`) — so the gate covers the array and
-  nothing else, and enabling the threshold at all makes that uncatchable path
-  *slightly more likely to fire*, because it is charged on buffers too. That is a
-  trade, not a free win. Wired at `install_import`, `add_layer` and `add_mask`;
+  It fires when the **driver** refuses: `create_texture` maps its hal error
+  through `handle_hal_error_with_nonfatal_oom`, which returns rather than calling
+  `lose`, so the device survives a caught refusal. The upload is the opposite
+  (`StagingBuffer::new` uses the fatal `handle_hal_error`) — so the gate covers
+  the array and nothing else.
+  **It used to fire *early*, and that is retracted: 0.1.3 would not start on an
+  RTX 3070 with 7 GB free.** `gpu::instance_descriptor` set
+  `memory_budget_thresholds.for_resource_creation` to 90, so an allocation past
+  that share of the reported budget was refused before it was attempted. wgpu's
+  Vulkan check cannot ask `gpu-alloc` which heap a resource will land on, so it
+  measures against **every** heap carrying the flag — and NVIDIA under Windows
+  publishes a third one when Resizable BAR is off, the ~246 MiB aperture flagged
+  `DEVICE_LOCAL`, against which every texture is refused. The threshold is unset
+  now; `no_allocation_is_refused_against_a_reported_budget` is what stops it
+  coming back without the heap layout being read first. **The generalisable
+  part**: a limit the *driver* reports is a claim about a machine nobody here
+  owns, and the development machine's own reading is one sample. `for_device_loss`
+  was never set and must not be — it *loses* the device under pressure, which is
+  the outcome a refusal exists to avoid, and would have made this bug
+  uncatchable. Wired at `install_import`, `add_layer` and `add_mask`;
   `begin_float`, `resize`, File → New and the effect cache are still fatal and
   `try_reserve`'s docs enumerate them. **The bake is not, any more.** A bake
   promotes every slice it targets and runs on an ordinary frame, so it was the
