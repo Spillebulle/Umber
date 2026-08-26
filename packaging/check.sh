@@ -74,4 +74,32 @@ for f in packaging/linux/build-packages.sh packaging/linux/PKGBUILD \
 done
 ok "every packaging script names $APP_ID"
 
+# --- the house archive -------------------------------------------------------
+#
+# The path the `.deb` writes and the path the updater looks for have to be the
+# same string, and they are written in two files in two languages that never
+# see each other. Get it wrong and nothing breaks: the packages still install,
+# the updater still runs, and it simply tells every user of the archive to go
+# and download a file by hand for ever. That is the shape of defect this whole
+# script exists for.
+for path in /etc/apt/sources.list.d/spillebulle.sources \
+            /etc/yum.repos.d/spillebulle.repo; do
+    grep -q "$path" packaging/linux/build-packages.sh || \
+        fail "packaging/linux/build-packages.sh never writes $path"
+    grep -q "$path" crates/umber-app/src/update/install.rs || \
+        fail "the updater never looks for $path"
+done
+ok "the packages and the updater agree on where the archive is configured"
+
+# Not a failure: the public key is checked in when the archive has one, and
+# until then the packages build exactly as they did before it existed. Said out
+# loud on every run, because a package that quietly stopped enrolling machines
+# would look identical to one that never did.
+if [ -f packaging/linux/spillebulle-archive.asc ]; then
+    ok "the archive key is checked in, so packages will enrol the machine"
+else
+    printf '  --  no packaging/linux/spillebulle-archive.asc: packages will not\n'
+    printf '      enrol the machine in the archive (see ../Packages/README.md)\n'
+fi
+
 printf 'packaging metadata is consistent\n'

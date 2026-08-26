@@ -43,6 +43,40 @@ notes and the checksums.
 | Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.4/umber-0.1.4-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.4/umber-0.1.4-aarch64-pc-windows-msvc.zip) |
 | Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.4/umber-0.1.4-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.4/umber-0.1.4-aarch64-unknown-linux-gnu.tar.gz) |
 
+The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
+as they install, so `apt upgrade` or your usual system update carries Umber along
+with everything else. Nothing to configure.
+
+To add the archive first and install from it, or on a machine that installed
+Umber before 0.1.5, on Debian, Ubuntu, Mint and Pop!_OS:
+
+```sh
+curl -fsSL https://spillebulle.github.io/packages/spillebulle-archive.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/spillebulle-archive.gpg
+sudo tee /etc/apt/sources.list.d/spillebulle.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://spillebulle.github.io/packages/deb/
+Suites: ./
+Signed-By: /usr/share/keyrings/spillebulle-archive.gpg
+EOF
+sudo apt update && sudo apt install umber
+```
+
+On Fedora, RHEL and openSUSE:
+
+```sh
+sudo rpm --import https://spillebulle.github.io/packages/spillebulle-archive.asc
+sudo tee /etc/yum.repos.d/spillebulle.repo >/dev/null <<'EOF'
+[spillebulle]
+name=Spillebulle
+baseurl=https://spillebulle.github.io/packages/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://spillebulle.github.io/packages/spillebulle-archive.asc
+EOF
+```
+
 You need a GPU with Vulkan, Direct3D 12 or Metal, which is essentially any
 machine from the last decade. The Linux packages pull in the libraries Umber
 opens at runtime, so your package manager handles the rest.

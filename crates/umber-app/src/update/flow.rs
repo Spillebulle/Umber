@@ -23,8 +23,9 @@
 //!    behind a failure cannot put the bar back up.
 
 use super::apply::Applied;
-use super::install::InstallKind;
+use super::install::{Arch, InstallKind};
 use super::release::Release;
+use super::version::Version;
 use std::time::{Duration, Instant};
 
 /// How long the completion screen waits before it restarts — or, for the
@@ -251,12 +252,21 @@ pub struct Actions {
 /// two questions are separate on purpose, because "a package manager owns this"
 /// and "that release carries no aarch64 build" have different answers even
 /// though both end at the releases page.
-pub fn actions(kind: &InstallKind, has_asset: bool) -> Actions {
+///
+/// `version` and `arch` are what the obstacle needs to name the package a
+/// managed installation should fetch. They are the release's version, not this
+/// build's: the sentence is about the thing being offered.
+pub fn actions(
+    kind: &InstallKind,
+    version: &Version,
+    arch: Option<Arch>,
+    has_asset: bool,
+) -> Actions {
     // The obstacle is asked for first and wins outright. A managed installation
     // that happens to have a matching asset in the release must still never be
     // offered "Update now" — that button is the first half of writing over a
     // package manager's files.
-    if let Some(obstacle) = kind.cannot_update() {
+    if let Some(obstacle) = kind.cannot_update(version, arch) {
         return Actions {
             update_now: false,
             open_page: true,
@@ -445,6 +455,12 @@ mod tests {
 
     fn flow() -> Flow {
         Flow::offering(release())
+    }
+
+    /// The version the offer is about, which is what an obstacle names a
+    /// package file for.
+    fn offered() -> Version {
+        release().version
     }
 
     /// The whole happy path, in the order it happens.
@@ -779,7 +795,7 @@ mod tests {
             InstallKind::Msi,
             InstallKind::AppImage(PathBuf::from("/home/a/Umber.AppImage")),
         ] {
-            let a = actions(&kind, true);
+            let a = actions(&kind, &offered(), Some(Arch::X86_64), true);
             assert!(a.update_now, "{kind:?}");
             assert!(!a.open_page, "{kind:?}");
             assert_eq!(a.obstacle, None, "{kind:?}");
@@ -792,12 +808,19 @@ mod tests {
         // writing over files a manager keeps a record of.
         for manager in [
             Manager::Flatpak,
-            Manager::Dpkg,
-            Manager::Rpm,
+            Manager::Dpkg { archive: true },
+            Manager::Dpkg { archive: false },
+            Manager::Rpm { archive: true },
+            Manager::Rpm { archive: false },
             Manager::Pacman,
             Manager::Unknown,
         ] {
-            let a = actions(&InstallKind::Managed(manager), true);
+            let a = actions(
+                &InstallKind::Managed(manager),
+                &offered(),
+                Some(Arch::X86_64),
+                true,
+            );
             assert!(!a.update_now, "{manager:?}");
             assert!(a.open_page, "{manager:?}");
             let obstacle = a.obstacle.expect("a managed copy says why");
@@ -807,7 +830,7 @@ mod tests {
 
     #[test]
     fn an_unrecognised_installation_is_told_where_the_build_is() {
-        let a = actions(&InstallKind::Unknown, true);
+        let a = actions(&InstallKind::Unknown, &offered(), Some(Arch::X86_64), true);
         assert!(!a.update_now);
         assert!(a.open_page);
         assert!(a.obstacle.is_some());
@@ -818,7 +841,12 @@ mod tests {
         // Umber owns this copy and would happily replace it; the release simply
         // published nothing for this architecture. Different sentence, same
         // destination.
-        let a = actions(&InstallKind::Portable, false);
+        let a = actions(
+            &InstallKind::Portable,
+            &offered(),
+            Some(Arch::X86_64),
+            false,
+        );
         assert!(!a.update_now);
         assert!(a.open_page);
         assert!(a.no_build);

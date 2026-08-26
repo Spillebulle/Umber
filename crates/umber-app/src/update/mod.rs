@@ -248,7 +248,12 @@ impl Updates {
 
     /// Which buttons the offer screen puts up for this installation.
     pub fn actions(&self, release: &Release) -> flow::Actions {
-        flow::actions(&self.kind, self.installable(release).is_some())
+        flow::actions(
+            &self.kind,
+            &release.version,
+            Arch::CURRENT,
+            self.installable(release).is_some(),
+        )
     }
 
     /// Collect whatever a background job has reported.
@@ -930,7 +935,7 @@ mod tests {
         for kind in [
             InstallKind::Portable,
             InstallKind::Msi,
-            InstallKind::Managed(install::Manager::Dpkg),
+            InstallKind::Managed(install::Manager::Dpkg { archive: false }),
             InstallKind::Unknown,
         ] {
             let updates = Updates {
@@ -960,7 +965,7 @@ mod tests {
         // Belt and braces over `release::asset_for` and `flow::actions`: this is
         // the path the button actually takes.
         let mut updates = Updates {
-            kind: InstallKind::Managed(install::Manager::Dpkg),
+            kind: InstallKind::Managed(install::Manager::Dpkg { archive: false }),
             ..Updates::default()
         };
         let release = release();

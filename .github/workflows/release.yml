@@ -358,3 +358,25 @@ jobs:
             --title "Umber $GITHUB_REF_NAME" \
             --notes-file notes.md \
             artifacts/*
+      # The apt and rpm archive rebuilds itself from the newest release of
+      # every project it carries, so this asks for a rebuild and tells it
+      # nothing it could not look up. It runs after the release exists,
+      # because the archive's first act is to download that release's assets.
+      #
+      # The token is a fine-grained one with write access to
+      # `Spillebulle/packages` and to nothing else. Skipped when it is absent
+      # rather than failing: a fork, or this repository before the archive was
+      # set up, should still be able to cut a release, and the archive's own
+      # weekly run picks up anything a skipped dispatch missed.
+      - name: Tell the archive
+        env:
+          ARCHIVE_DISPATCH_TOKEN: ${{ secrets.ARCHIVE_DISPATCH_TOKEN }}
+        if: env.ARCHIVE_DISPATCH_TOKEN != ''
+        run: |
+          set -eu
+          GH_TOKEN="$ARCHIVE_DISPATCH_TOKEN" gh api \
+            /repos/Spillebulle/packages/dispatches \
+            -f event_type=package \
+            -f "client_payload[repository]=$GITHUB_REPOSITORY" \
+            -f "client_payload[tag]=$GITHUB_REF_NAME"
+

@@ -487,7 +487,7 @@ mod tests {
         // and this is what makes a mistake upstream a refusal rather than a
         // package manager's files being overwritten.
         for kind in [
-            InstallKind::Managed(super::super::install::Manager::Dpkg),
+            InstallKind::Managed(super::super::install::Manager::Dpkg { archive: false }),
             InstallKind::Managed(super::super::install::Manager::Flatpak),
             InstallKind::Unknown,
         ] {

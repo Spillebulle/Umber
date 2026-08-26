@@ -99,6 +99,41 @@ RPM_SONAMES="libX11.so.6 libXcursor.so.1 libXrandr.so.2 libXi.so.6 libxkbcommon.
 # build fails. It reads as pedantry right up until it does that.
 APP_ID=io.github.spillebulle.umber
 
+# --- the house archive -------------------------------------------------------
+#
+# The `.deb` and the `.rpm` carry the archive's public key and add its source
+# on install, so somebody who downloads one package from the release page ends
+# up on a machine that upgrades Umber by itself from then on. Without this the
+# package manager owns the installation, refuses to let Umber replace it, and
+# has nowhere to get a newer one: `apt install --only-upgrade umber` answers
+# "already the newest version" for ever and sounds authoritative doing it.
+# That was the whole bug this exists to close.
+#
+# The key is not generated here and is not in git as a secret: it is the public
+# half, taken from the archive's own Pages site, and checked in beside this
+# script. When it is absent the packages are built exactly as they were before
+# the archive existed, loudly, because a silent difference between two builds
+# of the same package is the worst outcome available here.
+#
+# `../Packages` is the archive. `Design-Principles/STYLE-GUIDE.md` §18 is why.
+ARCHIVE_KEYRING=spillebulle-archive
+ARCHIVE_BASE=https://spillebulle.github.io/packages
+archive_key=$root/packaging/linux/$ARCHIVE_KEYRING.asc
+
+if [ -f "$archive_key" ]; then
+    command -v gpg >/dev/null 2>&1 || {
+        echo "gpg is needed to dearmour $archive_key" >&2
+        exit 1
+    }
+    gpg --dearmor < "$archive_key" > "$work/$ARCHIVE_KEYRING.gpg"
+    echo "==> packages will enrol the machine in $ARCHIVE_BASE"
+else
+    archive_key=
+    echo "!! $ARCHIVE_KEYRING.asc is not checked in, so these packages will not" >&2
+    echo "!! enrol the machine in the archive and will never be upgraded by a" >&2
+    echo "!! package manager. See ../Packages/README.md." >&2
+fi
+
 # --- the shared install tree -------------------------------------------------
 #
 # One layout, used by all three formats. /usr for the packages; the AppImage
@@ -137,6 +172,15 @@ echo "==> building umber_${version}_${arch}.deb"
 deb="$work/deb"
 stage_tree "$deb/usr"
 mkdir -p "$deb/DEBIAN"
+# `/usr/share/keyrings` rather than `/etc/apt/keyrings`: the first is where a
+# package puts a keyring it owns and dpkg can track, the second is where a
+# human puts one by hand. `Signed-By` in the source below names this file, so
+# the key is never fetched over the network and the archive is trusted for
+# these packages and for nothing else on the system.
+if [ -n "$archive_key" ]; then
+    install -Dm644 "$work/$ARCHIVE_KEYRING.gpg" \
+        "$deb/usr/share/keyrings/$ARCHIVE_KEYRING.gpg"
+fi
 # Installed-Size is in kibibytes and Debian's own tools warn without it.
 size=$(du -ks "$deb/usr" | cut -f1)
 cat > "$deb/DEBIAN/control" <<EOF
@@ -178,8 +222,39 @@ if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications || true
 fi
 EOF
+# The source file is **written by this script rather than shipped in the
+# package**, and that is the whole design of it. A file under `/etc` that dpkg
+# owns is a conffile, and dpkg removes a conffile when the package that owns it
+# is purged, so a shared source shipped by four applications would be cut off
+# the moment the first of them was removed. Written here it belongs to nobody,
+# every application's package creates it if it is missing, and removing one
+# leaves the other three upgrading normally.
+#
+# Only ever created, never overwritten: somebody who has edited it, pinned
+# against it or pointed it somewhere else keeps their version. Deleting it and
+# leaving `.disabled` beside it is the documented way off the archive, and is
+# honoured here so that the next upgrade does not quietly put it back.
+if [ -n "$archive_key" ]; then
+    cat >> "$deb/DEBIAN/postinst" <<EOF
+
+sources=/etc/apt/sources.list.d/spillebulle.sources
+if [ ! -e "\$sources" ] && [ ! -e "\$sources.disabled" ]; then
+    cat > "\$sources" <<'SOURCES'
+Types: deb
+URIs: $ARCHIVE_BASE/deb/
+Suites: ./
+Signed-By: /usr/share/keyrings/$ARCHIVE_KEYRING.gpg
+SOURCES
+fi
+EOF
+fi
 # The same on the way out, so a removed Umber stops being offered rather than
 # leaving a dead entry in every file manager's menu.
+#
+# **The source file is deliberately not removed here.** It is shared with every
+# other application from the same archive, and taking it away because one of
+# them was uninstalled would stop the others being updated, silently, months
+# later. `README.md` says how to leave the archive on purpose.
 cat > "$deb/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
@@ -200,6 +275,15 @@ rpmroot="$work/rpm"
 mkdir -p "$rpmroot"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 buildroot="$work/rpmtree"
 stage_tree "$buildroot/usr"
+# The armoured key, because `rpm --import` reads an armoured block where apt
+# wants the dearmoured keyring. `/etc/pki/rpm-gpg` is where Fedora and RHEL
+# keep them, and where a `gpgkey=file://` line in a `.repo` is expected to
+# point; openSUSE has no directory of its own for this and reads whatever the
+# repository file names.
+rpm_key=/etc/pki/rpm-gpg/RPM-GPG-KEY-spillebulle
+if [ -n "$archive_key" ]; then
+    install -Dm644 "$archive_key" "$buildroot$rpm_key"
+fi
 
 {
     echo "Name:           umber"
@@ -220,6 +304,7 @@ stage_tree "$buildroot/usr"
     echo
     echo "%install"
     echo "cp -a $buildroot/usr %{buildroot}/"
+    [ -n "$archive_key" ] && echo "cp -a $buildroot/etc %{buildroot}/"
     echo
     # The same two caches the `.deb` rebuilds, and for the same reason: without
     # `mimeinfo.cache` the desktop entry's MimeType line is inert, and without
@@ -230,6 +315,34 @@ stage_tree "$buildroot/usr"
     echo "    update-mime-database /usr/share/mime || :"
     echo "command -v update-desktop-database >/dev/null 2>&1 && \\"
     echo "    update-desktop-database -q /usr/share/applications || :"
+    # The archive, on the same terms as the `.deb`: created if absent, never
+    # overwritten, honouring a `.disabled` marker, and never removed on the way
+    # out because it is shared with every other application from the same
+    # archive. `repo_gpgcheck` is what verifies the index before dnf will read
+    # it, and `gpgcheck` is what verifies each package; the archive signs both,
+    # so both are on.
+    #
+    # **No `rpm --import` here**, which is the tempting line to add. A scriptlet
+    # runs inside the transaction that is installing this very package, and the
+    # rpm database is locked by it; importing a key is a write to that database,
+    # so the command fails, and with the `|| :` that a scriptlet needs it fails
+    # silently. `gpgkey=file://` below is the supported route: dnf reads the key
+    # from the installed file the first time it needs one, which is what every
+    # third-party release package does.
+    if [ -n "$archive_key" ]; then
+        echo "repo=/etc/yum.repos.d/spillebulle.repo"
+        echo "if [ ! -e \"\$repo\" ] && [ ! -e \"\$repo.disabled\" ]; then"
+        echo "    cat > \"\$repo\" <<'REPO'"
+        echo "[spillebulle]"
+        echo "name=Spillebulle"
+        echo "baseurl=$ARCHIVE_BASE/rpm/"
+        echo "enabled=1"
+        echo "gpgcheck=1"
+        echo "repo_gpgcheck=1"
+        echo "gpgkey=file://$rpm_key"
+        echo "REPO"
+        echo "fi"
+    fi
     echo
     echo "%postun"
     echo "command -v update-mime-database >/dev/null 2>&1 && \\"
@@ -238,6 +351,7 @@ stage_tree "$buildroot/usr"
     echo "    update-desktop-database -q /usr/share/applications || :"
     echo
     echo "%files"
+    [ -n "$archive_key" ] && echo "$rpm_key"
     echo "/usr/bin/umber"
     echo "/usr/share/applications/$APP_ID.desktop"
     echo "/usr/share/metainfo/$APP_ID.metainfo.xml"

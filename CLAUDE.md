@@ -4666,6 +4666,16 @@ checks the tree, the version and the notes, runs the same gates CI runs, pushes
 pushes an annotated `v<version>` tag. It uploads nothing, so it cannot
 half-publish; `.github/workflows/release.yml` does the rest.
 
+- **A release is not finished when the tag is.** `release.yml`'s last step
+  dispatches to `Spillebulle/packages`, which rebuilds the house apt and rpm
+  archive from the newest release of every project it carries. Until that run is
+  green, every Linux machine that has the archive is still being offered the old
+  version, and nothing in this repository will say so. It needs
+  `ARCHIVE_DISPATCH_TOKEN` in this repository's secrets; the step is skipped
+  when that is absent, so a release can still be cut without it, and the
+  archive's own weekly run is the backstop. `../Packages/README.md` is the whole
+  of the setup, and `Design-Principles/STYLE-GUIDE.md` §18 is why it works this
+  way.
 - **The tag waits for CI, and this is the rule the other three were learned
   from.** The gates in the script run on one machine, and every release that has
   gone wrong went wrong on a platform that machine is not: 0.0.2 on a timing
@@ -4888,6 +4898,13 @@ at which walking away has already gone wrong once. So:
   exactly the half that was never the risk. If shaders changed, run
   `UMBER_TEST_SOFTWARE=1` over `umber-render` as well — CI has no graphics card,
   and the last bit of floating point is where hardware and lavapipe disagree.
+- **Check the archive published, not only that the release did.** The release
+  page having the files is half of it; the other half is
+  `Spillebulle/packages`' publish run going green afterwards, because that is
+  what every Linux machine with the archive actually installs from. Its two
+  verify steps put a Debian and a Fedora container against the built archive
+  before it deploys, so a red run means nothing reached anybody rather than
+  something broken did.
 - **Build the Windows installer and run it before tagging.** It is the one
   artefact whose failure is total — a setup executable that does not install is
   a release nobody can take — and it shipped broken in 0.0.8 because it had
@@ -4949,6 +4966,33 @@ must not learn about HTTP, the same boundary that keeps them testable.
   the About dialog least of all — may imply that it is. Signing means a key with
   somewhere to live, a step in `release.yml`, and a public key compiled in;
   until that exists, say what is actually true.
+- **The Linux packages enrol the machine in the house archive**, `../Packages`,
+  published at `spillebulle.github.io/packages`. This exists because the updater
+  told every `.deb` user to run `sudo apt install --only-upgrade umber` and that
+  command cannot ever have worked: the packages come from a release page, apt
+  only consults archives it has been given, and a machine with none answers
+  "already the newest version" in the voice of something that had checked. So
+  the `.deb` carries the archive's public key in `/usr/share/keyrings` and
+  writes `/etc/apt/sources.list.d/spillebulle.sources` from its `postinst`, the
+  `.rpm` does the same with `/etc/yum.repos.d/spillebulle.repo`, and from then
+  on the package manager keeps Umber current the way it keeps everything else
+  current. Three rules come with it:
+  - **The source file is written by the scriptlet, never shipped in the
+    package.** A file under `/etc` that dpkg owns is a conffile, and dpkg
+    removes a conffile on purge, so a source shared by four applications would
+    be cut off the moment the first of them was uninstalled. Written by the
+    scriptlet it belongs to nobody, every application creates it if it is
+    missing, and `postrm` leaves it alone. `spillebulle.sources.disabled` is the
+    opt-out and is honoured.
+  - **The path is stated in two languages and checked by `packaging/check.sh`.**
+    The scriptlet writes it and `update::install::detect` looks for it; if they
+    ever disagree nothing breaks visibly, and every user of the archive is
+    simply told to download a file by hand for ever.
+  - **The updater says which of the two situations a machine is in.** With the
+    archive it prints the upgrade command; without it, it names the exact
+    package file to fetch. It never prints an upgrade command to a machine that
+    has nowhere to upgrade from, and `install.rs` has a test that fails on any
+    of the four commands that used to be printed.
 - **An installation a package manager owns is never written to.** `.deb`,
   `.rpm`, Arch and Flatpak copies are detected and told which manager owns them
   and what to run. Overwriting them is usually not permitted, makes the

@@ -433,8 +433,8 @@ mod tests {
         // files.
         let release = newest_of(FIXTURE);
         for kind in [
-            InstallKind::Managed(super::super::install::Manager::Dpkg),
-            InstallKind::Managed(super::super::install::Manager::Rpm),
+            InstallKind::Managed(super::super::install::Manager::Dpkg { archive: false }),
+            InstallKind::Managed(super::super::install::Manager::Rpm { archive: false }),
             InstallKind::Managed(super::super::install::Manager::Pacman),
             InstallKind::Managed(super::super::install::Manager::Flatpak),
             InstallKind::Unknown,

@@ -26,6 +26,7 @@
 //! exist" predicate. That is what lets the Linux and macOS answers be tested on
 //! a Windows machine, which is the only way they get tested at all.
 
+use super::version::Version;
 use std::path::{Path, PathBuf};
 
 /// The platforms Umber publishes for.
@@ -66,14 +67,40 @@ impl Arch {
     } else {
         None
     };
+
+    /// Debian's spelling, which is the one in a `.deb` file's name.
+    pub fn deb(self) -> &'static str {
+        match self {
+            Self::X86_64 => "amd64",
+            Self::Aarch64 => "arm64",
+        }
+    }
+
+    /// rpm's spelling, which the Arch package and the AppImage use too.
+    pub fn rpm(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
 }
 
 /// The package manager that owns an installation.
+///
+/// The two formats the house archive publishes carry a second fact with them:
+/// whether *this machine* has that archive configured. It is the difference
+/// between a package manager that can fetch a new Umber and one that cannot,
+/// and it changes the whole of what there is to say, so it is part of the
+/// answer rather than something the message guesses at later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Manager {
     Flatpak,
-    Dpkg,
-    Rpm,
+    Dpkg {
+        archive: bool,
+    },
+    Rpm {
+        archive: bool,
+    },
     Pacman,
     /// A system path with no recognisable manager behind it. Named separately
     /// from "unknown installation" because the answer to the user is different:
@@ -86,25 +113,98 @@ impl Manager {
     pub fn label(self) -> &'static str {
         match self {
             Self::Flatpak => "Flatpak",
-            Self::Dpkg => "apt / dpkg",
-            Self::Rpm => "dnf / zypper / rpm",
+            Self::Dpkg { .. } => "apt / dpkg",
+            Self::Rpm { .. } => "dnf / zypper / rpm",
             Self::Pacman => "pacman",
             Self::Unknown => "a package manager",
         }
     }
 
-    /// The command that updates it, where there is one worth printing.
+    /// What to do about it: a sentence, and a command where there is an honest
+    /// one to print.
     ///
-    /// The rpm line is deliberately absent: Fedora, RHEL and openSUSE use three
-    /// different front ends over the same package format, and printing one of
-    /// them would be wrong on two distributions out of three. Naming the format
-    /// and pointing at the release page is the honest version.
-    pub fn command(self) -> Option<&'static str> {
-        match self {
-            Self::Flatpak => Some("flatpak update io.github.spillebulle.umber"),
-            Self::Dpkg => Some("sudo apt install --only-upgrade umber"),
-            Self::Pacman => Some("sudo pacman -Syu umber"),
-            Self::Rpm | Self::Unknown => None,
+    /// **Every arm without the archive names a file rather than an upgrade.**
+    /// 0.1.4 printed `sudo apt install --only-upgrade umber`, and that command
+    /// cannot ever have worked: the packages come from a release page, apt only
+    /// consults archives it has been given, and a machine with none answers
+    /// "umber is already the newest version" however old it is. It sounds
+    /// authoritative, which is what makes it the worst kind of wrong. The same
+    /// was true of `pacman -Syu umber`, for a package in no repository, and of
+    /// `flatpak update`, for a bundle with no remote.
+    ///
+    /// The rpm arms still print no command even with the archive configured,
+    /// and for the original reason: Fedora, RHEL and openSUSE drive the same
+    /// package format with three different front ends, so naming one would be
+    /// wrong on two distributions out of three. "Your usual system update" is
+    /// the sentence that is true on all three.
+    fn remedy(self, version: &Version, arch: Option<Arch>) -> String {
+        // Where the architecture is unknown there is no file name to write, and
+        // inventing one would send somebody looking for a file that is not
+        // there. See `Arch::CURRENT`: a source build on riscv64 is a real case.
+        const BY_HAND: &str =
+            "Take the new package from the releases page and install it over this one.";
+
+        match (self, arch) {
+            (Self::Dpkg { archive: true }, _) => "This machine has the Spillebulle archive, \
+                 so apt already has the new version. Update it with:\n\n    \
+                 sudo apt update && sudo apt install --only-upgrade umber"
+                .to_string(),
+
+            (Self::Dpkg { archive: false }, Some(arch)) => {
+                let file = format!("umber_{version}_{}.deb", arch.deb());
+                format!(
+                    "This machine does not have the Spillebulle archive, so apt has \
+                     nothing newer to offer whatever it says. Take {file} from the \
+                     releases page and install it over this one:\n\n    \
+                     sudo apt install ./{file}\n\nThat package adds the archive, and \
+                     apt keeps Umber up to date from then on."
+                )
+            }
+
+            (Self::Rpm { archive: true }, _) => "This machine has the Spillebulle archive, \
+                 so your usual system update now includes Umber."
+                .to_string(),
+
+            (Self::Rpm { archive: false }, Some(arch)) => {
+                let file = format!("umber-{version}-1.{}.rpm", arch.rpm());
+                format!(
+                    "This machine does not have the Spillebulle archive, so there is \
+                     nothing newer for your package manager to find. Take {file} from \
+                     the releases page and install it over this one. That package adds \
+                     the archive, and your usual system update keeps Umber up to date \
+                     from then on."
+                )
+            }
+
+            // The Arch package is built for x86-64 only, and is in no
+            // repository: neither the official ones nor the AUR. So there is
+            // nothing for `pacman -Syu` to find, and the file is the answer.
+            (Self::Pacman, Some(Arch::X86_64)) => {
+                let file = format!("umber-bin-{version}-1-x86_64.pkg.tar.zst");
+                format!(
+                    "The Arch package is in no repository, so pacman has nothing to \
+                     upgrade from. Take {file} from the releases page and install it \
+                     over this one:\n\n    sudo pacman -U {file}"
+                )
+            }
+
+            // The bundle is published as a file, not through Flathub, so the
+            // installation has no remote behind it and `flatpak update` finds
+            // nothing to do. x86-64 only, for the same reason the release is.
+            (Self::Flatpak, Some(Arch::X86_64)) => {
+                let file = format!("umber-{version}-x86_64.flatpak");
+                format!(
+                    "This bundle has no remote behind it, so there is nothing for \
+                     flatpak to update from. Take {file} from the releases page and \
+                     install it over this one:\n\n    flatpak install --user {file}"
+                )
+            }
+
+            (Self::Unknown, _) => "Update it through your package manager, or take the new \
+                 package from the releases page."
+                .to_string(),
+
+            _ => BY_HAND.to_string(),
         }
     }
 }
@@ -147,26 +247,21 @@ impl InstallKind {
     }
 
     /// The sentence shown where an update cannot be applied from inside Umber.
-    pub fn cannot_update(&self) -> Option<String> {
+    ///
+    /// Takes the version being offered and this machine's architecture because
+    /// the answer is usually a file to fetch, and a file has a name. Naming it
+    /// is the difference between a message somebody can act on and one they
+    /// have to go and interpret.
+    pub fn cannot_update(&self, version: &Version, arch: Option<Arch>) -> Option<String> {
         match self {
             Self::Portable | Self::AppImage(_) | Self::Msi => None,
-            Self::Managed(m) => Some(match m.command() {
-                Some(command) => format!(
-                    "This copy was installed by {}, which keeps its own record of \
-                     every file it owns. Umber will not write over that: the next \
-                     system upgrade would put the old version back.\n\nUpdate it \
-                     with:\n\n    {command}",
-                    m.label(),
-                ),
-                None => format!(
-                    "This copy was installed by {}, which keeps its own record of \
-                     every file it owns. Umber will not write over that: the next \
-                     system upgrade would put the old version back.\n\nUpdate it \
-                     through your package manager, or take the new package from \
-                     the releases page.",
-                    m.label(),
-                ),
-            }),
+            Self::Managed(m) => Some(format!(
+                "This copy was installed by {}, which keeps its own record of \
+                 every file it owns. Umber will not write over that: the next \
+                 system upgrade would put the old version back.\n\n{}",
+                m.label(),
+                m.remedy(version, arch),
+            )),
             Self::Unknown => Some(
                 "Umber cannot tell how this copy was installed, so it will not \
                  replace any of its own files. Take the new build from the \
@@ -293,17 +388,30 @@ pub fn detect(probe: &Probe<'_>) -> InstallKind {
 /// naming the wrong command in a message, never a file being written.
 fn linux_manager(probe: &Probe<'_>) -> Manager {
     let exists = |path: &str| (probe.exists)(Path::new(path));
+
+    // Whether this machine has the house archive. These are the exact files the
+    // packages write on install (`packaging/linux/build-packages.sh`), so their
+    // presence is not a hint about it: it is the thing itself. A path rather
+    // than a call to the package manager, so this stays a pure function of the
+    // probe and the message can be tested on a machine that has neither.
+    let apt = Manager::Dpkg {
+        archive: exists("/etc/apt/sources.list.d/spillebulle.sources"),
+    };
+    let rpm = Manager::Rpm {
+        archive: exists("/etc/yum.repos.d/spillebulle.repo"),
+    };
+
     if exists("/var/lib/dpkg/info/umber.list") {
-        Manager::Dpkg
+        apt
     } else if exists("/var/lib/pacman/local") {
         Manager::Pacman
     } else if exists("/var/lib/rpm") || exists("/usr/lib/sysimage/rpm") {
-        Manager::Rpm
+        rpm
     } else if exists("/var/lib/dpkg/status") {
         // dpkg is here but has no record of umber — the tarball unpacked into
         // /usr by hand. Still not ours to overwrite: something else may own
         // those paths, and /usr is root's.
-        Manager::Dpkg
+        apt
     } else {
         Manager::Unknown
     }
@@ -501,7 +609,10 @@ mod tests {
             &env,
             &["/var/lib/dpkg/info/umber.list", "/var/lib/dpkg/status"],
         );
-        assert_eq!(detect(&p), InstallKind::Managed(Manager::Dpkg));
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Dpkg { archive: false }),
+        );
     }
 
     #[test]
@@ -526,10 +637,60 @@ mod tests {
             let p = probe(Os::Linux, Some("/usr/bin/umber"), &env, present);
             assert_eq!(
                 detect(&p),
-                InstallKind::Managed(Manager::Rpm),
+                InstallKind::Managed(Manager::Rpm { archive: false }),
                 "{present:?}",
             );
         }
+    }
+
+    #[test]
+    fn the_house_archive_is_read_from_the_file_the_packages_write() {
+        // The difference this makes is the difference between "apt has the new
+        // version" and "apt will say you are up to date for ever", so it is
+        // detected rather than assumed.
+        let env = no_env();
+
+        let p = probe(
+            Os::Linux,
+            Some("/usr/bin/umber"),
+            &env,
+            &[
+                "/var/lib/dpkg/info/umber.list",
+                "/etc/apt/sources.list.d/spillebulle.sources",
+            ],
+        );
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Dpkg { archive: true })
+        );
+
+        let p = probe(
+            Os::Linux,
+            Some("/usr/bin/umber"),
+            &env,
+            &["/var/lib/rpm", "/etc/yum.repos.d/spillebulle.repo"],
+        );
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Rpm { archive: true })
+        );
+
+        // And one manager's archive is not the other's. A Debian machine with
+        // a stray `.repo` file left over from something else has not got apt
+        // pointed anywhere.
+        let p = probe(
+            Os::Linux,
+            Some("/usr/bin/umber"),
+            &env,
+            &[
+                "/var/lib/dpkg/info/umber.list",
+                "/etc/yum.repos.d/spillebulle.repo",
+            ],
+        );
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Dpkg { archive: false })
+        );
     }
 
     #[test]
@@ -573,22 +734,45 @@ mod tests {
         assert_eq!(detect(&p), InstallKind::Unknown);
     }
 
+    /// The version an offer would be about, for the message tests below.
+    fn offered() -> Version {
+        Version {
+            major: 0,
+            minor: 1,
+            patch: 2,
+        }
+    }
+
+    /// Every manager, in both archive states where it has them.
+    fn every_manager() -> Vec<Manager> {
+        vec![
+            Manager::Flatpak,
+            Manager::Dpkg { archive: true },
+            Manager::Dpkg { archive: false },
+            Manager::Rpm { archive: true },
+            Manager::Rpm { archive: false },
+            Manager::Pacman,
+            Manager::Unknown,
+        ]
+    }
+
     #[test]
     fn only_the_three_shapes_umber_owns_may_replace_themselves() {
         assert!(InstallKind::Portable.is_self_updatable());
         assert!(InstallKind::AppImage(PathBuf::from("/x")).is_self_updatable());
         assert!(InstallKind::Msi.is_self_updatable());
-        for manager in [
-            Manager::Flatpak,
-            Manager::Dpkg,
-            Manager::Rpm,
-            Manager::Pacman,
-            Manager::Unknown,
-        ] {
+        for manager in every_manager() {
             let kind = InstallKind::Managed(manager);
             assert!(!kind.is_self_updatable(), "{manager:?}");
-            // And every one of them has something to say instead.
-            assert!(kind.cannot_update().is_some(), "{manager:?}");
+            // And every one of them has something to say instead, on every
+            // architecture — including one no release is built for, where the
+            // answer is a sentence with no file name in it.
+            for arch in [Some(Arch::X86_64), Some(Arch::Aarch64), None] {
+                assert!(
+                    kind.cannot_update(&offered(), arch).is_some(),
+                    "{manager:?} {arch:?}",
+                );
+            }
         }
         assert!(!InstallKind::Unknown.is_self_updatable());
     }
@@ -596,17 +780,125 @@ mod tests {
     #[test]
     fn a_managed_install_names_the_manager_it_belongs_to() {
         let flatpak = InstallKind::Managed(Manager::Flatpak)
-            .cannot_update()
+            .cannot_update(&offered(), Some(Arch::X86_64))
             .expect("a Flatpak cannot self-update");
-        assert!(
-            flatpak.contains("flatpak update io.github.spillebulle.umber"),
-            "{flatpak}",
-        );
-        let rpm = InstallKind::Managed(Manager::Rpm)
-            .cannot_update()
+        assert!(flatpak.contains("Flatpak"), "{flatpak}");
+        let rpm = InstallKind::Managed(Manager::Rpm { archive: false })
+            .cannot_update(&offered(), Some(Arch::X86_64))
             .expect("an rpm cannot self-update");
         // Three distributions share the format with three different front ends,
         // so no command is printed — but the format is still named.
         assert!(rpm.contains("rpm"), "{rpm}");
+    }
+
+    /// **The regression this whole arrangement exists for.**
+    ///
+    /// 0.1.4 told every `.deb` user to run `apt install --only-upgrade umber`.
+    /// There is no archive for apt to consult unless the machine has been given
+    /// one, so that command answered "already the newest version" on every
+    /// machine it was ever run on, and did it in the voice of something that
+    /// had checked. Nothing here may print an upgrade command to a machine that
+    /// has nowhere to upgrade from.
+    #[test]
+    fn no_upgrade_command_is_printed_to_a_machine_with_no_archive() {
+        let never = [
+            "apt install --only-upgrade",
+            "pacman -Syu",
+            "flatpak update",
+            "dnf upgrade",
+            "zypper update",
+        ];
+        for manager in every_manager() {
+            let archived = matches!(
+                manager,
+                Manager::Dpkg { archive: true } | Manager::Rpm { archive: true },
+            );
+            if archived {
+                continue;
+            }
+            for arch in [Some(Arch::X86_64), Some(Arch::Aarch64), None] {
+                let message = InstallKind::Managed(manager)
+                    .cannot_update(&offered(), arch)
+                    .expect("a managed copy says why");
+                for command in never {
+                    assert!(
+                        !message.contains(command),
+                        "{manager:?} {arch:?} was told to run `{command}`:\n{message}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_the_archive_the_message_names_the_file_to_fetch() {
+        // A name somebody can search the releases page for, spelt exactly as
+        // the release workflow spells it. `crates/umber-desktop/tests/release.rs`
+        // is the other half of that agreement.
+        let cases = [
+            (
+                Manager::Dpkg { archive: false },
+                Arch::X86_64,
+                "umber_0.1.2_amd64.deb",
+            ),
+            (
+                Manager::Dpkg { archive: false },
+                Arch::Aarch64,
+                "umber_0.1.2_arm64.deb",
+            ),
+            (
+                Manager::Rpm { archive: false },
+                Arch::X86_64,
+                "umber-0.1.2-1.x86_64.rpm",
+            ),
+            (
+                Manager::Pacman,
+                Arch::X86_64,
+                "umber-bin-0.1.2-1-x86_64.pkg.tar.zst",
+            ),
+            (Manager::Flatpak, Arch::X86_64, "umber-0.1.2-x86_64.flatpak"),
+        ];
+        for (manager, arch, file) in cases {
+            let message = InstallKind::Managed(manager)
+                .cannot_update(&offered(), Some(arch))
+                .expect("a managed copy says why");
+            assert!(message.contains(file), "{manager:?}:\n{message}");
+        }
+    }
+
+    #[test]
+    fn with_the_archive_apt_is_told_to_do_the_upgrade() {
+        let message = InstallKind::Managed(Manager::Dpkg { archive: true })
+            .cannot_update(&offered(), Some(Arch::X86_64))
+            .expect("a managed copy says why");
+        assert!(
+            message.contains("sudo apt update && sudo apt install --only-upgrade umber"),
+            "{message}",
+        );
+        // And no file name, because there is nothing to go and fetch.
+        assert!(!message.contains(".deb"), "{message}");
+    }
+
+    #[test]
+    fn an_architecture_with_no_package_gets_a_sentence_rather_than_a_made_up_name() {
+        // A source build on riscv64, or the Arch package on ARM, which is not
+        // built. Inventing a file name would send somebody looking for a file
+        // that has never existed.
+        for (manager, arch) in [
+            (Manager::Dpkg { archive: false }, None),
+            (Manager::Pacman, Some(Arch::Aarch64)),
+            (Manager::Flatpak, Some(Arch::Aarch64)),
+        ] {
+            let message = InstallKind::Managed(manager)
+                .cannot_update(&offered(), arch)
+                .expect("a managed copy says why");
+            assert!(message.contains("releases page"), "{manager:?}:\n{message}");
+            for extension in [".deb", ".rpm", ".flatpak", ".pkg.tar.zst"] {
+                assert!(
+                    !message.contains(extension),
+                    "{manager:?} {arch:?} named a {extension} that is not built:\n{message}",
+                );
+            }
+        }
     }
 }
