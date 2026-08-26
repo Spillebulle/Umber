@@ -25,14 +25,22 @@
 //! is loaded. That argument is what put the set here in the first place and is
 //! untouched by where the shapes come from.
 //!
-//! ## The five marks Umber still draws
+//! ## The four marks Umber still draws
 //!
 //! §11 allows an application to draw a mark the set does not carry, to Lucide's
 //! own construction and in this module. [`Drawn`] is the whole list, and each
 //! variant says what was searched for and not found. What that exception does
 //! **not** cover is redrawing a mark Lucide already has: a variant that could
-//! name a Lucide icon must, and `every_drawn_mark_is_one_lucide_does_not_carry`
+//! name a Lucide icon must, and `the_marks_umber_draws_itself_are_these_four`
 //! is what keeps the list from growing by habit.
+//!
+//! It was five, and the layer mask is the one that left. This module argued
+//! that Lucide carried no mask because the only thing in the set answering to
+//! the word is `venetian-mask` — a search of the *word* rather than of the
+//! picture, which is how a set of seventeen hundred marks hides one. `view` is
+//! a frame with an eye inside it, which is a layer and how much of it shows
+//! through. The rule above is what caught it; the lesson is that a search
+//! coming back empty is evidence about the search.
 //!
 //! Icons are authored against a 24x24 box and scaled to whatever rect they are
 //! given, so a 16 px and a 32 px instance are the same shape.
@@ -93,8 +101,15 @@ pub enum Icon {
     Eye,
     /// Lucide `eye-off`.
     EyeOff,
-    /// A frame with a disc in it: the layer, and the coverage that hides part
-    /// of it. See [`Drawn::Mask`] — Lucide carries no layer mask.
+    /// Lucide `view`: a frame with an eye inside it. The layer, and how much of
+    /// it shows through.
+    ///
+    /// Umber drew this itself — a frame with a solid disc in it — on the
+    /// argument that the set carried no layer mask, which was a search of the
+    /// word rather than of the picture; see the module docs. Lucide's mark is
+    /// the same idea with an eye where the disc was, so it reads as a mask
+    /// without having to be learnt, and it puts this and [`Icon::Eye`] in one
+    /// family, which is what a layer's eye and its mask are.
     Mask,
     /// Lucide `corner-left-down`: an arrow turning down and to the left, which
     /// is the mark every application uses for "bounded by the layer below".
@@ -254,6 +269,13 @@ pub enum Icon {
     /// [`Icon::Deselect`] already has to [`Icon::Select`], and for the same
     /// reason: this takes one specific thing off, and the mark has to say
     /// which. See [`Drawn::MaskOff`].
+    ///
+    /// Lucide has no `view-off`, read off the 1.34.0 tree rather than assumed:
+    /// `view` is the only mark in the set carrying that name, and none of the
+    /// twenty `-off` twins it ships is one of them. `eye-off` is the near miss
+    /// and is the wrong mark — it negates the eye alone, where this negates the
+    /// frame with the eye in it. So this stays drawn, as [`Icon::Mask`]'s own
+    /// geometry under Lucide's own `m2 2 20 20`.
     MaskOff,
     /// A colour wheel with three of its hues marked: the set of related colours
     /// the Colour panel's Harmony mode is showing, kept. See
@@ -310,12 +332,11 @@ enum Art {
 /// it may not be used for a mark Lucide has; see the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Drawn {
-    /// A layer mask. Searched for `mask`, `layer`, `square-circle`: the only
-    /// thing in the set carrying the word is `venetian-mask`, which is the
-    /// thing you wear to a ball.
-    Mask,
-    /// The same, with a stroke through it. Its pair is [`Drawn::Mask`], so it
-    /// could not come from the set even if the set had a mask.
+    /// A layer mask with a stroke through it. Searched for `view-off`,
+    /// `eye-off`, `mask`: the set carries no `-off` twin of `view`, and
+    /// `eye-off` negates the eye rather than the frame around it, so a pair
+    /// made of `view` and `eye-off` would be two objects rather than one with
+    /// something done to it.
     MaskOff,
     /// The marquee with a stroke through it. Lucide has `square-slash`, and its
     /// box is *solid*: the pair has to read as the same object with something
@@ -545,7 +566,19 @@ impl Icon {
                 ),
                 Node::Path("m2 2 20 20"),
             ]),
-            Self::Mask => Art::Drawn(Drawn::Mask),
+            // view
+            Self::Mask => Art::Lucide(&[
+                Node::Path("M21 17v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-2"),
+                Node::Path("M21 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v2"),
+                Node::Circle {
+                    cx: 12.0,
+                    cy: 12.0,
+                    r: 1.0,
+                },
+                Node::Path(
+                    "M18.944 12.33a1 1 0 0 0 0-.66 7.5 7.5 0 0 0-13.888 0 1 1 0 0 0 0 .66 7.5 7.5 0 0 0 13.888 0",
+                ),
+            ]),
             // corner-left-down
             Self::Clip => Art::Lucide(&[
                 Node::Path("m14 15-5 5-5-5"),
@@ -940,7 +973,7 @@ fn outlines_at(
     }
 }
 
-/// The five marks Lucide does not carry, drawn to its construction: the same
+/// The four marks Lucide does not carry, drawn to its construction: the same
 /// 24x24 box, the same two-unit stroke, the same round joins.
 ///
 /// `origin` is the box's top left in screen space and `scale` takes a unit of
@@ -964,9 +997,16 @@ fn drawn(
     let slash = || line(at(2.0, 2.0), at(22.0, 22.0));
 
     match mark {
-        Drawn::Mask => mask(painter, &at, scale, stroke, colour),
         Drawn::MaskOff => {
-            mask(painter, &at, scale, stroke, colour);
+            // `Icon::Mask`'s own outlines, for the reason `Drawn::Deselect`
+            // takes `Icon::Select`'s: the negated mark has to be the mark it
+            // negates *plus* something. A second drawing of `view` here would
+            // be a copy to keep in step with the one on the sheet beside it,
+            // which is what the hand-drawn pair shared a `mask` function to
+            // avoid; reaching for the geometry is that guarantee with nothing
+            // left to maintain.
+            let frame = geometry(Icon::Mask).expect("`Mask` is a Lucide mark");
+            outlines_at(painter, origin, scale, stroke, colour, frame);
             slash();
         }
         Drawn::Deselect => {
@@ -1005,26 +1045,6 @@ fn drawn(
             }
         }
     }
-}
-
-/// The layer mask: the frame, and the coverage that hides part of what is in
-/// it.
-///
-/// A frame plus a solid shape rather than two outlines, because at 16 px two
-/// nested rings read as a target. One function because [`Drawn::MaskOff`] is
-/// this and a stroke through it.
-fn mask(
-    painter: &Painter,
-    at: &impl Fn(f32, f32) -> Pos2,
-    scale: f32,
-    stroke: Stroke,
-    colour: Color32,
-) {
-    painter.add(Shape::closed_line(
-        vec![at(4.0, 5.0), at(20.0, 5.0), at(20.0, 19.0), at(4.0, 19.0)],
-        stroke,
-    ));
-    painter.circle_filled(at(12.0, 12.0), 4.2 * scale, colour);
 }
 
 #[cfg(test)]
@@ -1165,28 +1185,27 @@ mod tests {
         }
     }
 
-    /// The marks Umber draws itself are these five, and no more.
+    /// The marks Umber draws itself are these four, and no more.
     ///
     /// What it checks is the *list*, not Lucide: nothing here can ask the
-    /// package whether it carries a layer mask, so a sixth hand-drawn mark
+    /// package whether it carries a layer mask, so a fifth hand-drawn mark
     /// fails this test rather than being caught by a search. That is the point
     /// — the failure is what makes somebody write down what they looked for
     /// before adding one, which is what [`Drawn`]'s variants hold.
+    ///
+    /// It was five. [`Icon::Mask`] was drawn here because a search for the
+    /// *word* mask found only `venetian-mask`; the set carries `view`, which is
+    /// the same picture, and the mask is Lucide's now. A list this test blesses
+    /// is only ever as good as the searches written into [`Drawn`] beside it.
     #[test]
-    fn the_marks_umber_draws_itself_are_these_five() {
+    fn the_marks_umber_draws_itself_are_these_four() {
         let drawn: Vec<Icon> = Icon::ALL
             .into_iter()
             .filter(|i| matches!(i.art(), Art::Drawn(_)))
             .collect();
         assert_eq!(
             drawn,
-            vec![
-                Icon::Mask,
-                Icon::Corner,
-                Icon::Deselect,
-                Icon::MaskOff,
-                Icon::Harmony,
-            ],
+            vec![Icon::Corner, Icon::Deselect, Icon::MaskOff, Icon::Harmony,],
             "the set is Lucide's; a mark drawn here needs its search written \
              into `Drawn` and this list extended deliberately"
         );
