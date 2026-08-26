@@ -6063,7 +6063,7 @@ mod tests {
             // across the edge. Both inks have to turn up somewhere: the dashes
             // are the accent and the gaps between them are the underlay.
             let (mut solid_under, mut solid_accent) = (0, 0);
-            for row in (int_range(46.0, 134.0, ppp)).clone() {
+            for row in int_range(46.0, 134.0, ppp) {
                 let y = (row as f32 + 0.5) / ppp;
                 for col in int_range(30.0, 52.0, ppp) {
                     let at = pos2((col as f32 + 0.5) / ppp, y);
@@ -6082,7 +6082,12 @@ mod tests {
         }
     }
 
-    /// Device pixel indices covering a span given in points.
+    /// Device pixel indices whose *centres* lie inside a span given in points.
+    ///
+    /// The guard above samples at `(index + 0.5) / ppp`, which is where a
+    /// rasteriser takes its one sample, so the sweep has to be over indices and
+    /// not over points — a loop stepping by a point would miss whole rows at
+    /// 300% and take the same row twice at 50%.
     fn int_range(from: f32, to: f32, ppp: f32) -> std::ops::Range<u32> {
         (from * ppp).ceil() as u32..(to * ppp).floor() as u32
     }
