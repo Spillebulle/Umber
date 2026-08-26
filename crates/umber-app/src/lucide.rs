@@ -622,23 +622,32 @@ mod tests {
     /// cleared does, and it bends a curve in a direction nothing asked for.
     #[test]
     fn a_smooth_cubic_after_a_line_starts_from_where_it_is() {
+        // **There has to be a cubic earlier in the path**, or a `last_control`
+        // that is never cleared holds `None` anyway and the mutation this test
+        // is about is invisible. So: a curve, a line away from it, then the
+        // smooth cubic — which is the shape that makes a stale control point
+        // reachable at all. Demonstrated by mutation; the first draft of this
+        // fixture had no `c` in it and passed with the clearing removed.
         let mut out = Vec::new();
-        path("M0 0L10 0s0 6 6 6", &mut out);
+        path("M0 0c4 0 6 2 6 6L16 6s0 6 6 6", &mut out);
         let [only] = out.as_slice() else {
             panic!("one subpath, got {}", out.len());
         };
         let join = only
             .points
             .iter()
-            .position(|p| (p.x - 10.0).abs() < 0.01 && p.y.abs() < 0.01)
-            .expect("the line ends at (10, 0)");
-        // With both control points at (10, 6) and (16, 6), a curve that starts
-        // from its own position leaves straight down the y axis.
+            .position(|p| (p.x - 16.0).abs() < 0.01 && (p.y - 6.0).abs() < 0.01)
+            .expect("the line ends at (16, 6)");
+        // With no cubic immediately before it the first control point is the
+        // current point, so with the second at (16, 12) the curve leaves
+        // straight down the y axis. Carrying the earlier `c`'s own second
+        // control point instead reflects (6, 2) about (16, 6) and sends it out
+        // to the right — measured, [0.9, 0.4].
         let leaving = (only.points[join + 1] - only.points[join]).normalized();
         assert!(
             leaving.y > 0.9,
-            "it left along {leaving:?} rather than downwards, so something was \
-             reflected that should not have been"
+            "it left along {leaving:?} rather than downwards, so a control point \
+             from earlier in the path was reflected"
         );
     }
 
