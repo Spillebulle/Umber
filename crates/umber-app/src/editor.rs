@@ -1155,6 +1155,52 @@ impl Editor {
         self.text.editing.as_ref().map_or(self.color, |e| e.colour)
     }
 
+    /// Take back a layer a text placement made, recording nothing.
+    ///
+    /// The counterpart to `App::add_text_layer`, for every way a placement can
+    /// end without committing: Escape, a float that was refused, and a block
+    /// dragged entirely off the canvas. Nothing was written to the layer and
+    /// nothing was recorded about it, so the honest inverse is that it never
+    /// happened — which is also what keeps Escape free, exactly as it is for a
+    /// paste.
+    ///
+    /// **The layer is dropped rather than parked**, and that is the one
+    /// difference from `App::delete_entries`. A parked slice is held alive by
+    /// the undo entry that could put the layer back; there is no such entry
+    /// here, so parking would leak a canvas-sized slice per abandoned placement
+    /// — 400 MB apiece on a 10000² document, for pressing Escape.
+    ///
+    /// By **id**, never by index: this runs a whole gesture after the add.
+    ///
+    /// On `Editor` rather than on `App` because it touches nothing but the
+    /// stack, and that is what lets it be driven with no device — the half of
+    /// the placement that a headless test can actually measure.
+    pub fn unmake_layer(&mut self, made: Option<MadeLayer>) {
+        let Some(made) = made else {
+            return;
+        };
+        let Some(at) = self.layers.layers().iter().position(|l| l.id() == made.id) else {
+            return;
+        };
+        if self.layers.remove(at).is_none() {
+            // `remove` refuses to leave a document with nowhere to paint. A
+            // placement adds its layer *beside* one that already exists, so this
+            // cannot fire; logged rather than asserted because the outcome if it
+            // ever did is one extra empty layer, which is a great deal better
+            // than a panic on a path the artist reached by pressing Escape.
+            log::warn!("a placement's own layer could not be taken back");
+            return;
+        }
+        if let Some(back) = self
+            .layers
+            .layers()
+            .iter()
+            .position(|l| l.id() == made.was_active)
+        {
+            self.layers.set_active(back);
+        }
+    }
+
     /// Point the picker at a colour chosen elsewhere, preserving hue for greys.
     pub fn set_color(&mut self, color: Color) {
         let next = color.to_hsv();
@@ -3377,5 +3423,92 @@ mod tests {
             "the folder's lock has to reach it"
         );
         assert_eq!(ed.interaction, Interaction::Idle);
+    }
+
+    /// Abandoning a placement gives the slice back, not to an undo entry.
+    ///
+    /// The measurement is the **pool**, not the stack length: a deleted layer's
+    /// slice is parked alive by the entry that could restore it, and here there
+    /// is no entry, so a placement abandoned with Escape that parked its slice
+    /// would leak a canvas-sized slice apiece and nothing about the stack would
+    /// say so. `SlotRoom::ceiling` is what sees it — the stack comes back to the
+    /// right length under either rule.
+    #[test]
+    fn abandoning_a_placement_gives_its_slice_back_rather_than_parking_it() {
+        let mut ed = Editor::default();
+        let was_active = ed.layers.get(ed.layers.active_index()).unwrap().id();
+        let ceiling = ed.layers.live_slot_ceiling();
+
+        let made = ed.layers.add_named("Caption").expect("room for one");
+        assert_eq!(ed.layers.len(), 2);
+        assert!(ed.layers.live_slot_ceiling() > ceiling, "it took a slice");
+
+        ed.unmake_layer(Some(MadeLayer {
+            id: made.id,
+            was_active,
+        }));
+        assert_eq!(ed.layers.len(), 1, "the layer went");
+        assert_eq!(
+            ed.layers.live_slot_ceiling(),
+            ceiling,
+            "the slice was parked rather than given back"
+        );
+        assert_eq!(
+            ed.layers.get(ed.layers.active_index()).unwrap().id(),
+            was_active,
+            "the selection went back where the artist left it"
+        );
+    }
+
+    /// It finds the layer by id, so a reorder between the placement and the
+    /// Escape cannot make it take somebody else's layer away.
+    ///
+    /// The fixture reorders deliberately: with the made layer left where it was
+    /// put, its index and its id agree and a lookup by either would pass. This
+    /// is the one-layer-fixture trap in its other form — every wrong index is
+    /// the right one until the stack has moved.
+    #[test]
+    fn an_abandoned_placement_finds_its_own_layer_after_a_reorder() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("a second layer");
+        let was_active = ed.layers.get(ed.layers.active_index()).unwrap().id();
+        let made = ed.layers.add_named("Caption").expect("a third");
+        let at = ed.layers.active_index();
+        let bystander = ed.layers.get(0).unwrap().id();
+
+        // The caption goes to the bottom of the stack, so index 2 is now a
+        // layer it must not touch.
+        ed.layers.reorder(at, 0);
+        assert_ne!(
+            ed.layers.get(0).unwrap().id(),
+            bystander,
+            "the fixture did not actually move anything"
+        );
+
+        ed.unmake_layer(Some(MadeLayer {
+            id: made.id,
+            was_active,
+        }));
+        assert_eq!(ed.layers.len(), 2);
+        assert!(
+            ed.layers.layers().iter().any(|l| l.id() == bystander),
+            "it took the wrong layer away"
+        );
+        assert!(
+            !ed.layers.layers().iter().any(|l| l.id() == made.id),
+            "the caption's own layer is still there"
+        );
+    }
+
+    /// Nothing was made, so nothing is taken back. The case every ordinary
+    /// paste and every lift goes down.
+    #[test]
+    fn a_float_that_made_no_layer_takes_none_away() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("a second layer");
+        let before: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
+        ed.unmake_layer(None);
+        let after: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
+        assert_eq!(before, after);
     }
 }

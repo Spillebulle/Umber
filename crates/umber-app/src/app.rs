@@ -1425,7 +1425,7 @@ impl UmberApp {
                 .as_ref()
                 .is_some_and(|gfx| gfx.canvases.contains_key(&id));
         if nowhere {
-            self.unmake_layer(float.made);
+            self.editor.unmake_layer(float.made);
             if let Some(gfx) = self.gfx.as_mut()
                 && let Some(canvas) = gfx.canvases.get_mut(&id)
             {
@@ -1705,13 +1705,13 @@ impl UmberApp {
     /// layer is empty until the commit writes into it, so taking it out again
     /// puts the document exactly where it was. Nothing was recorded either, so
     /// there is no entry to spend and none to clean up — which is why
-    /// [`Self::unmake_layer`] drops the slice rather than parking it.
+    /// [`Editor::unmake_layer`] drops the slice rather than parking it.
     fn cancel_transform(&mut self) -> bool {
         self.put_down_at = None;
         let Some(float) = self.editor.float.take() else {
             return false;
         };
-        self.unmake_layer(float.made);
+        self.editor.unmake_layer(float.made);
         let id = self.editor.session.active_id();
         if let Some(gfx) = self.gfx.as_mut()
             && let Some(canvas) = gfx.canvases.get_mut(&id)
@@ -2136,7 +2136,7 @@ impl UmberApp {
             // to preview into, or a clip that landed entirely off the canvas.
             // Nothing was recorded, so the layer has to go back rather than be
             // left in the stack with no entry that could take it out.
-            self.unmake_layer(Some(made));
+            self.editor.unmake_layer(Some(made));
         }
     }
 
@@ -2154,7 +2154,7 @@ impl UmberApp {
     ///
     /// Escape is still free for the same reason it is free for any float: the
     /// layer is empty until the commit writes into it, and
-    /// [`Self::unmake_layer`] gives it back with nothing recorded either way.
+    /// [`Editor::unmake_layer`] gives it back with nothing recorded either way.
     ///
     /// `Err` carries the sentence to show. Both refusals are ones the Place
     /// button is already disabled for, so this catches a route that goes round
@@ -2164,28 +2164,36 @@ impl UmberApp {
         // and for `add_layer`'s reason: reserving ahead of a refusal the model
         // is about to make grows the texture array for a layer that will not
         // exist, and answers a full stack with a sentence about graphics memory.
-        if self.editor.layers.len() >= umber_core::LayerStack::MAX {
-            return Err(Notice {
-                title: "There is no room for another layer".to_string(),
-                lines: vec![format!(
-                    "This document already has {} entries, which is all Umber holds. \
-                     Delete a layer to make room, or switch off \"On its own layer\" \
-                     under the Text panel to set the words on the layer that is \
-                     selected.",
-                    umber_core::LayerStack::MAX
-                )],
-            });
-        }
-        if self.selected_folder_is_full() {
-            return Err(Notice {
-                title: "That folder is nested as deep as it goes".to_string(),
-                lines: vec![
-                    "A layer inside it would be one level too deep. Select a layer \
-                     outside it, or switch off \"On its own layer\" under the Text \
-                     panel."
-                        .to_string(),
-                ],
-            });
+        //
+        // A sentence per reason, which is the whole point of `add_refusal`
+        // answering an enum: "there is no room" told to somebody whose folder is
+        // merely nested too deep sends them to delete a layer that would not
+        // have helped.
+        match self.editor.layers.add_refusal() {
+            Some(umber_core::AddRefusal::StackFull) => {
+                return Err(Notice {
+                    title: "There is no room for another layer".to_string(),
+                    lines: vec![format!(
+                        "This document already has {} entries, which is all Umber holds. \
+                         Delete a layer to make room, or switch off \"On its own layer\" \
+                         under the Text panel to set the words on the layer that is \
+                         selected.",
+                        umber_core::LayerStack::MAX
+                    )],
+                });
+            }
+            Some(umber_core::AddRefusal::TooDeep) => {
+                return Err(Notice {
+                    title: "That folder is nested as deep as it goes".to_string(),
+                    lines: vec![
+                        "A layer inside it would be one level too deep. Select a layer \
+                         outside it, or switch off \"On its own layer\" under the Text \
+                         panel."
+                            .to_string(),
+                    ],
+                });
+            }
+            None => {}
         }
         if let Err(refused) = self.reserve_a_slice() {
             return Err(vram::slice_refused("a layer", &refused));
@@ -2244,54 +2252,6 @@ impl UmberApp {
             id: made.id,
             was_active,
         })
-    }
-
-    /// Take back a layer a placement made, recording nothing.
-    ///
-    /// The counterpart to [`Self::add_text_layer`], for every way a placement
-    /// can end without committing: Escape, a float that was refused, and a block
-    /// dragged entirely off the canvas. Nothing was written to the layer and
-    /// nothing was recorded about it, so the honest inverse is that it never
-    /// happened — which is also what makes Escape free, exactly as it is for a
-    /// paste.
-    ///
-    /// The layer is dropped rather than parked, and that is the difference from
-    /// `delete_entries`: a parked slice is held alive by the undo entry that
-    /// could put the layer back, and here there is no such entry, so holding the
-    /// slice would leak one slice per abandoned placement.
-    ///
-    /// By **id**, never by index: this runs a whole gesture after the add.
-    fn unmake_layer(&mut self, made: Option<crate::editor::MadeLayer>) {
-        let Some(made) = made else {
-            return;
-        };
-        let Some(at) = self
-            .editor
-            .layers
-            .layers()
-            .iter()
-            .position(|l| l.id() == made.id)
-        else {
-            return;
-        };
-        if self.editor.layers.remove(at).is_none() {
-            // `remove` refuses to leave a document with nowhere to paint. A
-            // placement adds its layer *beside* one that already exists, so this
-            // cannot fire; logged rather than asserted because the outcome if it
-            // ever did is an extra empty layer, which is a great deal better
-            // than a panic on a path the artist reached by pressing Escape.
-            log::warn!("a placement's own layer could not be taken back");
-            return;
-        }
-        if let Some(back) = self
-            .editor
-            .layers
-            .layers()
-            .iter()
-            .position(|l| l.id() == made.was_active)
-        {
-            self.editor.layers.set_active(back);
-        }
     }
 
     /// Set the selected text layer again from what the Text panel is showing.
@@ -2720,19 +2680,6 @@ impl UmberApp {
         self.editor.history.free_until(move || room.has_headroom())
     }
 
-    /// Would a new layer inside the selected folder be nested too deep?
-    ///
-    /// The second of `LayerStack::add`'s two refusals that a released slice
-    /// cannot mend. Read here rather than asked of the stack, because it is a
-    /// statement about what *this* add would do and the stack's own answer is
-    /// the `None` we are already looking at.
-    fn selected_folder_is_full(&self) -> bool {
-        self.editor
-            .layers
-            .get(self.editor.layers.active_index())
-            .is_some_and(|l| l.is_folder() && l.depth >= umber_core::LayerStack::MAX_DEPTH)
-    }
-
     fn add_layer(&mut self) {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
@@ -2749,10 +2696,12 @@ impl UmberApp {
         // The two conditions are the ones the retry arm below used to state, so
         // this is where they were rather than a second copy of them: hoisted,
         // that arm's "only where a slice is the plausible reason" becomes
-        // automatic instead of restated.
-        if self.editor.layers.len() >= umber_core::LayerStack::MAX || self.selected_folder_is_full()
-        {
-            log::warn!("layer limit reached");
+        // automatic instead of restated. They are `LayerStack::add_refusal`'s
+        // now rather than spelled out here, because a text placement and the
+        // Text panel's Place button both have to agree with this and three
+        // spellings of one rule is three chances to write it differently.
+        if let Some(why) = self.editor.layers.add_refusal() {
+            log::warn!("layer limit reached: {why:?}");
             return;
         }
         // **Before the add**, for the reason `install_import` reserves before it

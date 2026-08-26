@@ -91,7 +91,8 @@ pub use harmony::Harmony;
 pub use history::{Edit, EditBody, EditKind, History, Jump, PixelPatch};
 pub use input::InputPoint;
 pub use layer::{
-    AddedLayer, BlendMode, EditRefusal, EditTarget, Layer, LayerStack, SlotRoom, StackShape,
+    AddRefusal, AddedLayer, BlendMode, EditRefusal, EditTarget, Layer, LayerStack, SlotRoom,
+    StackShape,
 };
 pub use overlay::{Side, Strip};
 // `palette::Palette` is deliberately **not** re-exported at the root. The app

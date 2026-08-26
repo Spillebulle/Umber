@@ -826,6 +826,20 @@ pub fn well_formed(entries: &[(u8, bool)]) -> bool {
     true
 }
 
+/// Why a layer cannot be added. See [`LayerStack::add_refusal`].
+///
+/// An enum rather than a `bool` because the two have different remedies and a
+/// caller that says "there is no room" to somebody whose folder is merely too
+/// deep has sent them to delete a layer that would not have helped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddRefusal {
+    /// The stack already holds [`LayerStack::MAX`] entries, folders included.
+    StackFull,
+    /// The selected folder is at [`LayerStack::MAX_DEPTH`], so a layer inside it
+    /// would be one level too deep.
+    TooDeep,
+}
+
 /// What [`LayerStack::add_named`] hands back.
 ///
 /// Two numbers that answer different questions and are easy to confuse, which
@@ -1475,6 +1489,34 @@ impl LayerStack {
     /// selected layer is. One predicate answering both would refuse an
     /// operation the model allows, which is the control that lies in its other
     /// direction.
+    /// Why a layer added right now would be refused, or `None` where it would
+    /// go ahead.
+    ///
+    /// The other `can_` beside [`LayerStack::add_named`], and it names the two
+    /// refusals **no released slice can mend** — a stack that is already as long
+    /// as Umber holds, and a folder nested as deep as one goes. Deliberately not
+    /// the pool: `add_named` answers `None` for that too, and the caller's
+    /// remedy there is to give a parked slice back and ask again, which is a
+    /// step rather than a verdict.
+    ///
+    /// It exists because three places have to agree about it and used to state
+    /// it twice: `App::add_layer` refuses before reserving a slice, so that a
+    /// full stack is not answered with a sentence about graphics memory;
+    /// `App::add_text_layer` refuses with a sentence *per reason*, because the
+    /// remedies differ; and the Text panel disables Place ahead of both, so the
+    /// button cannot promise what the model will decline. A predicate the
+    /// control and the gate each spell out for themselves is one they will
+    /// eventually spell differently.
+    pub fn add_refusal(&self) -> Option<AddRefusal> {
+        if self.layers.len() >= Self::MAX {
+            return Some(AddRefusal::StackFull);
+        }
+        match self.layers.get(self.active) {
+            Some(l) if l.folder && l.depth >= Self::MAX_DEPTH => Some(AddRefusal::TooDeep),
+            _ => None,
+        }
+    }
+
     pub fn new_layer_would_be_locked(&self) -> bool {
         match self.layers.get(self.active) {
             Some(l) if l.folder => self.effective_locked(self.active),
@@ -5269,5 +5311,62 @@ mod tests {
         let made = s.add_named("Caption").expect("room");
         s.remove(s.active_index());
         assert!(s.shape_before_add(made.id, 0, 4).is_none());
+    }
+
+    /// `add_refusal` names both bounds, and `add_named` agrees with it.
+    ///
+    /// The agreement is the half worth measuring rather than the arithmetic:
+    /// three callers read this predicate to decide whether to *offer* an add,
+    /// and a predicate that answered `None` where `add_named` then said no would
+    /// be a control promising what the model declines. Driven against the real
+    /// `add_named` in both cases, not restated.
+    #[test]
+    fn the_two_refusals_no_slice_can_mend_are_named_and_agree_with_the_add() {
+        let mut s = LayerStack::new();
+        assert_eq!(s.add_refusal(), None, "a fresh stack has room");
+
+        while s.len() < LayerStack::MAX {
+            s.add_named("filler").expect("under the cap");
+        }
+        assert_eq!(s.add_refusal(), Some(AddRefusal::StackFull));
+        assert!(
+            s.add_named("one too many").is_none(),
+            "the model let through what the predicate refused"
+        );
+
+        // A folder nested as deep as one goes, which is a different refusal with
+        // a different remedy - and reachable on a stack that is nowhere near
+        // full, so the two cannot be told apart by the length alone.
+        //
+        // **Built the way a real one arrives, which is an import.** `group`
+        // cannot reach this state: it puts the contents one level deeper than
+        // the folder it makes, so the deepest folder it can produce is at
+        // `MAX_DEPTH - 1` with a layer at `MAX_DEPTH` inside it. What does reach
+        // it is `flatten_ill_formed`, which caps an over-nested source document
+        // at `MAX_DEPTH`, the folder included. Setting `depth` by hand would
+        // have been a malformed stack answering the question - and since the
+        // predicate reads the selected entry alone, it would have passed without
+        // the state ever being one Umber could hold.
+        let mut deep = LayerStack::new();
+        for depth in (0..=LayerStack::MAX_DEPTH).rev() {
+            deep.push_imported(true, depth, format!("Group at {depth}"));
+        }
+        assert!(
+            well_formed(&deep.shape_pairs()),
+            "the fixture is not a stack Umber would ever hold"
+        );
+        let innermost = deep
+            .layers()
+            .iter()
+            .position(|l| l.depth == LayerStack::MAX_DEPTH)
+            .expect("a folder at the cap");
+        deep.set_active(innermost);
+        assert!(deep.get(innermost).unwrap().is_folder());
+        assert!(deep.len() < LayerStack::MAX, "not full, merely deep");
+        assert_eq!(deep.add_refusal(), Some(AddRefusal::TooDeep));
+        assert!(
+            deep.add_named("too deep").is_none(),
+            "the model let through what the predicate refused"
+        );
     }
 }

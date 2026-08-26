@@ -1774,10 +1774,6 @@ struct Landing {
 impl Landing {
     fn of(ed: &Editor) -> Self {
         let own_layer = ed.ui.text_own_layer;
-        let at_depth = ed
-            .layers
-            .get(ed.layers.active_index())
-            .is_some_and(|l| l.is_folder() && l.depth >= umber_core::LayerStack::MAX_DEPTH);
         Self {
             own_layer,
             locked: if own_layer {
@@ -1786,7 +1782,11 @@ impl Landing {
                 ed.layers.active_is_locked()
             },
             folder: !own_layer && ed.layers.active_slot().is_none(),
-            no_room: own_layer && (ed.layers.len() >= umber_core::LayerStack::MAX || at_depth),
+            // **`LayerStack::add_refusal`'s answer, not a second reading of
+            // it.** The button has to be dead exactly where
+            // `App::add_text_layer` will refuse, and two spellings of "is there
+            // room" is how a control comes to promise what the model declines.
+            no_room: own_layer && ed.layers.add_refusal().is_some(),
         }
     }
 }
@@ -2303,7 +2303,10 @@ mod tests {
         assert!(place_state(own, false, None).tooltip.contains("its own"));
         assert!(place_state(here, false, None).tooltip.contains("selected"));
 
-        let locked_own = Landing { locked: true, ..own };
+        let locked_own = Landing {
+            locked: true,
+            ..own
+        };
         let locked_here = Landing {
             locked: true,
             ..here
@@ -3523,5 +3526,58 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         println!("wrote 6 shots to {}", dir.display());
+    }
+
+    /// The switch is on the panel, and the panel draws it.
+    ///
+    /// **A guard on `Landing` is not a guard on the panel**, which is this
+    /// codebase's own lesson and the reason this one reads the text egui
+    /// actually drew: `place_state` could be perfect and the row could be
+    /// missing, and every assertion above it would stay green. Deleting the
+    /// `toggle_row` call is what this fails on.
+    #[test]
+    fn the_text_panel_draws_the_own_layer_switch() {
+        let drawn = panel_text(|ed| {
+            ed.text.block.text = "Chapter One".to_string();
+        });
+        assert!(
+            drawn.contains("On its own layer"),
+            "the switch that decides where a placement lands was not drawn: {drawn}"
+        );
+        assert!(drawn.contains("Place"), "{drawn}");
+    }
+
+    /// Place goes dead where the stack cannot take another layer, and comes back
+    /// the moment the artist switches the mode off.
+    ///
+    /// The pair is the point. A control that was merely dead would be one an
+    /// artist at sixty-four layers could do nothing about, and the tooltip that
+    /// names the remedy is only honest if the remedy works — so both halves are
+    /// measured rather than one asserted and the other described.
+    #[test]
+    fn a_full_stack_kills_place_only_while_the_text_wants_its_own_layer() {
+        let mut ed = Editor::default();
+        while ed.layers.len() < umber_core::LayerStack::MAX {
+            ed.layers.add().expect("under the cap");
+        }
+        ed.text.block.text = "Chapter One".to_string();
+
+        ed.ui.text_own_layer = true;
+        let full = place_state(Landing::of(&ed), false, None);
+        assert!(
+            !full.enabled,
+            "Place promised a layer the model would refuse"
+        );
+        assert!(
+            full.tooltip.contains("On its own layer"),
+            "the remedy does not name the control that fixes it: {}",
+            full.tooltip
+        );
+
+        ed.ui.text_own_layer = false;
+        assert!(
+            place_state(Landing::of(&ed), false, None).enabled,
+            "the remedy the tooltip names does not work"
+        );
     }
 }
