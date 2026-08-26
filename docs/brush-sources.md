@@ -25,6 +25,18 @@ project's owner and marked as such everywhere it appears. It is the rubberduck
 entry below. Nothing else gets the same treatment without the same decision
 being made again.
 
+**A brush that ships under an author's name is converted faithfully, with one
+stated exception: its spacing.** Every pack listed here composites each dab,
+where Umber saturates coverage with a `max`, so an author's own step reads as a
+continuous mark in the application it was written for and scallops here.
+Transcribing it is what makes a brush paint unlike its author's, so
+`preset::SHIPPED_SPACING_CAP` caps it at 10 % for the shipped library — leaving
+a brush whose dabs were already clear of one another exactly as it was spaced,
+because there the gaps are the mark. `docs/brushes.md` has the argument and the
+measurements. It applies to what Umber **ships**, never to what somebody
+imports: a brush brought in through *Import brushes…* keeps the number its
+author wrote.
+
 ## Shipping
 
 ### MyPaint default brushes 2.0.2 — CC0-1.0
