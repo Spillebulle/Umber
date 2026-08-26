@@ -5263,4 +5263,126 @@ mod tests {
         }
         println!("wrote {written} shots to {}", dir.display());
     }
+
+    // -----------------------------------------------------------------------
+    // The selection marquee
+    // -----------------------------------------------------------------------
+
+    /// Set an editor up with one selection over a document the size of the
+    /// field, at zoom 1 and centred.
+    ///
+    /// Zoom 1 and no pan, so a document pixel is a point and the rectangle's
+    /// edges land wherever the arithmetic puts them — which is the case that
+    /// matters, since a marquee is drawn at whatever zoom the artist is at.
+    fn editor_with_selection(doc: glam::UVec2, rings: Vec<Vec<glam::Vec2>>, ppp: f32) -> Editor {
+        let mut ed = Editor::default();
+        ed.pixels_per_point = ppp;
+        // A zoom of `ppp` puts one document pixel on one point, so the two
+        // scales draw the same picture; the fractional centre is what stops
+        // every edge landing on a whole device pixel for free, which is the
+        // case a snap has to earn rather than inherit.
+        ed.camera = umber_core::Camera {
+            zoom: ppp,
+            center: glam::Vec2::new(doc.x as f32 * 0.5 + 0.37, doc.y as f32 * 0.5 + 0.21),
+        };
+        ed.selection = Some(std::sync::Arc::new(
+            umber_core::selection::Selection::from_rings(rings, doc).expect("a selection"),
+        ));
+        ed
+    }
+
+    /// The darkest device pixel in the picture, and how many are within one
+    /// level of it.
+    ///
+    /// The whole of "washed out" is that the darkest pixel of a black line on
+    /// white paper is not black. Looking at a picture says it is soft; this
+    /// says by how much, which is what makes an appearance change arguable.
+    fn darkest(image: &crate::docshot::Image, w: u32, h: u32) -> (u8, u32) {
+        let mut best = 255u8;
+        for y in 0..h {
+            for x in 0..w {
+                let p = image.pixel(x, y);
+                best = best.min(p.r().max(p.g()).max(p.b()));
+            }
+        }
+        let mut count = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let p = image.pixel(x, y);
+                if p.r().max(p.g()).max(p.b()) <= best + 1 {
+                    count += 1;
+                }
+            }
+        }
+        (best, count)
+    }
+
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn marquee_preview() {
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/marquee");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        let field = vec2(320.0, 220.0);
+        let doc = glam::UVec2::new(320, 220);
+        // A rectangle, and a lasso-ish blob beside it. The rectangle is the
+        // case the artist meets; the blob is the staircase a traced mask
+        // produces, which is where a snap has to hold per segment rather than
+        // per ring.
+        let rect_ring = vec![
+            glam::Vec2::new(40.0, 40.0),
+            glam::Vec2::new(160.0, 40.0),
+            glam::Vec2::new(160.0, 140.0),
+            glam::Vec2::new(40.0, 140.0),
+        ];
+        let blob: Vec<glam::Vec2> = (0..24)
+            .map(|i| {
+                let a = i as f32 / 24.0 * std::f32::consts::TAU;
+                glam::Vec2::new(240.0 + 52.0 * a.cos(), 110.0 + 46.0 * a.sin())
+            })
+            .collect();
+
+        let mut written = 0;
+        for (theme, ink) in [
+            (ThemeKind::Graphite, "graphite"),
+            (ThemeKind::Paper, "paper"),
+        ] {
+            let palette = Palette::of(theme);
+            // White paper is the case reported, and black is its opposite: the
+            // pair has to read on both, which is what `accent_underlay` is for.
+            for (paper, paper_name) in [
+                (egui::Color32::WHITE, "white"),
+                (egui::Color32::from_gray(128), "grey"),
+                (egui::Color32::BLACK, "black"),
+            ] {
+                for ppp in [1.0f32, 2.0] {
+                    let mut ed =
+                        editor_with_selection(doc, vec![rect_ring.clone(), blob.clone()], ppp);
+                    ed.ui.theme = theme;
+                    let image = stage.shoot(field, ppp, &palette, paper, |ui| {
+                        let rect = ui.max_rect();
+                        ui.painter().rect_filled(rect, 0.0, paper);
+                        super::selection_outline(ui, &palette, &mut ed, rect);
+                    });
+                    let (w, h) = (
+                        (field.x * ppp).round() as u32,
+                        (field.y * ppp).round() as u32,
+                    );
+                    let (dark, n) = darkest(&image, w, h);
+                    println!("{ink}/{paper_name}/@{ppp}: darkest {dark}, {n} pixels at it");
+                    docshot::write_png(&dir.join(format!("{ink}-{paper_name}-{ppp}x.png")), &image)
+                        .expect("write the png");
+                    written += 1;
+                }
+            }
+        }
+        println!("wrote {written} shots to {}", dir.display());
+    }
 }

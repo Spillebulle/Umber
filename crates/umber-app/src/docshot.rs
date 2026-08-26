@@ -142,7 +142,10 @@ pub(crate) struct Image {
 }
 
 impl Image {
-    fn pixel(&self, x: u32, y: u32) -> Color32 {
+    /// `pub(crate)` so a preview test can *measure* what it drew rather than
+    /// only look at it: `marquee_preview` reads the darkest device pixel across
+    /// the outline, which is the whole of what "washed out" means.
+    pub(crate) fn pixel(&self, x: u32, y: u32) -> Color32 {
         let i = ((y * self.width + x) * 3) as usize;
         Color32::from_rgb(self.rgb[i], self.rgb[i + 1], self.rgb[i + 2])
     }
