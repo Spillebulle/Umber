@@ -12,10 +12,9 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
-## 0.1.4 — 2026-08-13
+## 0.1.5
 
-A fix for 0.1.3, which would not start on some machines, smoother lines when
-you zoom out, and a new set of icons.
+A new set of icons, and Linux packages that can actually upgrade themselves.
 
 ### New
 
@@ -23,7 +22,22 @@ you zoom out, and a new set of icons.
   [Lucide](https://lucide.dev), the set used across this family of
   applications. Every mark is the same size and weight it was, and means the
   same thing; five of them stay hand-drawn because Lucide has no mark for a
-  layer mask, a deselect, a resize corner or a colour harmony.
+  layer mask, a deselect, a resize corner or a colour harmony. The transform
+  tool's mark changed the most: it is a box with a handle at each corner now,
+  which is what the tool draws on the canvas.
+- **The `.deb` and `.rpm` enrol your machine in Umber's package archive.** The
+  updater used to tell you to run an upgrade command that could not work,
+  because there was no archive to upgrade from. Install either package now and
+  your package manager keeps Umber current the way it keeps everything else
+  current. There is an opt-out, and nothing else on your system is touched.
+
+## 0.1.4 — 2026-08-13
+
+A fix for 0.1.3, which would not start on some machines, and smoother lines when
+you zoom out.
+
+### New
+
 - **The canvas is filtered when you zoom out.** Thin lines used to break up and
   crawl as you panned, because each screen pixel showed one document pixel and
   ignored the rest it covered. Each pixel now shows the average of what it
