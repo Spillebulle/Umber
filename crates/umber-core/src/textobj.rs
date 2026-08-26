@@ -1330,4 +1330,52 @@ mod tests {
         assert!(!name.is_empty(), "Archivo carries one");
         assert!(!name.contains(' '), "a PostScript name has no spaces");
     }
+
+    /// The name is the words, and the four ways that can go wrong.
+    ///
+    /// Each case is one somebody's caption really produces.
+    #[test]
+    fn a_layer_is_named_after_the_words_on_it() {
+        assert_eq!(layer_name("Chapter One"), "Chapter One");
+        // The first line with anything on it, not the first line.
+        assert_eq!(layer_name("\n\n  Chapter One\nand more"), "Chapter One");
+        // Whitespace collapsed, so a tab never reaches `stack.xml`.
+        assert_eq!(layer_name("Chapter\tOne   again"), "Chapter One again");
+        // Cut at a word boundary, with no mark saying so.
+        let long = "The quick brown fox jumps over the lazy dog";
+        assert_eq!(layer_name(long), "The quick brown fox");
+        assert!(
+            !layer_name(long).contains('.'),
+            "nothing marks a name that was cut"
+        );
+    }
+
+    /// A single word past the budget has no word boundary to cut at, and the cut
+    /// has to be on a character.
+    ///
+    /// Driven with a multi-byte word deliberately: at `MAX_LAYER_NAME_CHARS`
+    /// *bytes* this string is cut in the middle of a character, which is a panic
+    /// rather than a wrong answer — the trap `clean_name` already names — so a
+    /// test over ASCII alone would agree with a broken implementation.
+    #[test]
+    fn a_word_longer_than_the_whole_budget_is_cut_on_a_character() {
+        let long = "\u{e5}".repeat(60);
+        let name = layer_name(&long);
+        assert_eq!(name.chars().count(), MAX_LAYER_NAME_CHARS);
+        assert_eq!(name, "\u{e5}".repeat(MAX_LAYER_NAME_CHARS));
+    }
+
+    /// Total, so no caller has a second answer to draw.
+    ///
+    /// The control-character line is the one that is not obvious: `\u{7}` is not
+    /// whitespace, so it survives `split_whitespace` and would otherwise name a
+    /// layer with something no panel can draw. That is exactly the bug
+    /// `palette::clean_line` was written for, one module along.
+    #[test]
+    fn text_with_nothing_drawable_in_it_still_names_its_layer() {
+        assert_eq!(layer_name(""), "Text");
+        assert_eq!(layer_name("   \n\t  \n"), "Text");
+        assert_eq!(layer_name("\u{7}\u{7}"), "Text");
+        assert_eq!(layer_name("\u{7}Hi\u{7}"), "Hi");
+    }
 }

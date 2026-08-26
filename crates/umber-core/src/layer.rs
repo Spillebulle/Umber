@@ -5142,4 +5142,130 @@ mod tests {
         assert!(s.get(1).unwrap().effects().is_empty());
         assert!(s.get(2).unwrap().effects().is_empty());
     }
+
+    /// **A new layer is not locked by the layer it is put beside.** The two
+    /// readings a control could take here disagree on this fixture and agree on
+    /// nearly every other, which is what makes it worth writing: a locked layer
+    /// inside an unlocked folder is a place a new layer may perfectly well go,
+    /// and `active_is_locked` — the predicate the Place button used before there
+    /// was anywhere else for text to land — answers that it may not.
+    ///
+    /// The folder half is the one that must still refuse: a new layer made with
+    /// a locked folder selected goes *inside* it and inherits the lock.
+    #[test]
+    fn only_what_encloses_a_new_layer_can_lock_it() {
+        let mut s = grouped();
+        // "Layer 2", inside the unlocked "Group 1".
+        s.set_active(1);
+        s.get_mut(1).unwrap().locked = true;
+        assert!(s.active_is_locked(), "the fixture's own layer is locked");
+        assert!(
+            !s.new_layer_would_be_locked(),
+            "a sibling of a locked layer is not itself locked"
+        );
+
+        // The folder round it, selected. Now the new layer goes inside.
+        s.get_mut(1).unwrap().locked = false;
+        s.set_active(3);
+        s.get_mut(3).unwrap().locked = true;
+        assert!(
+            s.new_layer_would_be_locked(),
+            "a layer added inside a locked folder inherits the lock"
+        );
+
+        // And the ancestor case with a layer selected: the folder is locked and
+        // the sibling is not, so the new layer is locked all the same.
+        s.set_active(1);
+        assert!(
+            s.new_layer_would_be_locked(),
+            "an unlocked layer inside a locked folder is still a locked place"
+        );
+    }
+
+    /// A layer added under a name of its own keeps it, and hands back both
+    /// numbers.
+    ///
+    /// The id is the half worth checking: it is what a caller holds across a
+    /// gesture, and a fixture of one layer could not tell it from the slot,
+    /// because on a fresh stack both count from the same place. Two adds and a
+    /// reorder is what makes them disagree.
+    #[test]
+    fn a_layer_added_by_name_keeps_it_and_says_which_entry_it_is() {
+        let mut s = LayerStack::new();
+        s.add();
+        let made = s.add_named("Chapter One").expect("room for a third layer");
+        assert_eq!(s.get(s.active_index()).unwrap().name, "Chapter One");
+        assert_eq!(made.slot, 2);
+        s.reorder(2, 0);
+        assert_eq!(
+            s.layers().iter().position(|l| l.id == made.id),
+            Some(0),
+            "the id finds the layer where the index no longer would"
+        );
+        assert_eq!(s.get(0).unwrap().name, "Chapter One");
+    }
+
+    /// Undoing a text placement takes the whole layer back out, and puts the
+    /// selection where it was.
+    ///
+    /// This is the shape of the entry a placement records, driven on the model
+    /// alone: `shape_before_add` is derived from the stack **after** the layer
+    /// exists, so restoring it has to remove exactly that one entry and leave
+    /// every other alone — including one added *after* it, which is the case a
+    /// snapshot taken at the add would have got wrong.
+    #[test]
+    fn the_shape_before_an_add_removes_only_that_entry() {
+        let mut s = LayerStack::new();
+        s.add();
+        let was_active = s.get(s.active_index()).unwrap().id;
+        let made = s.add_named("Caption").expect("room");
+        // A layer added afterwards, which the recorded shape must keep. A
+        // snapshot taken at the moment "Caption" appeared would not name it, so
+        // restoring that snapshot would delete somebody else's layer.
+        s.add();
+        let later = s.get(s.active_index()).unwrap().id;
+
+        let before = s
+            .shape_before_add(made.id, was_active, 4)
+            .expect("the made layer is in the stack");
+        let back = s.restore_shape(before);
+
+        assert!(
+            !s.layers().iter().any(|l| l.id == made.id),
+            "the text layer is gone"
+        );
+        assert!(
+            s.layers().iter().any(|l| l.id == later),
+            "the layer added afterwards survived"
+        );
+        assert_eq!(
+            s.get(s.active_index()).unwrap().id,
+            was_active,
+            "the selection went back where the artist left it"
+        );
+
+        // And redoing puts it back, with its name and its slice, because the
+        // shape that came back is holding the whole layer.
+        s.restore_shape(back);
+        let at = s
+            .layers()
+            .iter()
+            .position(|l| l.id == made.id)
+            .expect("the layer came back");
+        assert_eq!(s.get(at).unwrap().name, "Caption");
+        assert_eq!(s.get(at).unwrap().slot(), Some(made.slot));
+    }
+
+    /// `shape_before_add` answers rather than asserting when the entry has gone.
+    ///
+    /// The caller's fall-back depends on it: a shape naming an entry that is not
+    /// there is one `restore_shape` refuses whole, so the placement records an
+    /// ordinary pixel entry instead of a structural one that would do nothing.
+    #[test]
+    fn a_shape_before_an_add_that_is_no_longer_there_is_refused() {
+        let mut s = LayerStack::new();
+        let made = s.add_named("Caption").expect("room");
+        s.remove(s.active_index());
+        assert_eq!(s.shape_before_add(made.id, 0, 4).is_none(), true);
+    }
 }
