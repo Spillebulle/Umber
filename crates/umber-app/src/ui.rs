@@ -30,8 +30,8 @@ use crate::tweaks::Tweak;
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use umber_core::{
-    BlendMode, Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan,
-    Selection, SelectionMode, SelectionOp, input::PressureSource,
+    BlendMode, Brush, DabInput, DabTarget, GrainPattern, ModeSetting, Modulation, ResponseCurve,
+    ScrollSpan, Selection, SelectionDraft, SelectionMode, SelectionOp, input::PressureSource,
 };
 
 /// Requests the UI makes that need GPU access, handled by the caller.
@@ -560,11 +560,11 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         // Into the editor's own buffer rather than a fresh one: this is the
         // one part of the selection path that runs every frame.
         draft.outline_into(selection_outline);
-        // Only the rectangle is closed while it is being drawn: its four
-        // corners *are* the shape. A lasso mid-drag and a polygon two clicks in
-        // are paths, and drawing the edge back to the start would promise a
-        // shape the next moment is going to change.
-        draw_ring(selection_outline, draft.mode() == SelectionMode::Rectangle);
+        // Which modes draw shut mid-gesture is `SelectionDraft::outline_closed`'s
+        // to say rather than this file's: it is a statement about the gesture,
+        // and the `mode() == Rectangle` that used to be here was one new mode
+        // away from drawing an ellipse with a bite out of it.
+        draw_ring(selection_outline, draft.outline_closed());
     }
 }
 
@@ -1979,6 +1979,18 @@ mod strip_budget {
     /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn` declines to
     /// sweep and says why.
     pub const FEATHER: f32 = 185.0;
+    /// The one rail the current selection mode owns: the rectangle's Roundness
+    /// or the lasso's Stabiliser.
+    ///
+    /// One figure for the pair because they are the same control — a percentage
+    /// rail, a label of nine or ten characters, and a field reserving the three
+    /// digits of "100" plus a caret's room. "Stabiliser" is the longer of the
+    /// two by one character, and it is the same word the brush strip's third
+    /// rail carries, so this is [`STABILISER`]'s 190 rather than a figure of its
+    /// own. Widened by hand for [`FEATHER`]'s reason — the Select strip is the
+    /// one `every_rail_on_the_strip_fits_the_budget_that_lets_it_be_drawn`
+    /// declines to sweep, and says why.
+    pub const SELECT_MODE_RAIL: f32 = 190.0;
     /// The eyedropper's second sentence: what a drag off the window does, or
     /// why it does nothing here. Both readings are within a few characters of
     /// each other, so unlike the navigation pair one figure covers them.
@@ -2248,6 +2260,30 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 divider(ui, p);
                 widgets::inline_slider(ui, p, &mut ed.ui.selection_feather, &strip_feather_rail());
             }
+            // The mode's own rail, and it is last of the controls because it is
+            // the one that only *one* mode answers to — the operations and the
+            // feather are the same four and the same softening whichever
+            // outline is being drawn, so a narrow window should drop this
+            // before either of them. `SelectionMode::extra` is what decides
+            // there is one; the draft records both settings whatever the mode,
+            // so nothing here has to be kept in step with what it drew.
+            if room
+                >= strip_budget::SELECT_OP + strip_budget::FEATHER + strip_budget::SELECT_MODE_RAIL
+                && let Some(setting) = ed.ui.selection_mode.extra()
+            {
+                divider(ui, p);
+                let (value, rail) = match setting {
+                    ModeSetting::Roundness => (
+                        &mut ed.ui.selection_roundness,
+                        strip_percent_rail("Roundness", 1.0),
+                    ),
+                    ModeSetting::Stabiliser => (
+                        &mut ed.ui.selection_stabiliser,
+                        strip_percent_rail("Stabiliser", SelectionDraft::MAX_STABILISER),
+                    ),
+                };
+                widgets::inline_slider(ui, p, value, &rail);
+            }
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(ed.ui.selection_mode.hint())
@@ -2343,8 +2379,44 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
 }
 
-/// The selection tool's mode switch: the mode name and a chevron, opening a
-/// list of the three.
+/// The mark for one selection mode: a picture of the outline the gesture
+/// leaves.
+///
+/// Rectangle's is [`Icon::Select`], the tool's own dashed square, which is
+/// exactly what a rectangular marquee looks like on the canvas. That does mean
+/// the tool glyph at the left of the strip and this trigger draw the same mark
+/// while the default mode is in force; see [`Icon::SelectEllipse`] for why
+/// that is agreement rather than duplication.
+///
+/// Exhaustive, so a fifth mode has to be given a mark rather than falling
+/// through to whichever one a wildcard named.
+const fn mode_mark(mode: SelectionMode) -> Icon {
+    match mode {
+        SelectionMode::Rectangle => Icon::Select,
+        SelectionMode::Ellipse => Icon::SelectEllipse,
+        SelectionMode::Lasso => Icon::SelectLasso,
+        SelectionMode::Polygon => Icon::SelectPolygon,
+    }
+}
+
+/// How wide the mode trigger draws itself, in points.
+///
+/// [`widgets::DropdownWidth::Exact`] rather than `Content`, which is what a
+/// trigger in a row usually takes, because the *menu* is as wide as its trigger
+/// and the rows in it are marks beside names — a menu sized to "Lasso" would
+/// clip "Rectangle" on the row above it. Fixed also means the strip's own
+/// budget does not move when the mode changes, so the rails after it do not
+/// shuffle sideways as somebody picks.
+///
+/// A fixed width is the control `docs`' "a widened enum silently breaks a
+/// fixed-width control" is about, so
+/// `the_selection_mode_picker_fits_every_mode_name` walks
+/// `SelectionMode::ALL` through the real font and measures what is left after
+/// the mark and the chevron.
+const SELECT_MODE_WIDTH: f32 = 92.0;
+
+/// The selection tool's mode switch: the mode's mark, its name and a chevron,
+/// opening a list of the four.
 ///
 /// [`widgets::dropdown`], like every other dropdown in the interface. It used
 /// to paint a filled `p.control` pill behind itself so it would read as a
@@ -2355,22 +2427,33 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 /// meaning one thing here and another in Settings, where the chips remain.
 /// What says this opens is the chevron, which is what says it everywhere else
 /// too.
+///
+/// **It keeps its leading mark**, which is the one exception `widgets::dropdown`
+/// already names: a mark is drawn where there is a natural one, and here the
+/// choice *is* a shape. That is also why the menu rows are
+/// [`widgets::menu_choice`] rather than `selectable_label` — a list of four
+/// outlines told apart by their names alone would be spending four pictures the
+/// interface already has.
 fn selection_mode_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    let label = ed.ui.selection_mode.label();
-    widgets::dropdown(ui, p, widgets::Dropdown::new(label), |ui| {
-        for mode in SelectionMode::ALL {
-            if ui
-                .selectable_label(ed.ui.selection_mode == mode, mode.label())
-                .clicked()
-            {
-                ed.ui.selection_mode = mode;
-                // A half-drawn outline belongs to the mode that was drawing it,
-                // and a polygon left open under the lasso would take its next
-                // click as a vertex.
-                ed.cancel_selection_draft();
+    let current = ed.ui.selection_mode;
+    widgets::dropdown(
+        ui,
+        p,
+        widgets::Dropdown::new(current.label())
+            .icon(mode_mark(current))
+            .width(widgets::DropdownWidth::Exact(SELECT_MODE_WIDTH)),
+        |ui| {
+            for mode in SelectionMode::ALL {
+                if widgets::menu_choice(ui, p, mode_mark(mode), mode.label(), current == mode) {
+                    ed.ui.selection_mode = mode;
+                    // A half-drawn outline belongs to the mode that was drawing
+                    // it, and a polygon left open under the lasso would take its
+                    // next click as a vertex.
+                    ed.cancel_selection_draft();
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 /// What a new shape does to the selection already standing: four marks, of
@@ -4402,6 +4485,129 @@ mod tests {
             "it runs to {:.0} points on a {:.0} point strip",
             widest_overrun.unwrap().1,
             widest_overrun.unwrap().0
+        );
+    }
+
+    /// **The selection mode picker is wide enough for the widest mode name.**
+    ///
+    /// [`SELECT_MODE_WIDTH`] is [`widgets::DropdownWidth::Exact`], and Exact
+    /// does not grow: a width a few points short clips the word rather than
+    /// widening the trigger, which is how the layer row's blend picker came to
+    /// draw "Luminosit" when `BlendMode` went from five variants to twenty-
+    /// three. The same hazard, in a picker that has just gained a fourth mode
+    /// and a leading mark.
+    ///
+    /// Measured against the font the trigger actually uses and against
+    /// **every** label, and the room is `widgets::dropdown_label_room` — the
+    /// widget's own arithmetic — rather than a subtraction restated here, so
+    /// this cannot agree with a rule the trigger does not follow.
+    #[test]
+    fn the_selection_mode_picker_fits_every_mode_name() {
+        use crate::theme::text;
+        use crate::widgets;
+        use umber_core::SelectionMode;
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut widest: (f32, &str) = (0.0, "");
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(text::TINY);
+            for mode in SelectionMode::ALL {
+                let w = ui
+                    .painter()
+                    .layout_no_wrap(mode.label().to_owned(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x;
+                if w > widest.0 {
+                    widest = (w, mode.label());
+                }
+            }
+        });
+        let room = widgets::dropdown_label_room(super::SELECT_MODE_WIDTH, true, None, 0.0);
+        assert!(
+            widest.0 <= room,
+            "\"{}\" needs {:.1} points and the trigger leaves {:.1}; raise \
+             SELECT_MODE_WIDTH",
+            widest.1,
+            widest.0,
+            room
+        );
+    }
+
+    /// The mode's own rail is drawn for the mode that owns it and for no other.
+    ///
+    /// A guard on `SelectionMode::extra` would only say what that function
+    /// answers; this reads the **labels the strip actually painted**, which is
+    /// the difference between the model being right and the strip calling it.
+    /// Deleting the `extra()` call from `options_strip` leaves the model's own
+    /// test green and fails this one.
+    #[test]
+    fn each_selection_mode_draws_its_own_rail_and_nobody_elses() {
+        use crate::editor::Tool;
+        use umber_core::{ModeSetting, SelectionMode};
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+
+        let mut ever_drew = (false, false);
+        for mode in SelectionMode::ALL {
+            let mut ed = Editor::default();
+            ed.ui.tool = Tool::Select;
+            ed.ui.selection_mode = mode;
+            let mut drawn = Vec::new();
+            // Twice: the first pass through a fresh context builds the font
+            // atlas, and a field measured against a half-built one is not the
+            // width it settles at.
+            for _ in 0..2 {
+                drawn.clear();
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        // Wide enough that no budget can be what drops a rail:
+                        // this is about the mode, not about the room.
+                        vec2(1400.0, metrics::OPTIONS_STRIP),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                        .show(ui, |ui| {
+                            ui.set_height(metrics::OPTIONS_STRIP);
+                            super::options_strip(ui, &palette, &mut ed);
+                        });
+                });
+                for clipped in &output.shapes {
+                    strings_in(&clipped.shape, &mut drawn);
+                }
+            }
+            let saw = |text: &str| drawn.iter().any(|d| d.text == text);
+            assert_eq!(
+                saw("Roundness"),
+                mode.extra() == Some(ModeSetting::Roundness),
+                "{mode:?} and the Roundness rail disagree"
+            );
+            assert_eq!(
+                saw("Stabiliser"),
+                mode.extra() == Some(ModeSetting::Stabiliser),
+                "{mode:?} and the Stabiliser rail disagree"
+            );
+            // The name of the mode is on the trigger whatever the mode, which
+            // is what says the strip drew at all — without it a strip that drew
+            // nothing would pass every line above.
+            assert!(saw(mode.label()), "{mode:?} drew no picker");
+            ever_drew.0 |= saw("Roundness");
+            ever_drew.1 |= saw("Stabiliser");
+        }
+        // And both were drawn *somewhere*, or the two lines above are a pair of
+        // falses agreeing with each other — which is what they would be if
+        // `extra` answered `None` for everything.
+        assert_eq!(
+            ever_drew,
+            (true, true),
+            "a rail this test is about was never drawn for any mode"
         );
     }
 

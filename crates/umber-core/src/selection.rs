@@ -1303,11 +1303,14 @@ const MAX_ARC_STEPS: u32 = 512;
 /// A radius at or under the tolerance is a corner nobody can see, so it is one
 /// segment.
 fn arc_steps(r: f32) -> u32 {
-    if !(r > ARC_TOLERANCE) {
+    // Written as a NaN test and a comparison rather than a negated `>`, so
+    // that the case a radius comes out of a drag as NaN is stated rather than
+    // relying on how `!` reads over a partial order.
+    if r.is_nan() || r <= ARC_TOLERANCE {
         return 1;
     }
     let theta = 2.0 * (1.0 - ARC_TOLERANCE / r).clamp(-1.0, 1.0).acos();
-    if !(theta > 0.0) {
+    if theta.is_nan() || theta <= 0.0 {
         return MAX_ARC_STEPS;
     }
     ((std::f32::consts::FRAC_PI_2 / theta).ceil() as u32).clamp(1, MAX_ARC_STEPS)
@@ -1346,7 +1349,9 @@ fn rounded_rect_ring(a: Vec2, b: Vec2, roundness: f32, out: &mut Vec<Vec2>) {
     let max = a.max(b);
     let size = max - min;
     let r = 0.5 * size.min_element() * roundness.clamp(0.0, 1.0);
-    if !(r > 0.0) {
+    // NaN reaches here from a roundness typed into the rail, and `clamp`
+    // passes one straight through; a square is the safe answer for it.
+    if r.is_nan() || r <= 0.0 {
         out.extend_from_slice(&[min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]);
         return;
     }
@@ -1443,7 +1448,7 @@ fn smoothing_passes(points: &[Vec2]) -> u32 {
     }
     let travel: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
     let spacing = travel / (points.len() - 1) as f32;
-    if !(spacing > LASSO_SEGMENT) {
+    if spacing.is_nan() || spacing <= LASSO_SEGMENT {
         return 0;
     }
     let passes = (spacing / LASSO_SEGMENT).log2().ceil();
