@@ -110,6 +110,18 @@ pub enum Icon {
     /// the same idea with an eye where the disc was, so it reads as a mask
     /// without having to be learnt, and it puts this and [`Icon::Eye`] in one
     /// family, which is what a layer's eye and its mask are.
+    ///
+    /// **The hand-drawn mark carried a legibility argument and it has been
+    /// answered rather than deleted**, because the substitution is precisely
+    /// what it warned against. It read: a frame plus a *solid* shape rather
+    /// than two outlines, because at 16 px two nested rings read as a target.
+    /// Lucide's mark is two nested outlines, and it is drawn at 14 in a brush
+    /// chip and at [`crate::ui::ICON_BUTTON_MARK`]'s 12 in a header — both
+    /// under the size that argument was made against. Looked at on
+    /// `icon_sheet`, which now shoots 12 for this reason, it holds: the two
+    /// outlines are a rounded **rectangle** and a **lens**, so they do not
+    /// concentre, and the pupil is the solid mark in the middle that the disc
+    /// used to be. Rings were the hazard, not outlines.
     Mask,
     /// Lucide `corner-left-down`: an arrow turning down and to the left, which
     /// is the mark every application uses for "bounded by the layer below".
@@ -1238,12 +1250,20 @@ mod tests {
 
     /// Not a guard: a way to look at the set.
     ///
-    /// Writes a sheet of every icon in both themes, at the two sizes the
+    /// Writes a sheet of every icon in both themes, at the three sizes the
     /// interface actually draws them, so a migration can be judged by eye. It
     /// is what caught the one real defect in this one — `scaling` and
     /// `external-link` are the same mark at 18 px — which no assertion over
     /// path data could have found, because both icons were exactly what the
     /// package says they are.
+    ///
+    /// **The smallest row is `crate::ui::ICON_BUTTON_MARK`**, taken from the
+    /// constant rather than typed, so the sheet cannot go on showing a size the
+    /// interface has stopped drawing. It is also the size at which
+    /// `icons::draw`'s stroke stops thinning: the weight is `(2 * size / 24)`
+    /// held at a floor of 1.0, and 12 is exactly where the two meet, so
+    /// anything drawn smaller than the header's mark gets a stroke too heavy
+    /// for it and blots. That is the row to look at first.
     ///
     /// Into the temporary directory rather than the tree: nothing here is
     /// checked in, and the picture is out of date the moment an icon moves.
@@ -1261,7 +1281,7 @@ mod tests {
             let palette = Palette::of(kind);
             let cols = 9;
             let rows = Icon::ALL.len().div_ceil(cols);
-            let cell = 44.0;
+            let cell = 58.0;
             let size = egui::vec2(cols as f32 * cell, rows as f32 * cell);
             let image = stage.shoot(size, 2.0, &palette, palette.window, |ui| {
                 let painter = ui.painter().clone();
@@ -1282,6 +1302,14 @@ mod tests {
                         egui::Vec2::splat(14.0),
                     );
                     draw(&painter, small, *icon, palette.text_dim);
+                    // And a module header's own mark, which is the smallest
+                    // instance in the interface and therefore the one that
+                    // decides whether a mark reads at all.
+                    let header = egui::Rect::from_min_size(
+                        top + egui::vec2(x + 8.0, y + 42.0),
+                        egui::Vec2::splat(crate::ui::ICON_BUTTON_MARK),
+                    );
+                    draw(&painter, header, *icon, palette.text_dim);
                 }
             });
             let out = std::env::temp_dir().join(name);
