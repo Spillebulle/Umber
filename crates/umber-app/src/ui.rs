@@ -457,8 +457,9 @@ const ANT_SPEED: f32 = 2.0 * ANT_DASH;
 /// about rather than saying "any fractional scale". The core is under-covered
 /// only where the nearest whole number of device pixels is *even* while the
 /// scale is not, and that is the interval from 150% up to 200%; 125% rounds to
-/// one, lands on a pixel centre and was already crisp. So this is invisible on
-/// the two settings anybody developing would look at. Measured over white paper:
+/// one, lands on a pixel centre and was already crisp. So it is invisible at
+/// 100% and 200%, which are the two scales anybody developing would be at.
+/// Measured over white paper:
 /// the darkest pixel of the dark half is 0 at 100%, 125% and 200%, and **64** at
 /// 150%, where the accent reads 160 against its own 192.
 ///
@@ -550,7 +551,8 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
     // not draw its outline across it.
     let painter = ui.painter().with_clip_rect(rect);
     // See `ant_width`: one *point* is a soft, two-pixel line at 150% and 175%
-    // scaling, and 150% is what most Windows laptops ship set to.
+    // scaling, which are two of the settings Windows offers and neither of them
+    // is a scale anybody developing this would have been looking at.
     let width = ant_width(ui.ctx().pixels_per_point());
     // Field by field, so the buffers can be borrowed while the selection and
     // the draft are read. They are the editor's for the reason given there:
@@ -1464,10 +1466,15 @@ const GLASS_SEGMENTS: usize = 96;
 
 /// Where the light falls on the lens, as an angle in the painter's y-down frame.
 ///
-/// Up and to the left, which is where this design lights everything raised
-/// from. **Fixed rather than following the pointer**: a highlight that swung
-/// round as the hand moved would read as the picture sliding about under the
-/// glass rather than as a lens being carried over it.
+/// Up and to the left, which is the direction every drawing tradition and every
+/// interface toolkit lights a raised thing from. It is **not** a convention this
+/// interface already had: the lens is the only shaded surface in Umber, so this
+/// sets one rather than following one, and anything raised added later should
+/// agree with it.
+///
+/// **Fixed rather than following the pointer**: a highlight that swung round as
+/// the hand moved would read as the picture sliding about under the glass rather
+/// than as a lens being carried over it.
 const GLASS_LIGHT: f32 = -3.0 * std::f32::consts::FRAC_PI_4;
 
 /// How dark the glass goes at its own edge, as a fraction of [`contrast::SHADE`].
