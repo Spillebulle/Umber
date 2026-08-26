@@ -2910,9 +2910,13 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         ui,
         p,
         if ed.brush.flow < 1.0 {
-            "Each dab lays down less than the finished mark, so the stroke              builds towards it and darkens where it crosses itself. Opacity              still caps the whole stroke, once."
+            "Each dab lays down less than the finished mark, so the stroke \
+             builds towards it and darkens where it crosses itself. Opacity \
+             still caps the whole stroke, once."
         } else {
-            "Every dab carries the full mark, so the stroke is as strong at its              first dab as anywhere else and crossing it changes nothing. Lower              this to make a stroke build."
+            "Every dab carries the full mark, so the stroke is as strong at \
+             its first dab as anywhere else and crossing it changes nothing. \
+             Lower this to make a stroke build."
         },
     );
     ui.add_space(4.0);

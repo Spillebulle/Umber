@@ -1142,7 +1142,8 @@ mod tests {
         );
         assert!(
             Brush::MIN_FLOW / 10.0 < level / 2.0,
-            "the decade below the bound is still storable, so the bound is              costing granularity it does not buy"
+            "the decade below the bound is still storable, so the bound is \
+             costing granularity it does not buy"
         );
     }
 }

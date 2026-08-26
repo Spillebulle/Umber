@@ -1042,7 +1042,9 @@ mod tests {
                         let mid = dabs[dabs.len() / 2].coverage;
                         assert_eq!(
                             mid, COVERAGE_BEFORE_FLOW[i],
-                            "build_up {build_up}, size {size}, spacing {spacing},                              pressure {pressure}: flow 1.0 moved a dab that a build                              without the field left at {}",
+                            "build_up {build_up}, size {size}, spacing \
+                             {spacing}, pressure {pressure}: flow 1.0 moved a \
+                             dab that a build without the field left at {}",
                             COVERAGE_BEFORE_FLOW[i]
                         );
                         i += 1;
@@ -1083,7 +1085,8 @@ mod tests {
         for dab in s.drain_pending() {
             assert!(
                 dab.coverage >= crate::tip::SCRATCH_LEVEL,
-                "a dab came back at {} — under one level, so the stroke is not                  faint but absent",
+                "a dab came back at {} — under one level, so the stroke is not \
+                 faint but absent",
                 dab.coverage
             );
         }
