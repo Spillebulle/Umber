@@ -141,6 +141,37 @@ pub struct Floating {
     /// Absolute against that point rather than accumulated per event — see
     /// [`Transform::drag`].
     pub drag: Option<(Handle, Vec2)>,
+    /// The layer this float **made for itself**, where it made one.
+    ///
+    /// Only a text placement does, and only where `Editor::ui.text_own_layer` is
+    /// on. It rides on the float rather than beside [`Editor::float_text`] on
+    /// purpose, and the reason is that field's own docs read backwards:
+    /// `float_text` is cleared by `App::begin_float` and deliberately *not* by
+    /// `App::cancel_transform`, so a duty hung on it would be a duty the cancel
+    /// path forgets — and what would be forgotten here is an empty layer left in
+    /// somebody's stack every time they press Escape. Every path that abandons a
+    /// float takes `float` itself, so this is the one place that cannot be
+    /// missed.
+    ///
+    /// [`MadeLayer`] is two `u32`s so [`Floating`] stays `Copy`, which it has to:
+    /// it is read by value at three call sites and a `StackShape` is not `Copy`.
+    /// The shape the undo entry needs is **derived** from these at the commit
+    /// rather than snapshotted here — see `LayerStack::shape_before_add`.
+    pub made: Option<MadeLayer>,
+}
+
+/// A layer a float created for itself, and what was selected before it did.
+///
+/// Both by [`umber_core::Layer::id`], never by index and never by slot: this is
+/// written at the placement and read a whole gesture later, and an index stops
+/// meaning this layer the moment anything is reordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MadeLayer {
+    /// The entry the placement added.
+    pub id: u32,
+    /// The entry that was selected before it, so an undo puts the selection back
+    /// where the artist left it rather than on whatever now sits in that row.
+    pub was_active: u32,
 }
 
 /// "one text layer" or "3 text layers", for a notice that has to count them.
@@ -283,6 +314,25 @@ pub struct UiState {
     /// and because the cost is bounded at both ends — see
     /// `umber_core::docformat::history`.
     pub save_history: bool,
+    /// Whether placing text makes a layer of its own to hold it.
+    ///
+    /// **On by default, and the default is the whole feature.** A placement only
+    /// keeps its [`umber_core::TextObject`] where it lands on nothing — see
+    /// `App::finish_transform` — so text put down over a picture is paint from
+    /// the moment it touches the canvas and can never be set again. Its own
+    /// layer makes "lands on nothing" true by construction, which is what turns
+    /// "text you can edit again" from something that depends on where you
+    /// clicked into something that simply holds.
+    ///
+    /// It is a preference and not a fixed policy because placing a caption
+    /// straight onto the layer under it is a real way to work — somebody
+    /// flattening as they go — and because at `LayerStack::MAX` there is no new
+    /// layer to be had and the artist needs a way through. Its control is on the
+    /// Text panel beside Place rather than in the settings dialog, which is
+    /// `Prefs::wheel_rotates`' arrangement and its argument: where a setting is
+    /// changed does not decide whether it should still be true tomorrow, and the
+    /// only place this one means anything is the button it governs.
+    pub text_own_layer: bool,
 }
 
 /// Tabs of the brush editor dialog.
@@ -418,6 +468,7 @@ impl Default for UiState {
             quit_prompt: false,
             modulation: 0,
             save_history: true,
+            text_own_layer: true,
         }
     }
 }

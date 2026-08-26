@@ -231,7 +231,10 @@ pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
 /// Here rather than beside its callers because two modules now draw one, and a
 /// second copy is how the pill ends up a different size in the Colour panel
 /// than in the brush editor.
-pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) {
+/// Returns the **row's** response, not the pill's, so a caller can hang a
+/// tooltip on the whole line. A tooltip on the pill alone would be one a
+/// pointer resting on the words that name the setting never finds.
+pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) -> Response {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(label)
@@ -241,7 +244,8 @@ pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             toggle(ui, p, value);
         });
-    });
+    })
+    .response
 }
 
 /// A row of mutually exclusive choices inside an inset well.

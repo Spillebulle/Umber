@@ -1478,7 +1478,9 @@ impl LayerStack {
     pub fn new_layer_would_be_locked(&self) -> bool {
         match self.layers.get(self.active) {
             Some(l) if l.folder => self.effective_locked(self.active),
-            Some(_) => self.ancestors_of(self.active).any(|i| self.layers[i].locked),
+            Some(_) => self
+                .ancestors_of(self.active)
+                .any(|i| self.layers[i].locked),
             None => false,
         }
     }
@@ -5266,6 +5268,6 @@ mod tests {
         let mut s = LayerStack::new();
         let made = s.add_named("Caption").expect("room");
         s.remove(s.active_index());
-        assert_eq!(s.shape_before_add(made.id, 0, 4).is_none(), true);
+        assert!(s.shape_before_add(made.id, 0, 4).is_none());
     }
 }

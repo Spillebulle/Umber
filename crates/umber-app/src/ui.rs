@@ -102,6 +102,15 @@ pub struct UiActions {
     /// which is the frame the button was clicked in. Same arrangement, and the
     /// same reason, as [`UiActions::delete_picked`].
     pub place_text: bool,
+    /// The Text panel's "On its own layer" switch, where it was moved this
+    /// frame.
+    ///
+    /// An `Option` rather than the flag itself, for the reason the Colour
+    /// panel's five wheel settings are compared before and after rather than
+    /// written every frame: writing it unconditionally would queue a
+    /// preferences write on every frame the panel is open. `None` is "nobody
+    /// touched it", which is almost every frame.
+    pub text_own_layer: Option<bool>,
     /// Set the selected text layer again from what the Text panel is showing:
     /// re-render in place, over the union of where the text was and where it is
     /// going. The caller's for [`UiActions::place_text`]'s reasons and one more
