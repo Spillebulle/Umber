@@ -51,6 +51,8 @@ mod logo;
 /// drift these measurements exist to prevent. Nothing else here is opened up:
 /// the decision reaches the interface through `app.rs` and `ui.rs` alone.
 pub mod loupe;
+/// Lucide's path data, flattened into polylines. See [`icons`].
+mod lucide;
 mod palettelib;
 mod panels;
 /// Reading back what a panel drew. See its own docs: the walk was written

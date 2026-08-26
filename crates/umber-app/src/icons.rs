@@ -1,119 +1,196 @@
-//! Vector icons.
+//! The interface's icons.
 //!
-//! Everything here is drawn from primitives rather than taken from a font.
+//! **The shapes are Lucide's, and they were not always.** Everything here used
+//! to be drawn from primitives — the reason is below and still holds against a
+//! *font* — and the set was Umber's own, hand-drawn mark by mark. The house
+//! rule is now one stroke set across every application (`STYLE-GUIDE.md` §11),
+//! and Umber was the application that predated it. This module is that
+//! migration: where Lucide carries a mark, Lucide's geometry is what gets
+//! drawn, copied out of the package verbatim and flattened by [`crate::lucide`]
+//! — which also carries the licence and the argument for taking the path data
+//! rather than an SVG file.
 //!
-//! The obvious alternative — Unicode glyphs like `🗑`, `◉`, `⇋` — works only
-//! for as long as the UI font happens to carry them. A text face such as
-//! Archivo carries none of those symbols, so they silently become blank boxes,
-//! and platform fallback would render them at a different weight and size on
-//! Windows, Linux and Android. Drawing them keeps the icon set consistent with
-//! the stroke weight of the rest of the interface and independent of whatever
-//! font is loaded.
+//! A hand-drawn icon is only ever as good as the hour it got, and it cannot be
+//! compared against anything. Taking the set makes Umber's settings mark and
+//! Muster's the same mark, which is the whole point of a house style.
 //!
-//! Icons are authored against a 24×24 box and scaled to whatever rect they are
+//! ## Why not a font, still
+//!
+//! The obvious alternative — Unicode glyphs like a wastebasket or a ring —
+//! works only for as long as the UI font happens to carry them. A text face
+//! such as Archivo carries none of those symbols, so they silently become blank
+//! boxes, and platform fallback would render them at a different weight and
+//! size on Windows, Linux and Android. Drawn geometry keeps the set at the
+//! stroke weight of the rest of the interface and independent of whatever font
+//! is loaded. That argument is what put the set here in the first place and is
+//! untouched by where the shapes come from.
+//!
+//! ## The five marks Umber still draws
+//!
+//! §11 allows an application to draw a mark the set does not carry, to Lucide's
+//! own construction and in this module. [`Drawn`] is the whole list, and each
+//! variant says what was searched for and not found. What that exception does
+//! **not** cover is redrawing a mark Lucide already has: a variant that could
+//! name a Lucide icon must, and `every_drawn_mark_is_one_lucide_does_not_carry`
+//! is what keeps the list from growing by habit.
+//!
+//! Icons are authored against a 24x24 box and scaled to whatever rect they are
 //! given, so a 16 px and a 32 px instance are the same shape.
 
-use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2, vec2};
+use crate::lucide::{Node, Outline};
+use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2, pos2};
+use std::sync::LazyLock;
 
+/// The side of the box every icon is drawn against. Lucide's own.
 const BOX: f32 = 24.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     // Tools
+    /// Lucide `brush`.
     Brush,
+    /// Lucide `eraser`.
     Eraser,
-    /// A dashed box — the marquee, which is what a selection looks like on the
-    /// canvas.
+    /// Lucide `square-dashed`: the marquee, which is what a selection looks
+    /// like on the canvas.
     Select,
-    /// A box with its corner handles — what a floating transform looks like on
-    /// the canvas, as `Select` is what a selection looks like.
+    /// Lucide `vector-square`: a box with a handle at each corner, which is
+    /// exactly what the tool draws on the canvas. Deliberately *not* the dashed
+    /// square — the dashes belong to the selection, and a transform box is a
+    /// different thing that happens to be the same shape.
+    ///
+    /// `scaling` is the obvious pick and was drawn here first. It is a rounded
+    /// box with a diagonal arrow leaving its top right corner, and so is
+    /// `external-link`, which [`Icon::Link`] wears: side by side on a sheet of
+    /// the whole set the two are one mark. A collision like that is what
+    /// looking at the set catches and no assertion would have.
     Transform,
+    /// Lucide `hand`.
     Pan,
+    /// Lucide `search`, which is the plain magnifier. Not `zoom-in`: its plus
+    /// would name half of a tool that zooms both ways, and the magnifier is
+    /// what stands for zoom everywhere else in the family.
     Zoom,
     // The transform tool's own marks, drawn over the canvas beside the box.
-    /// An arrow curving round: drag outside the box to turn it.
+    /// Lucide `rotate-cw`: an arrow curving round. Drag outside the box to turn
+    /// it.
     Rotate,
-    /// Two shapes either side of a dashed axis, mirrored left to right.
+    /// Lucide `flip-horizontal-2`: two shapes either side of a dashed axis,
+    /// mirrored left to right.
     FlipHorizontal,
-    /// The same, mirrored top to bottom.
+    /// Lucide `flip-vertical-2`: the same, mirrored top to bottom.
     FlipVertical,
     // Layers
+    /// Lucide `plus`.
     Plus,
+    /// Lucide `trash-2`.
     Trash,
+    /// Lucide `chevron-up`.
     ChevronUp,
+    /// Lucide `chevron-down`.
     ChevronDown,
+    /// Lucide `eye`.
     Eye,
+    /// Lucide `eye-off`.
     EyeOff,
     /// A frame with a disc in it: the layer, and the coverage that hides part
-    /// of it. Drawn as an outline plus a solid shape rather than as two
-    /// outlines, because at 16 px two nested rings read as a target.
+    /// of it. See [`Drawn::Mask`] — Lucide carries no layer mask.
     Mask,
-    /// An arrow turning down and to the left, over a rule — the mark every
-    /// application uses for "bounded by the layer below".
+    /// Lucide `corner-left-down`: an arrow turning down and to the left, which
+    /// is the mark every application uses for "bounded by the layer below".
+    ///
+    /// Umber drew this over a rule, on the argument that without one it is just
+    /// a return arrow. The rule is gone with the rest of the hand-drawn set:
+    /// the arrow alone is what Photoshop and Krita put on a clipped layer, and
+    /// there is no other arrow in this interface for it to be confused with.
     Clip,
-    /// A closed padlock.
+    /// Lucide `lock`: a closed padlock.
     Lock,
-    /// The same padlock with its shackle open. A second icon rather than the
-    /// first drawn dim: dim means "unavailable" everywhere else in the
-    /// interface, and a lock that is merely *off* is very much available.
+    /// Lucide `lock-open`: the same padlock with its shackle open. A second
+    /// icon rather than the first drawn dim: dim means "unavailable" everywhere
+    /// else in the interface, and a lock that is merely *off* is very much
+    /// available.
     Unlock,
-    /// Two chain links: these layers move together.
+    /// Lucide `link`: two chain links. These layers move together.
+    ///
+    /// Lucide's name for this is the one [`Icon::Link`] wears here, and the two
+    /// are different marks — that one is `external-link`. The doc comment
+    /// carries the Lucide name and the variant keeps the name the interface
+    /// uses, because renaming either would make the pair harder to find than
+    /// the crossover makes them.
     Chain,
     // Chrome
+    /// Lucide `x`.
     Close,
+    /// Lucide `pencil`.
     Pencil,
+    /// Lucide `settings`: the cog.
     Gear,
+    /// Lucide `check`.
     Check,
     // Brush library
+    /// Lucide `layout-grid`: four cells, "show me the whole set", against the
+    /// single column the Brushes panel has room for.
     Grid,
+    /// Lucide `import`: an arrow dropping into a tray. The tray is what
+    /// separates this from [`Icon::Download`] — the file is coming *into* a
+    /// collection that already exists.
     Import,
     // About and updates
-    /// An arrow leaving a box: this opens somewhere outside Umber.
+    /// Lucide `external-link`: an arrow leaving a box. This opens somewhere
+    /// outside Umber. See [`Icon::Chain`] for why the names cross over.
     Link,
-    /// An arrow onto a line: fetch this.
+    /// Lucide `download`: an arrow onto a line. Fetch this.
     Download,
     // Layout
+    /// Lucide `grip-vertical`: two columns of dots, the universal "drag me".
     Grip,
+    /// Stepped diagonals in the bottom right: the corner a panel is resized by.
+    /// See [`Drawn::Corner`].
     Corner,
     // Picker
+    /// Lucide `contrast`: a disc filled down one side, which is the half-filled
+    /// disc this mark already was. It is what Muster draws for a theme; here it
+    /// opens the colour picker, and the shape says "two halves of a colour" in
+    /// both places, which is what a shared set is for.
     HalfCircle,
     // History
-    /// A sheet with its corner turned down: the document itself, as opposed to
-    /// something done to it.
+    /// Lucide `file`: a sheet with its corner turned down, the document itself
+    /// as opposed to something done to it.
     Document,
     // Added at the end deliberately — this enum is shared, and renumbering it
     // would be a merge that compiles and draws the wrong marks.
     //
     // There used to be a `BrushNew` here, a brush with a plus beside it,
     // because `Plus` alone meant "save what is in your hand" in the Brushes
-    // panel's header and nowhere else in the interface. That header's `＋` makes
-    // a brush now, which is what `Plus` means on the Layers header, the Palette
-    // header and the tab strip, so the mark that existed to tell the two apart
-    // had nothing left to say and is gone rather than left undrawn.
-    /// A triangle with a bar and a dot in it — the crash box's mark, and the
-    /// only place in the interface that something has gone irrecoverably wrong.
-    /// A triangle rather than a circle: a circled `i` is information and a
-    /// circled `!` is a warning somebody can carry on past, and this is
-    /// neither.
+    // panel's header and nowhere else in the interface. That header's plus
+    // makes a brush now, which is what `Plus` means on the Layers header, the
+    // Palette header and the tab strip, so the mark that existed to tell the
+    // two apart had nothing left to say and is gone rather than left undrawn.
+    /// Lucide `triangle-alert` — the crash box's mark, and the only place in
+    /// the interface that something has gone irrecoverably wrong. A triangle
+    /// rather than a circle: a circled `i` is information and a circled `!` is
+    /// a warning somebody can carry on past, and this is neither.
     Alert,
     // The selection's own strip of controls, drawn over the canvas beside a
     // marquee. Added at the end for the reason the marks above were.
-    /// Two sheets, one behind the other: take a copy and leave the original.
+    /// Lucide `copy`: two sheets, one behind the other. Take a copy and leave
+    /// the original.
     Copy,
-    /// A pair of scissors: take it and leave nothing.
+    /// Lucide `scissors`: take it and leave nothing.
     Cut,
-    /// `Select`'s dashed box with a stroke through it — not the box greyed, and
-    /// not `Close`'s cross: this clears one specific thing, and the mark has to
-    /// say *which*.
+    /// [`Icon::Select`]'s dashed box with a stroke through it — not the box
+    /// greyed, and not [`Icon::Close`]'s cross: this clears one specific thing,
+    /// and the mark has to say *which*. See [`Drawn::Deselect`].
     Deselect,
     // Layer folders. At the end for the reason the brush marks above are: this
     // enum is shared, and renumbering it would be a merge that compiles and
     // draws the wrong marks.
-    /// A folder with a tab, as a layer group's row mark. Drawn where a layer's
-    /// row draws its thumbnail — a folder has no picture of its own, and one of
-    /// an arbitrary child would be a picture that lies about what is inside.
+    /// Lucide `folder`, as a layer group's row mark. Drawn where a layer's row
+    /// draws its thumbnail — a folder has no picture of its own, and one of an
+    /// arbitrary child would be a picture that lies about what is inside.
     Folder,
-    /// A chevron pointing right: this folder is shut. Its pair is
+    /// Lucide `chevron-right`: this folder is shut. Its pair is
     /// [`Icon::ChevronDown`], which already exists and already points the way a
     /// disclosure open should.
     ChevronRight,
@@ -121,31 +198,33 @@ pub enum Icon {
     // the reason the folder marks above are: this enum is shared, and
     // renumbering it would be a merge that compiles and draws the wrong marks.
     //
-    // The four are the universal spelling of this control — Photoshop, GIMP,
-    // Krita and Affinity all draw a pair of overlapping squares with the
-    // *result* of the operation filled in — and being one motif they can only
-    // be told apart by that fill, which is why the outlines stay visible
-    // through it rather than the filled part being drawn alone.
-    /// One square, filled: the new shape becomes the selection. Deliberately a
+    // These four were a hand-drawn motif — a pair of overlapping squares with
+    // the *result* filled in — because being one motif they could only be told
+    // apart by that fill. Lucide carries the whole family and tells them apart
+    // by the outline itself, which is a stroke set's answer to the same
+    // problem and needs no fill to read at 16 px.
+    /// Lucide `square`: the new shape becomes the selection. Deliberately a
     /// single square where its three neighbours are a pair, because replacing
     /// is the one of the four that does not involve what was already there.
     SelectReplace,
-    /// Two overlapping squares, both filled: the union.
+    /// Lucide `squares-unite`: the union, drawn as the one outline the two
+    /// squares make together.
     SelectAdd,
-    /// Two overlapping squares with the first filled only where the second does
-    /// not reach: the difference.
+    /// Lucide `squares-subtract`: the first square with the second taken out of
+    /// it, the rest of the second left as a hint of where it was.
     SelectSubtract,
-    /// Two overlapping squares with only the overlap filled: the intersection.
+    /// Lucide `squares-intersect`: the overlap drawn whole, the two squares it
+    /// came from left as corners.
     SelectIntersect,
     // The stamps and papers a brush is made of. At the end for the reason every
     // mark above it is: this enum is shared, and renumbering it would be a
     // merge that compiles and draws the wrong icons.
-    /// A square with a stipple in it: the pictures a brush paints *through* —
-    /// bitmap stamps and paper tiles. Distinct from [`Icon::Grid`], which means
-    /// "the whole set of brushes"; this one is the set of pictures. Four dots
-    /// rather than a real texture, because a texture at 16 px is mud.
+    /// Lucide `images`: a stack of pictures — the pictures a brush paints
+    /// *through*, bitmap stamps and paper tiles. Distinct from [`Icon::Grid`],
+    /// which means "the whole set of brushes"; this one is the set of pictures.
     Stamps,
-    /// A text caret standing on a rule: change what this is *called*.
+    /// Lucide `text-cursor-input`: a caret between two fields. Change what this
+    /// is *called*.
     ///
     /// Deliberately not a second pencil. [`Icon::Pencil`] means "open the brush
     /// editor" — in the Brushes panel header and on every row of the library
@@ -155,26 +234,30 @@ pub enum Icon {
     // Text. At the end for the reason every mark above it is: this enum is
     // shared, and renumbering it would be a merge that compiles and draws the
     // wrong marks.
-    /// A serifed capital `A` — the mark every application uses for text, and
-    /// deliberately *drawn* rather than the letter set in Archivo. A glyph
+    /// Lucide `type`: the serifed `T` every application uses for text.
+    ///
+    /// Deliberately *drawn* rather than the letter set in Archivo. A glyph
     /// would be the one icon in the interface whose weight and proportions came
     /// from the font rather than from the stroke weight beside it, and it would
-    /// change shape the day the interface changed typeface.
+    /// change shape the day the interface changed typeface. Lucide's letter is
+    /// geometry, so it is a drawn mark in exactly that sense.
     Text,
     // Structural undo's two rows. At the end for the reason every group above
     // is: this enum is shared, and renumbering it would be a merge that
     // compiles and draws the wrong marks.
-    /// Two chevrons back to back, pointing apart: an entry moved in the stack.
-    /// [`Icon::ChevronUp`] alone would say "moved up" on a row that may have
-    /// moved down, and [`Icon::Grip`] is the drag *handle* rather than the act.
+    /// Lucide `chevrons-up-down`: two chevrons back to back, pointing apart —
+    /// an entry moved in the stack. [`Icon::ChevronUp`] alone would say "moved
+    /// up" on a row that may have moved down, and [`Icon::Grip`] is the drag
+    /// *handle* rather than the act.
     MoveLayer,
     /// [`Icon::Mask`] with a stroke through it — the relationship
     /// [`Icon::Deselect`] already has to [`Icon::Select`], and for the same
     /// reason: this takes one specific thing off, and the mark has to say
-    /// which.
+    /// which. See [`Drawn::MaskOff`].
     MaskOff,
-    /// A colour wheel with three of its hues marked: the set of related
-    /// colours the Colour panel's Harmony mode is showing, kept.
+    /// A colour wheel with three of its hues marked: the set of related colours
+    /// the Colour panel's Harmony mode is showing, kept. See
+    /// [`Drawn::Harmony`].
     ///
     /// Appended rather than filed beside [`Icon::Grid`] for the reason the two
     /// above give: this enum is shared, and inserting into the middle of it is
@@ -183,32 +266,619 @@ pub enum Icon {
     // The Text module's two style controls. At the end for the reason every
     // group above is: this enum is shared, and renumbering it would be a merge
     // that compiles and draws the wrong marks.
-    /// A capital `B`, **drawn heavier than every other mark here** — the weight
-    /// is the content of it, not the letter. Set this text in the family's own
-    /// bold.
+    /// Lucide `bold`. The weight is the content of the mark, not the letter:
+    /// set this text in the family's own bold.
     ///
     /// A letter rather than an abstraction, for the one reason that overrides
     /// this interface's usual taste for a symbol: `B` and `I` are what every
     /// application on every platform draws for these two, so a mark somebody
-    /// had to learn would be worse. Drawn rather than *set* in Archivo, exactly
-    /// as [`Icon::Text`] is: a glyph would take its weight and proportions from
-    /// the font instead of from the stroke beside it, and it would change shape
-    /// the day the interface changed typeface — which for this one mark would
-    /// be doubly odd, since what it means is a weight.
+    /// had to learn would be worse. Lucide draws them as letters for the same
+    /// reason, and as geometry rather than as type — see [`Icon::Text`].
     Bold,
-    /// A slanted capital `I` between two bars: set this text in the family's own
-    /// italic. The bars are what stop a lone oblique stroke reading as a
-    /// divider. See [`Icon::Bold`] for why these two are letters.
+    /// Lucide `italic`: a slanted stroke between two bars, the bars being what
+    /// stops a lone oblique reading as a divider. See [`Icon::Bold`] for why
+    /// these two are letters.
     Italic,
-    /// A pipette: the eyedropper tool. At the end for the reason every group
-    /// above it is — this enum is shared, and inserting into the middle of it
-    /// is a merge that compiles and draws the wrong marks.
+    /// Lucide `pipette`: the eyedropper tool. At the end for the reason every
+    /// group above it is — this enum is shared, and inserting into the middle
+    /// of it is a merge that compiles and draws the wrong marks.
     ///
     /// A pipette rather than the other common spelling, a dropper *over a
     /// swatch*: at 18 px the swatch is three pixels of flat colour and reads as
     /// a shadow under the mark. The pipette alone is what Photoshop, GIMP,
     /// Krita and Affinity all draw, so it is a shape somebody already knows.
     Eyedropper,
+}
+
+/// Where a mark's geometry comes from.
+///
+/// Two arms rather than an `Option<&[Node]>`, so that `drawn` below is an
+/// exhaustive match over [`Drawn`] with no unreachable arm in it: the partial
+/// exhaustiveness this codebase refuses everywhere else would otherwise arrive
+/// here as a `_ => {}` that silently draws nothing.
+enum Art {
+    /// Lucide's, verbatim.
+    Lucide(&'static [Node]),
+    /// A mark Lucide does not carry.
+    Drawn(Drawn),
+}
+
+/// The marks Umber draws itself, and what was searched for before each.
+///
+/// This is §11's first exception — "a mark the set does not carry" — and it is
+/// the whole list. Adding to it means the search below it, written down, and
+/// it may not be used for a mark Lucide has; see the module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drawn {
+    /// A layer mask. Searched for `mask`, `layer`, `square-circle`: the only
+    /// thing in the set carrying the word is `venetian-mask`, which is the
+    /// thing you wear to a ball.
+    Mask,
+    /// The same, with a stroke through it. Its pair is [`Drawn::Mask`], so it
+    /// could not come from the set even if the set had a mask.
+    MaskOff,
+    /// The marquee with a stroke through it. Lucide has `square-slash`, and its
+    /// box is *solid*: the pair has to read as the same object with something
+    /// done to it, and [`Icon::Select`] is `square-dashed`.
+    Deselect,
+    /// The stepped diagonals in a panel's bottom right corner. Searched for
+    /// `resize`, `corner`, `grip`: `move-diagonal` is a two-headed arrow naming
+    /// the gesture, where this is the *texture* of the corner itself, drawn
+    /// under the pointer rather than as a control. An arrow there would read as
+    /// a button.
+    Corner,
+    /// A colour wheel with three hues marked. Searched for `harmony`, `triad`,
+    /// `color-wheel`: `palette` is a painter's palette and means "colours",
+    /// where this has to mean "these colours are related round the wheel", and
+    /// `blend` is two discs overlapping.
+    Harmony,
+}
+
+impl Icon {
+    /// Every icon, which is what the tests walk.
+    ///
+    /// Hand-written and therefore checkable rather than self-evident: a test
+    /// indexes it from an exhaustive match, so a variant added without a row
+    /// here is a compile error rather than an icon nothing ever looks at.
+    pub const ALL: [Self; 51] = [
+        Self::Brush,
+        Self::Eraser,
+        Self::Select,
+        Self::Transform,
+        Self::Pan,
+        Self::Zoom,
+        Self::Rotate,
+        Self::FlipHorizontal,
+        Self::FlipVertical,
+        Self::Plus,
+        Self::Trash,
+        Self::ChevronUp,
+        Self::ChevronDown,
+        Self::Eye,
+        Self::EyeOff,
+        Self::Mask,
+        Self::Clip,
+        Self::Lock,
+        Self::Unlock,
+        Self::Chain,
+        Self::Close,
+        Self::Pencil,
+        Self::Gear,
+        Self::Check,
+        Self::Grid,
+        Self::Import,
+        Self::Link,
+        Self::Download,
+        Self::Grip,
+        Self::Corner,
+        Self::HalfCircle,
+        Self::Document,
+        Self::Alert,
+        Self::Copy,
+        Self::Cut,
+        Self::Deselect,
+        Self::Folder,
+        Self::ChevronRight,
+        Self::SelectReplace,
+        Self::SelectAdd,
+        Self::SelectSubtract,
+        Self::SelectIntersect,
+        Self::Stamps,
+        Self::Rename,
+        Self::Text,
+        Self::MoveLayer,
+        Self::MaskOff,
+        Self::Harmony,
+        Self::Bold,
+        Self::Italic,
+        Self::Eyedropper,
+    ];
+
+    /// The icon's elements, copied from Lucide 1.34.0 unchanged.
+    ///
+    /// Updating one is a paste over one line; adding one is a paste of a new
+    /// arm, and the name in the doc comment on the variant is the name to
+    /// search lucide.dev for. Nothing here reorders, simplifies or nudges what
+    /// the package says, which is what makes an icon comparable against the
+    /// site character by character.
+    fn art(self) -> Art {
+        match self {
+            // brush
+            Self::Brush => Art::Lucide(&[
+                Node::Path("m11 10 3 3"),
+                Node::Path(
+                    "M6.5 21A3.5 3.5 0 1 0 3 17.5a2.62 2.62 0 0 1-.708 1.792A1 1 0 0 0 3 21z",
+                ),
+                Node::Path("M9.969 17.031 21.378 5.624a1 1 0 0 0-3.002-3.002L6.967 14.031"),
+            ]),
+            // eraser
+            Self::Eraser => Art::Lucide(&[
+                Node::Path(
+                    "M21 21H8a2 2 0 0 1-1.42-.587l-3.994-3.999a2 2 0 0 1 0-2.828l10-10a2 2 0 0 1 2.829 0l5.999 6a2 2 0 0 1 0 2.828L12.834 21",
+                ),
+                Node::Path("m5.082 11.09 8.828 8.828"),
+            ]),
+            // square-dashed
+            Self::Select => Art::Lucide(&[
+                Node::Path("M5 3a2 2 0 0 0-2 2"),
+                Node::Path("M19 3a2 2 0 0 1 2 2"),
+                Node::Path("M21 19a2 2 0 0 1-2 2"),
+                Node::Path("M5 21a2 2 0 0 1-2-2"),
+                Node::Path("M9 3h1"),
+                Node::Path("M9 21h1"),
+                Node::Path("M14 3h1"),
+                Node::Path("M14 21h1"),
+                Node::Path("M3 9v1"),
+                Node::Path("M21 9v1"),
+                Node::Path("M3 14v1"),
+                Node::Path("M21 14v1"),
+            ]),
+            // vector-square
+            Self::Transform => Art::Lucide(&[
+                Node::Path("M19.5 7a24 24 0 0 1 0 10"),
+                Node::Path("M4.5 7a24 24 0 0 0 0 10"),
+                Node::Path("M7 19.5a24 24 0 0 0 10 0"),
+                Node::Path("M7 4.5a24 24 0 0 1 10 0"),
+                Node::Rect {
+                    x: 17.0,
+                    y: 17.0,
+                    w: 5.0,
+                    h: 5.0,
+                    r: 1.0,
+                },
+                Node::Rect {
+                    x: 17.0,
+                    y: 2.0,
+                    w: 5.0,
+                    h: 5.0,
+                    r: 1.0,
+                },
+                Node::Rect {
+                    x: 2.0,
+                    y: 17.0,
+                    w: 5.0,
+                    h: 5.0,
+                    r: 1.0,
+                },
+                Node::Rect {
+                    x: 2.0,
+                    y: 2.0,
+                    w: 5.0,
+                    h: 5.0,
+                    r: 1.0,
+                },
+            ]),
+            // hand
+            Self::Pan => Art::Lucide(&[
+                Node::Path("M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2"),
+                Node::Path("M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2"),
+                Node::Path("M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8"),
+                Node::Path(
+                    "M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15",
+                ),
+            ]),
+            // search
+            Self::Zoom => Art::Lucide(&[
+                Node::Path("m21 21-4.34-4.34"),
+                Node::Circle {
+                    cx: 11.0,
+                    cy: 11.0,
+                    r: 8.0,
+                },
+            ]),
+            // rotate-cw
+            Self::Rotate => Art::Lucide(&[
+                Node::Path("M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"),
+                Node::Path("M21 3v5h-5"),
+            ]),
+            // flip-horizontal-2
+            Self::FlipHorizontal => Art::Lucide(&[
+                Node::Path("m3 7 5 5-5 5V7"),
+                Node::Path("m21 7-5 5 5 5V7"),
+                Node::Path("M12 20v2"),
+                Node::Path("M12 14v2"),
+                Node::Path("M12 8v2"),
+                Node::Path("M12 2v2"),
+            ]),
+            // flip-vertical-2
+            Self::FlipVertical => Art::Lucide(&[
+                Node::Path("m17 3-5 5-5-5h10"),
+                Node::Path("m17 21-5-5-5 5h10"),
+                Node::Path("M4 12H2"),
+                Node::Path("M10 12H8"),
+                Node::Path("M16 12h-2"),
+                Node::Path("M22 12h-2"),
+            ]),
+            // plus
+            Self::Plus => Art::Lucide(&[Node::Path("M5 12h14"), Node::Path("M12 5v14")]),
+            // trash-2
+            Self::Trash => Art::Lucide(&[
+                Node::Path("M10 11v6"),
+                Node::Path("M14 11v6"),
+                Node::Path("M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"),
+                Node::Path("M3 6h18"),
+                Node::Path("M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"),
+            ]),
+            // chevron-up
+            Self::ChevronUp => Art::Lucide(&[Node::Path("m18 15-6-6-6 6")]),
+            // chevron-down
+            Self::ChevronDown => Art::Lucide(&[Node::Path("m6 9 6 6 6-6")]),
+            // eye
+            Self::Eye => Art::Lucide(&[
+                Node::Path(
+                    "M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0",
+                ),
+                Node::Circle {
+                    cx: 12.0,
+                    cy: 12.0,
+                    r: 3.0,
+                },
+            ]),
+            // eye-off
+            Self::EyeOff => Art::Lucide(&[
+                Node::Path(
+                    "M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49",
+                ),
+                Node::Path("M14.084 14.158a3 3 0 0 1-4.242-4.242"),
+                Node::Path(
+                    "M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143",
+                ),
+                Node::Path("m2 2 20 20"),
+            ]),
+            Self::Mask => Art::Drawn(Drawn::Mask),
+            // corner-left-down
+            Self::Clip => Art::Lucide(&[
+                Node::Path("m14 15-5 5-5-5"),
+                Node::Path("M20 4h-7a4 4 0 0 0-4 4v12"),
+            ]),
+            // lock
+            Self::Lock => Art::Lucide(&[
+                Node::Rect {
+                    x: 3.0,
+                    y: 11.0,
+                    w: 18.0,
+                    h: 11.0,
+                    r: 2.0,
+                },
+                Node::Path("M7 11V7a5 5 0 0 1 10 0v4"),
+            ]),
+            // lock-open
+            Self::Unlock => Art::Lucide(&[
+                Node::Rect {
+                    x: 3.0,
+                    y: 11.0,
+                    w: 18.0,
+                    h: 11.0,
+                    r: 2.0,
+                },
+                Node::Path("M7 11V7a5 5 0 0 1 9.9-1"),
+            ]),
+            // link
+            Self::Chain => Art::Lucide(&[
+                Node::Path("M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"),
+                Node::Path("M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"),
+            ]),
+            // x
+            Self::Close => Art::Lucide(&[Node::Path("M18 6 6 18"), Node::Path("m6 6 12 12")]),
+            // pencil
+            Self::Pencil => Art::Lucide(&[
+                Node::Path(
+                    "M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z",
+                ),
+                Node::Path("m15 5 4 4"),
+            ]),
+            // settings
+            Self::Gear => Art::Lucide(&[
+                Node::Path(
+                    "M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915",
+                ),
+                Node::Circle {
+                    cx: 12.0,
+                    cy: 12.0,
+                    r: 3.0,
+                },
+            ]),
+            // check
+            Self::Check => Art::Lucide(&[Node::Path("M20 6 9 17l-5-5")]),
+            // layout-grid
+            Self::Grid => Art::Lucide(&[
+                Node::Rect {
+                    x: 3.0,
+                    y: 3.0,
+                    w: 7.0,
+                    h: 7.0,
+                    r: 1.0,
+                },
+                Node::Rect {
+                    x: 14.0,
+                    y: 3.0,
+                    w: 7.0,
+                    h: 7.0,
+                    r: 1.0,
+                },
+                Node::Rect {
+                    x: 14.0,
+                    y: 14.0,
+                    w: 7.0,
+                    h: 7.0,
+                    r: 1.0,
+                },
+                Node::Rect {
+                    x: 3.0,
+                    y: 14.0,
+                    w: 7.0,
+                    h: 7.0,
+                    r: 1.0,
+                },
+            ]),
+            // import
+            Self::Import => Art::Lucide(&[
+                Node::Path("M12 3v12"),
+                Node::Path("m8 11 4 4 4-4"),
+                Node::Path(
+                    "M8 5H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-4",
+                ),
+            ]),
+            // external-link
+            Self::Link => Art::Lucide(&[
+                Node::Path("M15 3h6v6"),
+                Node::Path("M10 14 21 3"),
+                Node::Path("M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"),
+            ]),
+            // download
+            Self::Download => Art::Lucide(&[
+                Node::Path("M12 15V3"),
+                Node::Path("M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"),
+                Node::Path("m7 10 5 5 5-5"),
+            ]),
+            // grip-vertical
+            Self::Grip => Art::Lucide(&[
+                Node::Circle {
+                    cx: 9.0,
+                    cy: 12.0,
+                    r: 1.0,
+                },
+                Node::Circle {
+                    cx: 9.0,
+                    cy: 5.0,
+                    r: 1.0,
+                },
+                Node::Circle {
+                    cx: 9.0,
+                    cy: 19.0,
+                    r: 1.0,
+                },
+                Node::Circle {
+                    cx: 15.0,
+                    cy: 12.0,
+                    r: 1.0,
+                },
+                Node::Circle {
+                    cx: 15.0,
+                    cy: 5.0,
+                    r: 1.0,
+                },
+                Node::Circle {
+                    cx: 15.0,
+                    cy: 19.0,
+                    r: 1.0,
+                },
+            ]),
+            Self::Corner => Art::Drawn(Drawn::Corner),
+            // contrast
+            Self::HalfCircle => Art::Lucide(&[
+                Node::Circle {
+                    cx: 12.0,
+                    cy: 12.0,
+                    r: 10.0,
+                },
+                Node::Path("M12 18a6 6 0 0 0 0-12v12z"),
+            ]),
+            // file
+            Self::Document => Art::Lucide(&[
+                Node::Path(
+                    "M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z",
+                ),
+                Node::Path("M14 2v5a1 1 0 0 0 1 1h5"),
+            ]),
+            // triangle-alert
+            Self::Alert => Art::Lucide(&[
+                Node::Path(
+                    "m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3",
+                ),
+                Node::Path("M12 9v4"),
+                Node::Path("M12 17h.01"),
+            ]),
+            // copy
+            Self::Copy => Art::Lucide(&[
+                Node::Rect {
+                    x: 8.0,
+                    y: 8.0,
+                    w: 14.0,
+                    h: 14.0,
+                    r: 2.0,
+                },
+                Node::Path("M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"),
+            ]),
+            // scissors
+            Self::Cut => Art::Lucide(&[
+                Node::Circle {
+                    cx: 6.0,
+                    cy: 6.0,
+                    r: 3.0,
+                },
+                Node::Path("M8.12 8.12 12 12"),
+                Node::Path("M20 4 8.12 15.88"),
+                Node::Circle {
+                    cx: 6.0,
+                    cy: 18.0,
+                    r: 3.0,
+                },
+                Node::Path("M14.8 14.8 20 20"),
+            ]),
+            Self::Deselect => Art::Drawn(Drawn::Deselect),
+            // folder
+            Self::Folder => Art::Lucide(&[Node::Path(
+                "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z",
+            )]),
+            // chevron-right
+            Self::ChevronRight => Art::Lucide(&[Node::Path("m9 18 6-6-6-6")]),
+            // square
+            Self::SelectReplace => Art::Lucide(&[Node::Rect {
+                x: 3.0,
+                y: 3.0,
+                w: 18.0,
+                h: 18.0,
+                r: 2.0,
+            }]),
+            // squares-unite
+            Self::SelectAdd => Art::Lucide(&[Node::Path(
+                "M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v3a1 1 0 0 0 1 1h3a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2v-3a1 1 0 0 0-1-1z",
+            )]),
+            // squares-subtract
+            Self::SelectSubtract => Art::Lucide(&[
+                Node::Path("M10 22a2 2 0 0 1-2-2"),
+                Node::Path("M16 22h-2"),
+                Node::Path(
+                    "M16 4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3a1 1 0 0 0 1-1v-5a2 2 0 0 1 2-2h5a1 1 0 0 0 1-1z",
+                ),
+                Node::Path("M20 8a2 2 0 0 1 2 2"),
+                Node::Path("M22 14v2"),
+                Node::Path("M22 20a2 2 0 0 1-2 2"),
+            ]),
+            // squares-intersect
+            Self::SelectIntersect => Art::Lucide(&[
+                Node::Path("M10 22a2 2 0 0 1-2-2"),
+                Node::Path("M14 2a2 2 0 0 1 2 2"),
+                Node::Path("M16 22h-2"),
+                Node::Path("M2 10V8"),
+                Node::Path("M2 4a2 2 0 0 1 2-2"),
+                Node::Path("M20 8a2 2 0 0 1 2 2"),
+                Node::Path("M22 14v2"),
+                Node::Path("M22 20a2 2 0 0 1-2 2"),
+                Node::Path("M4 16a2 2 0 0 1-2-2"),
+                Node::Path("M8 10a2 2 0 0 1 2-2h5a1 1 0 0 1 1 1v5a2 2 0 0 1-2 2H9a1 1 0 0 1-1-1z"),
+                Node::Path("M8 2h2"),
+            ]),
+            // images
+            Self::Stamps => Art::Lucide(&[
+                Node::Path("m22 11-1.296-1.296a2.4 2.4 0 0 0-3.408 0L11 16"),
+                Node::Path("M4 8a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2"),
+                Node::Disc {
+                    cx: 13.0,
+                    cy: 7.0,
+                    r: 1.0,
+                },
+                Node::Rect {
+                    x: 8.0,
+                    y: 2.0,
+                    w: 14.0,
+                    h: 14.0,
+                    r: 2.0,
+                },
+            ]),
+            // text-cursor-input
+            Self::Rename => Art::Lucide(&[
+                Node::Path("M12 20h-1a2 2 0 0 1-2-2 2 2 0 0 1-2 2H6"),
+                Node::Path("M13 8h7a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-7"),
+                Node::Path("M5 16H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h1"),
+                Node::Path("M6 4h1a2 2 0 0 1 2 2 2 2 0 0 1 2-2h1"),
+                Node::Path("M9 6v12"),
+            ]),
+            // type
+            Self::Text => Art::Lucide(&[
+                Node::Path("M12 4v16"),
+                Node::Path("M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2"),
+                Node::Path("M9 20h6"),
+            ]),
+            // chevrons-up-down
+            Self::MoveLayer => {
+                Art::Lucide(&[Node::Path("m7 15 5 5 5-5"), Node::Path("m7 9 5-5 5 5")])
+            }
+            Self::MaskOff => Art::Drawn(Drawn::MaskOff),
+            Self::Harmony => Art::Drawn(Drawn::Harmony),
+            // bold
+            Self::Bold => Art::Lucide(&[Node::Path(
+                "M6 12h9a4 4 0 0 1 0 8H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h7a4 4 0 0 1 0 8",
+            )]),
+            // italic
+            Self::Italic => Art::Lucide(&[
+                Node::Line {
+                    x1: 19.0,
+                    y1: 4.0,
+                    x2: 10.0,
+                    y2: 4.0,
+                },
+                Node::Line {
+                    x1: 14.0,
+                    y1: 20.0,
+                    x2: 5.0,
+                    y2: 20.0,
+                },
+                Node::Line {
+                    x1: 15.0,
+                    y1: 4.0,
+                    x2: 9.0,
+                    y2: 20.0,
+                },
+            ]),
+            // pipette
+            Self::Eyedropper => Art::Lucide(&[
+                Node::Path(
+                    "m12 9-8.414 8.414A2 2 0 0 0 3 18.828v1.344a2 2 0 0 1-.586 1.414A2 2 0 0 1 3.828 21h1.344a2 2 0 0 0 1.414-.586L15 12",
+                ),
+                Node::Path(
+                    "m18 9 .4.4a1 1 0 1 1-3 3l-3.8-3.8a1 1 0 1 1 3-3l.4.4 3.4-3.4a1 1 0 1 1 3 3z",
+                ),
+                Node::Path("m2 22 .414-.414"),
+            ]),
+        }
+    }
+}
+
+/// Every Lucide icon's outlines, flattened once.
+///
+/// The parse and the arcs are cheap, but they are the same answer every frame
+/// for every row of the layer list, and an icon set is drawn some dozens of
+/// times a frame. Held in the 24x24 box and scaled at the point of drawing, so
+/// one copy serves every size. `None` is a [`Drawn`] mark, which has no
+/// geometry to hold.
+static GEOMETRY: LazyLock<Vec<Option<Vec<Outline>>>> = LazyLock::new(|| {
+    Icon::ALL
+        .iter()
+        .map(|i| match i.art() {
+            Art::Lucide(nodes) => Some(crate::lucide::flatten(nodes)),
+            Art::Drawn(_) => None,
+        })
+        .collect()
+});
+
+fn geometry(icon: Icon) -> Option<&'static [Outline]> {
+    let at = Icon::ALL
+        .iter()
+        .position(|i| *i == icon)
+        .expect("every icon is in ALL");
+    GEOMETRY[at].as_deref()
 }
 
 /// Draw `icon` centred in `rect`.
@@ -222,639 +892,108 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
     }
     let scale = size / BOX;
     let origin = rect.center() - Vec2::splat(size * 0.5);
-    let at = |x: f32, y: f32| origin + vec2(x * scale, y * scale);
     let stroke = Stroke::new((2.0 * scale).max(1.0), colour);
-    let line = |a: Pos2, b: Pos2| painter.line_segment([a, b], stroke);
-    let path = |pts: Vec<Pos2>| {
-        painter.add(Shape::line(pts, stroke));
+
+    let Some(outlines) = geometry(icon) else {
+        let Art::Drawn(mark) = icon.art() else {
+            unreachable!("geometry answers None only for a drawn mark");
+        };
+        drawn(painter, origin, scale, stroke, colour, mark);
+        return;
     };
 
-    match icon {
-        Icon::Brush => {
-            line(at(6.0, 18.0), at(17.0, 7.0));
-            painter.circle_filled(at(6.0, 18.0), 2.8 * scale, colour);
+    outlines_at(painter, origin, scale, stroke, colour, outlines);
+}
+
+/// Stroke flattened 24x24 geometry into the box at `origin`.
+///
+/// Its own function because [`Drawn::Deselect`] draws [`Icon::Select`]'s
+/// outlines and then a stroke through them: the negated mark is the mark it
+/// negates *plus* something, rather than a second drawing of the same box that
+/// has to be kept in step with it by hand.
+fn outlines_at(
+    painter: &Painter,
+    origin: Pos2,
+    scale: f32,
+    stroke: Stroke,
+    colour: Color32,
+    outlines: &[Outline],
+) {
+    for outline in outlines {
+        let points: Vec<_> = outline
+            .points
+            .iter()
+            .map(|p| pos2(origin.x + p.x * scale, origin.y + p.y * scale))
+            .collect();
+        if outline.is_dot() {
+            // A dot is a stroke that goes nowhere, and egui would draw nothing
+            // at all. Half the stroke's width is the radius SVG's round cap
+            // would have given it.
+            painter.circle_filled(points[0], stroke.width / 2.0, colour);
+        } else if outline.filled {
+            painter.add(Shape::convex_polygon(points, colour, Stroke::NONE));
+        } else if outline.closed {
+            painter.add(Shape::closed_line(points, stroke));
+        } else {
+            painter.add(Shape::line(points, stroke));
         }
+    }
+}
 
-        Icon::Eraser => {
-            // A block tipped 35°, as the design draws it.
-            path(rotated_rect(&at, 12.0, 12.0, 5.5, 7.0, 35.0));
+/// The five marks Lucide does not carry, drawn to its construction: the same
+/// 24x24 box, the same two-unit stroke, the same round joins.
+///
+/// `origin` is the box's top left in screen space and `scale` takes a unit of
+/// the box to a pixel, which is exactly what the loop above works in — so a
+/// drawn mark and a pasted one cannot end up at different sizes.
+fn drawn(
+    painter: &Painter,
+    origin: Pos2,
+    scale: f32,
+    stroke: Stroke,
+    colour: Color32,
+    mark: Drawn,
+) {
+    let at = |x: f32, y: f32| pos2(origin.x + x * scale, origin.y + y * scale);
+    let line = |a: Pos2, b: Pos2| painter.line_segment([a, b], stroke);
+
+    // Lucide's own way of saying a thing is off: `eye-off` and `pen-off` both
+    // draw the mark and then `m2 2 20 20` across it. Both marks below negate
+    // one that is on the sheet beside them, so they take that stroke rather
+    // than an angle of their own.
+    let slash = || line(at(2.0, 2.0), at(22.0, 22.0));
+
+    match mark {
+        Drawn::Mask => mask(painter, &at, scale, stroke, colour),
+        Drawn::MaskOff => {
+            mask(painter, &at, scale, stroke, colour);
+            slash();
         }
-
-        Icon::Pan => {
-            // Four-way arrow. A bare cross reads as "add", not "move", so the
-            // heads are what make this legible at 18 px.
-            line(at(12.0, 4.0), at(12.0, 20.0));
-            line(at(4.0, 12.0), at(20.0, 12.0));
-            for (tip, a, b) in [
-                ((12.0, 4.0), (9.2, 7.0), (14.8, 7.0)),
-                ((12.0, 20.0), (9.2, 17.0), (14.8, 17.0)),
-                ((4.0, 12.0), (7.0, 9.2), (7.0, 14.8)),
-                ((20.0, 12.0), (17.0, 9.2), (17.0, 14.8)),
-            ] {
-                line(at(tip.0, tip.1), at(a.0, a.1));
-                line(at(tip.0, tip.1), at(b.0, b.1));
-            }
+        Drawn::Deselect => {
+            // `Icon::Select`'s own outlines, so the two cannot drift: this is
+            // the marquee with a stroke through it, and the marquee is Lucide's
+            // `square-dashed`. Drawing the dashes again here is what the first
+            // version did, and it left the pair at two different sizes with two
+            // different dash spans.
+            let marquee = geometry(Icon::Select).expect("`Select` is a Lucide mark");
+            outlines_at(painter, origin, scale, stroke, colour, marquee);
+            slash();
         }
-
-        Icon::Select => {
-            // Dashes rather than a stroked rectangle: a solid box reads as a
-            // shape tool, and the dashes are the same mark the selection makes
-            // on the canvas. The spans reach both corners of every side, so the
-            // box still reads as a box at 18 px.
-            const LO: f32 = 5.0;
-            const HI: f32 = 19.0;
-            for (from, to) in [(0.0, 4.0), (6.0, 8.0), (10.0, 14.0)] {
-                line(at(LO + from, LO), at(LO + to, LO));
-                line(at(LO + from, HI), at(LO + to, HI));
-                line(at(LO, LO + from), at(LO, LO + to));
-                line(at(HI, LO + from), at(HI, LO + to));
-            }
-        }
-
-        Icon::Transform => {
-            // A solid box with its four corner handles, which is exactly what
-            // the tool draws on the canvas. Deliberately *not* dashed: the
-            // dashes belong to the selection, and a transform box is a
-            // different thing that happens to be the same shape.
-            const LO: f32 = 6.0;
-            const HI: f32 = 18.0;
-            path(vec![
-                at(LO, LO),
-                at(HI, LO),
-                at(HI, HI),
-                at(LO, HI),
-                at(LO, LO),
-            ]);
-            for (x, y) in [(LO, LO), (HI, LO), (HI, HI), (LO, HI)] {
-                painter.circle_filled(at(x, y), 2.4 * scale, colour);
-            }
-        }
-
-        Icon::Zoom => {
-            painter.circle_stroke(at(10.0, 10.0), 5.5 * scale, stroke);
-            line(at(14.2, 14.2), at(20.0, 20.0));
-        }
-
-        Icon::Eyedropper => {
-            // Read from the tip up: a filled point where the colour is taken,
-            // the barrel, the collar that stops the barrel reading as a plain
-            // diagonal — which is what `Icon::Brush` already is — and the bulb.
-            // Everything sits on the 45° line the diagonal marks in this set
-            // are drawn on.
-            painter.add(Shape::convex_polygon(
-                vec![at(3.5, 20.5), at(8.0, 19.0), at(5.0, 16.0)],
-                colour,
-                Stroke::NONE,
-            ));
-            line(at(6.5, 17.5), at(15.0, 9.0));
-            line(at(12.6, 8.0), at(16.0, 11.4));
-            path(rotated_rect(&at, 17.9, 6.1, 2.6, 3.7, 45.0));
-        }
-
-        Icon::Rotate => {
-            // Most of a circle with a head on one end, the gap at the top.
-            // Deliberately not the pair of opposed arrows the same idea is
-            // often drawn with: at 16 px that reads as "swap these two".
-            const STEPS: usize = 20;
-            const R: f32 = 7.0;
-            let a0 = (-60.0_f32).to_radians();
-            let a1 = 240.0_f32.to_radians();
-            let mut pts = Vec::with_capacity(STEPS + 1);
-            for k in 0..=STEPS {
-                let a = a0 + (a1 - a0) * k as f32 / STEPS as f32;
-                let (s, c) = a.sin_cos();
-                pts.push(at(12.0 + c * R, 12.0 + s * R));
-            }
-            path(pts);
-            // The head sits on the *tangent* at the open end, which is what
-            // makes the ring read as travelling rather than as a circle
-            // somebody left unclosed.
-            let (s, c) = a1.sin_cos();
-            let tip = (12.0 + c * R, 12.0 + s * R);
-            let dir = (-s, c);
-            for turn in [140.0_f32, -140.0] {
-                let (ts, tc) = turn.to_radians().sin_cos();
-                let barb = (dir.0 * tc - dir.1 * ts, dir.0 * ts + dir.1 * tc);
-                line(
-                    at(tip.0, tip.1),
-                    at(tip.0 + barb.0 * 5.0, tip.1 + barb.1 * 5.0),
-                );
-            }
-        }
-
-        Icon::FlipHorizontal | Icon::FlipVertical => {
-            // Two arrowheads facing away from a dashed mirror line. The dashes
-            // are what say *mirror* rather than *move apart*: a solid rule
-            // between two shapes reads as a divider.
-            let horizontal = icon == Icon::FlipHorizontal;
-            // Along the mirror line, and across it. One pair of coordinates
-            // serves both icons by swapping which is which — the two marks are
-            // the same drawing a quarter turn apart, and writing it twice is
-            // how they end up subtly different weights.
-            let put = |along: f32, across: f32| {
-                if horizontal {
-                    at(across, along)
-                } else {
-                    at(along, across)
-                }
-            };
-            for (from, to) in [(4.0, 8.0), (10.5, 13.5), (16.0, 20.0)] {
-                line(put(from, 12.0), put(to, 12.0));
-            }
-            for side in [-1.0_f32, 1.0] {
-                path(vec![
-                    put(6.5, 12.0 + side * 2.0),
-                    put(17.5, 12.0 + side * 2.0),
-                    put(12.0, 12.0 + side * 8.5),
-                    put(6.5, 12.0 + side * 2.0),
-                ]);
-            }
-        }
-
-        Icon::Plus => {
-            line(at(12.0, 6.0), at(12.0, 18.0));
-            line(at(6.0, 12.0), at(18.0, 12.0));
-        }
-
-        Icon::Trash => {
-            line(at(5.0, 7.0), at(19.0, 7.0));
-            path(vec![
-                at(9.5, 7.0),
-                at(9.5, 4.5),
-                at(14.5, 4.5),
-                at(14.5, 7.0),
-            ]);
-            path(vec![
-                at(6.8, 7.0),
-                at(7.8, 20.0),
-                at(16.2, 20.0),
-                at(17.2, 7.0),
-            ]);
-        }
-
-        Icon::ChevronUp => path(vec![at(6.0, 15.0), at(12.0, 9.0), at(18.0, 15.0)]),
-        Icon::ChevronDown => path(vec![at(6.0, 9.0), at(12.0, 15.0), at(18.0, 9.0)]),
-
-        Icon::ChevronRight => path(vec![at(9.0, 6.0), at(15.0, 12.0), at(9.0, 18.0)]),
-
-        Icon::Text => {
-            // A capital `A` with a serifed foot on each leg. The crossbar sits
-            // low, at 40% of the height rather than halfway, because a bar in
-            // the middle reads as a triangle with a line through it at 16 px.
-            path(vec![at(5.0, 20.0), at(12.0, 4.0), at(19.0, 20.0)]);
-            line(at(8.2, 13.0), at(15.8, 13.0));
-            line(at(2.5, 20.0), at(7.5, 20.0));
-            line(at(16.5, 20.0), at(21.5, 20.0));
-        }
-
-        Icon::Bold => {
-            // Deliberately the one mark in the set drawn at a heavier stroke.
-            // Everything else here shares `stroke` so the icons read as one
-            // family; this one *means* weight, so a `B` at the common weight
-            // would say "the letter B" and nothing more. Its pair, `Italic`,
-            // keeps the common weight, which is what makes the two a contrast
-            // rather than two heavy marks.
-            let heavy = Stroke::new((2.9 * scale).max(1.5), colour);
-            let run = |pts: Vec<Pos2>| {
-                painter.add(Shape::line(pts, heavy));
-            };
-            // The stem, then two bowls hung off it. Three segments a bowl rather
-            // than an arc: at 16 px a chamfer and a curve are the same picture,
-            // and the polyline is what every other mark here is made of.
-            //
-            // The bowls are drawn **deeper than the letter wants**, and the
-            // figures below are the reason rather than taste. An `icon_toggle`
-            // shrinks its 20 pt box by two, so this is a 16 pt mark: `scale` is
-            // 2/3 and the stroke is 1.93 pt. The upper bowl is 7.8 units tall and
-            // the lower 8.2, which after the stroke leaves 4.9 and 5.3 of
-            // counter, or 3.3 and 3.5 points of hole. At the letter's own
-            // proportions the holes close up and the mark is a blob.
-            //
-            // Points, not pixels: on a 2× display there is twice as much to go
-            // round, so the blob is a claim about the worst case only.
-            //
-            // The stem is at 6.9 and the widest bowl reaches 17.1, so the mark
-            // is centred in the 24 box. It was not at first, and the offset is
-            // exactly the sort of thing that reads as a wobble beside the
-            // `Italic` next to it without anybody being able to say why.
-            run(vec![at(6.9, 4.0), at(6.9, 20.0)]);
-            run(vec![
-                at(6.9, 4.0),
-                at(12.9, 4.0),
-                at(15.9, 6.2),
-                at(15.9, 9.6),
-                at(12.9, 11.8),
-                at(6.9, 11.8),
-            ]);
-            run(vec![
-                at(6.9, 11.8),
-                at(13.7, 11.8),
-                at(17.1, 14.0),
-                at(17.1, 17.8),
-                at(13.7, 20.0),
-                at(6.9, 20.0),
-            ]);
-        }
-
-        Icon::Italic => {
-            line(at(9.6, 5.0), at(18.0, 5.0));
-            line(at(6.0, 19.0), at(14.4, 19.0));
-            // The stem leans by four units over fourteen, which is about 16° —
-            // the slant a text italic actually carries. Steeper reads as a
-            // slash.
-            line(at(14.0, 5.0), at(10.0, 19.0));
-        }
-
-        Icon::SelectReplace | Icon::SelectAdd | Icon::SelectSubtract | Icon::SelectIntersect => {
-            // One motif, four fills. The squares are the same two in every
-            // case — the selection already standing and the shape being drawn —
-            // and what tells the four apart is which part of them is filled, so
-            // the fill is drawn *under* the outlines and at a fraction of the
-            // ink. A solid fill would swallow the outlines and leave Add and
-            // Replace the same silhouette.
-            let tint = colour.gamma_multiply(0.4);
-            let fill = |x0: f32, y0: f32, x1: f32, y1: f32| {
-                painter.rect_filled(Rect::from_min_max(at(x0, y0), at(x1, y1)), 0.0, tint);
-            };
-            let outline = |x0: f32, y0: f32, x1: f32, y1: f32| {
-                path(vec![
-                    at(x0, y0),
-                    at(x1, y0),
-                    at(x1, y1),
-                    at(x0, y1),
-                    at(x0, y0),
-                ]);
-            };
-
-            if icon == Icon::SelectReplace {
-                // One square, not a pair: replacing is the one of the four that
-                // does not involve what was already selected, and a mark that
-                // showed two shapes would say it did.
-                fill(5.0, 5.0, 19.0, 19.0);
-                outline(5.0, 5.0, 19.0, 19.0);
-            } else {
-                match icon {
-                    // The union, as **three disjoint rectangles**. Filling both
-                    // squares whole is the obvious spelling and is wrong: the
-                    // tint is a fraction of the ink, so two fills composite in
-                    // the lens where they cross and Add draws a darker overlap
-                    // — which is exactly Intersect's mark, on the one control
-                    // whose four members can only be told apart by their fill.
-                    Icon::SelectAdd => {
-                        fill(4.0, 4.0, 15.0, 15.0);
-                        fill(15.0, 9.0, 20.0, 20.0);
-                        fill(9.0, 15.0, 15.0, 20.0);
-                    }
-                    // The first square with the second taken out of it: an L,
-                    // which is two rectangles because both are axis-aligned.
-                    Icon::SelectSubtract => {
-                        fill(4.0, 4.0, 15.0, 9.0);
-                        fill(4.0, 9.0, 9.0, 15.0);
-                    }
-                    _ => fill(9.0, 9.0, 15.0, 15.0),
-                }
-                outline(4.0, 4.0, 15.0, 15.0);
-                outline(9.0, 9.0, 20.0, 20.0);
-            }
-        }
-
-        Icon::Folder => {
-            // The tab first, so the body's top edge draws over its base and the
-            // two read as one shape rather than as a box with a bump.
-            path(vec![
-                at(3.0, 8.0),
-                at(3.0, 5.5),
-                at(9.5, 5.5),
-                at(11.5, 8.0),
-            ]);
-            path(vec![
-                at(3.0, 8.0),
-                at(21.0, 8.0),
-                at(21.0, 18.5),
-                at(3.0, 18.5),
-                at(3.0, 8.0),
-            ]);
-        }
-
-        Icon::Eye => {
-            path(eye_outline(&at));
-            painter.circle_filled(at(12.0, 12.0), 2.6 * scale, colour);
-        }
-
-        Icon::EyeOff => {
-            path(eye_outline(&at));
-            line(at(5.0, 19.0), at(19.0, 5.0));
-        }
-
-        Icon::Mask => {
-            path(vec![
-                at(4.0, 5.0),
-                at(20.0, 5.0),
-                at(20.0, 19.0),
-                at(4.0, 19.0),
-                at(4.0, 5.0),
-            ]);
-            painter.circle_filled(at(12.0, 12.0), 4.2 * scale, colour);
-        }
-
-        Icon::MaskOff => {
-            // `Mask`, a size smaller to leave room for the stroke, so the two
-            // read as the same object with something done to it.
-            path(vec![
-                at(5.5, 6.5),
-                at(18.5, 6.5),
-                at(18.5, 17.5),
-                at(5.5, 17.5),
-                at(5.5, 6.5),
-            ]);
-            painter.circle_filled(at(12.0, 12.0), 3.4 * scale, colour);
-            line(at(4.0, 20.0), at(20.0, 4.0));
-        }
-
-        Icon::MoveLayer => {
-            // Back to back, pointing apart, with a gap between them: one
-            // chevron means a direction, two mean the axis.
-            path(vec![at(7.0, 10.0), at(12.0, 5.0), at(17.0, 10.0)]);
-            path(vec![at(7.0, 14.0), at(12.0, 19.0), at(17.0, 14.0)]);
-        }
-
-        Icon::Clip => {
-            // The rule is the layer being clipped *to*; the arrow turns down
-            // onto it. Without the rule the mark is just a return arrow.
-            line(at(5.0, 19.0), at(19.0, 19.0));
-            path(vec![at(16.0, 5.0), at(16.0, 14.5), at(8.0, 14.5)]);
-            path(vec![at(11.5, 11.0), at(8.0, 14.5), at(11.5, 18.0)]);
-        }
-
-        Icon::Lock | Icon::Unlock => {
-            // Body first, so the shackle sits on top of it at any size.
-            path(vec![
-                at(6.0, 11.0),
-                at(18.0, 11.0),
-                at(18.0, 20.0),
-                at(6.0, 20.0),
-                at(6.0, 11.0),
-            ]);
-            // Half a ring, and where its ends land is the whole difference: a
-            // closed lock drops both legs onto the body, an open one lifts the
-            // right-hand leg clear and shifts the arch across.
-            const STEPS: usize = 12;
-            let closed = icon == Icon::Lock;
-            let cx = if closed { 12.0 } else { 15.0 };
-            let mut pts = Vec::with_capacity(STEPS + 2);
-            pts.push(at(cx - 3.6, 11.0));
-            for k in 0..=STEPS {
-                let a = std::f32::consts::PI + k as f32 * std::f32::consts::PI / STEPS as f32;
-                let (s, c) = a.sin_cos();
-                pts.push(at(cx + c * 3.6, 7.4 + s * 3.6));
-            }
-            if closed {
-                pts.push(at(cx + 3.6, 11.0));
-            }
-            path(pts);
-        }
-
-        Icon::Chain => {
-            // Two rounded links overlapping on the diagonal, plus the bar that
-            // joins them — the bar is what stops this reading as two capsules.
-            for side in [-1.0_f32, 1.0] {
-                path(rotated_rect(
-                    &at,
-                    12.0 + side * 3.6,
-                    12.0 - side * 3.6,
-                    3.2,
-                    5.0,
-                    45.0,
-                ));
-            }
-            line(at(9.5, 14.5), at(14.5, 9.5));
-        }
-
-        Icon::Close => {
-            line(at(6.5, 6.5), at(17.5, 17.5));
-            line(at(17.5, 6.5), at(6.5, 17.5));
-        }
-
-        Icon::Pencil => {
-            path(vec![
-                at(5.0, 19.0),
-                at(6.2, 15.0),
-                at(16.5, 4.7),
-                at(19.3, 7.5),
-                at(9.0, 17.8),
-                at(5.0, 19.0),
-            ]);
-            line(at(14.5, 6.7), at(17.3, 9.5));
-        }
-
-        Icon::Rename => {
-            // An I-beam caret standing on a rule. The rule is what stops the
-            // caret alone reading as a divider at 18 px, and it is the line of
-            // text the name is being typed onto.
-            line(at(12.0, 5.0), at(12.0, 15.0));
-            line(at(9.0, 5.0), at(15.0, 5.0));
-            line(at(9.0, 15.0), at(15.0, 15.0));
-            line(at(5.0, 19.5), at(19.0, 19.5));
-        }
-
-        Icon::Gear => {
-            painter.circle_stroke(at(12.0, 12.0), 4.0 * scale, stroke);
-            for k in 0..8 {
-                let a = k as f32 * std::f32::consts::TAU / 8.0;
-                let (s, c) = a.sin_cos();
-                line(
-                    at(12.0 + c * 6.4, 12.0 + s * 6.4),
-                    at(12.0 + c * 9.2, 12.0 + s * 9.2),
-                );
-            }
-        }
-
-        Icon::Check => path(vec![at(5.0, 12.5), at(10.0, 17.5), at(19.0, 6.5)]),
-
-        Icon::Grid => {
-            // Four cells: "show me the whole set", against the single column
-            // the Brushes panel has room for. Drawn as closed paths rather than
-            // stroked rects so the corner radius matches the rest of the set.
-            for (x, y) in [(4.5, 4.5), (13.0, 4.5), (4.5, 13.0), (13.0, 13.0)] {
-                path(vec![
-                    at(x, y),
-                    at(x + 6.5, y),
-                    at(x + 6.5, y + 6.5),
-                    at(x, y + 6.5),
-                    at(x, y),
-                ]);
-            }
-        }
-
-        Icon::Stamps => {
-            // The sheet, and the grain on it. The dots are off a regular grid
-            // on purpose: four in a square would read as `Grid` with a border
-            // round it, which is the one mark this has to be told apart from.
-            path(vec![
-                at(4.5, 4.5),
-                at(19.5, 4.5),
-                at(19.5, 19.5),
-                at(4.5, 19.5),
-                at(4.5, 4.5),
-            ]);
-            for (x, y) in [(9.0, 8.5), (15.0, 10.5), (8.5, 15.0), (14.5, 16.0)] {
-                painter.circle_filled(at(x, y), 1.6 * scale, colour);
-            }
-        }
-
-        Icon::Import => {
-            // An arrow dropping into an open tray. The tray is what separates
-            // this from a plain download mark: the file is coming *into* a
-            // collection that already exists.
-            line(at(12.0, 3.5), at(12.0, 14.5));
-            path(vec![at(8.0, 10.5), at(12.0, 14.5), at(16.0, 10.5)]);
-            path(vec![
-                at(5.0, 15.0),
-                at(5.0, 20.0),
-                at(19.0, 20.0),
-                at(19.0, 15.0),
-            ]);
-        }
-
-        Icon::Link => {
-            // A box with its top-right corner open, and an arrow leaving
-            // through it. The gap is what stops this reading as "add to a
-            // frame": the arrow has to be seen to be going *out*.
-            path(vec![
-                at(13.0, 5.0),
-                at(5.0, 5.0),
-                at(5.0, 19.0),
-                at(19.0, 19.0),
-                at(19.0, 11.0),
-            ]);
-            line(at(11.5, 12.5), at(19.0, 5.0));
-            path(vec![at(13.0, 5.0), at(19.0, 5.0), at(19.0, 11.0)]);
-        }
-
-        Icon::Download => {
-            // Distinct from `Import`, which drops into an open tray: this is a
-            // plain arrow onto a closed line, because what it fetches is one
-            // file rather than an addition to a collection.
-            line(at(12.0, 4.0), at(12.0, 15.0));
-            path(vec![at(7.5, 10.5), at(12.0, 15.0), at(16.5, 10.5)]);
-            line(at(5.0, 19.5), at(19.0, 19.5));
-        }
-
-        Icon::Grip => {
-            // Two columns of dots — the universal "drag me" mark. Drawn as
-            // filled circles rather than the `⠿` braille glyph a text font
-            // would have to carry.
-            for row in 0..3 {
-                let y = 8.0 + row as f32 * 4.0;
-                painter.circle_filled(at(10.0, y), 1.1 * scale, colour);
-                painter.circle_filled(at(14.0, y), 1.1 * scale, colour);
-            }
-        }
-
-        Icon::Corner => {
+        Drawn::Corner => {
             // Resize grip: stepped diagonals in the bottom-right corner.
             line(at(20.0, 10.0), at(10.0, 20.0));
             line(at(20.0, 15.0), at(15.0, 20.0));
         }
-
-        Icon::Document => {
-            // The turned-down corner is what separates a document from a plain
-            // rectangle at 12 px, where the aspect ratio alone does not.
-            path(vec![
-                at(6.0, 3.5),
-                at(14.0, 3.5),
-                at(18.5, 8.0),
-                at(18.5, 20.5),
-                at(6.0, 20.5),
-                at(6.0, 3.5),
-            ]);
-            path(vec![at(14.0, 3.5), at(14.0, 8.0), at(18.5, 8.0)]);
-        }
-
-        Icon::Alert => {
-            // Drawn with a flat top-left to bottom-right sweep rather than as
-            // an equilateral triangle: at 16 px an equilateral one loses its
-            // apex to the stroke weight and reads as a blob.
-            path(vec![
-                at(12.0, 3.5),
-                at(22.0, 20.5),
-                at(2.0, 20.5),
-                at(12.0, 3.5),
-            ]);
-            line(at(12.0, 9.5), at(12.0, 15.0));
-            painter.circle_filled(at(12.0, 18.0), 1.3 * scale, colour);
-        }
-
-        Icon::Copy => {
-            // The sheet behind is drawn as three sides rather than a whole
-            // rectangle: at 18 px a complete second box under the first reads
-            // as one thick-walled frame, where an open corner reads as depth.
-            path(vec![at(9.0, 5.0), at(19.0, 5.0), at(19.0, 15.0)]);
-            path(vec![
-                at(5.0, 9.0),
-                at(15.0, 9.0),
-                at(15.0, 19.0),
-                at(5.0, 19.0),
-                at(5.0, 9.0),
-            ]);
-        }
-
-        Icon::Cut => {
-            // Two blades crossing above two finger rings. The crossing point is
-            // above centre so the rings have room to be circles rather than
-            // dots — below about 14 px they merge with the blades otherwise,
-            // and what is left reads as a plus.
-            line(at(7.0, 4.0), at(15.5, 15.5));
-            line(at(17.0, 4.0), at(8.5, 15.5));
-            painter.circle_stroke(at(7.0, 18.0), 2.6 * scale, stroke);
-            painter.circle_stroke(at(17.0, 18.0), 2.6 * scale, stroke);
-        }
-
-        Icon::Deselect => {
-            // `Select`'s box, drawn a size smaller to leave room for the
-            // stroke, with its dash spans scaled to match so the two read as
-            // the same object with something done to it.
-            const LO: f32 = 6.0;
-            const HI: f32 = 18.0;
-            for (from, to) in [(0.0, 3.5), (5.0, 7.0), (8.5, 12.0)] {
-                line(at(LO + from, LO), at(LO + to, LO));
-                line(at(LO + from, HI), at(LO + to, HI));
-                line(at(LO, LO + from), at(LO, LO + to));
-                line(at(HI, LO + from), at(HI, LO + to));
-            }
-            line(at(4.0, 20.0), at(20.0, 4.0));
-        }
-
-        Icon::HalfCircle => {
-            painter.circle_stroke(at(12.0, 12.0), 7.0 * scale, stroke);
-            // Left half filled, as a triangle fan.
-            let centre = at(12.0, 12.0);
-            let mut mesh = egui::Mesh::default();
-            const STEPS: usize = 20;
-            for k in 0..=STEPS {
-                let a =
-                    std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / STEPS as f32;
-                let (s, c) = a.sin_cos();
-                mesh.colored_vertex(centre + vec2(c, s) * 7.0 * scale, colour);
-            }
-            mesh.colored_vertex(centre, colour);
-            let hub = mesh.vertices.len() as u32 - 1;
-            for k in 0..STEPS as u32 {
-                mesh.indices.extend_from_slice(&[hub, k, k + 1]);
-            }
-            painter.add(Shape::mesh(mesh));
-        }
-
-        Icon::Harmony => {
+        Drawn::Harmony => {
             // A wheel with three of its hues marked on it. Filled discs rather
             // than a second ring inside the first: at 18 px a ring within a
             // ring is a blur, and what this has to say is "several colours,
             // related round the wheel" — the marks are the relation.
             //
-            // Three of them, and at 120°, because a triad is the harmony whose
-            // shape reads at this size; two would be a pair of dots and four
-            // would sit on the axes and read as a compass. The mark names the
-            // idea rather than whichever relation happens to be chosen.
+            // Three of them, and at 120 degrees, because a triad is the harmony
+            // whose shape reads at this size; two would be a pair of dots and
+            // four would sit on the axes and read as a compass. The mark names
+            // the idea rather than whichever relation happens to be chosen.
             // The discs are small against the ring's radius on purpose: at 2.4
             // they merged into the stroke and the mark read as a clover rather
             // than as a wheel with points on it.
@@ -868,47 +1007,260 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
     }
 }
 
-/// The lens shape of an eye, as two arcs meeting at the corners.
-fn eye_outline(at: &impl Fn(f32, f32) -> Pos2) -> Vec<Pos2> {
-    const STEPS: usize = 14;
-    let mut pts = Vec::with_capacity(STEPS * 2 + 2);
-    let lid = |sign: f32, t: f32| {
-        let x = 3.5 + t * 17.0;
-        // `abs` guards the same NaN trap as elsewhere: sin(PI) in f32 lands a
-        // hair below zero, and these values feed a position, not a colour, but
-        // a negative bulge would kink the outline.
-        let bulge = (t * std::f32::consts::PI).sin().abs();
-        (x, 12.0 + sign * bulge * 5.5)
-    };
-    for k in 0..=STEPS {
-        let (x, y) = lid(-1.0, k as f32 / STEPS as f32);
-        pts.push(at(x, y));
-    }
-    for k in 0..=STEPS {
-        let (x, y) = lid(1.0, 1.0 - k as f32 / STEPS as f32);
-        pts.push(at(x, y));
-    }
-    pts
+/// The layer mask: the frame, and the coverage that hides part of what is in
+/// it.
+///
+/// A frame plus a solid shape rather than two outlines, because at 16 px two
+/// nested rings read as a target. One function because [`Drawn::MaskOff`] is
+/// this and a stroke through it.
+fn mask(
+    painter: &Painter,
+    at: &impl Fn(f32, f32) -> Pos2,
+    scale: f32,
+    stroke: Stroke,
+    colour: Color32,
+) {
+    painter.add(Shape::closed_line(
+        vec![at(4.0, 5.0), at(20.0, 5.0), at(20.0, 19.0), at(4.0, 19.0)],
+        stroke,
+    ));
+    painter.circle_filled(at(12.0, 12.0), 4.2 * scale, colour);
 }
 
-/// Corners of a rectangle rotated about its centre, closed back to the start.
-fn rotated_rect(
-    at: &impl Fn(f32, f32) -> Pos2,
-    cx: f32,
-    cy: f32,
-    half_w: f32,
-    half_h: f32,
-    degrees: f32,
-) -> Vec<Pos2> {
-    let (sin, cos) = degrees.to_radians().sin_cos();
-    [
-        (-half_w, -half_h),
-        (half_w, -half_h),
-        (half_w, half_h),
-        (-half_w, half_h),
-        (-half_w, -half_h),
-    ]
-    .iter()
-    .map(|(dx, dy)| at(cx + dx * cos - dy * sin, cy + dx * sin + dy * cos))
-    .collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ALL` holds every icon, at the position an exhaustive match gives it.
+    ///
+    /// Walking `ALL` could only ever check what is in it, so the arms are the
+    /// authority and the array is what is checked: a variant added without a
+    /// row is a compile error here, and one filed in the wrong place is a
+    /// failure naming both.
+    #[test]
+    fn every_icon_is_in_all_where_the_match_puts_it() {
+        let at = |icon: Icon| -> usize {
+            match icon {
+                Icon::Brush => 0,
+                Icon::Eraser => 1,
+                Icon::Select => 2,
+                Icon::Transform => 3,
+                Icon::Pan => 4,
+                Icon::Zoom => 5,
+                Icon::Rotate => 6,
+                Icon::FlipHorizontal => 7,
+                Icon::FlipVertical => 8,
+                Icon::Plus => 9,
+                Icon::Trash => 10,
+                Icon::ChevronUp => 11,
+                Icon::ChevronDown => 12,
+                Icon::Eye => 13,
+                Icon::EyeOff => 14,
+                Icon::Mask => 15,
+                Icon::Clip => 16,
+                Icon::Lock => 17,
+                Icon::Unlock => 18,
+                Icon::Chain => 19,
+                Icon::Close => 20,
+                Icon::Pencil => 21,
+                Icon::Gear => 22,
+                Icon::Check => 23,
+                Icon::Grid => 24,
+                Icon::Import => 25,
+                Icon::Link => 26,
+                Icon::Download => 27,
+                Icon::Grip => 28,
+                Icon::Corner => 29,
+                Icon::HalfCircle => 30,
+                Icon::Document => 31,
+                Icon::Alert => 32,
+                Icon::Copy => 33,
+                Icon::Cut => 34,
+                Icon::Deselect => 35,
+                Icon::Folder => 36,
+                Icon::ChevronRight => 37,
+                Icon::SelectReplace => 38,
+                Icon::SelectAdd => 39,
+                Icon::SelectSubtract => 40,
+                Icon::SelectIntersect => 41,
+                Icon::Stamps => 42,
+                Icon::Rename => 43,
+                Icon::Text => 44,
+                Icon::MoveLayer => 45,
+                Icon::MaskOff => 46,
+                Icon::Harmony => 47,
+                Icon::Bold => 48,
+                Icon::Italic => 49,
+                Icon::Eyedropper => 50,
+            }
+        };
+        for icon in Icon::ALL {
+            assert_eq!(Icon::ALL[at(icon)], icon, "{icon:?} is filed elsewhere");
+        }
+    }
+
+    /// Every Lucide icon flattens to something, and to something the size of
+    /// the box it was authored in.
+    ///
+    /// The parser answers a command it does not know by stopping, which would
+    /// leave half an icon rather than a panic — this is what would catch it,
+    /// along with a path whose numbers failed to parse and collapsed everything
+    /// to the origin.
+    #[test]
+    fn every_icon_fills_its_box() {
+        for icon in Icon::ALL {
+            let Art::Lucide(nodes) = icon.art() else {
+                continue;
+            };
+            let outlines = crate::lucide::flatten(nodes);
+            assert!(!outlines.is_empty(), "{icon:?} flattened to nothing");
+
+            let points: Vec<_> = outlines.iter().flat_map(|o| o.points.iter()).collect();
+            let left = points.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+            let right = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+            let top = points.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+            let bottom = points.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+
+            assert!(
+                left >= -0.5 && top >= -0.5 && right <= BOX + 0.5 && bottom <= BOX + 0.5,
+                "{icon:?} runs outside the 24x24 box: {left}..{right}, {top}..{bottom}"
+            );
+            // Lucide leaves a unit or two of margin, so an icon reaching less
+            // than half the box in *either* direction has lost a subpath. Half
+            // is what the narrowest mark in the set actually reaches — a
+            // chevron is 12 units across and 6 tall — so this is the floor the
+            // shipped set meets rather than a round number.
+            assert!(
+                right - left >= BOX / 2.0 || bottom - top >= BOX / 2.0,
+                "{icon:?} is too small to have all of its parts: {left}..{right}, {top}..{bottom}"
+            );
+        }
+    }
+
+    /// No icon uses a command the parser would stop at.
+    ///
+    /// Quadratics and the smooth forms are not implemented, and the day a
+    /// pasted-in icon uses one this says so by name rather than by a shape
+    /// somebody notices later.
+    #[test]
+    fn every_command_is_one_the_parser_knows() {
+        const KNOWN: [char; 12] = ['M', 'm', 'L', 'l', 'H', 'h', 'V', 'v', 'C', 'c', 'A', 'a'];
+        for icon in Icon::ALL {
+            let Art::Lucide(nodes) = icon.art() else {
+                continue;
+            };
+            for node in nodes {
+                let Node::Path(d) = node else {
+                    continue;
+                };
+                for c in d.chars().filter(|c| c.is_ascii_alphabetic()) {
+                    // `e` is an exponent rather than a command; no icon here
+                    // uses one, and the check would be wrong if one did.
+                    assert!(
+                        KNOWN.contains(&c) || c == 'Z' || c == 'z',
+                        "{icon:?} uses the SVG command {c}, which the parser does not know"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The marks Umber draws itself are these five, and no more.
+    ///
+    /// What it checks is the *list*, not Lucide: nothing here can ask the
+    /// package whether it carries a layer mask, so a sixth hand-drawn mark
+    /// fails this test rather than being caught by a search. That is the point
+    /// — the failure is what makes somebody write down what they looked for
+    /// before adding one, which is what [`Drawn`]'s variants hold.
+    #[test]
+    fn the_marks_umber_draws_itself_are_these_five() {
+        let drawn: Vec<Icon> = Icon::ALL
+            .into_iter()
+            .filter(|i| matches!(i.art(), Art::Drawn(_)))
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![
+                Icon::Mask,
+                Icon::Corner,
+                Icon::Deselect,
+                Icon::MaskOff,
+                Icon::Harmony,
+            ],
+            "the set is Lucide's; a mark drawn here needs its search written \
+             into `Drawn` and this list extended deliberately"
+        );
+    }
+
+    /// The cache holds an entry for every icon and geometry for every Lucide
+    /// one, which is what `draw`'s `else` branch rests on.
+    #[test]
+    fn every_lucide_icon_has_geometry_and_no_drawn_one_does() {
+        for icon in Icon::ALL {
+            match icon.art() {
+                Art::Lucide(_) => {
+                    let held = geometry(icon).unwrap_or_else(|| panic!("{icon:?} has no geometry"));
+                    assert!(!held.is_empty(), "{icon:?} flattened to nothing");
+                }
+                Art::Drawn(_) => assert!(
+                    geometry(icon).is_none(),
+                    "{icon:?} is drawn and should hold no flattened geometry"
+                ),
+            }
+        }
+    }
+
+    /// Not a guard: a way to look at the set.
+    ///
+    /// Writes a sheet of every icon in both themes, at the two sizes the
+    /// interface actually draws them, so a migration can be judged by eye. It
+    /// is what caught the one real defect in this one — `scaling` and
+    /// `external-link` are the same mark at 18 px — which no assertion over
+    /// path data could have found, because both icons were exactly what the
+    /// package says they are.
+    ///
+    /// Into the temporary directory rather than the tree: nothing here is
+    /// checked in, and the picture is out of date the moment an icon moves.
+    #[test]
+    #[ignore = "writes a picture to look at; run deliberately"]
+    fn icon_sheet() {
+        use crate::theme::{Palette, ThemeKind};
+        let Some(mut stage) = crate::docshot::Stage::new() else {
+            return;
+        };
+        for (kind, name) in [
+            (ThemeKind::Graphite, "umber-icons-graphite.png"),
+            (ThemeKind::Paper, "umber-icons-paper.png"),
+        ] {
+            let palette = Palette::of(kind);
+            let cols = 9;
+            let rows = Icon::ALL.len().div_ceil(cols);
+            let cell = 44.0;
+            let size = egui::vec2(cols as f32 * cell, rows as f32 * cell);
+            let image = stage.shoot(size, 2.0, &palette, palette.window, |ui| {
+                let painter = ui.painter().clone();
+                let top = ui.max_rect().min;
+                for (k, icon) in Icon::ALL.iter().enumerate() {
+                    let x = (k % cols) as f32 * cell;
+                    let y = (k / cols) as f32 * cell;
+                    let at = egui::Rect::from_min_size(
+                        top + egui::vec2(x + 8.0, y + 6.0),
+                        egui::Vec2::splat(18.0),
+                    );
+                    draw(&painter, at, *icon, palette.text);
+                    // The 14 px instance under it: a mark that only reads at
+                    // the tool rail's size is a mark that is wrong in a layer
+                    // row.
+                    let small = egui::Rect::from_min_size(
+                        top + egui::vec2(x + 8.0, y + 26.0),
+                        egui::Vec2::splat(14.0),
+                    );
+                    draw(&painter, small, *icon, palette.text_dim);
+                }
+            });
+            let out = std::env::temp_dir().join(name);
+            crate::docshot::write_png(&out, &image).expect("a picture");
+            println!("wrote {}", out.display());
+        }
+    }
 }

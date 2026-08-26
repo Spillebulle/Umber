@@ -421,3 +421,6 @@ names travel with them. [`docs/brush-sources.md`](docs/brush-sources.md) records
 every one.
 
 **Archivo**, the typeface, is bundled under the SIL Open Font License.
+
+**Lucide**, the icon set, is used under the ISC licence, Copyright (c) Lucide
+Icons and Contributors.

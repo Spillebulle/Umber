@@ -3427,7 +3427,32 @@ design shows a whole row of them.
 - **`theme::metrics` holds the design's fixed sizes.** Use them instead of
   re-typing 264.0 or 36.0 at the call site.
 - **Never put a Unicode symbol in the UI.** Archivo carries none of them, so
-  they render as blank boxes. Add a variant to `icons::Icon` and draw it.
+  they render as blank boxes. Add a variant to `icons::Icon` instead.
+- **The icon set is Lucide's, and a new mark is a paste rather than a
+  drawing.** `STYLE-GUIDE.md` §11 is the house rule and Umber is now on it:
+  `Icon::art` carries the package's own `d` attributes, copied verbatim, and
+  `lucide.rs` flattens them into polylines at the interface's own stroke
+  weight — no rasteriser, no icon font, and an icon updated by pasting one
+  line over another. **The exception is a mark Lucide does not carry**, which
+  is `Drawn`'s five and no more: a layer mask, its off twin, deselect, the
+  resize corner and the colour harmony. Each variant records what was searched
+  for and not found, `the_marks_umber_draws_itself_are_these_five` pins the
+  list, and what the exception does **not** cover is redrawing a mark Lucide
+  already has.
+- **Two marks can be correct and still collide, and only looking finds it.**
+  Lucide's `scaling` and `external-link` are both a rounded box with a diagonal
+  arrow leaving the top right corner; at 18 px they are one mark, and the
+  transform tool had one while the About dialog had the other. Both were
+  byte-for-byte what the package says, so no assertion over path data could
+  have seen it. `icons::tests::icon_sheet` is the instrument — an ignored test
+  that renders every icon in both themes at the two sizes the interface draws
+  them — and the answer was `vector-square`, which is the box with corner
+  handles the tool actually draws on the canvas.
+- **A negated mark is drawn from the mark it negates.** `Drawn::Deselect`
+  strokes `Icon::Select`'s *own* flattened outlines and puts Lucide's own
+  `m2 2 20 20` across them, and `Drawn::MaskOff` is `mask()` plus the same
+  stroke. Drawing the box again is what the first version did, and it left the
+  pair at two sizes with two dash spans that had to be kept in step by hand.
 - **Shortcuts live in `shortcuts.rs`, not in a `match`.** The settings dialog
   enumerates them, which a match arm cannot do. `resolve` compares ctrl/shift/alt
   exactly — that is what stops plain `Z` (zoom tool) also firing on `Ctrl+Z`.
