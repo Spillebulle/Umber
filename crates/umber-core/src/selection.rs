@@ -234,7 +234,8 @@ impl SelectionMode {
     /// exhaustive match, so a variant added without a row here is a compile
     /// error rather than a mode that exists and nothing can reach. A test that
     /// walked `ALL` could only ever check what is already in it.
-    pub const ALL: [SelectionMode; 4] = [Self::Rectangle, Self::Ellipse, Self::Lasso, Self::Polygon];
+    pub const ALL: [SelectionMode; 4] =
+        [Self::Rectangle, Self::Ellipse, Self::Lasso, Self::Polygon];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -1312,14 +1313,18 @@ fn arc_steps(r: f32) -> u32 {
     ((std::f32::consts::FRAC_PI_2 / theta).ceil() as u32).clamp(1, MAX_ARC_STEPS)
 }
 
-/// Append a quarter-turn about `centre` with radii `r`, from angle `from` to
-/// `from + FRAC_PI_2`, **without** its first point.
+/// Append the **interior** of a quarter-turn about `centre` with radii `r`,
+/// from angle `from` to `from + FRAC_PI_2`.
 ///
-/// The first point is left out because every caller has just emitted it as the
-/// end of the straight run before the corner, and a ring carrying it twice is a
-/// zero-length edge the rasteriser walks on every sub-scanline it spans.
+/// Both endpoints are left out, and that is not tidiness. `cos(π/2)` in `f32`
+/// is `-4.4e-8` rather than zero, so an arc's own last point misses the corner
+/// it lands on by about a millionth of a pixel — which is invisible in the mask
+/// and is still a *second* vertex a hair from the one the straight run beside
+/// it contributes. The caller pushes every junction analytically instead, so
+/// the two agree bit for bit and [`push_new`] can drop the duplicate by exact
+/// equality wherever a straight run has no length at all.
 fn push_quarter(out: &mut Vec<Vec2>, centre: Vec2, r: Vec2, from: f32, steps: u32) {
-    for k in 1..=steps {
+    for k in 1..steps {
         let a = from + std::f32::consts::FRAC_PI_2 * (k as f32 / steps as f32);
         let (s, c) = a.sin_cos();
         out.push(centre + Vec2::new(c * r.x, s * r.y));
@@ -1342,32 +1347,49 @@ fn rounded_rect_ring(a: Vec2, b: Vec2, roundness: f32, out: &mut Vec<Vec2>) {
     let size = max - min;
     let r = 0.5 * size.min_element() * roundness.clamp(0.0, 1.0);
     if !(r > 0.0) {
-        out.extend_from_slice(&[
-            min,
-            Vec2::new(max.x, min.y),
-            max,
-            Vec2::new(min.x, max.y),
-        ]);
+        out.extend_from_slice(&[min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]);
         return;
     }
     let steps = arc_steps(r);
     let rr = Vec2::splat(r);
     use std::f32::consts::{FRAC_PI_2, PI};
-    // Top edge, then each corner as a quarter-turn whose first point is the end
-    // of the edge that led into it. Angles are measured with y *down*, so the
-    // sweep that looks anticlockwise on paper is the clockwise one here.
-    out.push(Vec2::new(min.x + r, min.y));
-    out.push(Vec2::new(max.x - r, min.y));
+    // Each straight run's far end, and then the corner it leads into as a
+    // quarter-turn whose own first point is that end. Angles are measured with
+    // y *down*, so the sweep that looks anticlockwise on paper is the clockwise
+    // one here.
+    //
+    // The runs are pushed only where they are a run. At full roundness the
+    // radius is half the *shorter* side, so both straight edges on that axis
+    // have zero length — a fully rounded square has none at all — and pushing
+    // them anyway would put coincident points in the ring. A zero-length edge
+    // is one the rasteriser walks on every sub-scanline that spans it and one
+    // more term in `winding`'s sum, for a segment that encloses nothing.
+    push_new(out, Vec2::new(min.x + r, min.y));
+    push_new(out, Vec2::new(max.x - r, min.y));
     push_quarter(out, Vec2::new(max.x - r, min.y + r), rr, -FRAC_PI_2, steps);
-    out.push(Vec2::new(max.x, max.y - r));
+    push_new(out, Vec2::new(max.x, min.y + r));
+    push_new(out, Vec2::new(max.x, max.y - r));
     push_quarter(out, Vec2::new(max.x - r, max.y - r), rr, 0.0, steps);
-    out.push(Vec2::new(min.x + r, max.y));
+    push_new(out, Vec2::new(max.x - r, max.y));
+    push_new(out, Vec2::new(min.x + r, max.y));
     push_quarter(out, Vec2::new(min.x + r, max.y - r), rr, FRAC_PI_2, steps);
-    out.push(Vec2::new(min.x, min.y + r));
+    push_new(out, Vec2::new(min.x, max.y - r));
+    push_new(out, Vec2::new(min.x, min.y + r));
     push_quarter(out, Vec2::new(min.x + r, min.y + r), rr, PI, steps);
-    // The last arc ends exactly where the ring began, so drop it: the closing
-    // edge is implicit and a repeated first point is a zero-length one.
-    out.pop();
+    // The last corner lands back on the ring's first point, which the implicit
+    // closing edge already carries — so nothing is pushed for it.
+}
+
+/// Append `p` unless it is already the last point.
+///
+/// Exact equality rather than a tolerance, because every caller is pushing a
+/// point built from the *same* expression the last one was — `max.y - r` twice,
+/// say — so where they coincide they are bit-identical, and a tolerance here
+/// would be a second, looser rule about what counts as a distinct vertex.
+fn push_new(out: &mut Vec<Vec2>, p: Vec2) {
+    if out.last() != Some(&p) {
+        out.push(p);
+    }
 }
 
 /// The ring of the ellipse inscribed in the box between two corners.
@@ -1388,6 +1410,47 @@ fn ellipse_ring(a: Vec2, b: Vec2, out: &mut Vec<Vec2>) {
         let (s, c) = angle.sin_cos();
         out.push(centre + Vec2::new(c * r.x, s * r.y));
     }
+}
+
+/// How many corner-cutting passes a polyline with these samples needs to reach
+/// [`LASSO_SEGMENT`].
+///
+/// A pass halves every segment, so the count is `⌈log2(spacing / target)⌉`,
+/// bounded by [`MAX_LASSO_SMOOTHING`]. **Adaptive rather than a fixed number of
+/// passes**, and the reason is that the two ends of the zoom range want
+/// opposite things: a lasso drawn at 0.1 has ten-pixel edges and needs four
+/// passes to become a curve, while one drawn at 8:1 already has edges an eighth
+/// of a pixel long and needs none at all — where a fixed count would multiply
+/// the busiest ring anybody can produce by eight for a difference no mask and
+/// no camera can show. Zero passes is the exact identity, which is what makes
+/// the zoomed-in case cost nothing.
+///
+/// The **mean** spacing rather than the largest. One long edge is a jump the
+/// pointer made — a fast flick, or a dropped frame — and it is a straight line
+/// the hand really took rather than a staircase, so letting it drive the count
+/// would subdivide a whole gesture on the strength of the one segment that
+/// least needs it.
+///
+/// It is re-derived as the gesture grows, so a lasso whose mean spacing crosses
+/// a power of two mid-drag changes smoothness once, by one halving. That is
+/// sub-pixel by construction — the crossing happens at the target — and it is
+/// the price of the preview and the finished shape sharing one function rather
+/// than the count being snapshotted at a press, where the first two samples
+/// would decide it for the whole gesture.
+fn smoothing_passes(points: &[Vec2]) -> u32 {
+    if points.len() < 3 {
+        return 0;
+    }
+    let travel: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let spacing = travel / (points.len() - 1) as f32;
+    if !(spacing > LASSO_SEGMENT) {
+        return 0;
+    }
+    let passes = (spacing / LASSO_SEGMENT).log2().ceil();
+    if !passes.is_finite() {
+        return MAX_LASSO_SMOOTHING;
+    }
+    (passes as u32).min(MAX_LASSO_SMOOTHING)
 }
 
 /// One corner-cutting pass over an **open** polyline, in place.
@@ -1468,30 +1531,26 @@ pub struct SelectionDraft {
     cursor: Vec2,
 }
 
-/// How many corner-cutting passes a freehand lasso's samples get.
+/// How short a freehand lasso's segments are subdivided towards, in document
+/// pixels.
 ///
 /// **This is what fixes a lasso drawn zoomed out and inspected zoomed in**, and
 /// the mechanism is worth stating because "record the pointer more often" is
 /// the obvious repair and is not available. At zoom 0.1 one screen pixel *is*
 /// ten document pixels, so the finest polyline the pointer can describe already
 /// has a vertex only every ten document pixels; there is nothing finer to
-/// sample. Zoom back to 8:1 afterwards and each of those edges is 80 screen
-/// pixels of straight line meeting the next at a visible kink — the staircase
-/// the artist reported. Subdividing is the only thing that can put a curve
-/// there, because the information the samples lack has to be *interpolated*
-/// rather than measured.
+/// sample. Zoom back in afterwards and each of those edges is a long straight
+/// line meeting the next at a right angle — the staircase the artist reported.
+/// Subdividing is the only thing that can put a curve there, because the detail
+/// the samples lack has to be *interpolated* rather than measured.
 ///
-/// Two passes, which is a measured trade rather than a round number. Each pass
-/// doubles the ring and quarters the turn at every vertex, so two take a
-/// ten-pixel sample spacing to two-and-a-half-pixel segments: invisible at the
-/// 2:1 or 4:1 somebody actually zooms back to, and still faintly faceted if
-/// they go from 0.1 straight to 8. Three would fix that case and cost eight
-/// times the vertices on a ring the marquee walks **every frame for as long as
-/// the selection stands** — `ui::selection_outline` draws one line segment per
-/// vertex under the dashes. If that ever needs revisiting the answer is to
-/// simplify the smoothed ring by curvature, not to smooth it less.
+/// One document pixel, because that is the finest distinction the mask can
+/// carry: [`rasterise`] resolves a quarter of a row and exact horizontal
+/// coverage, so a vertex every pixel already describes every byte the shape can
+/// produce. Below it only the marquee could tell the difference, and only above
+/// the zoom the gesture was made at.
 ///
-/// The two alternatives, and why not:
+/// The two alternatives to corner-cutting, and why not:
 /// - **Catmull-Rom through the samples** interpolates them, so it reproduces
 ///   the screen lattice as a wave instead of removing it — smooth, and still
 ///   half a screen pixel wrong at every sample — and it overshoots at a fast
@@ -1499,7 +1558,23 @@ pub struct SelectionDraft {
 /// - **A symmetric (1, 2, 1) average in place** removes the lattice noise for
 ///   nothing and adds no vertices, so it leaves the facets exactly where they
 ///   were. It is the right instrument for the wrong half of the problem.
-const LASSO_SMOOTHING: u32 = 2;
+const LASSO_SEGMENT: f32 = 1.0;
+
+/// The most corner-cutting passes a lasso's samples ever get.
+///
+/// Each pass doubles the ring, and the ring is walked **every frame for as long
+/// as the selection stands** — `ui::selection_outline` draws one line segment
+/// per vertex under the dashes — so this is a bound on a per-frame cost rather
+/// than on a one-off. Three is eight times the samples, and the samples are
+/// themselves bounded by how far the hand moved *on the glass*, so the worst
+/// realistic ring is a few tens of thousands of vertices rather than unbounded.
+///
+/// It binds below about zoom 0.125, where the sample spacing is over eight
+/// document pixels. Somebody lassoing at 0.05 gets segments of two pixels
+/// rather than one; that is a much better outline than the twenty-pixel edges
+/// they have now, and the remedy if it is ever not good enough is to simplify
+/// the smoothed ring by curvature rather than to raise this.
+const MAX_LASSO_SMOOTHING: u32 = 3;
 
 impl SelectionDraft {
     /// The heaviest damping the lasso may be asked for.
@@ -1751,7 +1826,7 @@ impl SelectionDraft {
     fn lasso_ring(&self, out: &mut Vec<Vec2>) {
         out.clear();
         out.extend_from_slice(&self.points);
-        for _ in 0..LASSO_SMOOTHING {
+        for _ in 0..smoothing_passes(&self.points) {
             cut_corners(out);
         }
     }
@@ -1821,6 +1896,222 @@ mod tests {
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Selection {
         Selection::rectangle(vec2(x0, y0), vec2(x1, y1), DOC).expect("a rectangle")
+    }
+
+    // --- modes ------------------------------------------------------------
+
+    /// `ALL` holds every mode, at the position an exhaustive match gives it.
+    ///
+    /// Walking `ALL` could only ever check what is in it, so the arms are the
+    /// authority and the array is what is checked: a variant added without a
+    /// row here is a compile error, and one filed in the wrong place is a
+    /// failure naming it. `icons::every_icon_is_in_all_where_the_match_puts_it`
+    /// is the same guard on the same hazard.
+    #[test]
+    fn every_mode_is_in_all_where_the_match_puts_it() {
+        let at = |mode: SelectionMode| -> usize {
+            match mode {
+                SelectionMode::Rectangle => 0,
+                SelectionMode::Ellipse => 1,
+                SelectionMode::Lasso => 2,
+                SelectionMode::Polygon => 3,
+            }
+        };
+        for mode in SelectionMode::ALL {
+            assert_eq!(
+                SelectionMode::ALL[at(mode)],
+                mode,
+                "{mode:?} is filed elsewhere"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mode_says_what_its_gesture_is_and_which_setting_it_owns() {
+        // A label and a hint are what the picker and the strip draw, so an
+        // empty one is a row with nothing on it — and the two settings must be
+        // claimed by exactly one mode each, or the strip either draws a rail
+        // twice or offers one the gesture ignores.
+        let mut owners = Vec::new();
+        for mode in SelectionMode::ALL {
+            assert!(!mode.label().is_empty(), "{mode:?} has no name");
+            assert!(
+                !mode.hint().is_empty(),
+                "{mode:?} says nothing about itself"
+            );
+            if let Some(setting) = mode.extra() {
+                owners.push(setting);
+            }
+        }
+        owners.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(
+            owners,
+            vec![ModeSetting::Roundness, ModeSetting::Stabiliser]
+        );
+    }
+
+    // --- rounded rectangles and ellipses ----------------------------------
+
+    /// How many pixels of the canvas the selection covers, counting a partly
+    /// covered one by its coverage. The shapes below are about *area*, so this
+    /// is what they measure rather than a vertex or a sampled pixel.
+    fn area(s: &Selection) -> f32 {
+        s.coverage().iter().map(|c| f32::from(*c) / 255.0).sum()
+    }
+
+    #[test]
+    fn no_roundness_is_the_exact_identity() {
+        // The same rule the feather's zero and the grain's `mix(1.0, tile, s)`
+        // hold to. It matters more here than it reads: an arc of radius zero
+        // still emits its endpoints, so a rounding path taken at zero would
+        // hand the rasteriser eight vertices in coincident pairs where the
+        // plain rectangle hands it four — and the plain rectangle is the one
+        // shape the fill rule is exact on both axes for.
+        let plain = rect(10.0, 12.0, 30.0, 24.0);
+        for roundness in [0.0, -1.0, f32::NAN] {
+            let rounded =
+                Selection::rounded_rectangle(vec2(10.0, 12.0), vec2(30.0, 24.0), roundness, DOC)
+                    .expect("a rectangle");
+            assert_eq!(rounded.rings(), plain.rings(), "roundness {roundness}");
+            assert_eq!(rounded.bounds(), plain.bounds(), "roundness {roundness}");
+            assert_eq!(
+                rounded.coverage(),
+                plain.coverage(),
+                "roundness {roundness}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_rounded_square_is_a_disc() {
+        // Roundness 1 takes the corner radius to half the shorter side, so on a
+        // square there are no straight flanks left at all.
+        let s = Selection::rounded_rectangle(vec2(8.0, 8.0), vec2(48.0, 48.0), 1.0, DOC)
+            .expect("a disc");
+        assert_eq!(
+            s.bounds(),
+            PixelRect {
+                x: 8,
+                y: 8,
+                width: 40,
+                height: 40
+            }
+        );
+        // The corners of the box are outside it and the middles of its sides
+        // are on the boundary.
+        assert_eq!(
+            s.coverage_at(8, 8),
+            0,
+            "the box's corner is inside the disc"
+        );
+        assert_eq!(s.coverage_at(28, 28), 255, "the middle is not selected");
+        assert!(
+            s.contains(vec2(28.0, 9.0)),
+            "the top of the disc is missing"
+        );
+
+        // And it really is a circle rather than a rounded square: within half a
+        // percent of πr², where the square it came from is 27% larger. The
+        // slack is the fill rule's, not the geometry's — `SUB_SCANLINES`
+        // resolves a quarter of a row, which under-reports a curve by a
+        // fraction of a pixel per row, so the measured 1253.3 against 1256.6 is
+        // the rasteriser and would not shrink if the arcs were exact.
+        let r = 20.0;
+        let disc = std::f32::consts::PI * r * r;
+        let got = area(&s);
+        assert!(
+            (got - disc).abs() < disc * 0.005,
+            "a fully rounded square covers {got:.1} px against a disc's {disc:.1}"
+        );
+    }
+
+    #[test]
+    fn a_fully_rounded_oblong_is_a_stadium_and_an_ellipse_is_not() {
+        // The two shapes the picker has to be able to tell apart, on the one
+        // box where they differ most: twice as wide as it is tall. A stadium
+        // keeps its full height along the whole of the straight flank; an
+        // ellipse is at its full height only where it crosses the centre.
+        let (a, b) = (vec2(4.0, 20.0), vec2(44.0, 40.0));
+        let stadium = Selection::rounded_rectangle(a, b, 1.0, DOC).expect("a stadium");
+        let ellipse = Selection::ellipse(a, b, DOC).expect("an ellipse");
+        assert_eq!(stadium.bounds(), ellipse.bounds(), "the same box");
+
+        // A quarter of the way along the top edge, which is inside the
+        // stadium's flat flank and well outside the ellipse.
+        let probe = vec2(24.0 - 10.0, 20.5);
+        assert!(stadium.contains(probe), "the stadium lost its flat top");
+        assert!(!ellipse.contains(probe), "the ellipse has a flat top");
+
+        // And by area: a stadium of these proportions is a 20x20 square plus a
+        // disc of radius 10, which is 14% more than the ellipse's πab. Half a
+        // percent of slack, for `a_fully_rounded_square_is_a_disc`'s reason.
+        let disc = std::f32::consts::PI * 100.0;
+        let expected_stadium = 400.0 + disc;
+        let expected_ellipse = std::f32::consts::PI * 20.0 * 10.0;
+        assert!(
+            (area(&stadium) - expected_stadium).abs() < expected_stadium * 0.005,
+            "the stadium covers {:.1} against {expected_stadium:.1}",
+            area(&stadium)
+        );
+        assert!(
+            (area(&ellipse) - expected_ellipse).abs() < expected_ellipse * 0.005,
+            "the ellipse covers {:.1} against {expected_ellipse:.1}",
+            area(&ellipse)
+        );
+    }
+
+    #[test]
+    fn a_curved_outline_is_flattened_finely_enough_to_be_a_curve() {
+        // `ARC_TOLERANCE`'s claim, measured on the geometry rather than
+        // restated: no vertex of a big circle sits more than a twentieth of a
+        // pixel off the true one, and the count is derived rather than fixed —
+        // so a circle ten times the size gets more vertices and stays inside
+        // the same bound.
+        let big = UVec2::splat(2048);
+        for radius in [8.0f32, 100.0, 900.0] {
+            let centre = Vec2::splat(1000.0);
+            let s = Selection::ellipse(centre - radius, centre + radius, big).expect("a disc");
+            let ring = &s.rings()[0];
+            let worst = worst_radial_error(ring, centre, radius);
+            assert!(
+                worst <= ARC_TOLERANCE,
+                "a circle of radius {radius} is flattened {worst:.4} px off, past \
+                 the {ARC_TOLERANCE} it promises, with {} vertices",
+                ring.len()
+            );
+            // And it is not simply flattening everything to death: the count
+            // follows the square root of the radius rather than the radius.
+            assert!(
+                ring.len() < 4 * MAX_ARC_STEPS as usize,
+                "a circle of radius {radius} took {} vertices",
+                ring.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_curved_ring_never_repeats_a_point() {
+        // A ring's closing edge is implicit, so a first point emitted again at
+        // the end is a zero-length edge the rasteriser walks on every
+        // sub-scanline that spans it — and `winding` counts it. Both curved
+        // constructors join arcs to straight runs, which is exactly where a
+        // duplicate creeps in.
+        let mut ring = Vec::new();
+        for roundness in [0.2f32, 0.5, 1.0] {
+            rounded_rect_ring(vec2(4.0, 4.0), vec2(40.0, 28.0), roundness, &mut ring);
+            for (i, w) in ring.windows(2).enumerate() {
+                assert!(
+                    w[0].distance(w[1]) > 1e-4,
+                    "roundness {roundness} repeats a point at {i}"
+                );
+            }
+            assert!(
+                ring[0].distance(*ring.last().expect("a ring")) > 1e-4,
+                "roundness {roundness} closes the ring by hand"
+            );
+        }
+        ellipse_ring(vec2(4.0, 4.0), vec2(40.0, 28.0), &mut ring);
+        assert!(ring[0].distance(*ring.last().expect("a ring")) > 1e-4);
     }
 
     #[test]
@@ -1993,6 +2284,273 @@ mod tests {
         draft.moved(vec2(40.0, 10.0), STEP);
         draft.moved(vec2(40.0, 40.0), STEP);
         assert_eq!(draft.finish(DOC).map(|s| s.bounds().width), Some(30));
+    }
+
+    // --- the lasso's smoothing --------------------------------------------
+
+    /// A circle sampled on a lattice `spacing` document pixels apart, which is
+    /// what the pointer can describe at a zoom of `1 / spacing`.
+    ///
+    /// The snap is the whole fixture: it is *why* a lasso drawn zoomed out
+    /// comes back as a staircase, and no amount of sampling the circle more
+    /// finely can undo it. Consecutive duplicates are dropped because the
+    /// pointer reports a position rather than a change.
+    fn lattice_circle(centre: Vec2, radius: f32, spacing: f32) -> Vec<Vec2> {
+        let mut out: Vec<Vec2> = Vec::new();
+        for k in 0..4000 {
+            let a = std::f32::consts::TAU * (k as f32 / 4000.0);
+            let (s, c) = a.sin_cos();
+            let p = centre + vec2(c * radius, s * radius);
+            let snapped = vec2(
+                (p.x / spacing).round() * spacing,
+                (p.y / spacing).round() * spacing,
+            );
+            if out.last().is_none_or(|l| *l != snapped) {
+                out.push(snapped);
+            }
+        }
+        out
+    }
+
+    /// The sharpest corner in a polyline, in degrees. Zero is a straight line.
+    fn sharpest_turn(points: &[Vec2]) -> f32 {
+        let mut worst = 0.0f32;
+        for w in points.windows(3) {
+            let a = (w[1] - w[0]).normalize_or_zero();
+            let b = (w[2] - w[1]).normalize_or_zero();
+            worst = worst.max(a.dot(b).clamp(-1.0, 1.0).acos().to_degrees());
+        }
+        worst
+    }
+
+    fn longest_edge(points: &[Vec2]) -> f32 {
+        points
+            .windows(2)
+            .map(|w| w[0].distance(w[1]))
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The furthest any vertex sits from the circle it was meant to trace.
+    fn worst_radial_error(points: &[Vec2], centre: Vec2, radius: f32) -> f32 {
+        points
+            .iter()
+            .map(|p| ((*p - centre).length() - radius).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn a_lasso_drawn_zoomed_out_comes_back_as_a_curve_and_not_a_staircase() {
+        // The artist's report, in the smallest form that reproduces it: a
+        // circle drawn at a tenth scale, where one screen pixel is ten document
+        // pixels and the samples therefore land on a ten-pixel lattice.
+        //
+        // The whole polyline is measured rather than a vertex or two, because
+        // "choppy" is a statement about the sharpest corner anywhere in it —
+        // and both readings are taken from the *raw* samples too, so this fails
+        // if the smoothing is removed and cannot pass by agreeing with itself
+        // about a threshold.
+        let centre = vec2(256.0, 256.0);
+        let radius = 200.0;
+        let spacing = 10.0;
+        let raw = lattice_circle(centre, radius, spacing);
+
+        let mut draft = SelectionDraft::new(SelectionMode::Lasso, raw[0]);
+        for p in &raw[1..] {
+            draft.moved(*p, spacing);
+        }
+        let mut ring = Vec::new();
+        draft.lasso_ring(&mut ring);
+
+        // A lattice staircase turns a right angle at its worst corner, whatever
+        // the shape being traced, because the samples only ever step along an
+        // axis or diagonally.
+        let raw_turn = sharpest_turn(&raw);
+        assert!(
+            raw_turn > 85.0,
+            "the fixture is not a staircase: its sharpest corner is {raw_turn:.1}°"
+        );
+        let smooth_turn = sharpest_turn(&ring);
+        assert!(
+            smooth_turn < 20.0,
+            "the smoothed outline still corners at {smooth_turn:.1}°"
+        );
+
+        // And the facets are gone as well as the corners: a right angle spread
+        // over segments still fourteen pixels long is a smooth polygon, not a
+        // curve.
+        let raw_edge = longest_edge(&raw);
+        let smooth_edge = longest_edge(&ring);
+        assert!(
+            raw_edge >= spacing,
+            "the fixture's longest edge is {raw_edge:.1} px, so its samples are \
+             not a lattice apart"
+        );
+        assert!(
+            smooth_edge < 2.0,
+            "the smoothed outline still has {smooth_edge:.1} px facets"
+        );
+
+        // Corner-cutting moves the outline, so this says which way: **towards**
+        // the shape the hand was tracing, because a lattice sample is always
+        // outside or inside the true curve and the cut lands between two of
+        // them. A smoother outline further from what was drawn would be a worse
+        // selection wearing a better one's numbers.
+        let raw_error = worst_radial_error(&raw, centre, radius);
+        let smooth_error = worst_radial_error(&ring, centre, radius);
+        assert!(
+            smooth_error <= raw_error,
+            "smoothing moved the outline away from the circle: {smooth_error:.2} \
+             px against the samples' own {raw_error:.2}"
+        );
+    }
+
+    #[test]
+    fn a_lasso_drawn_zoomed_in_is_recorded_and_left_alone() {
+        // The other end of the same rule, and the one that keeps the cost off
+        // the frame loop. At 8:1 a screen pixel is an eighth of a document
+        // pixel, so the samples are already finer than any byte of the mask can
+        // express and there is nothing to interpolate: the ring is the samples,
+        // vertex for vertex.
+        let step = 0.125;
+        let raw = lattice_circle(vec2(32.0, 32.0), 20.0, step);
+        let mut draft = SelectionDraft::new(SelectionMode::Lasso, raw[0]);
+        for p in &raw[1..] {
+            draft.moved(*p, step);
+        }
+        let mut ring = Vec::new();
+        draft.lasso_ring(&mut ring);
+        assert_eq!(
+            ring, raw,
+            "a lasso finer than a pixel was subdivided anyway"
+        );
+
+        // And the step is what let those samples be recorded at all: the
+        // constant document pixel this used to be would have thrown most of
+        // them away. Counted rather than measured off the ring, because a
+        // coarser polyline gets *more* smoothing passes and the two effects
+        // would cancel in any reading of the finished geometry.
+        let coarse = {
+            let mut d = SelectionDraft::new(SelectionMode::Lasso, raw[0]);
+            for p in &raw[1..] {
+                d.moved(*p, 1.0);
+            }
+            d
+        };
+        assert!(
+            draft.points.len() > 4 * coarse.points.len(),
+            "a screen-pixel step recorded {} samples where a document-pixel one \
+             recorded {}, which is not the difference this is about",
+            draft.points.len(),
+            coarse.points.len()
+        );
+    }
+
+    #[test]
+    fn a_lasso_with_no_stabiliser_records_the_points_it_was_given() {
+        // Zero has to be the exact identity, and "exact" is the word to test:
+        // an alpha of one is `s + (a - s)`, which is not `a` wherever the two
+        // are far apart in magnitude. These coordinates are a lasso across the
+        // largest canvas Umber will make, where a float's step is already a
+        // four-hundredth of a pixel — so the filter's own arithmetic is
+        // measurably lossy and the branch is what makes the promise true.
+        let far = vec2(32768.0, 32768.0);
+        let near = vec2(0.1, 0.2);
+        let mut draft = SelectionDraft::new(SelectionMode::Lasso, far);
+        draft.moved(near, STEP);
+        assert_eq!(
+            draft.points,
+            vec![far, near],
+            "an unstabilised lasso moved the sample it was handed"
+        );
+
+        // Which is only worth asserting because the filter really would move
+        // it. Stated here rather than trusted, because a test of an exactness
+        // whose inexact twin happens to agree is a test of nothing.
+        let mut smoothed = far;
+        smoothed += (near - smoothed) * 1.0;
+        assert_ne!(
+            smoothed, near,
+            "the filter is exact at these coordinates, so the branch is untested"
+        );
+    }
+
+    #[test]
+    fn a_stabilised_lasso_rounds_what_the_hand_did_and_trails_behind_it() {
+        // What a stabiliser is, measured against the same pointer path with the
+        // rail at zero — the two drafts are fed one list of samples, so the
+        // difference between them is the filter and nothing else.
+        //
+        // A hand turning a right angle, sixty reports along each leg, which is
+        // what crossing a hundred document pixels actually produces.
+        let corner = [vec2(0.0, 0.0), vec2(100.0, 0.0), vec2(100.0, 100.0)];
+        let mut path = vec![corner[0]];
+        for leg in corner.windows(2) {
+            for k in 1..=60 {
+                path.push(leg[0].lerp(leg[1], k as f32 / 60.0));
+            }
+        }
+        let feed = |stabiliser: f32| {
+            let mut d = SelectionDraft::new(SelectionMode::Lasso, path[0]).stabilised(stabiliser);
+            for p in &path[1..] {
+                d.moved(*p, 0.1);
+            }
+            d
+        };
+
+        let loose = feed(0.0);
+        let damped = feed(0.8);
+
+        // It rounds the corner, which is the thing somebody turns it on for.
+        let nearest = |d: &SelectionDraft| {
+            d.points
+                .iter()
+                .map(|p| p.distance(corner[1]))
+                .fold(f32::MAX, f32::min)
+        };
+        assert!(
+            nearest(&loose) < 1.0,
+            "the raw line went through the corner"
+        );
+        // 3.8 px as it stands, against a raw line that passes exactly through.
+        // The bound is under the measurement rather than on it, so that a
+        // change to the filter's shape has room to be a change rather than a
+        // failure — what this is about is the two lines differing by pixels
+        // and not by rounding.
+        assert!(
+            nearest(&damped) > 2.5,
+            "the stabilised line still went through the corner, {:.1} px away",
+            nearest(&damped)
+        );
+
+        // **And it ends short of the pointer, which is not a defect to fix.**
+        // An exponential filter following a moving target settles at a constant
+        // lag rather than catching up — `(1 - a) / a` reports' worth, which is
+        // four here — so a stabilised lasso stops where the hand was a moment
+        // ago. That is what `StrokeBuilder` does to a brush stroke too, and for
+        // a *closed* outline it costs nothing anybody can see: the ring's last
+        // edge runs back to the first point either way. Pulling the filter onto
+        // the release would be a jump at exactly the moment the shape is
+        // committed.
+        let hard = *loose.points.last().expect("a point");
+        let soft = *damped.points.last().expect("a point");
+        assert_eq!(hard, corner[2], "the unstabilised line ends at the pointer");
+        let lag = soft.distance(corner[2]);
+        assert!(
+            (3.0..12.0).contains(&lag),
+            "the stabilised line ended {lag:.1} px behind the pointer, which is \
+             not the four reports' lag this filter has"
+        );
+
+        // The lag is a property of the target moving, not a permanent offset:
+        // a hand that stops is arrived at.
+        let mut resting = damped.clone();
+        for _ in 0..200 {
+            resting.moved(corner[2], 0.0);
+        }
+        assert!(
+            resting.points.last().expect("a point").distance(corner[2]) < 0.01,
+            "the filter never reached a pointer that stopped moving"
+        );
     }
 
     // --- combining --------------------------------------------------------
