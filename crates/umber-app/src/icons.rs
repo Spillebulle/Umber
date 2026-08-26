@@ -270,12 +270,19 @@ pub enum Icon {
     /// reason: this takes one specific thing off, and the mark has to say
     /// which. See [`Drawn::MaskOff`].
     ///
-    /// Lucide has no `view-off`, read off the 1.34.0 tree rather than assumed:
-    /// `view` is the only mark in the set carrying that name, and none of the
-    /// twenty `-off` twins it ships is one of them. `eye-off` is the near miss
-    /// and is the wrong mark — it negates the eye alone, where this negates the
-    /// frame with the eye in it. So this stays drawn, as [`Icon::Mask`]'s own
-    /// geometry under Lucide's own `m2 2 20 20`.
+    /// Lucide has no `view-off`, read off the 1.34.0 git tree rather than
+    /// assumed: `view` is the only mark in the whole set carrying that name,
+    /// and none of the eighty-two `-off` twins it ships is one of them.
+    /// `eye-off` is the near miss and is the wrong mark — it negates the eye
+    /// alone, where this negates the frame with the eye in it. So this stays
+    /// drawn, as [`Icon::Mask`]'s own geometry under Lucide's own
+    /// `m2 2 20 20`.
+    ///
+    /// **The tree, not the contents API**, which pages at a thousand entries
+    /// against Lucide's 1,777 and answered this question with sixty-two of the
+    /// twins missing. A listing that comes back short looks exactly like a
+    /// listing that came back complete, which is the same failure as the search
+    /// that put [`Icon::Mask`] here in the first place.
     MaskOff,
     /// A colour wheel with three of its hues marked: the set of related colours
     /// the Colour panel's Harmony mode is showing, kept. See

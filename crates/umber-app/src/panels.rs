@@ -482,17 +482,29 @@ pub(crate) fn panel(
     // comment is what has to be brought into line.
     //
     // **This changes every module, not only Layers, and what it changes is a
-    // title that was overdrawn into one that is clipped.** In edit mode at 190
-    // points the room left is about 41 — it was 31 while these marks were 18
-    // square, and taking them to the header's own 16 is where the ten came
-    // from. That is still short of "Palette" at some widths, and a clipped
-    // title is worse to read than the full word and better than the full word
-    // with a button through it; it is also the state the panel is in while
-    // somebody is dragging it, where the title is the least useful thing on it.
-    // Outside edit mode at that width there are four marks rather than five and
-    // every module's title fits whole. There is no room to reclaim: the grip
-    // and its gap take the first 27 points and the marks are the panel's
-    // commands.
+    // title that was overdrawn into one that is clipped.** The module to watch
+    // is **Brushes**, and this comment used to illustrate with Palette, which
+    // is the one module that never had the problem: at `SIDEBAR_MIN_WIDTH` in
+    // edit mode Palette gets 59 points for a 35-point word, and since the room
+    // grows as `width - 131` it would need a column narrower than 166 to clip —
+    // narrower than the dock permits, so "Palette" is unclippable at every
+    // reachable width and always was. Brushes is the real case: five marks, a
+    // 41-point word, and 31 points of room while these marks were 18 square. It
+    // *was* clipped, and taking the marks to 16 is what un-clipped it.
+    //
+    // **The margin is now 0.375 points and that is not comfortable.** Brushes
+    // at 190 in edit mode has 41 points of room for a title that lays out at
+    // 40.625 in Archivo. So the guard asserts the *design's* width rather than
+    // this one — at `metrics::PANEL` no title is elided and there is real slack
+    // — and the narrow end is left to the "clipped is better than overdrawn"
+    // rule below. Anyone adding a fifth mark to a module header should expect
+    // to clip a title at the narrow end and should measure rather than guess.
+    //
+    // A clipped title is worse to read than the full word and better than the
+    // full word with a button through it; it is also the state the panel is in
+    // while somebody is dragging it, where the title is the least useful thing
+    // on it. There is no room to reclaim: the grip and its gap take the first 27
+    // points and the marks are the panel's commands.
     let controls = Rect::from_min_max(
         pos2(rect.center().x, header.top()),
         pos2(rect.right() - pad, header.bottom()),
@@ -550,6 +562,12 @@ pub(crate) fn panel(
     job.wrap.max_rows = 1;
     let galley = ui.painter().layout_job(job);
     let rows = galley.rows.len();
+    // Whether epaint had to put its overflow character in. The row count cannot
+    // say: a title clipped to one row is still one row, which is the whole
+    // point of `max_rows`. This is the reading that says the word came out
+    // short.
+    #[cfg(test)]
+    let elided = galley.elided;
     let title = Align2::LEFT_CENTER.anchor_size(title_at, galley.size());
     ui.painter().galley(title.min, galley, p.text_strong);
     // Test-only, and gated so it is: this is the drawing path, and every module
@@ -559,7 +577,7 @@ pub(crate) fn panel(
     ui.ctx().data_mut(|d| {
         d.insert_temp(
             header_geometry_id(kind),
-            (title, controls_at, rows, controls),
+            (title, controls_at, rows, controls, elided),
         )
     });
     #[cfg(not(test))]
@@ -3513,14 +3531,36 @@ mod tests {
     /// `metrics::TOOL_RAIL`. Five controls want 104: `crate::ui::ICON_BUTTON`
     /// is 16 and [`metrics::BUTTON_GAP`] is 6.
     ///
-    /// **The third assertion is what makes those figures measurements.** The
-    /// header records the strip egui laid out *and* the rect it was offered, so
-    /// the test compares two drawn rectangles rather than recomputing the sum —
-    /// which is the difference between a guard and a restatement of the rule,
-    /// and the reason 114 could stand in a comment for as long as it did after
-    /// it had stopped being true. It is asserted at [`metrics::PANEL`] alone
-    /// and deliberately: at every narrower width the strip is *meant* to hang
-    /// off the left of its rect, which is what the first assertion bounds.
+    /// **The third assertion is the fit, and on its own it pins almost
+    /// nothing.** `controls.width() <= offered.width()` is 104 against 120, so
+    /// it tolerates every mark size from 0 to 19 — demonstrated by mutation:
+    /// `ui::ICON_BUTTON` at 18, the size this whole arrangement was changed
+    /// *from*, passes it, and only 20 fails. It is also inert for six of the
+    /// eight kinds, because Tools, Tweaks, History and Text draw a strip of 0
+    /// points outside edit mode and 16 inside it, and `0 <= 120` says nothing.
+    /// What it is worth is the one failure the two above cannot see: a strip
+    /// that overran its rect at the design's width would merely *truncate the
+    /// title*, which those two permit. It is asserted at [`metrics::PANEL`]
+    /// alone and deliberately — at every narrower width the strip is meant to
+    /// hang off the left of its rect.
+    ///
+    /// **The fourth is what pins the figure**, and it is a literal on purpose.
+    /// The widest strip any module draws at the design's width is 104 points,
+    /// and that number is quoted in `panel`'s own comment and in CLAUDE.md; a
+    /// figure in a comment is what the next change gets argued against, so it
+    /// is asserted here rather than recomputed as `5 * ICON_BUTTON + 4 *
+    /// BUTTON_GAP` — which would be a sum agreeing with itself and would go on
+    /// passing at any mark size. Changing a mark hands you the new number in
+    /// the failure message, and the comments are what have to be brought into
+    /// line with it.
+    ///
+    /// **The fifth is that no title comes out short**, read off epaint's own
+    /// `Galley::elided` rather than inferred. The row count cannot answer it —
+    /// a title clipped to one row is still one row, which is what `max_rows`
+    /// is for — so without this the guard could not tell "fits" from "fits
+    /// because it was cut". At [`metrics::PANEL`] alone, for the reason the
+    /// third is: clipping at a column dragged narrow is the intended
+    /// behaviour, and Brushes has 0.375 points of margin there.
     ///
     /// **What the first assertion catches, exactly.** `room` is derived from
     /// where the controls actually landed, so epaint cannot lay a row out past
@@ -3558,6 +3598,11 @@ mod tests {
         use crate::theme::{Palette, ThemeKind, metrics};
         use egui::{Pos2, Rect, vec2};
 
+        // The widest strip any module lays out at the design's width, which is
+        // the figure `panel`'s comment quotes. Collected across the sweep and
+        // asserted once at the end, because it is a property of the *set* of
+        // modules rather than of any one of them.
+        let mut widest: f32 = 0.0;
         for kind in PanelKind::ALL {
             for width in [metrics::PANEL, limits::SIDEBAR_MIN_WIDTH, kind.min_width()] {
                 for editing in [false, true] {
@@ -3573,15 +3618,29 @@ mod tests {
                         ed.layout.set_edit_mode(true);
                     }
                     let palette = Palette::of(ThemeKind::Graphite);
-                    // The interface's own style, because the header's whole
-                    // arithmetic is in points egui supplies. A bare `Context`
-                    // spaces items 8 apart and `theme::apply` sets 6, so
-                    // without this the strip measured here is two points wider
-                    // per gap than the one anybody sees — and the *fit* is what
-                    // this test now asserts, so it would be asserting it about
-                    // a header Umber never draws. That is CLAUDE.md's "a
-                    // guard's inputs must span the domain the code sees",
-                    // arriving through a style rather than through a constant.
+                    // The interface's own font and its own style, because
+                    // both halves of what this test measures are in units egui
+                    // supplies and a bare `Context` supplies different ones.
+                    //
+                    // The style is the strip: a bare context spaces items 8
+                    // points apart where `theme::apply` sets 6, so without it
+                    // the strip measured here is two points wider per gap than
+                    // the one anybody sees — 112 rather than 104 — and the
+                    // *fit* is what the third assertion pins, which is an
+                    // inequality against a fixed rect with the spacing on one
+                    // side of it. The font is the title: the first assertion is
+                    // about where a galley ended, and a galley laid out in
+                    // egui's default face is a different width from the same
+                    // words in Archivo, which is the only face this interface
+                    // ever draws.
+                    //
+                    // Both are CLAUDE.md's "a guard's inputs must span the
+                    // domain the code sees, not the one the constants
+                    // describe", arriving through a context rather than through
+                    // a constant. `ui.rs`'s own panel tests already install the
+                    // fonts; this one did not, and it is the test whose whole
+                    // subject is how wide a word is.
+                    crate::theme::install_fonts(&ctx);
                     crate::theme::apply(&ctx, &palette);
                     // Twice: the first pass through a fresh context builds the
                     // font atlas, and a title laid out against a half-built one
@@ -3599,9 +3658,9 @@ mod tests {
                             );
                         });
                     }
-                    let placed: Option<(Rect, Rect, usize, Rect)> =
+                    let placed: Option<(Rect, Rect, usize, Rect, bool)> =
                         ctx.data(|d| d.get_temp(super::header_geometry_id(kind)));
-                    let (title, controls, rows, offered) =
+                    let (title, controls, rows, offered, elided) =
                         placed.expect("the header drew nothing, so nothing here was measured");
                     assert!(
                         title.right() <= controls.left(),
@@ -3625,10 +3684,28 @@ mod tests {
                             controls.width(),
                             offered.width()
                         );
+                        assert!(
+                            !elided,
+                            "{kind:?} at the design's width (edit mode {editing}) had to \
+                             cut its title short, with {} points of room left by a {} \
+                             point strip",
+                            controls.left() - metrics::BUTTON_GAP - title.left(),
+                            controls.width()
+                        );
+                        widest = widest.max(controls.width());
                     }
                 }
             }
         }
+        // A literal, not `5.0 * ICON_BUTTON + 4.0 * BUTTON_GAP`: that sum is
+        // the same arithmetic the header does, so it would agree with itself at
+        // any mark size and pin nothing. This is the number two comments and
+        // CLAUDE.md quote, and the failure message hands over the new one.
+        assert_eq!(
+            widest, 104.0,
+            "the widest module header strip is {widest} points at the design's width, \
+             not the 104 `panel`'s comment and CLAUDE.md both quote"
+        );
     }
 
     /// The Layers body fits the narrowest column it can be dragged to, in every
