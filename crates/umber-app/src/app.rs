@@ -1452,30 +1452,21 @@ impl UmberApp {
         // absence of one — a full-canvas caption on a 10000² document would be
         // 400 MB of patch and a blocking read at the moment the artist lets go.
         //
-        // The shape is **derived here** rather than snapshotted when the layer
-        // was added, so a gesture that changed the stack in between cannot leave
-        // this recording a stack that no longer exists. `None` where the layer
-        // has gone, which no live path produces, and the fall-through is then
-        // the ordinary patch below rather than a shape `restore_shape` would
-        // refuse whole.
-        let own_layer = float.made.and_then(|made| {
-            self.editor.layers.shape_before_add(
-                made.id,
-                made.was_active,
-                self.editor.doc.layer_bytes(),
-            )
-        });
+        // **The entry itself was recorded at the add**, by `add_text_layer`, and
+        // this is only the reading that says so. It has to be that way round:
+        // the layer stands in the stack for the whole gesture, so an entry
+        // recorded here would sit on the undo stack above a reorder made in
+        // between — and undoing top-down would take the layer out before that
+        // reorder's shape, which names it, was ever reached. See
+        // `crate::editor::MadeLayer::entry_at`.
+        let own_layer = float.made.is_some();
 
         // Blocks on the GPU, and is submitted on its own encoder so it observes
         // the layer before the commit below touches it. Once per gesture, at
         // pointer-up, exactly as a stroke's is. Skipped entirely for the case
         // above, which has nothing to put in a patch and knows what it landed on.
-        let before = match &own_layer {
-            Some(_) => None,
-            None => {
-                Some(canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, float.slot, damage))
-            }
-        };
+        let before = (!own_layer)
+            .then(|| canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, float.slot, damage));
         // **A placement becomes a record only where it lands on nothing**, and
         // the reading is free: `before` is the pixels the commit is about to
         // write over, which for a paste is the destination rectangle alone.
@@ -1550,50 +1541,64 @@ impl UmberApp {
             .flatten()
             .and_then(|at| self.editor.layers.take_text(at));
         let took_a_record = lifted_text.is_some();
-        match (own_layer, before) {
-            // **One entry, and its kind is `AddLayer` rather than a variant of
-            // its own.** This project's rule is that two rows undoing
-            // identically must not have two names, and this row undoes exactly
-            // as an add does — `restore_shape`, no pixels touched, the layer
-            // parked in the entry with its slice and its record inside it. A
-            // paste is filed under Transform for the same reason and a cut under
-            // Erase. What the History list therefore says after a placement is
-            // "Add layer", which is what the one undo will do.
-            //
-            // It also means no `history::VERSION` bump and nothing new in the
-            // file: `SaveHistory::new` skips every structural entry already, so
-            // a saved document carries exactly what it carried before.
-            (Some(shape), _) => {
-                self.editor
-                    .history
-                    .record(Edit::new(EditKind::AddLayer, shape));
-            }
+        // **Nothing at all is recorded for a placement onto its own layer**, and
+        // that is the whole of its undo rather than a gap in it: `add_text_layer`
+        // recorded the entry when the layer appeared, and taking that layer back
+        // out takes the pixels this commit is about to write with it, because a
+        // `ShapeEntry::Gone` carries the whole `Layer` and its `SlotClaim`. So
+        // one Ctrl+Z takes back the layer, the words and the record together.
+        //
+        // The kind is `EditKind::AddLayer` rather than a variant of its own,
+        // because that row undoes exactly as an add does and two rows that undo
+        // identically must not have two names — the rule that already files a
+        // paste under Transform and a cut under Erase. It also means no
+        // `history::VERSION` bump and nothing new in the file, since
+        // `SaveHistory::new` skips every structural entry already.
+        //
+        // A lift can never be in this case: `made` is set by `place_text` alone
+        // and a placement is a paste, so `lifted` is false. Stated rather than
+        // asserted, because `take_text` has already run by here and a record
+        // dropped on this path would be one the artist could not get back — the
+        // `is_none` below is what keeps that structural instead of hopeful.
+        if let Some(before) = before {
+            debug_assert!(
+                !own_layer,
+                "a float that made its own layer also captured a patch"
+            );
+            let patch = PixelPatch::new(damage, float.slot, before);
             // The record and the pixels go into **one** entry, so an undo cannot
             // take the text off the canvas and leave the layer claiming it, or
             // put a lifted caption back without the record that describes it —
             // see `EditBody::Text`. `was` is what the layer held: nothing for a
             // placement, and the record a lift has just taken off.
-            (None, Some(before)) => {
-                let patch = PixelPatch::new(damage, float.slot, before);
-                let carries_text = record.is_some() || took_a_record;
-                self.editor.history.record(Edit::new(
-                    EditKind::Transform,
-                    if carries_text {
-                        EditBody::Text {
-                            patch,
-                            was: lifted_text,
-                        }
-                    } else {
-                        EditBody::Pixels(patch)
-                    },
-                ));
+            let carries_text = record.is_some() || took_a_record;
+            self.editor.history.record(Edit::new(
+                EditKind::Transform,
+                if carries_text {
+                    EditBody::Text {
+                        patch,
+                        was: lifted_text,
+                    }
+                } else {
+                    EditBody::Pixels(patch)
+                },
+            ));
+        } else if took_a_record {
+            // Unreachable by the paragraph above, and it is put back rather than
+            // dropped: a record thrown away here is a caption the artist cannot
+            // get back by any route, where putting it back is merely a layer
+            // that stayed text.
+            log::error!("a float made its own layer and also lifted a record");
+            if let Some(at) = self
+                .editor
+                .layers
+                .layers()
+                .iter()
+                .position(|l| l.slot() == Some(float.slot))
+                && let Some(was) = lifted_text
+            {
+                self.editor.layers.set_text(at, *was);
             }
-            // Unreachable: `before` is read exactly where `own_layer` is `None`,
-            // one match on one binding a few lines up. Recording nothing is the
-            // answer that cannot damage a document, where an `expect` here would
-            // take the application down at the moment somebody put text on the
-            // canvas.
-            (None, None) => log::error!("a transform commit had neither a patch nor a shape"),
         }
         if let Some(record) = record {
             // By the float's own **slot**, not by the selected row: the slot was
@@ -2140,21 +2145,36 @@ impl UmberApp {
         }
     }
 
-    /// Add the layer a text placement puts its words on, recording nothing.
+    /// Add the layer a text placement puts its words on, and record the one
+    /// entry the whole placement gets.
     ///
-    /// [`Self::add_layer`]'s gates without its history entry, and the missing
-    /// entry is the design rather than an omission. A placement is **one** thing
-    /// the artist did, so one Ctrl+Z has to take all of it back; recording the
-    /// add here and the pixels at the commit would make it two, and the first
-    /// undo would leave an empty layer named after words that are no longer on
-    /// it. The entry is recorded by `finish_transform` instead, from
-    /// `LayerStack::shape_before_add` — and because the layer is *new*, that one
-    /// structural entry is the whole undo: taking the layer out takes its pixels
-    /// with it, so there is no patch to capture and no readback to block on.
+    /// [`Self::add_layer`], with the name taken from the text and with what it
+    /// hands back. **The entry is the placement's whole undo**, and that is the
+    /// design rather than a coincidence: the layer is new, so taking it back out
+    /// takes its pixels with it — a `ShapeEntry::Gone` carries the whole `Layer`
+    /// with its `SlotClaim` — and `finish_transform` therefore records nothing at
+    /// all for this case, captures no patch, and does not block on a readback.
+    /// One Ctrl+Z takes back the layer, the words on it and its record together,
+    /// which is one entry for one thing the artist did.
     ///
-    /// Escape is still free for the same reason it is free for any float: the
-    /// layer is empty until the commit writes into it, and
-    /// [`Editor::unmake_layer`] gives it back with nothing recorded either way.
+    /// **Recorded here rather than at the commit**, which is the part that was
+    /// wrong first and is worth stating at the code: the layer stands in the
+    /// stack for the whole gesture, so an entry recorded at the *end* of it sits
+    /// on the undo stack above anything recorded in between — and a reorder in
+    /// that window records a shape naming this layer. Undoing top-down would
+    /// then take the layer out before the reorder's shape was reached, and
+    /// `LayerStack::restore_shape` refuses a shape naming an entry that is gone.
+    /// See [`crate::editor::MadeLayer::entry_at`].
+    ///
+    /// Escape is still free: the layer is empty until the commit writes into it,
+    /// and [`Editor::unmake_layer`] takes the layer and the entry back off
+    /// together.
+    ///
+    /// It deliberately does **not** `mark_modified`. The window between Place
+    /// and the commit ends either in a commit, which marks it, or in a cancel,
+    /// which leaves the document exactly as it was found — and a dot claiming
+    /// unsaved work after an Escape that changed nothing is a claim about the
+    /// document that is not true.
     ///
     /// `Err` carries the sentence to show. Both refusals are ones the Place
     /// button is already disabled for, so this catches a route that goes round
@@ -2204,6 +2224,10 @@ impl UmberApp {
             .layers
             .get(self.editor.layers.active_index())
             .map_or(0, |l| l.id());
+        // Before the add and after every refusal above, exactly as `add_layer`
+        // takes its own: a shape snapshotted before an add that then does not
+        // happen is an entry describing a change nobody made.
+        let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         let made = match self.editor.layers.add_named(&name) {
             Some(made) => made,
             // A parked layer may be holding the last slice; give the oldest
@@ -2248,9 +2272,16 @@ impl UmberApp {
             // make a placement onto a brand new layer report itself as paint.
             canvas.clear_layer(&gfx.gpu.queue, made.slot);
         }
+        // **The placement's whole undo, recorded now.** See this function's docs
+        // for why it is here and not at the commit, and
+        // `crate::editor::MadeLayer::entry_at` for what the position buys.
+        self.editor
+            .history
+            .record(Edit::new(EditKind::AddLayer, before));
         Ok(crate::editor::MadeLayer {
             id: made.id,
             was_active,
+            entry_at: self.editor.history.position(),
         })
     }
 

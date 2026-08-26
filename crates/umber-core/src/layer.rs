@@ -2571,55 +2571,6 @@ impl LayerStack {
         }
     }
 
-    /// The shape the stack had **before** the entry `made` was added, derived
-    /// from the stack as it stands now.
-    ///
-    /// [`LayerStack::shape`]'s twin for one caller: a text placement, which adds
-    /// its layer when the artist presses Place and records the entry when the
-    /// float is put down, several seconds and a whole drag later. The obvious
-    /// spelling is to snapshot `shape` at the add and carry it to the commit,
-    /// which is what [`LayerStack::add`]'s own caller does — and it would be
-    /// carrying a **stale** description of a stack the gesture had time to
-    /// change. Deriving it at the commit cannot be stale, because it is read off
-    /// what is there.
-    ///
-    /// `was_active` is the entry that was selected before the add, by id, so an
-    /// undo puts the selection back where the artist left it rather than on
-    /// whatever happens to sit where the text layer was. An id no longer in the
-    /// stack is harmless: [`LayerStack::restore_shape`] falls back on the first
-    /// row, which is what an unknown id has always meant there.
-    ///
-    /// `None` where `made` is not in the stack. That is not a state any live
-    /// path produces — every route that removes an entry commits the float
-    /// first — and answering it rather than asserting is what keeps a caller
-    /// that reached it recording an ordinary pixel entry instead of a shape
-    /// naming an entry that is gone, which [`LayerStack::restore_shape`] would
-    /// refuse whole.
-    pub fn shape_before_add(
-        &self,
-        made: u32,
-        was_active: u32,
-        slice_bytes: u64,
-    ) -> Option<StackShape> {
-        if !self.layers.iter().any(|l| l.id == made) {
-            return None;
-        }
-        Some(StackShape {
-            entries: self
-                .layers
-                .iter()
-                .filter(|l| l.id != made)
-                .map(|l| ShapeEntry::Kept {
-                    id: l.id,
-                    depth: l.depth,
-                })
-                .collect(),
-            active: was_active,
-            masks: Vec::new(),
-            slice_bytes,
-        })
-    }
-
     /// The same, also recording the mask the entry at `index` has now.
     ///
     /// For the two edits that change one — adding a mask and taking one off.
@@ -5247,70 +5198,6 @@ mod tests {
             "the id finds the layer where the index no longer would"
         );
         assert_eq!(s.get(0).unwrap().name, "Chapter One");
-    }
-
-    /// Undoing a text placement takes the whole layer back out, and puts the
-    /// selection where it was.
-    ///
-    /// This is the shape of the entry a placement records, driven on the model
-    /// alone: `shape_before_add` is derived from the stack **after** the layer
-    /// exists, so restoring it has to remove exactly that one entry and leave
-    /// every other alone — including one added *after* it, which is the case a
-    /// snapshot taken at the add would have got wrong.
-    #[test]
-    fn the_shape_before_an_add_removes_only_that_entry() {
-        let mut s = LayerStack::new();
-        s.add();
-        let was_active = s.get(s.active_index()).unwrap().id;
-        let made = s.add_named("Caption").expect("room");
-        // A layer added afterwards, which the recorded shape must keep. A
-        // snapshot taken at the moment "Caption" appeared would not name it, so
-        // restoring that snapshot would delete somebody else's layer.
-        s.add();
-        let later = s.get(s.active_index()).unwrap().id;
-
-        let before = s
-            .shape_before_add(made.id, was_active, 4)
-            .expect("the made layer is in the stack");
-        let back = s.restore_shape(before);
-
-        assert!(
-            !s.layers().iter().any(|l| l.id == made.id),
-            "the text layer is gone"
-        );
-        assert!(
-            s.layers().iter().any(|l| l.id == later),
-            "the layer added afterwards survived"
-        );
-        assert_eq!(
-            s.get(s.active_index()).unwrap().id,
-            was_active,
-            "the selection went back where the artist left it"
-        );
-
-        // And redoing puts it back, with its name and its slice, because the
-        // shape that came back is holding the whole layer.
-        s.restore_shape(back);
-        let at = s
-            .layers()
-            .iter()
-            .position(|l| l.id == made.id)
-            .expect("the layer came back");
-        assert_eq!(s.get(at).unwrap().name, "Caption");
-        assert_eq!(s.get(at).unwrap().slot(), Some(made.slot));
-    }
-
-    /// `shape_before_add` answers rather than asserting when the entry has gone.
-    ///
-    /// The caller's fall-back depends on it: a shape naming an entry that is not
-    /// there is one `restore_shape` refuses whole, so the placement records an
-    /// ordinary pixel entry instead of a structural one that would do nothing.
-    #[test]
-    fn a_shape_before_an_add_that_is_no_longer_there_is_refused() {
-        let mut s = LayerStack::new();
-        let made = s.add_named("Caption").expect("room");
-        s.remove(s.active_index());
-        assert!(s.shape_before_add(made.id, 0, 4).is_none());
     }
 
     /// `add_refusal` names both bounds, and `add_named` agrees with it.
