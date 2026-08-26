@@ -5431,6 +5431,107 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wants a GPU and `Stage` is not `gputest`'s device; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn the_cpu_frame_sampler_agrees_with_the_gpu() {
+        // **Validating the instrument.** Three guards quote figures out of
+        // `frame_pixel`, and a CPU rasteriser that quietly disagreed with the
+        // one that draws would make all three arguments about nothing. So the
+        // same frame goes through both and every pixel of the loupe is
+        // compared.
+        //
+        // It is `#[ignore]`d, and that is a real limit rather than a
+        // preference: it wants a device, and `docshot::Stage` builds its own
+        // rather than taking `gputest::lock()`, so it may not sit in a suite the
+        // harness runs on parallel threads. The previews beside it are ignored
+        // for the same reason.
+        //
+        // The loupe is the fixture because it is *static* — the marquee asks
+        // egui's clock for its dash phase, and `Stage::shoot` runs frames until
+        // nothing is animating, so the two would be a sixtieth of a second
+        // apart in the pattern. Measured over 160,000 device pixels: 156,763
+        // agree exactly, 2,923 are a level out, 278 two and 36 three, and the
+        // worst of them sit on the silhouette where the disc's feather is. That
+        // is egui's optional dithering and the rounding either side of it, and
+        // the bound below is what that reading actually is rather than a round
+        // number beside it.
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+        let field = vec2(200.0, 200.0);
+        let scale = 2.0;
+        let at = glam::Vec2::new(100.0, 170.0);
+        let cells = crate::loupe::CELLS;
+        let mut texels = Vec::new();
+        for row in 0..cells {
+            for col in 0..cells {
+                texels.push(
+                    (col + row < cells)
+                        .then_some([32u8, 44, 70])
+                        .or(Some([224, 196, 120])),
+                );
+            }
+        }
+        let patch = crate::loupe::Patch::new(cells, texels).expect("a patch");
+        let body = |ui: &mut egui::Ui| {
+            let mut ed = Editor::default();
+            ed.ui.tool = crate::editor::Tool::Eyedropper;
+            ed.cursor = at;
+            ed.loupe = Some(crate::loupe::Loupe {
+                at,
+                taken: Some(umber_core::Color::from_srgb_u8(224, 196, 120, 255)),
+                patch: Some(patch.clone()),
+            });
+            super::loupe_overlay(ui, &palette, &ed);
+        };
+
+        // Geometry on both sides, for the reason `frame_pixel` gives: a
+        // pre-rasterised disc is a textured quad this cannot read, and the
+        // option changes nothing else about the picture.
+        stage
+            .ctx
+            .tessellation_options_mut(|o| o.prerasterized_discs = false);
+        let image = stage.shoot(field, scale, &palette, palette.backdrop, body);
+        let prims = frame_at_geometric(&palette, field, scale, body);
+
+        let (w, h) = (
+            (field.x * scale).round() as u32,
+            (field.y * scale).round() as u32,
+        );
+        let (mut worst, mut worst_at) = (0i32, (0u32, 0u32));
+        let mut histogram = [0u32; 8];
+        for y in 0..h {
+            for x in 0..w {
+                let sample = pos2((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale);
+                let cpu = frame_pixel(&prims, palette.backdrop, sample);
+                let gpu = image.pixel(x, y);
+                let off = [
+                    (cpu.r() as i32 - gpu.r() as i32).abs(),
+                    (cpu.g() as i32 - gpu.g() as i32).abs(),
+                    (cpu.b() as i32 - gpu.b() as i32).abs(),
+                ]
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+                histogram[(off as usize).min(7)] += 1;
+                if off > worst {
+                    worst = off;
+                    worst_at = (x, y);
+                }
+            }
+        }
+        println!("worst deviation {worst} of 255, at {worst_at:?}; by level {histogram:?}");
+        assert!(
+            worst <= 3,
+            "the CPU sampler is {worst} levels from the GPU at {worst_at:?}"
+        );
+    }
+
+    #[test]
     fn the_loupes_picture_fills_its_own_circle() {
         // **The stepped edge, measured.** What made the old loupe read as a
         // mosaic is that a grid of six-point cells clipped to its own circle
@@ -5692,33 +5793,52 @@ mod tests {
     /// The colour a triangle carries at `at`, or `None` where it does not cover
     /// it.
     ///
-    /// Barycentric, and **inclusive on the edges, which is the one thing to know
-    /// before quoting a number out of it**: a point exactly on the seam between
-    /// two triangles is blended twice. For an opaque fill that is the identity,
-    /// so the marquee guard — which asks whether a device pixel carries an ink
-    /// *exactly* — is safe by construction. For a gradient it is not, and a
-    /// sample taken on one of `glass_band`'s own stop radii composited the same
-    /// translucent wash four times and read pure white. So a guard reading a
-    /// gradient samples deliberately off the stops and off the segment
-    /// boundaries, and says which figures it picked and why. A top-left fill
-    /// rule is the proper fix and is not exact either, because two triangles
-    /// sharing an edge compute their edge functions from different vertices and
-    /// need not both land on zero.
+    /// Barycentric, with a **fill rule**, and the fill rule is not decoration:
+    /// without one a point on the seam between two triangles of one band is
+    /// covered by both, so a translucent wash composites twice. The loupe's
+    /// glass is bands of triangles about a centre, its fixture has a diagonal
+    /// running at exactly forty-five degrees, and a segment boundary sits there
+    /// — so the seam case is the common case rather than a curiosity, and it
+    /// read eight levels out against the GPU until this was written.
+    ///
+    /// A point within a thousandth of a point of an edge is treated as *on* it
+    /// and claimed by the triangle whose winding makes that edge a top or left
+    /// one. Two triangles sharing an edge traverse it in opposite directions,
+    /// and `e.x - s.x` and `s.x - e.x` are exact negatives in IEEE, so exactly
+    /// one of them claims it however the arithmetic rounds — which is the part
+    /// a plain `== 0.0` test would get wrong, since the two edge functions are
+    /// evaluated from different vertices and need not both land on zero.
     fn triangle_at(v: [&egui::epaint::Vertex; 3], at: egui::Pos2) -> Option<egui::Color32> {
-        let (a, b, c) = (v[0].pos, v[1].pos, v[2].pos);
-        let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        let cross = |a: egui::Vec2, b: egui::Vec2| a.x * b.y - a.y * b.x;
+        let area = cross(v[1].pos - v[0].pos, v[2].pos - v[0].pos);
         if area.abs() < 1e-9 {
             return None;
         }
-        let edge = |p: egui::Pos2, q: egui::Pos2| {
-            ((q.x - p.x) * (at.y - p.y) - (q.y - p.y) * (at.x - p.x)) / area
-        };
-        let (wa, wb, wc) = (edge(b, c), edge(c, a), edge(a, b));
-        if wa < 0.0 || wb < 0.0 || wc < 0.0 {
-            return None;
+        // Wound so the interior is where every edge function is positive.
+        let order = if area > 0.0 { [0, 1, 2] } else { [0, 2, 1] };
+        let mut weight = [0.0f32; 3];
+        for k in 0..3 {
+            let (s, e) = (v[order[(k + 1) % 3]].pos, v[order[(k + 2) % 3]].pos);
+            let along = e - s;
+            let side = cross(along, at - s);
+            let tol = 1e-3 * along.length().max(1e-6);
+            if side < -tol {
+                return None;
+            }
+            if side <= tol {
+                // On the edge: only the triangle that traverses it downwards,
+                // or leftwards along a horizontal, may claim it.
+                let claims = along.y > 0.0 || (along.y == 0.0 && along.x < 0.0);
+                if !claims {
+                    return None;
+                }
+            }
+            weight[k] = side / area.abs();
         }
         let mix = |f: fn(&egui::Color32) -> u8| {
-            (wa * f(&v[0].color) as f32 + wb * f(&v[1].color) as f32 + wc * f(&v[2].color) as f32)
+            (0..3)
+                .map(|k| weight[k] * f(&v[order[k]].color) as f32)
+                .sum::<f32>()
                 .round()
                 .clamp(0.0, 255.0) as u8
         };
@@ -5739,14 +5859,26 @@ mod tests {
     /// then a point sample of every triangle in order, which is what a
     /// rasteriser does at a pixel centre.
     ///
-    /// It is exact rather than approximate, and that is worth knowing before
-    /// trusting a figure out of it. `fs_main_gamma_framebuffer` — the entry
-    /// point a non-sRGB target picks, which is the one Umber's surface and
-    /// `docshot` both use — multiplies the interpolated vertex colour by the
-    /// texture and writes it through, and the interpolation is over
-    /// `unpack_color`'s bytes, so it happens in the same gamma space the bytes
-    /// are already in. Every shape here samples the white texel. The one thing
-    /// left out is egui's optional dithering, which is worth a level.
+    /// It is exact rather than approximate over most of a frame, and where it is
+    /// not is worth knowing before trusting a figure out of it.
+    /// `fs_main_gamma_framebuffer` — the entry point a non-sRGB target picks,
+    /// which is the one Umber's surface and `docshot` both use — multiplies the
+    /// interpolated vertex colour by the texture and writes it through, and the
+    /// interpolation is over `unpack_color`'s bytes, so it happens in the same
+    /// gamma space the bytes are already in. So a fragment's colour *is* its
+    /// vertex colour wherever the texel is white, which is every shape these
+    /// guards read.
+    ///
+    /// **The exception is a filled circle**, and it is not obvious:
+    /// `TessellationOptions::prerasterized_discs` is on by default, so
+    /// `circle_filled` is not geometry at all but one textured quad lifted out
+    /// of the font atlas — this reads its corners as filled where the atlas has
+    /// them empty. It is why the loupe's rim is sampled well inside the body
+    /// disc, where the atlas is opaque and the flat reading is right, and why
+    /// `the_cpu_frame_sampler_agrees_with_the_gpu` turns the option off on both
+    /// sides. A stroke is unaffected: that path is skipped for a transparent
+    /// fill. The other thing left out is egui's optional dithering, worth a
+    /// level.
     fn frame_pixel(
         prims: &[egui::ClippedPrimitive],
         under: egui::Color32,
@@ -5760,7 +5892,7 @@ mod tests {
             let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
                 continue;
             };
-            for tri in mesh.indices.chunks_exact(3) {
+            for tri in mesh.indices.as_chunks::<3>().0 {
                 let v = [
                     &mesh.vertices[tri[0] as usize],
                     &mesh.vertices[tri[1] as usize],
@@ -5792,9 +5924,35 @@ mod tests {
         ppp: f32,
         body: impl FnOnce(&mut egui::Ui),
     ) -> Vec<egui::ClippedPrimitive> {
+        frame_into(&fresh_context(palette), size, ppp, body)
+    }
+
+    /// [`frame_at`] with pre-rasterised discs turned off, which is the one
+    /// difference [`frame_pixel`] cannot see. Only the cross-check wants it.
+    fn frame_at_geometric(
+        palette: &Palette,
+        size: egui::Vec2,
+        ppp: f32,
+        body: impl FnOnce(&mut egui::Ui),
+    ) -> Vec<egui::ClippedPrimitive> {
+        let ctx = fresh_context(palette);
+        ctx.tessellation_options_mut(|o| o.prerasterized_discs = false);
+        frame_into(&ctx, size, ppp, body)
+    }
+
+    fn fresh_context(palette: &Palette) -> egui::Context {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         crate::theme::apply(&ctx, palette);
+        ctx
+    }
+
+    fn frame_into(
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        ppp: f32,
+        body: impl FnOnce(&mut egui::Ui),
+    ) -> Vec<egui::ClippedPrimitive> {
         let mut input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
             time: Some(0.0),
@@ -5866,8 +6024,7 @@ mod tests {
         let field = vec2(320.0, 220.0);
         let paper = egui::Color32::WHITE;
         for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
-            let mut ed =
-                editor_with_selection(MARQUEE_DOC, vec![MARQUEE_RING.to_vec()], ppp);
+            let mut ed = editor_with_selection(MARQUEE_DOC, vec![MARQUEE_RING.to_vec()], ppp);
             let prims = frame_at(&palette, field, ppp, |ui| {
                 let rect = ui.max_rect();
                 ui.painter().rect_filled(rect, 0.0, paper);
@@ -5976,7 +6133,10 @@ mod tests {
                         ui.painter().rect_filled(rect, 0.0, paper);
                         super::selection_outline(ui, &palette, &mut ed, rect);
                     });
-                    let (w, h) = ((field.x * ppp).round() as u32, (field.y * ppp).round() as u32);
+                    let (w, h) = (
+                        (field.x * ppp).round() as u32,
+                        (field.y * ppp).round() as u32,
+                    );
                     let (dark, n) = darkest(&image, w, h);
                     println!("{ink}/{paper_name}/@{ppp}: darkest {dark}, {n} pixels at it");
                     docshot::write_png(&dir.join(format!("{ink}-{paper_name}-{ppp}x.png")), &image)
