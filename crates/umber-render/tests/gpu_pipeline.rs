@@ -5708,7 +5708,11 @@ fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
             })
             .collect();
         assert!(
-            pixels.chunks_exact(4).any(|p| (1..255).contains(&p[3])),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| (1..255).contains(&p[3])),
             "the fixture has no partly covered pixel, so this test would pass on \
              a blit that only handled opaque ones"
         );

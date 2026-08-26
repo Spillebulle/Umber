@@ -253,7 +253,12 @@ mod tests {
         // field: without it a 16 px icon is a plain square with four jagged
         // corners, which is exactly where a brand mark is judged.
         let rgba = mark_rgba(16, brand());
-        assert!(rgba.chunks_exact(4).any(|px| px[3] > 0 && px[3] < 255));
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] > 0 && px[3] < 255)
+        );
     }
 
     #[test]

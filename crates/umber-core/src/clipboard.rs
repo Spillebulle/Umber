@@ -181,7 +181,7 @@ impl Clip {
         // Everything the mask covered was transparent, or the mask covered
         // nothing of it. An empty clipboard and no clipboard are the same thing
         // to every caller.
-        if pixels.chunks_exact(4).all(|px| px[3] == 0) {
+        if pixels.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
             return None;
         }
         Some(Cut {

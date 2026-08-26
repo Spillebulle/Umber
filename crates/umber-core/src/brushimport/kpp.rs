@@ -2090,11 +2090,15 @@ fn decode_rgba(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let rgba: Vec<u8> = match info.color_type {
         png::ColorType::Grayscale => buf[..texels].iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::GrayscaleAlpha => buf[..texels * 2]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|px| [px[0], px[0], px[0], px[1]])
             .collect(),
         png::ColorType::Rgb => buf[..texels * 3]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|px| [px[0], px[1], px[2], 255])
             .collect(),
         png::ColorType::Rgba => buf[..texels * 4].to_vec(),
@@ -2195,7 +2199,7 @@ fn tip_from_png(bytes: &[u8]) -> Result<TipMask, PresetError> {
     let coverage: Vec<u8> = match info.color_type {
         png::ColorType::Grayscale => buf[..texels].iter().map(|g| 255 - g).collect(),
         png::ColorType::GrayscaleAlpha => {
-            let px: Vec<&[u8]> = buf[..texels * 2].chunks_exact(2).collect();
+            let px: Vec<&[u8; 2]> = buf[..texels * 2].as_chunks::<2>().0.iter().collect();
             if px.iter().any(|p| p[1] != 255) {
                 px.iter().map(|p| p[1]).collect()
             } else {
@@ -2203,15 +2207,17 @@ fn tip_from_png(bytes: &[u8]) -> Result<TipMask, PresetError> {
             }
         }
         png::ColorType::Rgb => buf[..texels * 3]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|px| 255 - luminance(px))
             .collect(),
         png::ColorType::Rgba => {
-            let px: Vec<&[u8]> = buf[..texels * 4].chunks_exact(4).collect();
+            let px: Vec<&[u8; 4]> = buf[..texels * 4].as_chunks::<4>().0.iter().collect();
             if px.iter().any(|p| p[3] != 255) {
                 px.iter().map(|p| p[3]).collect()
             } else {
-                px.iter().map(|p| 255 - luminance(p)).collect()
+                px.iter().map(|p| 255 - luminance(*p)).collect()
             }
         }
         other => {

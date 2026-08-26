@@ -666,7 +666,7 @@ impl MaskImage {
                 expected,
             });
         }
-        let grey: Vec<u8> = pixels.chunks_exact(4).map(|px| px[0]).collect();
+        let grey: Vec<u8> = pixels.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
         let mut png = Vec::new();
         write_png_grey(&mut png, canvas, &grey)?;
         Ok(Self { png })
@@ -1602,7 +1602,7 @@ fn write_archive<W: Write + std::io::Seek>(
                         let grey: Vec<u8> = {
                             let mask =
                                 resolve(canvases, mask, Wanted::Mask(at), expected, doc.layers)?;
-                            mask.chunks_exact(4).map(|px| px[0]).collect()
+                            mask.as_chunks::<4>().0.iter().map(|px| px[0]).collect()
                         };
                         zip.start_file(&src, stored())?;
                         write_png_grey(zip, doc.size, &grey)?;
@@ -3972,7 +3972,9 @@ mod tests {
         assert!(
             back.layers[0]
                 .dense(size)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .all(|p| p[3] == 255),
             "the background layer must be opaque everywhere"
         );

@@ -4723,6 +4723,28 @@ half-publish; `.github/workflows/release.yml` does the rest.
   second a row left behind for a package that is no longer built. `ASSETS` in
   that file is the **third** statement of the asset names, after `release.yml`
   and `update::release::wanted_asset`; changing a name means changing all three.
+- **CI is on whatever stable is *today*, and this machine is on whatever it
+  was last updated to.** `rust-toolchain.toml` says `channel = "stable"`, which
+  pins nothing, and `dtolnay/rust-toolchain@stable` installs the newest one. So
+  a clippy release that adds a lint turns `main` red while `cargo clippy` here
+  stays green — and with `-D warnings` it is a *build failure*, not a warning,
+  which means no release can be cut until it is fixed. 1.98 did exactly that
+  with `chunks_exact_to_as_chunks`: 104 spans, 57 lines, five runners, on a
+  commit whose own change had nothing to do with any of it. **`rustup update`
+  before believing a green clippy**, and treat the version skew as the first
+  thing to check when CI fails on a lint this machine has never heard of. The
+  same reasoning as "a local pass is not evidence" below, arriving through the
+  compiler rather than through the platform.
+- **A lint fixed across a hundred sites needs its *fallout* read, not just its
+  count.** `as_chunks::<N>().0` hands back `&[T; N]` where `chunks_exact(N)`
+  gave `&[T]`, so twelve sites stopped compiling and every one was a real
+  difference: a comparison against `[u8; 4]` needs the deref, a `Vec<&[u8]>`
+  annotation becomes `Vec<&[u8; 4]>`, and `px.copy_from_slice(&f([px[0], …]))`
+  becomes `*px = f(*px)` because the array knows its own length — which is what
+  stops the borrow checker seeing a read inside a call that borrows mutably.
+  The remainder behaviour is identical (both drop a partial chunk), which is
+  the property that made the sweep safe at all. `as_chunks` is stable since
+  1.88, under the declared `rust-version` of 1.92, so the MSRV did not move.
 - **`ci.yml`'s matrix must cover every runner `release.yml` builds on**, or the
   wait above is a gate with a hole in it. v0.0.5 was tagged on a green CI and
   then failed on `windows-11-arm`, which CI did not run at all. Adding a target

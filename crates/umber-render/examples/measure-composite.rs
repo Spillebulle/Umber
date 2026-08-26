@@ -830,7 +830,7 @@ const UPLOAD_BAND_BYTES: u64 = 16 << 20;
 /// canvas's agree by construction.
 fn page_bytes(page: UVec2, doc: UVec2) -> Vec<u8> {
     let mut out = vec![0u8; (page.x as usize) * (page.y as usize) * 4];
-    for (i, px) in out.chunks_exact_mut(4).enumerate() {
+    for (i, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = (i % page.x as usize) as u32;
         let y = (i / page.x as usize) as u32;
         let (x, y) = (x.min(doc.x - 1), y.min(doc.y - 1));

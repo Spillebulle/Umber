@@ -1492,7 +1492,9 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
         let clip = setting.clip(colour)?;
         let pixels: Vec<egui::Color32> = clip
             .pixels()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
             .collect();
         let image = egui::ColorImage {

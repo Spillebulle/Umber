@@ -325,7 +325,9 @@ fn pixels(
         // which is not a mistake in this code: GIMP reads them the same way.
         (0, 2) => Ok(at
             .take(texels * 2)?
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|px| (u16::from_le_bytes([px[0], px[1]]) >> 8) as u8)
             .collect()),
         (1, _) => rle(at, width as usize, height as usize),
@@ -467,7 +469,9 @@ impl<'a> Reader<'a> {
         }
         let bytes = self.take(chars * 2)?;
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .take_while(|&u| u != 0)
             .collect();

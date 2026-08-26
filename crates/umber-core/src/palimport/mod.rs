@@ -564,7 +564,7 @@ fn read_riff_pal(bytes: &[u8], source: &str) -> Result<(Vec<Swatch>, Losses), Pa
     let entries = &body[4..];
     let mut out = Vec::new();
     let mut losses = Losses::default();
-    for entry in entries.chunks_exact(4).take(stated) {
+    for entry in entries.as_chunks::<4>().0.iter().take(stated) {
         push(
             &mut out,
             Swatch::new([entry[0], entry[1], entry[2]]),
@@ -666,7 +666,9 @@ impl<'a> BigEndian<'a> {
     pub(crate) fn utf16(&mut self, units: usize) -> Option<String> {
         let bytes = self.take(units.checked_mul(2)?)?;
         let mut code_units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect();
         if code_units.last() == Some(&0) {

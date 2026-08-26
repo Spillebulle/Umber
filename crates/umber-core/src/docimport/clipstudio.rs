@@ -2389,8 +2389,8 @@ mod tests {
         assert_eq!(doc.layers.len(), 1);
         let pixels = doc.layers[0].dense(UVec2::new(w, h));
         assert_eq!(pixels.len(), (w * h * 4) as usize);
-        for (i, px) in pixels.chunks_exact(4).enumerate() {
-            assert_eq!(px, [10, 120, 240, 255], "pixel {i}");
+        for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*px, [10, 120, 240, 255], "pixel {i}");
         }
     }
 

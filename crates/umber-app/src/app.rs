@@ -1435,7 +1435,7 @@ impl UmberApp {
         // The layer's own form — sRGB with alpha premultiplied in linear space —
         // and alpha is the fourth byte. A zero there is the one value that
         // cannot be hiding a colour, whichever way the alpha is carried.
-        let landed_on_nothing = before.chunks_exact(4).all(|px| px[3] == 0);
+        let landed_on_nothing = before.as_chunks::<4>().0.iter().all(|px| px[3] == 0);
         // **Taken before the filter, because `record.is_none()` is two different
         // things.** It is true when a *placement* was refused the record, and
         // equally true for every ordinary paste and every lift, which carry no

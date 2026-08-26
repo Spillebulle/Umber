@@ -684,7 +684,9 @@ impl<'a> Database<'a> {
             TextEncoding::Utf16Le | TextEncoding::Utf16Be => {
                 let le = self.encoding == TextEncoding::Utf16Le;
                 let units: Vec<u16> = bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|p| {
                         if le {
                             u16::from_le_bytes([p[0], p[1]])

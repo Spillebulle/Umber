@@ -508,7 +508,9 @@ pub fn sample_patch(x: i32, y: i32, size: u32) -> Option<Vec<Option<[u8; 3]>>> {
                 {
                     // A 32-bit DIB is BGRA in memory.
                     out = Some(
-                        px.chunks_exact(4)
+                        px.as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|c| [c[2], c[1], c[0]])
                             .collect::<Vec<_>>(),
                     );

@@ -380,7 +380,12 @@ fn encode_via_image(
 fn matte_over(rgba: &[u8], matte: [u8; 3]) -> Vec<u8> {
     let tables: Vec<Vec<u8>> = matte.iter().map(|m| matte_table(*m)).collect();
     let mut out = vec![0u8; rgba.len() / 4 * 3];
-    for (px, dst) in rgba.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+    for (px, dst) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<3>().0.iter_mut())
+    {
         let a = px[3] as usize * 256;
         for c in 0..3 {
             dst[c] = tables[c][a + px[c] as usize];

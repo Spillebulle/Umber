@@ -49,7 +49,9 @@ pub(crate) fn be32(bytes: &[u8], at: usize) -> Option<u32> {
 pub(crate) fn utf16be(bytes: &[u8]) -> String {
     String::from_utf16_lossy(
         &bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| u16::from_be_bytes([p[0], p[1]]))
             .collect::<Vec<_>>(),
     )

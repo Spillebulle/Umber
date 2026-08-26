@@ -257,7 +257,7 @@ impl TipMask {
     pub fn colour_premultiplied(&self) -> Option<Vec<u8>> {
         let colour = self.colour.as_ref()?;
         let mut out = Vec::with_capacity(self.coverage.len() * 4);
-        for (px, &a) in colour.chunks_exact(3).zip(&self.coverage) {
+        for (px, &a) in colour.as_chunks::<3>().0.iter().zip(&self.coverage) {
             out.extend_from_slice(&crate::docimport::srgb::encode_pixel([
                 px[0], px[1], px[2], a,
             ]));
@@ -324,7 +324,7 @@ impl TipMask {
             None => (png::ColorType::Grayscale, self.coverage.clone()),
             Some(rgb) => {
                 let mut rgba = Vec::with_capacity(self.coverage.len() * 4);
-                for (px, &a) in rgb.chunks_exact(3).zip(&self.coverage) {
+                for (px, &a) in rgb.as_chunks::<3>().0.iter().zip(&self.coverage) {
                     rgba.extend_from_slice(&[px[0], px[1], px[2], a]);
                 }
                 (png::ColorType::Rgba, rgba)
@@ -383,7 +383,12 @@ impl TipMask {
             // Written by some editors when the image has an alpha channel it
             // does not use. The grey is still the coverage.
             png::ColorType::GrayscaleAlpha => (
-                buf[..texels * 2].chunks_exact(2).map(|px| px[0]).collect(),
+                buf[..texels * 2]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|px| px[0])
+                    .collect(),
                 None,
             ),
             // A coloured stamp: the alpha is the coverage and the colour is
@@ -392,9 +397,11 @@ impl TipMask {
             png::ColorType::Rgba => {
                 let px = &buf[..texels * 4];
                 (
-                    px.chunks_exact(4).map(|p| p[3]).collect(),
+                    px.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
                     Some(
-                        px.chunks_exact(4)
+                        px.as_chunks::<4>()
+                            .0
+                            .iter()
                             .flat_map(|p| [p[0], p[1], p[2]])
                             .collect(),
                     ),
@@ -433,7 +440,12 @@ impl TipMask {
                 rgba.len()
             )));
         }
-        let coverage = rgba[..texels * 4].chunks_exact(4).map(|px| px[3]).collect();
+        let coverage = rgba[..texels * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| px[3])
+            .collect();
         Self::new(width, height, coverage)
     }
 
@@ -642,13 +654,15 @@ fn luminance(r: u8, g: u8, b: u8) -> f32 {
 /// under themselves and get their stamp inverted. That path takes
 /// [`TipMask::from_alpha`], which has nothing to decide.
 pub fn coverage_of(rgba: &[u8]) -> (Vec<u8>, TipReading) {
-    let opaque = rgba.chunks_exact(4).all(|px| px[3] == 255);
+    let opaque = rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 255);
     let coverage = if opaque {
-        rgba.chunks_exact(4)
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| (((1.0 - luminance(px[0], px[1], px[2])) * 255.0) + 0.5) as u8)
             .collect()
     } else {
-        rgba.chunks_exact(4).map(|px| px[3]).collect()
+        rgba.as_chunks::<4>().0.iter().map(|px| px[3]).collect()
     };
     (
         coverage,
@@ -697,7 +711,9 @@ pub fn coverage_of(rgba: &[u8]) -> (Vec<u8>, TipReading) {
 /// it directly. This is the one place in Umber where a picture is read without
 /// being linearised, and it is the one place where the number is not a colour.
 pub fn grain_of(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .map(|px| {
             let a = px[3] as f32 / 255.0;
             let over_white = (1.0 - a) + a * luminance(px[0], px[1], px[2]);

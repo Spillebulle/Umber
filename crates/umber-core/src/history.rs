@@ -564,7 +564,12 @@ impl PatchPiece {
 /// The single pixel a tightly packed RGBA8 buffer is made of, if it is.
 fn flat_pixel(bytes: &[u8]) -> Option<[u8; 4]> {
     let head: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-    bytes.chunks_exact(4).all(|p| p == head).then_some(head)
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|p| *p == head)
+        .then_some(head)
 }
 
 /// The pixels a stroke replaced, as the rectangles it actually touched.

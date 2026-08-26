@@ -1934,7 +1934,7 @@ mod pictures {
                 let n = (SIZE * SIZE) as usize;
                 let mut stroke = Vec::with_capacity(n);
                 let mut cov = Vec::with_capacity(n);
-                for p in view.chunks_exact(4).take(n) {
+                for p in view.as_chunks::<4>().0.iter().take(n) {
                     stroke.push(f32::from(p[0]) / 255.0);
                     cov.push(f32::from(p[1]) / 255.0);
                 }

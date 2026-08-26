@@ -4948,7 +4948,7 @@ mod tests {
                 let bytes = layer_written(path, index);
                 let first: [u8; 4] = bytes[..4].try_into().expect("four bytes");
                 assert!(
-                    bytes.chunks_exact(4).all(|p| p == first),
+                    bytes.as_chunks::<4>().0.iter().all(|p| *p == first),
                     "layer {index}'s fill was not flat, so this comparison says \
                      nothing",
                 );
@@ -5159,11 +5159,13 @@ mod tests {
 
         let bytes = layer_written(&loops.theirs, 0);
         assert!(
-            bytes.chunks_exact(4).all(|p| p == AFTER),
+            bytes.as_chunks::<4>().0.iter().all(|p| *p == AFTER),
             "the layer was written from the bands read before the edit and the \
              bands read after it: {:?}",
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|p| [p[0], p[1], p[2], p[3]])
                 .collect::<std::collections::BTreeSet<_>>(),
         );

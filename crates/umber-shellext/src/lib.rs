@@ -352,7 +352,12 @@ fn to_bitmap(preview: &Preview) -> windows::core::Result<HBITMAP> {
     // SAFETY: `CreateDIBSection` allocated exactly `count` 32-bit pixels for
     // the header above, and nothing else holds the buffer yet.
     let out = unsafe { std::slice::from_raw_parts_mut(pixels.cast::<u8>(), count * 4) };
-    for (dst, src) in out.chunks_exact_mut(4).zip(preview.rgba.chunks_exact(4)) {
+    for (dst, src) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(preview.rgba.as_chunks::<4>().0.iter())
+    {
         let a = u32::from(src[3]);
         // Rounded rather than truncated, so an opaque pixel is exactly itself.
         let pre = |c: u8| ((u32::from(c) * a + 127) / 255) as u8;
@@ -720,8 +725,13 @@ mod com_tests {
         // runner has ever executed this test, which is why the risk is removed
         // rather than documented.
         let stride = width as usize * 4;
-        let rgb =
-            |b: &[u8]| -> Vec<u8> { b.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect() };
+        let rgb = |b: &[u8]| -> Vec<u8> {
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect()
+        };
         let upright = rgb(&pixels);
         let flipped: Vec<u8> = rgb(&pixels
             .chunks_exact(stride)

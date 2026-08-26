@@ -936,7 +936,9 @@ fn reference_path(blob: &[u8]) -> Option<String> {
     let len = u32::from_be_bytes(blob[12..16].try_into().expect("four bytes")) as usize;
     let text = blob.get(16..16 + len)?;
     let units: Vec<u16> = text
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| u16::from_le_bytes([p[0], p[1]]))
         .collect();
     let path = String::from_utf16(&units).ok()?;
@@ -1027,7 +1029,9 @@ fn thumbnail_rgba(png_bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buffer[..texels * 4].to_vec(),
         png::ColorType::GrayscaleAlpha => buffer[..texels * 2]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         // `Transformations::ALPHA` gives every other type one, so these are
@@ -1078,15 +1082,21 @@ fn mask_from_thumbnail(png_bytes: &[u8]) -> Option<TipMask> {
 
     let coverage: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buffer[..texels * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| ink(p[0], p[1], p[2], p[3]))
             .collect(),
         png::ColorType::Rgb => buffer[..texels * 3]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|p| ink(p[0], p[1], p[2], 255))
             .collect(),
         png::ColorType::GrayscaleAlpha => buffer[..texels * 2]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| ink(p[0], p[0], p[0], p[1]))
             .collect(),
         png::ColorType::Grayscale => buffer[..texels]

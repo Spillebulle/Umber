@@ -190,7 +190,7 @@ fn lift(canvas: u32, pixels: &[u8], rect: PixelRect) -> Vec<u8> {
 /// Whether every pixel of a piece is the same one, which is what lets a piece
 /// of blank canvas or flat fill be stored as four bytes.
 fn uniform(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes.chunks_exact(4).all(|p| p == &bytes[..4])
+    bytes.len() >= 4 && bytes.as_chunks::<4>().0.iter().all(|p| p == &bytes[..4])
 }
 
 fn png_len(rect: PixelRect, bytes: &[u8]) -> usize {

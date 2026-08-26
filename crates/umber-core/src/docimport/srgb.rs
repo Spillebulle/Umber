@@ -133,8 +133,8 @@ pub fn encode_pixel(px: [u8; 4]) -> [u8; 4] {
 /// a reader miscounted, which is a bug worth catching in tests.
 pub fn encode_buffer(buf: &mut [u8]) {
     debug_assert_eq!(buf.len() % 4, 0, "not a whole number of RGBA pixels");
-    for px in buf.chunks_exact_mut(4) {
-        px.copy_from_slice(&encode_pixel([px[0], px[1], px[2], px[3]]));
+    for px in buf.as_chunks_mut::<4>().0.iter_mut() {
+        *px = encode_pixel(*px);
     }
 }
 
@@ -208,7 +208,7 @@ fn v3_coverage_table() -> &'static [u8; 256] {
 pub fn decode_v3_mask_buffer(buf: &mut [u8]) {
     debug_assert_eq!(buf.len() % 4, 0, "not a whole number of RGBA pixels");
     let t = v3_coverage_table();
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0.iter_mut() {
         let c = t[px[0] as usize];
         px[0] = c;
         px[1] = c;
@@ -255,8 +255,8 @@ pub fn decode_pixel(px: [u8; 4]) -> [u8; 4] {
 /// Convert a whole RGBA8 buffer in place, layer-texture form to straight alpha.
 pub fn decode_buffer(buf: &mut [u8]) {
     debug_assert_eq!(buf.len() % 4, 0, "not a whole number of RGBA pixels");
-    for px in buf.chunks_exact_mut(4) {
-        px.copy_from_slice(&decode_pixel([px[0], px[1], px[2], px[3]]));
+    for px in buf.as_chunks_mut::<4>().0.iter_mut() {
+        *px = decode_pixel(*px);
     }
 }
 
@@ -478,7 +478,7 @@ mod tests {
         // conversion that touched only red would leave a trap for whichever is
         // asked next.
         let out = v3_converted();
-        for (s, px) in out.chunks_exact(4).enumerate() {
+        for (s, px) in out.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(px[0], px[1], "stored {s}");
             assert_eq!(px[0], px[2], "stored {s}");
             assert_eq!(px[3], 255, "stored {s} lost its opaque fourth byte");

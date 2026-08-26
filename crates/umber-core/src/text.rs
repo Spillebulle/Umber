@@ -1325,7 +1325,7 @@ mod tests {
             .expect("a clip");
         assert_eq!(clip.size().x, s.width);
         assert_eq!(clip.size().y, s.height);
-        for (i, chunk) in clip.pixels().chunks_exact(4).enumerate() {
+        for (i, chunk) in clip.pixels().as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(chunk[..3], [20, 40, 60], "colour at {i}");
             assert_eq!(chunk[3], s.coverage[i], "alpha at {i}");
         }
@@ -1474,7 +1474,9 @@ mod tests {
         // wrong somewhere else.
         let px = placed
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .find(|px| (60..=200).contains(&px[3]))
             .expect("an antialiased pixel");
         assert!(px[0] < 250, "the colour was not premultiplied: {px:?}");

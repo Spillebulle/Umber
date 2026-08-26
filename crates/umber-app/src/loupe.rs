@@ -223,7 +223,9 @@ impl Patch {
         Self::new(
             size,
             rgba[..want * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
                 .map(|(i, c)| {
                     let x = first.0 + (i % size as usize) as i32;

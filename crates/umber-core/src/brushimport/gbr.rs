@@ -178,9 +178,11 @@ pub(crate) fn read_one(bytes: &[u8]) -> Result<(GbrBrush, usize), PresetError> {
             }
             let px = &pixels[..needed];
             (
-                px.chunks_exact(4).map(|p| p[3]).collect(),
+                px.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
                 Some(
-                    px.chunks_exact(4)
+                    px.as_chunks::<4>()
+                        .0
+                        .iter()
                         .flat_map(|p| [p[0], p[1], p[2]])
                         .collect(),
                 ),
