@@ -5641,8 +5641,10 @@ mod tests {
     fn the_loupes_rim_turns_from_the_light() {
         // **The whole of "it reads as glass rather than as a disc"**, and it is
         // a statement about pixels rather than about the constants that produce
-        // them: the rim towards `GLASS_LIGHT` is lighter than the body it is
-        // made of, and the rim opposite is darker. Delete either half of
+        // them: the rim towards `GLASS_LIGHT` is at least as light as the body
+        // it is made of, and the rim opposite is darker — "at least", because
+        // one theme's body is already at the end of the axis, which is the
+        // second half of this test. Delete either half of
         // `loupe_glass`'s shading and this fails; change the light's direction
         // and it fails the other way round, which is what a guard reading the
         // constant back could not do.
