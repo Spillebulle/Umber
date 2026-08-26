@@ -26,6 +26,18 @@
 //! The counts for both are printed on every run, because they are the honest
 //! answer to "why is my favourite brush not in here".
 //!
+//! # The one thing that is changed rather than refused
+//!
+//! [`preset::SHIPPED_SPACING_CAP`]. Every other setting is transcribed or the
+//! brush is left out, and the spacing is the one number whose *meaning* differs
+//! between the engine it was written for and this one — every pack Umber reads
+//! composites each dab, where Umber saturates coverage with a `max`, so a step
+//! those engines draw as a continuous mark scallops here. Transcribing it
+//! faithfully is what produces a brush that paints unlike its author's, which
+//! is the failure this whole file is arranged around. The argument, the
+//! measurements and the exemption for a brush whose gaps *are* its mark are all
+//! at the cap itself, further down.
+//!
 //! # Bitmap tips ship now
 //!
 //! This used to refuse every brush with a mask, because the shipped library is
@@ -356,6 +368,78 @@ fn main() {
                         reasons: vec![NOT_REDISTRIBUTED.to_string()],
                     });
                     continue;
+                }
+
+                // **The spacing cap, and it is this file's one deliberate
+                // departure from the rule at the top of it.** Everything else
+                // here refuses a brush rather than approximate it; this changes
+                // one number on brushes that ship under their authors' names,
+                // and the reason is that the number does not mean the same
+                // thing in the engine it was written for.
+                //
+                // MyPaint, Krita and Clip Studio all **composite every dab**,
+                // so a step of a quarter of the mark leaves a stroke that reads
+                // as continuous: the dips between dab centres are filled in by
+                // the neighbours piling up. Umber saturates coverage with a
+                // `max` — the anti-compounding guarantee the whole wet-layer
+                // scheme rests on — so nothing piles up and the same step
+                // leaves the edge visibly scalloped. Faithfully transcribing
+                // the author's figure therefore produces a brush that looks
+                // *unlike* their brush, which is the thing this generator
+                // exists to prevent, and it is what an artist reported as
+                // choppy strokes. 103 of the 252 converted presets sat above
+                // the cap; the median was already exactly at it.
+                //
+                // **It costs nothing in ink and it is not a judgement.** Under
+                // a `max` a stroke's mark is the *union* of its dabs'
+                // footprints, so inserting more dabs between overlapping ones
+                // covers the same ground and only fills in the scallops.
+                // Measured over every preset this touches by
+                // `examples/measure-spacing.rs`: mean ink 1.10x, and the cases
+                // above 1.5x are all brushes whose dabs already vary per dab —
+                // scatter, a rolling angle, a random size — where the count was
+                // always a density control and the author's own engine spaced
+                // them the same way.
+                //
+                // **The exemption is geometric rather than a list of names.**
+                // `Brush::step_at` is `reach × 2 × spacing`, so at
+                // `DABS_COME_APART_AT` the step is the dab's whole width and
+                // consecutive dabs stop touching: below it the spacing decides
+                // how smooth one continuous mark is, at or above it the gaps
+                // *are* the mark. Two presets are up there — Raghukamath's
+                // "Dots" at 5.12 and GDquest's "Special Shadow" at 1.47 — and
+                // capping them would lay 40x and 13x the dabs and cover 5.8x
+                // and 1.8x the ground, which is a row of dots replaced by a
+                // line. Nothing between the cap and that boundary is sparse in
+                // that sense, because by construction those dabs still overlap.
+                //
+                // A **scatter** clause was measured and refused. It looks like
+                // the same idea — a dab thrown clear of the line is one whose
+                // count sets a density — but it does not separate the library:
+                // the mean ink change is 1.38x for `scatter >= 1` against 1.10x
+                // for the rest, the distributions overlap, and the worst
+                // non-exempt case (`tanda/texture-06`, 2.10x) has no scatter at
+                // all. It is a chisel whose angle rolls through a full turn
+                // along the stroke, which no scatter reading can see. A rule
+                // wide enough to catch every per-dab variation would exempt
+                // most of the library and leave the strokes choppy.
+                //
+                // Applied **after** the refusals, so which brushes ship is
+                // untouched — and the faintness gate above already reads the
+                // mask at the cap as well as at the author's spacing, so the
+                // brush is measured at the spacing it will actually paint at.
+                // The opacity a MyPaint brush arrives with is deliberately
+                // *not* recomputed: `tip::dab_stack_alpha` converts a per-dab
+                // alpha into the stroke opacity that reproduces it **in
+                // MyPaint**, which is a question about the author's spacing in
+                // the author's engine, and Umber's own opacity is applied once
+                // at commit and is spacing-independent by construction. Nor is
+                // `build_up`, which does depend on Umber's spacing: measured,
+                // no shipped stamp or paper changes its verdict across the cap,
+                // and `every_shipped_stamp_still_wants_the_build_up_it_ships_
+                // with` is what keeps that true.
+                if preset.brush.spacing < preset::DABS_COME_APART_AT {
+                    preset.brush.spacing = preset.brush.spacing.min(preset::SHIPPED_SPACING_CAP);
                 }
 
                 let author = pack
