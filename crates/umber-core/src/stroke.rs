@@ -256,13 +256,20 @@ impl StrokeBuilder {
 
     /// Whether this stroke's dabs accumulate coverage instead of saturating.
     ///
+    /// [`Brush::builds`] is the whole of the question — [`Brush::build_up`] or a
+    /// [`Brush::flow`] under 1.0 — and asking it there rather than here is what
+    /// keeps this and the per-dab conversion in `emit` from answering
+    /// differently. A dab converted for the accumulating blend and then drawn
+    /// under the `max` is a mark at a fraction of its strength; the reverse is a
+    /// mark far past it.
+    ///
     /// Read off the brush snapshotted at [`Self::begin`] rather than off the
     /// live one, for the same reason the colour is: the dab pass picks a
     /// pipeline from this every frame, and a stroke that changed pipeline
     /// halfway would have its first half drawn under one rule and its second
     /// under the other.
     pub fn builds_up(&self) -> bool {
-        self.brush.build_up
+        self.brush.builds()
     }
 
     /// The grain this stroke bites through, as `(strength, tile size)`.
@@ -671,7 +678,7 @@ impl StrokeBuilder {
         // the most recent dabs. `preview_mark` mirrors it, so the row and the
         // canvas still agree, and no shipped preset combines the three; it is
         // named here because the alternative is somebody finding it.
-        let coverage = if self.brush.build_up {
+        let coverage = if self.brush.builds() {
             // The step and the reach from the brush's own two functions rather
             // than from the spacing: `step_at` floors the step at a quarter of a
             // pixel, so on a small dab the floor and not the spacing decides how
@@ -689,7 +696,48 @@ impl StrokeBuilder {
                 // number the vertex shader builds the quad from.
                 radius / aspect.max(1.0),
             );
-            tip::per_dab_for_stroke(mark, depth)
+            let per_dab = tip::per_dab_for_stroke(mark, depth);
+            // **Flow scales the dab and never the mark**, which is the whole of
+            // what makes it Photoshop's Flow rather than a second opacity. The
+            // conversion above answers "what must one dab carry for the stroke
+            // to *arrive* at `mark`"; flow is the artist declining that answer
+            // and asking for less, so the stroke builds towards the mark over
+            // several dabs and goes past it where it crosses itself. It is
+            // therefore the one thing that deliberately breaks the reaches-its-
+            // mark promise `per_dab_for_stroke` exists to keep, which is why it
+            // multiplies the converted figure rather than being folded into
+            // `mark` up beside the modulation: folded in there it would be a cap
+            // on the finished stroke, indistinguishable from `Brush::opacity`
+            // and reaching the commit through the same door the wet-layer scheme
+            // keeps shut.
+            //
+            // `flow()` and not the field, because a hand-written preset may name
+            // anything and `builds()` above has already been asked the bounded
+            // question — the two reading the field differently is a dab
+            // converted for one blend and drawn under the other.
+            let flow = self.brush.flow();
+            if flow < 1.0 {
+                // The floor is re-applied because flow can take a converted dab
+                // back under one level of an `R8Unorm` scratch, where a
+                // *constant* increment never moves the accumulator at all and
+                // the stroke is not faint but absent. `Brush::MIN_FLOW` bounds
+                // the rail against the same thing; this bounds the arithmetic,
+                // because `mark` may already be small when flow multiplies it.
+                //
+                // Guarded on `flow < 1.0` and on the value being positive, so
+                // flow 1.0 is the **exact** identity — including for the two
+                // cases `per_dab_for_stroke` deliberately leaves unfloored: a
+                // target of zero, which must stay nothing painted rather than
+                // becoming a level, and a stroke only one dab deep, which
+                // returns its target verbatim.
+                if per_dab > 0.0 {
+                    (per_dab * flow).max(tip::SCRATCH_LEVEL)
+                } else {
+                    0.0
+                }
+            } else {
+                per_dab
+            }
         } else {
             mark
         };

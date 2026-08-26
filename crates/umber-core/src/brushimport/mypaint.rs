@@ -625,6 +625,13 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         // keep where a dab is sparse by construction — a bitmap tip, or grain —
         // which is precisely what a `.myb` never has.
         build_up: false,
+        // A `.myb` states no flow. MyPaint composites every dab and
+        // reaches the same place by other means, so there is no figure to
+        // read across and none is invented: 1.0 is the identity and keeps
+        // every imported brush on the `max` path it has always been on.
+        // Inventing one would be the "an import that *gains* a behaviour
+        // nobody asked for" failure the blend mode above refuses.
+        flow: 1.0,
         // MyPaint has no paper texture. The `.gbr` packs do.
         grain: 0.0,
         grain_scale: Brush::default().grain_scale,

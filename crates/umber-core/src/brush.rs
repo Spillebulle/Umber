@@ -226,6 +226,36 @@ pub struct Brush {
     /// It is a **blend-state** change and nothing else — the dab shader is
     /// untouched, so the two paths cannot drift into stamping different shapes.
     pub build_up: bool,
+    /// What one dab lays down, as a fraction of the mark the stroke builds to.
+    ///
+    /// Photoshop's Flow and Krita's build-up painting mode. Below `1.0` a dab
+    /// carries less than the finished mark, so the stroke *arrives* at that
+    /// mark over several dabs instead of reaching it with the first — and a
+    /// stroke that crosses itself goes over the same pixels twice and comes out
+    /// darker there, which is the thing a painter reaches for this to get.
+    ///
+    /// **It is not [`Brush::opacity`] and the two are different numbers on
+    /// purpose.** Opacity caps the *finished stroke* and is applied exactly
+    /// once, at commit, over coverage the dab pass has already saturated —
+    /// folding it into a dab is the compounding bug the whole wet-layer scheme
+    /// exists to prevent, and [`crate::stroke`] says so at the line that would
+    /// do it. Flow is the opposite end: it is a statement about one dab, it
+    /// never reaches the commit, and the scratch still holds coverage in `0..1`
+    /// so composite and commit are untouched. Halving opacity halves the
+    /// finished stroke everywhere; halving flow leaves a well-travelled stroke
+    /// at full strength and thins only its thin ends and its first few dabs.
+    ///
+    /// **`1.0` is the exact identity and every shipped preset depends on it.**
+    /// Nothing multiplies by it on the `max` path — [`Brush::builds`] answers
+    /// false, so the conversion is not reached at all.
+    ///
+    /// **Below `1.0` it selects the accumulating blend**, through
+    /// [`Brush::builds`]. Under the `max` a uniform per-dab scale is not flow at
+    /// all: `max` is idempotent, so every dab writing `flow` caps the stroke at
+    /// `flow` and the mark comes out uniformly fainter and just as flat, with
+    /// crossing still doing nothing. There is nothing to build with until the
+    /// blend composites.
+    pub flow: f32,
     /// How strongly a tiling grain texture bites into dab coverage, `0.0`
     /// (none) to `1.0` (the grain's dark texels erase the dab entirely).
     ///
@@ -305,6 +335,7 @@ impl Default for Brush {
             scatter_curve: ResponseCurve::LINEAR,
             radius_jitter: 0.0,
             build_up: false,
+            flow: 1.0,
             grain: 0.0,
             grain_scale: 256.0,
             grain_pattern: GrainPattern::Tooth,
@@ -350,6 +381,47 @@ impl Brush {
     /// what an import can produce, and an imported brush above the rail's top
     /// is one whose setting cannot be put back where it was found.
     pub const MAX_STABILIZATION: f32 = 0.95;
+
+    /// The lightest flow the rails offer, and a bound on the *value* as well.
+    ///
+    /// A user-interface bound in the sense [`Brush::MAX_STABILIZATION`] is one,
+    /// and a pixel bound underneath it. At a mark of 1.0 a dab carries
+    /// `MIN_FLOW` straight into an `R8Unorm` scratch, so 0.01 is 2.55 levels of
+    /// 255: faint, and still a mark. The next decade down is not — 0.001 is a
+    /// quarter of a level, which the store rounds to nothing, and a *constant*
+    /// increment under half a level never moves the accumulator however many
+    /// dabs land on it. That is the invisible-stroke defect
+    /// [`crate::tip::SCRATCH_LEVEL`] exists to bound, and a rail that reaches it
+    /// is a control whose bottom end paints nothing at all.
+    pub const MIN_FLOW: f32 = 0.01;
+
+    /// [`Brush::flow`], bounded.
+    ///
+    /// The field is public and a hand-written preset may name anything, so the
+    /// bound is applied where it is *read* rather than trusted at the rail —
+    /// the same arrangement `grain` and `stabilization` keep.
+    pub fn flow(&self) -> f32 {
+        self.flow.clamp(Self::MIN_FLOW, 1.0)
+    }
+
+    /// Whether this stroke's dabs **accumulate** coverage instead of saturating
+    /// at the strongest of them.
+    ///
+    /// The one statement of the question, asked by [`crate::stroke::Stroke`] for
+    /// the pipeline the renderer picks and by the conversion in
+    /// [`crate::stroke::StrokeBuilder`] that decides what a dab carries. One
+    /// function rather than two readings of two fields, because those two have
+    /// to agree for every frame of a stroke: a dab converted for a blend it is
+    /// not then drawn under is a mark at the wrong strength, and which way it is
+    /// wrong depends on which of the two was consulted.
+    ///
+    /// [`Brush::build_up`] is the author saying the dab is not solid — a sparse
+    /// stamp, a grain — and [`Brush::flow`] below 1.0 is the author asking for
+    /// less than the mark per dab. Either needs the accumulating blend and
+    /// neither implies the other, so this is an `||` and not a single field.
+    pub fn builds(&self) -> bool {
+        self.build_up || self.flow() < 1.0
+    }
 
     /// Dab radius for a given pressure, in document pixels.
     pub fn radius_at(&self, pressure: f32) -> f32 {

@@ -2072,7 +2072,7 @@ fn smoothstep(from: f32, to: f32, x: f32) -> f32 {
 ///
 /// **This is a deliberate second implementation of the coverage rules, for a
 /// thumbnail, and it holds to all three of them.** Dabs saturate under a `max`
-/// — or accumulate, where [`Brush::build_up`] asks them to, which is a choice
+/// — or accumulate, where [`Brush::builds`] asks them to, which is a choice
 /// of accumulation and not a different shape. `Brush::opacity` is applied
 /// exactly once, afterwards, in [`preview_image`], and never folded into a
 /// dab's coverage. And the falloff, the antialiasing margin sized from the
@@ -2156,7 +2156,17 @@ fn preview_mark(brush: &Brush, tip: Option<&TipThumb>, at: &MarkBox) -> Mark {
                     continue;
                 }
                 let at = y * at.width + x;
-                if brush.build_up {
+                // `builds()` and not `build_up`, so a brush carrying only a
+                // flow under 1.0 previews on the same accumulating rule the
+                // canvas will draw it under. Reading the flag alone left the
+                // row taking a `max` of dabs the stroke builder had already
+                // converted *for* accumulation, which is the mark at a
+                // fraction of its strength — a row that lies about the one
+                // number the control exists to set. What a dab carries is
+                // `StrokeBuilder`'s and is already right here: `preview_dabs`
+                // runs the real builder, so flow reaches this buffer without
+                // a second statement of the conversion.
+                if brush.builds() {
                     mark.coverage[at] += cov * (1.0 - mark.coverage[at]);
                 } else {
                     mark.coverage[at] = mark.coverage[at].max(cov);
