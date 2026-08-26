@@ -474,6 +474,17 @@ const ANT_SPEED: f32 = 2.0 * ANT_DASH;
 /// written after the frame that used it and so is one frame stale — a marquee a
 /// frame behind the scale is exactly the soft line this exists to prevent, on
 /// the frame somebody drags Umber onto their second monitor.
+///
+/// **Two things this does not reach, and both are worth knowing before anybody
+/// reads it as settled.** It only helps a line egui *snapped*, which is one
+/// that is axis-aligned: `tessellate_line_segment` tests `a.x == b.x` and
+/// `a.y == b.y` and does nothing otherwise, so a lasso's marquee is as soft as
+/// it ever was and nothing here can change that. And the same one-point stroke
+/// is drawn by `transform_box` — its 2-point underlay is three device pixels at
+/// 150%, an odd count, so that half stays crisp while the accent on top is
+/// exactly the ridge described above. It has not been changed, because an
+/// appearance is not something to alter without looking at it and there is no
+/// preview for the float.
 fn ant_width(pixels_per_point: f32) -> f32 {
     let ppp = pixels_per_point.max(1e-3);
     ppp.round().max(1.0) / ppp
@@ -1517,6 +1528,13 @@ const GLASS_RIM: (f32, f32, f32) = (0.22, 0.66, 0.30);
 /// at a polygon edge and put a stepped silhouette back on the one shape the body
 /// disc underneath is antialiased for. Half a point is under a device pixel
 /// everywhere and is enough to hand the edge back to the disc.
+///
+/// It also covers a mismatch nothing else would: epaint tessellates a circle of
+/// this size with sixty-four segments and [`GLASS_SEGMENTS`] is ninety-six, so
+/// the band is the *rounder* of the two and can sit 0.03 of a point outside the
+/// disc it is laid on. That is nothing while the outermost stop is transparent
+/// and the disc's own feather reaches past [`loupe::OUTER`]; it stops being
+/// nothing the day somebody removes this fade.
 const GLASS_FADE: f32 = 0.5;
 
 /// A band of triangles between a run of radii, coloured per corner.
@@ -1686,7 +1704,12 @@ fn loupe_glass(painter: &egui::Painter, p: &Palette, centre: egui::Pos2) {
 /// of a grid stepping by six points reaches nowhere near the top of the disc —
 /// and that is the stepped mosaic this used to draw. A generous clip covers the
 /// disc entirely and overhangs it by at most one cell, which [`loupe_glass`]'s
-/// opaque rim then hides. One cell is the exact figure rather than a margin:
+/// opaque rim then hides. **The overhang is vertical only**: `half` is clamped
+/// by the grid's own width, which stops at [`loupe::RADIUS`], so along the
+/// middle row the picture meets the circle exactly and with no slack at all —
+/// covered because `Rect::contains` is inclusive, and covered *visually*
+/// because the rim's feather straddles the boundary either way. One cell is the
+/// exact figure rather than a margin:
 /// the worst gap between a staircase of that pitch and its own circle is
 /// `sqrt(R² + 2Rc − c²) − R`, which at eleven cells is 5.1 of the 6 available.
 /// The cells past the boundary are drawn and covered, which costs **26** more
@@ -5603,15 +5626,24 @@ mod tests {
     }
 
     #[test]
-    fn the_loupe_draws_no_outline() {
+    fn the_loupe_draws_nothing_in_popover_border() {
         // What the artist asked for, and it is checkable because the old
         // outline was a token: `popover_border` is the hairline that used to
         // ring the loupe, and a lens does not have one. Everything that
         // separates it from the canvas now is shading — the rim turning from
-        // the light — which is the next guard.
+        // the light — which is the guard below.
         //
         // Read off the shapes rather than off the source, so a stroke reaching
         // that colour by another route is caught too.
+        //
+        // **The name is what it checks and not the general property**, which is
+        // the honest half: a dark ring hand-mixed, or taken from `p.border`, or
+        // drawn in `contrast::SHADE` at full strength would pass this. It was
+        // called `the_loupe_draws_no_outline`, which promised the general
+        // property, and a name that overstates is what the next reader trusts
+        // instead of looking. Testing the general property means measuring
+        // whether the boundary has a *ring* in it, which is the shading guard's
+        // job from the other side.
         let palette = Palette::of(ThemeKind::Graphite);
         let at = glam::Vec2::new(600.0, 400.0);
         let prims = frame_at(&palette, vec2(1280.0, 800.0), 2.0, |ui| {
@@ -5635,6 +5667,85 @@ mod tests {
                 "the loupe still draws something in `popover_border`"
             );
         }
+    }
+
+    #[test]
+    fn the_loupes_glass_darkens_towards_its_edge_and_catches_the_light_there() {
+        // **The other three quarters of `loupe_glass`.** The rim guard beside
+        // this one samples at `RIM * 0.37`, which is in the rim's shading band
+        // and in none of the passes that lie on the *picture* — so the
+        // thickness and the catch-light could both have been deleted with every
+        // guard here still green, and `GLASS_EDGE.2`, the counter-lobe the
+        // comments call the thing that tells glass from a moulded button, had
+        // no measurement at all. That was found by a critic reading the radii
+        // rather than by anything failing.
+        //
+        // The fixture is one flat colour across the whole block deliberately:
+        // every sample below then differs *only* by what the glass put on it,
+        // so a difference between two of them cannot be the picture underneath.
+        //
+        // Radii and angles are off `glass_band`'s stops and off its segment
+        // boundaries — a segment turns through 3.75 degrees. That is belt and
+        // braces rather than load-bearing now that `triangle_at` has a fill
+        // rule; before it, a sample on a stop composited its wash twice.
+        let palette = Palette::of(ThemeKind::Graphite);
+        let at = glam::Vec2::new(600.0, 400.0);
+        let prims = frame_at(&palette, vec2(1280.0, 800.0), 2.0, |ui| {
+            let mut ed = Editor::default();
+            ed.ui.tool = crate::editor::Tool::Eyedropper;
+            ed.cursor = at;
+            ed.loupe = Some(crate::loupe::Loupe {
+                at,
+                taken: Some(umber_core::Color::from_srgb_u8(80, 80, 80, 255)),
+                patch: Some(patch_of([80, 80, 80], Some([80, 80, 80]))),
+            });
+            super::loupe_overlay(ui, &palette, &ed);
+        });
+        let centre = pos2(at.x, at.y - crate::loupe::OUTER - crate::loupe::CLEARANCE);
+        let r = crate::loupe::RADIUS;
+        let seen = |radius: f32, degrees: f32| {
+            let a = degrees.to_radians();
+            let p = centre + vec2(a.cos(), a.sin()) * radius;
+            crate::theme::contrast::luminance(frame_pixel(&prims, palette.backdrop, p))
+        };
+
+        // The thickness: further out is darker. Both radii are inside the
+        // thickness band and outside the catch-light's, so nothing else is on
+        // them.
+        let middle = seen(r * 0.25, 97.3);
+        let deep = seen(r * 0.85, 97.3);
+        assert!(
+            deep < middle,
+            "the glass does not darken towards its edge: {deep:.4} at 0.85 of \
+             the radius against {middle:.4} at 0.25"
+        );
+
+        // The catch-light: at the boundary, facing the light, the glass is
+        // *lighter* than the thickness alone left it further in. Take the
+        // thickness band's own outer wash away and the rim goes darker instead.
+        let rim_lit = seen(r - 1.1, 227.3);
+        assert!(
+            rim_lit > deep,
+            "the boundary does not catch the light: {rim_lit:.4} against \
+             {deep:.4} where there is thickness and no catch-light"
+        );
+
+        // The counter-lobe: the far side of the boundary is brighter than the
+        // quarter turn between the two lobes, where only `GLASS_EDGE.0` is
+        // left. Setting `GLASS_EDGE.2` to zero makes these two equal.
+        let rim_away = seen(r - 1.1, 47.3);
+        let rim_across = seen(r - 1.1, 137.3);
+        assert!(
+            rim_away > rim_across,
+            "the far side of the boundary does not carry the counter-lobe: \
+             {rim_away:.4} against {rim_across:.4} across the light"
+        );
+        // And it is the weaker of the two, or it is not a counter-lobe.
+        assert!(
+            rim_away < rim_lit,
+            "the counter-lobe is not weaker than the highlight: {rim_away:.4} \
+             against {rim_lit:.4}"
+        );
     }
 
     #[test]
@@ -5671,11 +5782,18 @@ mod tests {
             });
             let centre = pos2(at.x, at.y - crate::loupe::OUTER - crate::loupe::CLEARANCE);
             // The middle of the rim band, where its shading is peaked.
-            // Off the stops and off the segment boundaries, for the reason
-            // `frame_pixel` gives: `RIM * 0.37` is between the band's inner and
-            // middle stops, and 227.3 degrees is not a multiple of the 3.75 a
-            // segment turns through. Taken on a stop, one wash composites four
-            // times and reads as an extreme.
+            // Off the stops and off the segment boundaries: `RIM * 0.37` is
+            // between the shading band's inner and middle stops — short of the
+            // peak at the middle one, deliberately, so the reading is of the
+            // band rather than of its brightest ring — and 227.3 degrees is not
+            // a multiple of the 3.75 a segment turns through.
+            //
+            // That is belt and braces rather than load-bearing. Before
+            // `triangle_at` had a fill rule a sample on a stop composited its
+            // wash twice and read as an extreme, which is how this radius was
+            // chosen; the fill rule fixed the cause, and this stays because a
+            // sample that cannot land on a seam is one fewer thing to reason
+            // about.
             let band = crate::loupe::RADIUS + crate::loupe::RIM * 0.37;
             let sample = |degrees: f32| {
                 let a = degrees.to_radians();
@@ -5688,7 +5806,7 @@ mod tests {
             let away = sample(47.3);
             assert!(
                 towards >= body && away < body,
-                "{kind:?}: the rim reads {towards:.4} towards the light and                  {away:.4} away from it, against a body of {body:.4}"
+                "{kind:?}: the rim reads {towards:.4} towards the light and {away:.4} away from it, against a body of {body:.4}"
             );
             // **Only one half of the pair does any work in Paper**, and that is
             // stated rather than hidden: its `popover` is pure white, so
