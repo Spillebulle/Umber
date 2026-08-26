@@ -3573,6 +3573,16 @@ mod tests {
                         ed.layout.set_edit_mode(true);
                     }
                     let palette = Palette::of(ThemeKind::Graphite);
+                    // The interface's own style, because the header's whole
+                    // arithmetic is in points egui supplies. A bare `Context`
+                    // spaces items 8 apart and `theme::apply` sets 6, so
+                    // without this the strip measured here is two points wider
+                    // per gap than the one anybody sees — and the *fit* is what
+                    // this test now asserts, so it would be asserting it about
+                    // a header Umber never draws. That is CLAUDE.md's "a
+                    // guard's inputs must span the domain the code sees",
+                    // arriving through a style rather than through a constant.
+                    crate::theme::apply(&ctx, &palette);
                     // Twice: the first pass through a fresh context builds the
                     // font atlas, and a title laid out against a half-built one
                     // is not the width it will settle at.
