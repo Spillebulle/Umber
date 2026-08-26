@@ -59,25 +59,62 @@ use umber_core::Color;
 /// display refreshes. See `syspick::sample_patch`.
 ///
 /// **More is read than is shown, and that is the safe direction.** The grid is
-/// square and the window is round, so the corners of the block, and at this
-/// figure the outermost row and column, fall outside the circle and are never
-/// drawn. The block is this wide because a `BitBlt` of it is free, not because
-/// every texel reaches the screen — and a magnifier showing *fewer* pixels than
-/// it read is nothing like one showing pixels it did not.
+/// square and the window is round, so the block's four corners fall outside the
+/// circle and are never drawn — four cells at each of them, at this figure. The
+/// block is this wide because a `BitBlt` of it is free, not because every texel
+/// reaches the screen, and a magnifier showing *fewer* pixels than it read is
+/// nothing like one showing pixels it did not.
+///
+/// **This used to say the outermost row and column were dropped whole, and both
+/// halves of that were wrong.** The column half was never true: at the middle
+/// row the circle is 32.86 points wide against the grid's 33, so the outer
+/// column was always drawn, clipped by 0.14 of a point. The row half was true
+/// and `ui::loupe_cells`' generous clip retired it — the outer row is now drawn
+/// seven cells wide, and part of it is *shown*, because the boundary is at
+/// [`RADIUS`] and that row occupies 27 to 33. Which is the point of the change:
+/// a row that stopped at 27 is what made the lens a staircase.
 pub const CELLS: u32 = 11;
 
-/// The magnified grid's radius, in points.
+/// The radius of the picture, in points, and so of the lens.
+///
+/// **Not the radius of the grid**, which reaches one [`CELL`] further:
+/// `ui::loupe_cells` clips generously so the staircase covers this circle, and
+/// [`RIM`] hides what hangs over. This is the figure the boundary is drawn at
+/// and the one everything else here is stated against.
 pub const RADIUS: f32 = 33.0;
 
-/// The band of surface colour around the grid, in points.
+/// The lens edge around the grid, in points.
 ///
 /// Here rather than in `ui::loupe_overlay` where it is painted, because
 /// [`place`] is handed [`OUTER`] and the guard has to measure the shape that is
 /// actually drawn. A rim that lived at the call site would make the clearance
-/// sweep three points optimistic about a circle it had never seen — which is
+/// sweep nine points optimistic about a circle it had never seen — which is
 /// the "measure the output, never restate the rule" failure this codebase
 /// records at four other call sites.
-pub const RIM: f32 = 3.0;
+///
+/// **It was three, and what widened it is that the rim is now a surface rather
+/// than a hairline.** `ui::loupe_glass` shades it from the light end of the
+/// axis at the top left to the dark end at the bottom right, which is what
+/// makes the thing read as a lens instead of as a disc with a border round it,
+/// and three points of that is a line pretending to be a bevel. It also has to
+/// be at least one [`CELL`] wide, because the grid is drawn a cell past
+/// [`RADIUS`] and this band is what hides the overhang — see `ui::loupe_cells`.
+pub const RIM: f32 = 9.0;
+
+/// One magnified texel, in points.
+///
+/// Named because three things need it and only one of them is the drawing: the
+/// grid steps by it, the clip that fills the disc is generous by exactly it,
+/// and [`RIM`] has to be at least it. A figure recomputed at each of those is
+/// three that have to agree.
+pub const CELL: f32 = 2.0 * RADIUS / CELLS as f32;
+
+/// The rim has to be able to hide a whole cell of overhang, or the picture
+/// spills past the lens — which is what happened when the rim's radius was
+/// handed to `circle_stroke` as a mid-radius. A `const` assert rather than a
+/// sentence, for `effect::BUDGET_DERIVATION`'s reason: the failure is silent
+/// and directional, and only one of the two figures is likely to be edited.
+const _: () = assert!(RIM >= CELL, "the rim must hide a cell of overhang");
 
 /// What the loupe occupies: the grid plus its rim.
 pub const OUTER: f32 = RADIUS + RIM;

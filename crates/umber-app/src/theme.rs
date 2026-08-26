@@ -234,6 +234,33 @@ pub mod contrast {
     /// sweep rather than taking the algebra's word for it.
     pub const READABLE: f64 = 3.0;
 
+    /// The two ends of the lightness axis, named.
+    ///
+    /// [`ink_on`] answers with *one* of these; a shading pass needs both at
+    /// once, because a curved surface is light where it faces the light and
+    /// dark where it turns away, and one end alone is a wash rather than a
+    /// shape. That argument is the whole of it and it holds even where the
+    /// surface *is* a token this palette named: Paper's `popover` is pure
+    /// white, so there is no lighter half to derive and `ink_on` can only
+    /// answer with the dark one.
+    ///
+    /// Where a pass also lies on the artist's own picture rather than on a
+    /// surface — the eyedropper's lens does, over two of its three shading
+    /// passes — [`super::Palette::accent_underlay`]'s argument about the
+    /// marquee applies on top: nothing between the extremes reads on every
+    /// artwork. That is a second reason and not the first one, and saying so
+    /// matters, because read as the first it would license reaching for these
+    /// wherever a mark happens to lie on paint.
+    ///
+    /// They are named here rather than written as two literals at the call
+    /// site, and this module is where the ends of the axis already live —
+    /// [`headroom`] returns exactly these two. A shading pass is the whole of
+    /// what they are for; a *mark* still asks [`ink_on`], which is the thing
+    /// that knows what it is being drawn on.
+    pub const LIT: Color32 = Color32::WHITE;
+    /// The dark end of the axis. See [`LIT`].
+    pub const SHADE: Color32 = Color32::BLACK;
+
     /// How loudly a mark should read against whatever it is drawn on.
     ///
     /// Named for the three type ranks these stand in for at the call sites that
