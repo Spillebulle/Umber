@@ -1991,6 +1991,23 @@ mod strip_budget {
     /// one `every_rail_on_the_strip_fits_the_budget_that_lets_it_be_drawn`
     /// declines to sweep, and says why.
     pub const SELECT_MODE_RAIL: f32 = 190.0;
+    /// The mode's own gesture line, plus the two gaps and the divider between
+    /// the last rail and [`super::combine_hint`].
+    ///
+    /// It exists only so that [`SELECT_MODE_RAIL`]'s gate can hold room for the
+    /// sentence *after* the hint — the hint itself is drawn unconditionally and
+    /// is in no budget, which is the whole reason the combine line reads
+    /// `available_width()` afresh instead of a figure.
+    ///
+    /// **Measured on the two modes that own a rail, not on the longest hint
+    /// there is.** `SelectionMode::Polygon`'s is eighty-four characters and has
+    /// no rail, so budgeting for it would drop the Roundness rail hundreds of
+    /// points early; the lasso's twenty-three characters is the longest that
+    /// can be on the strip at the same time as a rail. Bisected against
+    /// `the_modes_rail_never_costs_the_strip_the_line_about_the_feather`: the
+    /// rectangle needs 84 and the lasso 122, so this is the lasso's with a few
+    /// points of slack.
+    pub const SELECT_MODE_HINT: f32 = 130.0;
     /// The eyedropper's second sentence: what a drag off the window does, or
     /// why it does nothing here. Both readings are within a few characters of
     /// each other, so unlike the navigation pair one figure covers them.
@@ -2267,8 +2284,24 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // before either of them. `SelectionMode::extra` is what decides
             // there is one; the draft records both settings whatever the mode,
             // so nothing here has to be kept in step with what it drew.
+            //
+            // **[`strip_budget::COMBINE`] is in its gate, and this is the one
+            // place in this file that puts a control behind a sentence.** The
+            // general rule is the opposite and is stated a few lines up: a
+            // control that is not drawn cannot be reached at all, where a
+            // sentence has usually already been read. [`combine_hint`] is the
+            // exception because it is the only place in the whole interface
+            // that says what the Feather rail two dividers to its left applies
+            // to — and a feather rail with nothing saying it softens the *next*
+            // shape is precisely the control an artist reported as doing
+            // nothing. Spending that sentence to make room for a second rail
+            // would be answering the complaint by worsening its cause.
             if room
-                >= strip_budget::SELECT_OP + strip_budget::FEATHER + strip_budget::SELECT_MODE_RAIL
+                >= strip_budget::SELECT_OP
+                    + strip_budget::FEATHER
+                    + strip_budget::SELECT_MODE_RAIL
+                    + strip_budget::SELECT_MODE_HINT
+                    + strip_budget::COMBINE
                 && let Some(setting) = ed.ui.selection_mode.extra()
             {
                 divider(ui, p);
@@ -4609,6 +4642,96 @@ mod tests {
             (true, true),
             "a rail this test is about was never drawn for any mode"
         );
+    }
+
+    /// The mode's rail never costs the strip the sentence that explains the
+    /// feather.
+    ///
+    /// [`combine_hint`] is the only place in the interface that says the
+    /// Feather rail applies to the *next* shape, and a feather rail with
+    /// nothing saying that is the control an artist reported as doing nothing.
+    /// The Roundness rail is ~190 points and sits before it, so without a
+    /// budget for the sentence in its own gate there is a band of widths where
+    /// adding the rail is what takes the sentence away.
+    ///
+    /// Swept a point at a time and read off the **shapes egui drew**, for the
+    /// reason `neither_navigation_hint_overruns_the_strip_it_is_drawn_on` is:
+    /// the failure is a band of widths, not a value, and asserting that the
+    /// gate contains a constant would only agree with the gate. Both modes that
+    /// own a rail are swept, because between the rail and the sentence sits the
+    /// **mode hint**, which is in no budget at all and is twice as long for the
+    /// lasso as for the rectangle — so a gate measured on one of them is not a
+    /// gate for the other. Both directions are checked for emptiness, or a
+    /// sweep that never drew either would pass.
+    #[test]
+    fn the_modes_rail_never_costs_the_strip_the_line_about_the_feather() {
+        use crate::editor::Tool;
+        use umber_core::SelectionMode;
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+
+        let sentence = super::combine_hint();
+        for mode in SelectionMode::ALL {
+            let Some(setting) = mode.extra() else {
+                continue;
+            };
+            let label = match setting {
+                umber_core::ModeSetting::Roundness => "Roundness",
+                umber_core::ModeSetting::Stabiliser => "Stabiliser",
+            };
+            let mut seen = (false, false);
+            let mut worst: Option<f32> = None;
+            for step in 0..1000 {
+                let width = 200.0 + step as f32;
+                let mut ed = Editor::default();
+                ed.ui.tool = Tool::Select;
+                ed.ui.selection_mode = mode;
+                let mut drawn = Vec::new();
+                for _ in 0..2 {
+                    drawn.clear();
+                    let input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            pos2(0.0, 0.0),
+                            vec2(width, metrics::OPTIONS_STRIP),
+                        )),
+                        ..Default::default()
+                    };
+                    let output = ctx.run_ui(input, |ui| {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                            .show(ui, |ui| {
+                                ui.set_height(metrics::OPTIONS_STRIP);
+                                super::options_strip(ui, &palette, &mut ed);
+                            });
+                    });
+                    for clipped in &output.shapes {
+                        strings_in(&clipped.shape, &mut drawn);
+                    }
+                }
+                let rail = drawn.iter().any(|d| d.text == label);
+                let hint = drawn.iter().any(|d| d.text == sentence);
+                seen.0 |= rail;
+                seen.1 |= hint;
+                if rail && !hint {
+                    worst = Some(width);
+                }
+            }
+            assert_eq!(
+                seen,
+                (true, true),
+                "{mode:?}'s sweep never drew the {label} rail or never drew the \
+                 sentence, so it proved nothing"
+            );
+            assert!(
+                worst.is_none(),
+                "at {:.0} points {mode:?} drew the {label} rail and dropped the \
+                 line explaining the feather",
+                worst.unwrap()
+            );
+        }
     }
 
     /// Every category [`Action::category`] can answer with is either a menu

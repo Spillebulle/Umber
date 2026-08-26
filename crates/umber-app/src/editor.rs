@@ -213,7 +213,7 @@ pub struct UiState {
     pub pressure_open: bool,
     pub tool: Tool,
     /// Which outline the selection tool draws. One tool with a mode rather
-    /// than three tools: see `umber_core::selection`.
+    /// than four tools: see `umber_core::selection`.
     pub selection_mode: SelectionMode,
     /// What a gesture does to the selection already standing, when no modifier
     /// says otherwise.
@@ -1822,7 +1822,7 @@ impl Editor {
 
     /// A press on the canvas with the selection tool in hand.
     ///
-    /// Only the polygon can see a second press: the other two modes are one
+    /// Only the polygon can see a second press: the other three modes are one
     /// press, a drag and a release, and their draft is gone by the time
     /// another arrives.
     ///

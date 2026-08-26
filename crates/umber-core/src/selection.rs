@@ -229,11 +229,19 @@ pub enum SelectionMode {
 impl SelectionMode {
     /// Every mode, in the order the picker lists them.
     ///
-    /// Hand-written and therefore checkable rather than self-evident:
-    /// `every_mode_is_in_all_where_the_match_puts_it` indexes it from an
-    /// exhaustive match, so a variant added without a row here is a compile
-    /// error rather than a mode that exists and nothing can reach. A test that
-    /// walked `ALL` could only ever check what is already in it.
+    /// Hand-written, and `every_mode_is_in_all_where_the_match_puts_it` indexes
+    /// it from an exhaustive match rather than walking it — a test that walked
+    /// `ALL` could only ever check what is already in it.
+    ///
+    /// **The hole is named rather than denied**, which is `docs`' rule for this
+    /// exact shape and which an earlier draft of this comment got wrong. A
+    /// fifth variant left out of `ALL` does *not* fail that test: the loop is
+    /// over `ALL`, so it never evaluates the new arm and never indexes out of
+    /// bounds. What forces a new variant to be dealt with is
+    /// [`SelectionMode::label`], [`SelectionMode::hint`] and
+    /// [`SelectionMode::extra`], each exhaustive with no catch-all. What the
+    /// array's guard catches is a variant filed in the **wrong position**,
+    /// which is the likelier slip and the one nothing else can see.
     pub const ALL: [SelectionMode; 4] =
         [Self::Rectangle, Self::Ellipse, Self::Lasso, Self::Polygon];
 
@@ -430,11 +438,17 @@ impl Selection {
     /// existed.
     ///
     /// The ring runs clockwise in document space (y down), like
-    /// [`Selection::rectangle`]'s. The fill rule is nonzero winding, so the
-    /// direction does not change what is selected — but it does decide the sign
-    /// [`Selection::contains`] sums, and a ring that reversed halfway through
-    /// the roundness rail would be a hit test that answered differently either
-    /// side of it.
+    /// [`Selection::rectangle`]'s and [`Selection::ellipse`]'s, at every
+    /// roundness. **Nothing observable depends on that today** and the
+    /// handedness is kept anyway: the fill rule is nonzero winding, and
+    /// [`Selection::contains`] tests the sum against zero, so a single ring
+    /// answers identically whichever way round it runs. What it buys is that
+    /// the three constructors are comparable, and that anything which ever
+    /// concatenates rings — nothing does, because a boolean traces new ones out
+    /// of the mask — would see one handedness rather than two. Said as a
+    /// property rather than as a guarantee, because an earlier draft of this
+    /// comment claimed a reversed ring would change what `contains` answered,
+    /// and it would not.
     pub fn rounded_rectangle(a: Vec2, b: Vec2, roundness: f32, doc: UVec2) -> Option<Self> {
         let mut ring = Vec::new();
         rounded_rect_ring(a, b, roundness, &mut ring);
@@ -1283,11 +1297,17 @@ const ARC_TOLERANCE: f32 = 0.05;
 
 /// The most segments one quarter-turn is ever flattened into.
 ///
-/// The count is `O(sqrt(radius))` — about `(π/4)·sqrt(r / 2t)` — so a circle
-/// spanning `Document::MAX_EDGE`'s 32768 pixels asks for 450 segments a
-/// quarter, and this bound is never met by a shape anybody can draw. It exists
-/// because the radius reaches [`arc_steps`] from a drag in progress: an
-/// infinity there would otherwise be a `Vec` grown until the process died.
+/// The count is `O(sqrt(radius))` — about `(π/4)·sqrt(r / 2t)` — so the largest
+/// circle that fits `Document::MAX_EDGE`'s 32768 pixels has a **radius** of
+/// 16384 and asks for 318 segments a quarter. This bound is never met by a
+/// shape anybody can draw; it exists because the radius reaches [`arc_steps`]
+/// from a drag in progress, and an infinity there would otherwise be a `Vec`
+/// grown until the process died.
+///
+/// The figure was 450 here, which is the answer for a radius of 32768 — a
+/// circle spanning twice the canvas ceiling. Left as a note rather than
+/// silently corrected because it is the sort of number the next person sizing
+/// this argues against: 318 leaves 60% of headroom where 450 suggests 14%.
 const MAX_ARC_STEPS: u32 = 512;
 
 /// How many straight segments a quarter-turn of radius `r` needs to stay within
@@ -1383,6 +1403,19 @@ fn rounded_rect_ring(a: Vec2, b: Vec2, roundness: f32, out: &mut Vec<Vec2>) {
     push_quarter(out, Vec2::new(min.x + r, min.y + r), rr, PI, steps);
     // The last corner lands back on the ring's first point, which the implicit
     // closing edge already carries — so nothing is pushed for it.
+    //
+    // [`push_new`] compares against the previous point only, which is enough
+    // everywhere except across the ring's own seam: where `r` is under half an
+    // ulp of the coordinate, `min.x + r == min.x` and the *last* point
+    // collapses onto the *first*, leaving the zero-length closing edge this
+    // whole arrangement exists to avoid. Reachable only at roundness about
+    // 1e-5 near `Document::MAX_EDGE`, which is a hundred-thousandth of a
+    // percentage rail and so not reachable through the interface at all — but
+    // the seam is one comparison and a guard that says "never" should be able
+    // to mean it.
+    if out.len() > 1 && out.last() == out.first() {
+        out.pop();
+    }
 }
 
 /// Append `p` unless it is already the last point.
@@ -1421,7 +1454,8 @@ fn ellipse_ring(a: Vec2, b: Vec2, out: &mut Vec<Vec2>) {
 /// [`LASSO_SEGMENT`].
 ///
 /// A pass halves every segment, so the count is `⌈log2(spacing / target)⌉`,
-/// bounded by [`MAX_LASSO_SMOOTHING`]. **Adaptive rather than a fixed number of
+/// bounded by [`MAX_LASSO_SMOOTHING`] and by what [`MAX_LASSO_RING`] leaves.
+/// **Adaptive rather than a fixed number of
 /// passes**, and the reason is that the two ends of the zoom range want
 /// opposite things: a lasso drawn at 0.1 has ten-pixel edges and needs four
 /// passes to become a curve, while one drawn at 8:1 already has edges an eighth
@@ -1435,6 +1469,16 @@ fn ellipse_ring(a: Vec2, b: Vec2, out: &mut Vec<Vec2>) {
 /// the hand really took rather than a staircase, so letting it drive the count
 /// would subdivide a whole gesture on the strength of the one segment that
 /// least needs it.
+///
+/// **What makes that safe is that corner-cutting is local.** [`cut_corners`]
+/// moves a vertex by a quarter of its own two edges, so the mean decides *how
+/// many* passes the gesture gets while each corner is only ever cut in
+/// proportion to how far apart its own neighbours are. A hand that slows down
+/// to turn a deliberate corner lays dense samples there, and that corner
+/// survives a gesture whose mean spacing was set by the fast stretches either
+/// side of it — which is also why this bites so little at 1:1, where a quick
+/// hand can produce a mean of several pixels.
+/// `a_corner_the_hand_slowed_down_for_survives_a_fast_gesture` is the guard.
 ///
 /// It is re-derived as the gesture grows, so a lasso whose mean spacing crosses
 /// a power of two mid-drag changes smoothness once, by one halving. That is
@@ -1452,10 +1496,17 @@ fn smoothing_passes(points: &[Vec2]) -> u32 {
         return 0;
     }
     let passes = (spacing / LASSO_SEGMENT).log2().ceil();
-    if !passes.is_finite() {
-        return MAX_LASSO_SMOOTHING;
-    }
-    (passes as u32).min(MAX_LASSO_SMOOTHING)
+    let wanted = if passes.is_finite() {
+        passes as u32
+    } else {
+        MAX_LASSO_SMOOTHING
+    };
+    // How many doublings the output can still afford. Integer throughout, so a
+    // sample count already past the cap gives `1.ilog2()`, which is zero passes
+    // and the exact identity — the smoothing switches itself off rather than
+    // clamping to something arbitrary.
+    let doublings = (MAX_LASSO_RING / points.len()).max(1).ilog2();
+    wanted.min(MAX_LASSO_SMOOTHING).min(doublings)
 }
 
 /// One corner-cutting pass over an **open** polyline, in place.
@@ -1475,9 +1526,12 @@ fn smoothing_passes(points: &[Vec2]) -> u32 {
 /// exactly, since the preview draws the same polyline without the closing edge.
 ///
 /// In place, growing backwards, because this runs on the drawing path: the
-/// outline is rebuilt every frame of a drag and the selection's own ring is
-/// walked every frame the marquee is on screen, so a scratch buffer here would
-/// be an allocation per frame.
+/// outline is rebuilt every frame of a drag. A scratch buffer beside the
+/// caller's would be a **fresh** allocation on every one of those frames; the
+/// `resize` here reallocates only when the caller's own buffer is short, which
+/// during a drag is `Vec`'s doubling and therefore amortised to nothing. Not
+/// "no allocation" — that is stronger than what this does, and the first draft
+/// of this comment claimed it.
 fn cut_corners(points: &mut Vec<Vec2>) {
     let n = points.len();
     if n < 3 {
@@ -1567,19 +1621,39 @@ const LASSO_SEGMENT: f32 = 1.0;
 
 /// The most corner-cutting passes a lasso's samples ever get.
 ///
-/// Each pass doubles the ring, and the ring is walked **every frame for as long
-/// as the selection stands** — `ui::selection_outline` draws one line segment
-/// per vertex under the dashes — so this is a bound on a per-frame cost rather
-/// than on a one-off. Three is eight times the samples, and the samples are
-/// themselves bounded by how far the hand moved *on the glass*, so the worst
-/// realistic ring is a few tens of thousands of vertices rather than unbounded.
-///
-/// It binds below about zoom 0.125, where the sample spacing is over eight
-/// document pixels. Somebody lassoing at 0.05 gets segments of two pixels
-/// rather than one; that is a much better outline than the twenty-pixel edges
-/// they have now, and the remedy if it is ever not good enough is to simplify
-/// the smoothed ring by curvature rather than to raise this.
+/// Each pass doubles the ring. It binds below about zoom 0.125, where the
+/// sample spacing is over eight document pixels: somebody lassoing at 0.05 gets
+/// segments of two pixels rather than one, which is a much better outline than
+/// the twenty-pixel edges they have now.
 const MAX_LASSO_SMOOTHING: u32 = 3;
+
+/// The most vertices a smoothed lasso ring may reach.
+///
+/// **[`MAX_LASSO_SMOOTHING`] alone does not bound anything**, and the first
+/// draft of this claimed it did. A pass doubles the ring, so three passes is
+/// eight times the *samples* — and the samples are bounded only by how far the
+/// hand travelled on the glass, which a slow ten-second lasso takes to several
+/// thousand and a minute of scrubbing to a hundred thousand. Eight times that
+/// is a multiplier on two costs, not a number:
+///
+/// - **The marquee**, which `ui::selection_outline` draws as one line segment
+///   per vertex, every frame, for as long as the selection stands.
+/// - **[`rasterise`]**, which is `height × SUB_SCANLINES × edges` with no
+///   active-edge table — so multiplying the edges by eight multiplies the
+///   pointer-up cost by eight, and it does so exactly where the shape is
+///   tallest, because the zoom that needs three passes is the zoom somebody
+///   lassoes a whole large canvas at. That loop is quadratic and predates this;
+///   what is new is a change that would have multiplied it.
+///
+/// So the cap is on the **output**. 16384 vertices is a ring describing a shape
+/// four thousand pixels across at one vertex per pixel, which is past any
+/// selection somebody draws by hand — an ordinary lasso is five hundred to two
+/// thousand samples and smooths in full. What it does is switch the smoothing
+/// off for a gesture whose ring is already enormous, where the samples are
+/// dense in *screen* terms anyway and there is correspondingly little staircase
+/// to remove. `a_very_long_lasso_is_not_subdivided_into_a_slow_frame` is the
+/// guard, and it is what a mutation deleting the pass cap fails on too.
+const MAX_LASSO_RING: usize = 16384;
 
 impl SelectionDraft {
     /// The heaviest damping the lasso may be asked for.
@@ -1694,7 +1768,7 @@ impl SelectionDraft {
     /// A press, after the first. Returns true when the shape is now closed and
     /// the draft should be finished.
     ///
-    /// Only the polygon has anything to do with this: the other two modes are
+    /// Only the polygon has anything to do with this: the other three modes are
     /// one press, a drag and a release.
     ///
     /// `close_within` is in document pixels, and is how a click back on the
@@ -2067,21 +2141,28 @@ mod tests {
 
     #[test]
     fn a_curved_outline_is_flattened_finely_enough_to_be_a_curve() {
-        // `ARC_TOLERANCE`'s claim, measured on the geometry rather than
-        // restated: no vertex of a big circle sits more than a twentieth of a
-        // pixel off the true one, and the count is derived rather than fixed —
-        // so a circle ten times the size gets more vertices and stays inside
-        // the same bound.
+        // **The quantity here is the sagitta, and the vertices are exactly the
+        // wrong thing to read.** `ellipse_ring` puts every vertex on the curve
+        // by construction — it *is* `centre + (cos, sin) · r` — so a reading of
+        // how far a vertex sits from the circle is f32 noise whatever
+        // `arc_steps` answers, and it gets **better** as the flattening gets
+        // coarser. The first draft of this test did that, and measured: with
+        // `arc_steps` mutated to 1 a circle of radius 900 becomes a square 264
+        // pixels off the curve, and the vertex reading came back 0.000000
+        // against the shipped code's 0.000122. It passed. `ARC_TOLERANCE` is a
+        // bound on the deviation *between* two vertices, so that is what has to
+        // be measured: the midpoint of each chord.
         let big = UVec2::splat(2048);
         for radius in [8.0f32, 100.0, 900.0] {
             let centre = Vec2::splat(1000.0);
             let s = Selection::ellipse(centre - radius, centre + radius, big).expect("a disc");
             let ring = &s.rings()[0];
-            let worst = worst_radial_error(ring, centre, radius);
+            let worst = worst_sagitta(ring, centre, radius);
             assert!(
                 worst <= ARC_TOLERANCE,
-                "a circle of radius {radius} is flattened {worst:.4} px off, past \
-                 the {ARC_TOLERANCE} it promises, with {} vertices",
+                "a circle of radius {radius} bows {worst:.4} px away from the true \
+                 curve between two of its {} vertices, past the {ARC_TOLERANCE} it \
+                 promises",
                 ring.len()
             );
             // And it is not simply flattening everything to death: the count
@@ -2336,10 +2417,29 @@ mod tests {
     }
 
     /// The furthest any vertex sits from the circle it was meant to trace.
+    ///
+    /// Right for a *sampled* polyline, where the samples are the thing under
+    /// test — a lasso's lattice points really do sit off the curve. Wrong for a
+    /// flattened arc, where the vertices are on the curve by construction; use
+    /// [`worst_sagitta`] there.
     fn worst_radial_error(points: &[Vec2], centre: Vec2, radius: f32) -> f32 {
         points
             .iter()
             .map(|p| ((*p - centre).length() - radius).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The furthest a **chord** of a closed ring bows away from the circle it
+    /// approximates, which is what a flattening tolerance is a bound on.
+    ///
+    /// Read at the chord's midpoint, where a circular arc's deviation is
+    /// greatest. Cyclic, so the closing edge is measured like every other.
+    fn worst_sagitta(ring: &[Vec2], centre: Vec2, radius: f32) -> f32 {
+        (0..ring.len())
+            .map(|i| {
+                let mid = (ring[i] + ring[(i + 1) % ring.len()]) * 0.5;
+                ((mid - centre).length() - radius).abs()
+            })
             .fold(0.0f32, f32::max)
     }
 
@@ -2448,6 +2548,107 @@ mod tests {
             draft.points.len(),
             coarse.points.len()
         );
+    }
+
+    #[test]
+    fn a_corner_the_hand_slowed_down_for_survives_a_fast_gesture() {
+        // **The zoom nothing else here drives, and the property that makes the
+        // mean safe.** At 1:1 a quick hand reports several document pixels
+        // apart, so `smoothing_passes` asks for two — where before this existed
+        // the ring was the samples verbatim. That is a behaviour change at the
+        // commonest zoom of all, and what stops it costing anybody a corner is
+        // that corner-cutting is *local*: a vertex moves by a quarter of its
+        // own two edges, so a corner somebody slowed down to draw is barely cut
+        // even when the gesture's mean was set by the fast stretches around it.
+        //
+        // Two long fast legs meeting at a corner traced slowly, which is what a
+        // hand actually does when it goes round something square.
+        let corner = vec2(200.0, 20.0);
+        let mut draft = SelectionDraft::new(SelectionMode::Lasso, vec2(20.0, 20.0));
+        // In at six pixels a report, which is a fast hand at 1:1.
+        for k in 1..=29 {
+            draft.moved(vec2(20.0, 20.0).lerp(corner, k as f32 / 30.0), 1.0);
+        }
+        // Round the corner at a fifth of a pixel a report: the hand stopped.
+        for k in 1..=10 {
+            draft.moved(corner + vec2(-2.0 + k as f32 * 0.2, 0.0), 1.0);
+        }
+        for k in 1..=10 {
+            draft.moved(corner + vec2(0.0, k as f32 * 0.2), 1.0);
+        }
+        // And away again, fast.
+        for k in 1..=30 {
+            draft.moved(corner.lerp(vec2(200.0, 200.0), k as f32 / 30.0), 1.0);
+        }
+
+        assert!(
+            smoothing_passes(&draft.points) > 0,
+            "the fixture's mean spacing did not ask for any smoothing, so this \
+             says nothing about what smoothing does to a corner"
+        );
+        let mut ring = Vec::new();
+        draft.lasso_ring(&mut ring);
+        let nearest = ring
+            .iter()
+            .map(|p| p.distance(corner))
+            .fold(f32::MAX, f32::min);
+        assert!(
+            nearest < 0.5,
+            "the outline was rounded {nearest:.2} px away from a corner the hand \
+             slowed right down to draw"
+        );
+    }
+
+    #[test]
+    fn a_very_long_lasso_is_not_subdivided_into_a_slow_frame() {
+        // Both caps, and neither was guarded when it was written — a critic
+        // predicted that deleting `MAX_LASSO_SMOOTHING`'s clamp would leave
+        // every test green, and it would have.
+        //
+        // What is at stake is two costs, not tidiness: `ui::selection_outline`
+        // draws one line segment per vertex every frame for as long as the
+        // selection stands, and `rasterise` is `height × SUB_SCANLINES ×
+        // edges` with no active-edge table. Eight times the vertices is eight
+        // times both, on a gesture whose ring is already the largest anybody
+        // makes.
+        let feed = |count: usize, spacing: f32| {
+            let mut draft = SelectionDraft::new(SelectionMode::Lasso, Vec2::ZERO);
+            // A slow spiral, so the samples are neither collinear (which would
+            // change nothing under corner cutting) nor a closed loop the step
+            // could cull.
+            for k in 1..count {
+                let a = 0.02 * k as f32;
+                let r = spacing * k as f32 / std::f32::consts::TAU;
+                draft.moved(vec2(a.cos() * r, a.sin() * r), 0.0);
+            }
+            let raw = draft.points.len();
+            let mut ring = Vec::new();
+            draft.lasso_ring(&mut ring);
+            (raw, ring.len())
+        };
+
+        // A gesture past the cap: the smoothing gives way rather than the ring
+        // growing. Ten thousand samples is a minute of scrubbing, which is a
+        // real thing a hand does when cutting round hair.
+        let (raw, ring) = feed(10_000, 40.0);
+        assert!(raw > MAX_LASSO_RING / 2, "the fixture is too small to bind");
+        assert!(
+            ring <= MAX_LASSO_RING,
+            "a {raw}-sample lasso came back as {ring} vertices, past the \
+             {MAX_LASSO_RING} the marquee and the rasteriser are budgeted for"
+        );
+
+        // And a gesture the *pass* cap binds on instead: few enough samples
+        // that the ring cap leaves plenty of doublings, coarse enough that the
+        // spacing asks for more than three. Deleting `MAX_LASSO_SMOOTHING`'s
+        // clamp fails this line and nothing else.
+        let (raw, ring) = feed(200, 2000.0);
+        assert!(
+            ring <= 8 * raw,
+            "{raw} samples spaced far apart became {ring} vertices, which is \
+             more than three doublings"
+        );
+        assert!(ring >= 4 * raw, "the fixture never reached the pass cap");
     }
 
     #[test]
