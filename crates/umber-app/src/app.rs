@@ -1522,6 +1522,17 @@ impl UmberApp {
         });
         // Only the paint case, because the crop already has a notice of its own
         // and two dialogs for one click is worse than either.
+        //
+        // **The cropped case says nothing about editability, and that is now
+        // worth naming rather than leaving to the crop notice.** A placement
+        // onto its own layer that was cropped produces a layer named after the
+        // artist's words that is *not* text — the only sign being an Update
+        // button that is not offered — and the crop notice talks about the
+        // canvas rather than about that. It is not raised here because two
+        // dialogs for one click is still worse; what closes it properly is the
+        // crop sentence saying both, which is `float_a_clip`'s to say and needs
+        // to know a placement is what it is carrying. Left as a gap on purpose,
+        // and it is a gap: `docs/text-tool.md` is where the repair belongs.
         let placed_over_paint = was_text && record.is_none() && whole;
         // A lift off a text layer moves the pixels and leaves the record naming
         // where they used to be, so the record goes with them. It is dropped
@@ -2130,11 +2141,18 @@ impl UmberApp {
                 colour,
                 size: clip.size(),
             }));
-            if let Some(float) = self.editor.float.as_mut() {
+            match self.editor.float.as_mut() {
                 // The claim on the layer travels with the float rather than
                 // beside it, so every path that abandons one gives the layer
                 // back. See `Floating::made`.
-                float.made = made;
+                Some(float) => float.made = made,
+                // Unreachable: `float_a_clip` answering true means `begin_float`
+                // installed one. Written as the other arm rather than as a
+                // silent `if let` so that "no path leaves the layer behind" is
+                // structural — a `None` that quietly dropped `made` would leave
+                // a layer whose claim nothing holds, which is the one thing this
+                // field exists to make impossible.
+                None => self.editor.unmake_layer(made),
             }
         } else if let Some(made) = made {
             // The float was refused after the layer was made — no spare slice
@@ -2842,6 +2860,15 @@ impl UmberApp {
     /// nothing undo. The drag in the layers panel does the same thing at its
     /// own call site, because it holds the `Editor` and not the `App`.
     fn record_move(&mut self, moved: impl FnOnce(&mut umber_core::LayerStack) -> bool) {
+        // **This does not put a float down first, unlike every other structural
+        // edit here**, and that is deliberate rather than forgotten: a reorder
+        // moves an entry in a `Vec` and a float is bound to a *slot*, so the
+        // preview goes on naming the right slice whatever row it now sits in.
+        // What it costs is that a `MoveLayer` really can land in the middle of a
+        // gesture, which is why a text placement records its own entry when the
+        // layer appears rather than when the float is put down. See
+        // `crate::editor::MadeLayer::entry_at`; the layer-list drag in
+        // `panels.rs` is the same shape and the same argument.
         let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         if !moved(&mut self.editor.layers) {
             return;
@@ -5881,7 +5908,15 @@ impl ApplicationHandler<Wake> for UmberApp {
         // committed, because committing needs the GPU that is being taken
         // away — the same bargain the pixels themselves have always struck on
         // this path.
-        self.editor.float = None;
+        //
+        // **A layer the float made for itself goes with it**, and this is the
+        // third of the three sites `Floating::made` claims cannot be missed —
+        // taking the float and dropping it is exactly how one is missed, and
+        // this line is what makes that claim true rather than hopeful. The
+        // pixels are lost either way, so a layer left behind would be an empty
+        // one named after words the artist never got to put down.
+        let float = self.editor.float.take();
+        self.editor.unmake_layer(float.and_then(|f| f.made));
         self.gfx = None;
     }
 

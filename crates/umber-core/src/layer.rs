@@ -1468,9 +1468,47 @@ impl LayerStack {
         Some(AddedLayer { slot: number, id })
     }
 
+    /// Why a layer added right now would be refused, or `None` where it would
+    /// go ahead.
+    ///
+    /// One of two `can_`s beside [`LayerStack::add_named`], and it names the two
+    /// refusals **no released slice can mend** — a stack that is already as long
+    /// as Umber holds, and a folder nested as deep as one goes. Deliberately not
+    /// the pool: `add_named` answers `None` for that too, and the caller's
+    /// remedy there is to give a parked slice back and ask again, which is a
+    /// step rather than a verdict.
+    ///
+    /// It exists because three places have to agree about it and used to state
+    /// it twice: `App::add_layer` refuses before reserving a slice, so that a
+    /// full stack is not answered with a sentence about graphics memory;
+    /// `App::add_text_layer` refuses with a sentence *per reason*, because the
+    /// remedies differ; and the Text panel disables Place ahead of both, so the
+    /// button cannot promise what the model will decline. A predicate the
+    /// control and the gate each spell out for themselves is one they will
+    /// eventually spell differently — and one that answers a `bool` is one they
+    /// will eventually prescribe different remedies from, which is why this
+    /// answers *which*.
+    ///
+    /// **It fails closed on an index off the end**, which is
+    /// [`LayerStack::refusal_at`]'s stated rule and is not merely tidiness here:
+    /// [`LayerStack::add_named`] indexes `self.active` directly, so a caller
+    /// that read `None` as "go ahead" in that state would reach a panic. The
+    /// state is unreachable — a stack always has a valid selection — which is
+    /// exactly why the answer costs nothing.
+    pub fn add_refusal(&self) -> Option<AddRefusal> {
+        if self.layers.len() >= Self::MAX {
+            return Some(AddRefusal::StackFull);
+        }
+        match self.layers.get(self.active) {
+            Some(l) if l.folder && l.depth >= Self::MAX_DEPTH => Some(AddRefusal::TooDeep),
+            Some(_) => None,
+            None => Some(AddRefusal::StackFull),
+        }
+    }
+
     /// Would a layer added right now come out locked?
     ///
-    /// The `can_` beside [`LayerStack::add_named`], and it asks about the
+    /// The other `can_` beside [`LayerStack::add_named`], and it asks about the
     /// *insertion point* rather than about the selected entry — which is the one
     /// thing here that is easy to get backwards. A new layer carries no lock of
     /// its own, so the only thing that can lock it is what encloses it:
@@ -1489,34 +1527,6 @@ impl LayerStack {
     /// selected layer is. One predicate answering both would refuse an
     /// operation the model allows, which is the control that lies in its other
     /// direction.
-    /// Why a layer added right now would be refused, or `None` where it would
-    /// go ahead.
-    ///
-    /// The other `can_` beside [`LayerStack::add_named`], and it names the two
-    /// refusals **no released slice can mend** — a stack that is already as long
-    /// as Umber holds, and a folder nested as deep as one goes. Deliberately not
-    /// the pool: `add_named` answers `None` for that too, and the caller's
-    /// remedy there is to give a parked slice back and ask again, which is a
-    /// step rather than a verdict.
-    ///
-    /// It exists because three places have to agree about it and used to state
-    /// it twice: `App::add_layer` refuses before reserving a slice, so that a
-    /// full stack is not answered with a sentence about graphics memory;
-    /// `App::add_text_layer` refuses with a sentence *per reason*, because the
-    /// remedies differ; and the Text panel disables Place ahead of both, so the
-    /// button cannot promise what the model will decline. A predicate the
-    /// control and the gate each spell out for themselves is one they will
-    /// eventually spell differently.
-    pub fn add_refusal(&self) -> Option<AddRefusal> {
-        if self.layers.len() >= Self::MAX {
-            return Some(AddRefusal::StackFull);
-        }
-        match self.layers.get(self.active) {
-            Some(l) if l.folder && l.depth >= Self::MAX_DEPTH => Some(AddRefusal::TooDeep),
-            _ => None,
-        }
-    }
-
     pub fn new_layer_would_be_locked(&self) -> bool {
         match self.layers.get(self.active) {
             Some(l) if l.folder => self.effective_locked(self.active),

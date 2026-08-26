@@ -672,22 +672,13 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     own_layer_row(ui, p, ed, actions);
     ui.add_space(4.0);
     if ed.text.editing.is_some() {
+        // **A text layer's Place is `edit_row`'s, on its second line**, and it
+        // was drawn *here as well* for one commit: two live controls one row
+        // apart setting the same flag. Neither guard caught it — one asked
+        // whether Place was drawn at all, which two of them satisfy, and the
+        // button-gap one counts *pairs* on a line, which a second row holding a
+        // single button satisfies as well.
         edit_row(ui, p, ed, refused, actions);
-        // **Place is still offered here, and only because the switch is on.**
-        // With a layer of its own a placement does not touch the selected layer
-        // at all, so there is nothing for `begin_float` to refuse and Update is
-        // not doing this button's job — one sets *this* caption again, the other
-        // puts a second one down.
-        //
-        // Without it, placing a caption left the artist on the text layer they
-        // had just made with no way to place another but to go and select
-        // something else, and clearing the box to type the next one armed Update
-        // to overwrite the first. That is a trap this switch's own default
-        // created, so it is this switch that has to answer for it.
-        if ed.ui.text_own_layer {
-            ui.add_space(4.0);
-            place_row(ui, p, ed, refused, actions);
-        }
     } else {
         place_row(ui, p, ed, refused, actions);
     }
@@ -1819,10 +1810,17 @@ struct Landing {
     /// reachable with `own_layer` off: with it on the new layer goes *inside*
     /// the folder, which is where every application puts one.
     folder: bool,
-    /// There is nowhere to put a new layer — the stack is at
-    /// `LayerStack::MAX`, or the selected folder is nested as deep as it goes.
-    /// Only reachable with `own_layer` on.
-    no_room: bool,
+    /// Why a new layer cannot be had, where it cannot. Only ever `Some` with
+    /// `own_layer` on.
+    ///
+    /// **The reason, not a `bool`, because the two remedies differ** — which is
+    /// the whole point of `LayerStack::add_refusal` answering an enum. It was
+    /// flattened to a `bool` here first, and the single sentence that survived
+    /// told somebody whose folder was merely nested too deep to go and delete a
+    /// layer: word for word the failure that method's own docs say it exists to
+    /// prevent, in the control that is meant to be dead *ahead* of the gate that
+    /// gets it right.
+    no_room: Option<umber_core::AddRefusal>,
 }
 
 impl Landing {
@@ -1836,11 +1834,13 @@ impl Landing {
                 ed.layers.active_is_locked()
             },
             folder: !own_layer && ed.layers.active_slot().is_none(),
-            // **`LayerStack::add_refusal`'s answer, not a second reading of
-            // it.** The button has to be dead exactly where
-            // `App::add_text_layer` will refuse, and two spellings of "is there
-            // room" is how a control comes to promise what the model declines.
-            no_room: own_layer && ed.layers.add_refusal().is_some(),
+            // **`LayerStack::add_refusal`'s answer, and the answer *whole*
+            // rather than whether there was one.** The button has to be dead
+            // exactly where `App::add_text_layer` will refuse and to say the
+            // same thing it will say; two spellings of "is there room" is how a
+            // control comes to promise what the model declines, and flattening
+            // the reason away is how it comes to prescribe the wrong remedy.
+            no_room: own_layer.then(|| ed.layers.add_refusal()).flatten(),
         }
     }
 }
@@ -1865,14 +1865,25 @@ struct Place {
 /// because the preview does not rebuild for an empty block, so `refused` may be
 /// describing what was there a keystroke ago.
 fn place_state(landing: Landing, empty: bool, refused: Option<TextError>) -> Place {
-    if landing.locked {
+    // **Destructured, so a fifth reading is a compile error rather than a
+    // silence.** That is the trap [`Landing`]'s own docs invoke and the remedy
+    // `palimport::Losses::sentences` already uses: a function that reached into
+    // the struct field by field would go on compiling with a new field it never
+    // consulted, which is a refusal the model makes and the button does not.
+    let Landing {
+        own_layer,
+        locked,
+        folder,
+        no_room,
+    } = landing;
+    if locked {
         return Place {
             enabled: false,
             // Two sentences, because with a layer of its own the lock the artist
             // has to find is not the one on the row they are looking at: it is
             // on a folder somewhere above it, and "the layer is locked" would
             // send them to unlock a layer that is not the problem.
-            tooltip: if landing.own_layer {
+            tooltip: if own_layer {
                 "The folder this would go in is locked. Unlock it in the Layers panel, \
                  or select a layer outside it."
                     .into()
@@ -1881,7 +1892,7 @@ fn place_state(landing: Landing, empty: bool, refused: Option<TextError>) -> Pla
             },
         };
     }
-    if landing.folder {
+    if folder {
         return Place {
             enabled: false,
             tooltip: "A folder is selected. A folder holds no pixels, so select a layer, \
@@ -1889,12 +1900,27 @@ fn place_state(landing: Landing, empty: bool, refused: Option<TextError>) -> Pla
                 .into(),
         };
     }
-    if landing.no_room {
+    if let Some(why) = no_room {
+        // **A sentence per reason**, the same pair `App::add_text_layer` raises,
+        // so the dead button and the notice behind it cannot say different
+        // things. One sentence for both is what this had first, and it told
+        // somebody whose folder was merely nested too deep to go and delete a
+        // layer, which would not have helped.
         return Place {
             enabled: false,
-            tooltip: "There is nowhere to put another layer. Delete one, or switch off \
-                      \"On its own layer\" to set the words on the layer that is selected."
-                .into(),
+            tooltip: match why {
+                umber_core::AddRefusal::StackFull => {
+                    "There is nowhere to put another layer. Delete one, or switch off \
+                     \"On its own layer\" to set the words on the layer that is selected."
+                        .into()
+                }
+                umber_core::AddRefusal::TooDeep => {
+                    "That folder is nested as deep as it goes, so a layer inside it \
+                     would be one level too deep. Select a layer outside it, or switch \
+                     off \"On its own layer\"."
+                        .into()
+                }
+            },
         };
     }
     if empty {
@@ -1917,7 +1943,7 @@ fn place_state(landing: Landing, empty: bool, refused: Option<TextError>) -> Pla
         // It names *where* as well as what, because that is the half the switch
         // above it changes and a button whose outcome depends on a control
         // beside it should say which way that control is set.
-        tooltip: if landing.own_layer {
+        tooltip: if own_layer {
             "Put the text on a layer of its own, where the transform tool can move, \
              scale and turn it before it is committed"
                 .into()
@@ -2269,7 +2295,7 @@ mod tests {
                 own_layer,
                 locked: false,
                 folder: false,
-                no_room: false,
+                no_room: None,
             };
             for (landing, why) in [
                 (
@@ -2288,10 +2314,17 @@ mod tests {
                 ),
                 (
                     Landing {
-                        no_room: true,
+                        no_room: Some(umber_core::AddRefusal::StackFull),
                         ..clear
                     },
-                    "no room",
+                    "a full stack",
+                ),
+                (
+                    Landing {
+                        no_room: Some(umber_core::AddRefusal::TooDeep),
+                        ..clear
+                    },
+                    "a folder at the depth cap",
                 ),
             ] {
                 let state = place_state(landing, false, None);
@@ -2343,7 +2376,7 @@ mod tests {
             own_layer: true,
             locked: false,
             folder: false,
-            no_room: false,
+            no_room: None,
         };
         let here = Landing {
             own_layer: false,
@@ -2379,6 +2412,65 @@ mod tests {
             place_state(locked_here, false, None)
                 .tooltip
                 .contains("The layer is locked"),
+        );
+    }
+
+    /// The two ways a layer cannot be had get two remedies, because only one of
+    /// them is "delete a layer".
+    ///
+    /// `LayerStack::add_refusal`'s own docs say this is what it exists to
+    /// prevent, and the panel flattened it to a `bool` first: the single
+    /// sentence that survived told somebody whose folder was merely nested as
+    /// deep as one goes to go and delete a layer, which would not have helped.
+    /// `App::add_text_layer` got it right at the gate; the control meant to be
+    /// dead *ahead* of the gate did not.
+    ///
+    /// The `TooDeep` half is reachable on a stack nowhere near full, so it is
+    /// not a case the full-stack guard can stand in for.
+    #[test]
+    fn a_folder_too_deep_is_not_told_to_delete_a_layer() {
+        let clear = Landing {
+            own_layer: true,
+            locked: false,
+            folder: false,
+            no_room: None,
+        };
+        let full = place_state(
+            Landing {
+                no_room: Some(umber_core::AddRefusal::StackFull),
+                ..clear
+            },
+            false,
+            None,
+        );
+        let deep = place_state(
+            Landing {
+                no_room: Some(umber_core::AddRefusal::TooDeep),
+                ..clear
+            },
+            false,
+            None,
+        );
+        assert!(!full.enabled && !deep.enabled);
+        assert_ne!(
+            full.tooltip, deep.tooltip,
+            "both refusals prescribed the same remedy"
+        );
+        assert!(
+            full.tooltip.contains("Delete one"),
+            "a full stack must say what to delete: {}",
+            full.tooltip
+        );
+        assert!(
+            !deep.tooltip.contains("Delete"),
+            "a folder at the depth cap was told to delete a layer, which would not \
+             have helped: {}",
+            deep.tooltip
+        );
+        assert!(
+            deep.tooltip.contains("outside it"),
+            "the remedy that does work was not named: {}",
+            deep.tooltip
         );
     }
 
@@ -3510,9 +3602,16 @@ mod tests {
             ed.ui.text_own_layer = true;
             assert!(ed.layers.set_text(0, a_record("On the canvas")));
         });
-        assert!(
-            on.contains("Place"),
-            "a second caption could not be placed without leaving this layer: {on}"
+        // **Counted, not merely found.** `contains` is true for one Place and
+        // for two, and two is what shipped for a commit: the row was added to
+        // `edit_row` and the standalone one under it was never taken away, so a
+        // text layer drew two live buttons one row apart setting the same flag.
+        // Every other guard here was satisfied by it.
+        assert_eq!(
+            on.matches("Place").count(),
+            1,
+            "a text layer drew {} Place buttons: {on}",
+            on.matches("Place").count()
         );
         assert!(
             on.contains("Update text"),

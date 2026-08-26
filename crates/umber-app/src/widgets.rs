@@ -232,8 +232,16 @@ pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
 /// second copy is how the pill ends up a different size in the Colour panel
 /// than in the brush editor.
 /// Returns the **row's** response, not the pill's, so a caller can hang a
-/// tooltip on the whole line. A tooltip on the pill alone would be one a
-/// pointer resting on the words that name the setting never finds.
+/// tooltip on the label as well as on the pill — a tooltip on the pill alone is
+/// one a pointer resting on the words that name the setting never finds.
+///
+/// **Not on the whole line**, which an earlier draft of this sentence claimed.
+/// egui stops its hover search at the topmost *interactive* widget, so with the
+/// pointer over the pill the row reads as not-hovered and the caller's tooltip
+/// does not appear. What it covers is the label and the gap; the pill is its
+/// own. Hanging a *second* tooltip on the pill would fix that and would also be
+/// the two-controls-one-question shape this file refuses elsewhere, so the
+/// honest answer is that the words carry the sentence.
 pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) -> Response {
     ui.horizontal(|ui| {
         ui.label(

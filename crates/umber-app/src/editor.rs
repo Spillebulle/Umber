@@ -1395,6 +1395,14 @@ impl Editor {
         // a layer in a tab nobody is looking at. `app.rs` commits it before
         // every one of these; clearing it here means a path that forgot leaves
         // an abandoned transform rather than a corrupted one.
+        //
+        // **[`Editor::unmake_layer`] is deliberately not called**, unlike at the
+        // other two sites that take a float. By this line the stacks have
+        // already been swapped, so the layer a float made belongs to a document
+        // that is no longer here and the id would resolve — if it resolved at
+        // all — against the incoming one. Doing nothing leaves an empty layer in
+        // the outgoing document with the entry that removes it; reaching for
+        // that layer here would remove somebody else's.
         self.float = None;
         // The stroke that was in flight, if any, was finished by the caller
         // before the swap; this only stops a stale slot from the *previous*

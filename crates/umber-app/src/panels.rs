@@ -2037,6 +2037,12 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             // rather than there because this holds the `Editor` and not the
             // `App`. The entry costs nothing to hold: no slot changes hands, so
             // it is a shape and no pixels at all.
+            //
+            // **It does not settle a float first, and cannot from here**: this
+            // has the `Editor` and committing needs the renderer. So a
+            // `MoveLayer` can land in the middle of a gesture, which is what a
+            // text placement's undo entry is timed against — see
+            // `crate::editor::MadeLayer::entry_at`.
             let before = ed.layers.shape(ed.doc.layer_bytes());
             if ed.layers.reorder_to(carried.from, to.index, to.depth) {
                 ed.history.record(Edit::new(EditKind::MoveLayer, before));
