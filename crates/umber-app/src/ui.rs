@@ -2413,7 +2413,37 @@ fn divider(ui: &mut egui::Ui, p: &Palette) {
     ui.painter().rect_filled(rect, 0.0, p.border);
 }
 
-/// A bare 18×18 icon that acts as a button. Shared with `panels.rs`.
+/// The side of an [`icon_button`], in points, and of the mark inside it.
+///
+/// This widget's own geometry, beside it rather than in `theme::metrics`, the
+/// arrangement `widgets::ICON_TOGGLE` and `PICK_AT`/`PICK_HIT`/`PICK_MARK`
+/// already keep. `pub` because `panels::remove_button` is the same square with
+/// a warning fill behind it and has to be drawn to the same size, and because
+/// the module header lays a strip of these out before its title and therefore
+/// has to know what one costs.
+///
+/// **These were 18 and 18 — the mark filling its whole hit target — and that
+/// is what made a module header's marks read as oversized.** Two readings say
+/// so and neither is a matter of taste. [`metrics::PANEL_HEADER`] is 32 points
+/// described as the design's 8 px padding around an 11 px line, so the header's
+/// own content box is 16; an 18-point control is taller than the box the header
+/// is built from. And the close mark beside them was already 12 — a bare 18
+/// square with `shrink(3.0)` — so one strip drew four marks at 18 and a fifth
+/// at 12, which is the inconsistency somebody sees before they can name it.
+/// The mark is 12 now, which is what the close mark always was, and the hit
+/// target is the header's own 16.
+///
+/// The tool rail is untouched and is not an inconsistency with this: its mark
+/// is 18 inside `metrics::TOOL_BUTTON`'s 32-point button, so it has a button's
+/// worth of air around it. A header mark has none, which is exactly why it
+/// cannot be the same size.
+pub const ICON_BUTTON: f32 = 16.0;
+
+/// The mark inside an [`ICON_BUTTON`]. See there.
+pub const ICON_BUTTON_MARK: f32 = 12.0;
+
+/// A bare icon that acts as a button, [`ICON_BUTTON`] square. Shared with
+/// `panels.rs`.
 ///
 /// A disabled one still hovers, and still shows its tooltip — matching
 /// [`crate::controls::icon_button`], and for the same reason. Several callers
@@ -2423,7 +2453,7 @@ fn divider(ui: &mut egui::Ui, p: &Palette) {
 /// screen: what was left was a greyed mark with nothing to say for itself.
 pub fn icon_button(ui: &mut egui::Ui, p: &Palette, icon: Icon, enabled: bool, tip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(
-        vec2(18.0, 18.0),
+        vec2(ICON_BUTTON, ICON_BUTTON),
         if enabled {
             Sense::click()
         } else {
@@ -2433,7 +2463,7 @@ pub fn icon_button(ui: &mut egui::Ui, p: &Palette, icon: Icon, enabled: bool, ti
     let hovered = enabled && response.hovered();
     icons::draw(
         ui.painter(),
-        rect,
+        Rect::from_center_size(rect.center(), vec2(ICON_BUTTON_MARK, ICON_BUTTON_MARK)),
         icon,
         if !enabled {
             p.text_dim.gamma_multiply(0.4)

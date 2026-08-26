@@ -463,28 +463,36 @@ pub(crate) fn panel(
     // Header controls, right-aligned. Added after the drag handle, so they win.
     //
     // **Drawn before the title, though they sit to the right of it.** A header
-    // holding four marks and a close mark wants 114 points — `ui::icon_button`
-    // is 18 and `metrics::BUTTON_GAP` is 6 — against a rect that is 120 at
+    // holding four marks and a close mark wants 104 points — `ui::ICON_BUTTON`
+    // is 16 and `metrics::BUTTON_GAP` is 6 — against a rect that is 120 at
     // [`metrics::PANEL`], 83 at `limits::SIDEBAR_MIN_WIDTH` and 38 at
     // `metrics::TOOL_RAIL`, which is what a Tools column may be dragged to. So
-    // at the design's width it fits with six points spare, and at every narrower
-    // one the strip overruns leftwards — which is fine, there is nothing there,
-    // right up until it reaches the title, and then it is the "3 ticked" label
-    // and the six bulk buttons drawn over each other again, one storey up. So
-    // the controls claim their room first and the title takes what is left,
-    // which is the arrangement the Layers body's own heading row already had to
-    // make for the same reason.
+    // at the design's width it fits with sixteen points spare, and at every
+    // narrower one the strip overruns leftwards — which is fine, there is
+    // nothing there, right up until it reaches the title, and then it is the
+    // "3 ticked" label and the six bulk buttons drawn over each other again,
+    // one storey up. So the controls claim their room first and the title takes
+    // what is left, which is the arrangement the Layers body's own heading row
+    // already had to make for the same reason.
+    //
+    // These are figures `a_module_header_never_draws_its_title_under_its_
+    // controls` measures rather than figures written beside the code: it reads
+    // the strip egui actually laid out and the room the header actually gave
+    // it, so the day one of them moves the test carries the new number and this
+    // comment is what has to be brought into line.
     //
     // **This changes every module, not only Layers, and what it changes is a
     // title that was overdrawn into one that is clipped.** In edit mode at 190
-    // points the room left is about 31, which is five characters: "Palette"
-    // reads "Palet…". That is worse to read than the full word and better than
-    // the full word with a button through it, and it is the state the panel is
-    // in while somebody is dragging it, where the title is the least useful
-    // thing on it. Outside edit mode at that width there are four marks rather
-    // than five and every module's title fits whole. There is no room to
-    // reclaim: the grip and its gap take the first 27 points and the marks are
-    // the panel's commands.
+    // points the room left is about 41 — it was 31 while these marks were 18
+    // square, and taking them to the header's own 16 is where the ten came
+    // from. That is still short of "Palette" at some widths, and a clipped
+    // title is worse to read than the full word and better than the full word
+    // with a button through it; it is also the state the panel is in while
+    // somebody is dragging it, where the title is the least useful thing on it.
+    // Outside edit mode at that width there are four marks rather than five and
+    // every module's title fits whole. There is no room to reclaim: the grip
+    // and its gap take the first 27 points and the marks are the panel's
+    // commands.
     let controls = Rect::from_min_max(
         pos2(rect.center().x, header.top()),
         pos2(rect.right() - pad, header.bottom()),
@@ -548,8 +556,12 @@ pub(crate) fn panel(
     // in the layout would otherwise take an `IdTypeMap` lock and do an insert
     // every frame to feed a guard nothing in the application reads.
     #[cfg(test)]
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(header_geometry_id(kind), (title, controls_at, rows)));
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            header_geometry_id(kind),
+            (title, controls_at, rows, controls),
+        )
+    });
     #[cfg(not(test))]
     let _ = rows;
 
@@ -596,7 +608,17 @@ pub(crate) fn panel(
 /// than reversible — the module library puts any module back — which is why the
 /// tooltip names the way back rather than asking for a confirmation.
 fn remove_button(ui: &mut Ui, p: &Palette) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+    // `crate::ui::icon_button`'s geometry, taken rather than restated: this is
+    // that square with a warning fill behind it and it sits in the same strip,
+    // so a size typed here is the second statement of a number and the strip
+    // reads as two different controls the moment they drift. They *had*
+    // drifted — this one insetting its mark to 12 while the marks beside it
+    // filled all 18 — which is the half of "the header marks are too big" that
+    // is visible without measuring anything.
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(crate::ui::ICON_BUTTON, crate::ui::ICON_BUTTON),
+        Sense::click(),
+    );
     let hovered = response.hovered();
     if hovered {
         ui.painter()
@@ -604,7 +626,10 @@ fn remove_button(ui: &mut Ui, p: &Palette) -> bool {
     }
     icons::draw(
         ui.painter(),
-        rect.shrink(3.0),
+        Rect::from_center_size(
+            rect.center(),
+            vec2(crate::ui::ICON_BUTTON_MARK, crate::ui::ICON_BUTTON_MARK),
+        ),
         Icon::Close,
         if hovered { p.warning } else { p.text_dim },
     );
@@ -3485,7 +3510,17 @@ mod tests {
     /// up, down and delete marks into the header puts four marks and — in
     /// layout edit mode — a close mark into a strip whose rect is 120 points at
     /// that width, 83 at `limits::SIDEBAR_MIN_WIDTH` and 38 at
-    /// `metrics::TOOL_RAIL`. Five controls want 114.
+    /// `metrics::TOOL_RAIL`. Five controls want 104: `crate::ui::ICON_BUTTON`
+    /// is 16 and [`metrics::BUTTON_GAP`] is 6.
+    ///
+    /// **The third assertion is what makes those figures measurements.** The
+    /// header records the strip egui laid out *and* the rect it was offered, so
+    /// the test compares two drawn rectangles rather than recomputing the sum —
+    /// which is the difference between a guard and a restatement of the rule,
+    /// and the reason 114 could stand in a comment for as long as it did after
+    /// it had stopped being true. It is asserted at [`metrics::PANEL`] alone
+    /// and deliberately: at every narrower width the strip is *meant* to hang
+    /// off the left of its rect, which is what the first assertion bounds.
     ///
     /// **What the first assertion catches, exactly.** `room` is derived from
     /// where the controls actually landed, so epaint cannot lay a row out past
@@ -3554,9 +3589,9 @@ mod tests {
                             );
                         });
                     }
-                    let placed: Option<(Rect, Rect, usize)> =
+                    let placed: Option<(Rect, Rect, usize, Rect)> =
                         ctx.data(|d| d.get_temp(super::header_geometry_id(kind)));
-                    let (title, controls, rows) =
+                    let (title, controls, rows, offered) =
                         placed.expect("the header drew nothing, so nothing here was measured");
                     assert!(
                         title.right() <= controls.left(),
@@ -3572,6 +3607,15 @@ mod tests {
                          {rows} rows of a {} point header",
                         metrics::PANEL_HEADER
                     );
+                    if width == metrics::PANEL {
+                        assert!(
+                            controls.width() <= offered.width(),
+                            "{kind:?} at the design's width (edit mode {editing}) drew a \
+                             {} point control strip into the {} points the header offered it",
+                            controls.width(),
+                            offered.width()
+                        );
+                    }
                 }
             }
         }
