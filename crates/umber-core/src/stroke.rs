@@ -909,6 +909,146 @@ mod tests {
         }
     }
 
+    /// Flow scales what a dab carries and leaves the stroke's opacity alone.
+    ///
+    /// The two are different numbers and this is the guard that says so in the
+    /// emitted dabs rather than in a comment. `Brush::opacity` is applied once
+    /// at commit over coverage the dab pass has saturated; folding it into a dab
+    /// is the compounding bug the wet-layer scheme exists to prevent. So halving
+    /// flow must halve what a dab writes and must not touch `opacity` at all —
+    /// and halving `opacity` must not touch what a dab writes.
+    ///
+    /// `build_up` is on throughout, so the *pipeline* is the same in every
+    /// reading and what is being measured is the conversion alone. Left off, the
+    /// flow arm would also be moving between the `max` path and the accumulating
+    /// one and the ratio would be measuring both changes at once.
+    #[test]
+    fn flow_scales_the_dab_and_never_the_strokes_opacity() {
+        let base = Brush {
+            build_up: true,
+            opacity: 0.5,
+            ..unsmoothed(12.0, 0.1)
+        };
+        let coverage = |brush: Brush| {
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+            s.extend(InputPoint::new(vec2(120.0, 0.0), 1.0, 0.1));
+            let dabs: Vec<Dab> = s.drain_pending().collect();
+            dabs[dabs.len() / 2].coverage
+        };
+
+        let full = coverage(base);
+        let half = coverage(Brush { flow: 0.5, ..base });
+        assert!(
+            (half - full * 0.5).abs() < 1e-6,
+            "flow 0.5 carried {half} where half of {full} was asked for"
+        );
+
+        // The other direction, and the one that would go quiet: opacity moving
+        // must leave the dab where it was.
+        let dimmer = coverage(Brush {
+            opacity: 0.25,
+            ..base
+        });
+        assert_eq!(
+            dimmer, full,
+            "stroke opacity reached the dab, which is the compounding bug"
+        );
+        // And flow does not write itself back onto opacity on the way past.
+        assert_eq!(Brush { flow: 0.5, ..base }.opacity, 0.5);
+    }
+
+    /// A stroke at flow 1.0 emits the dabs it always did, bit for bit.
+    ///
+    /// Not "close to": the `max` path is what every pixel test in the suite is
+    /// written against, and `per_dab_for_stroke` goes to the trouble of an early
+    /// return for exactly this reason. A multiply by one is the identity in
+    /// floating point, so the guard is that flow's arm is **not taken** rather
+    /// than that it happens to be harmless — which is why the two cases
+    /// `per_dab_for_stroke` deliberately leaves unfloored are in the sweep. A
+    /// target of zero must stay zero and not become one level of the scratch,
+    /// and a stroke one dab deep must come back verbatim.
+    ///
+    /// Driven against a stroke built from a brush carrying **no** flow field
+    /// value at all — `Brush::default()`'s — beside one set to 1.0 by hand, so
+    /// the default and the literal are pinned to agree.
+    #[test]
+    fn flow_at_one_emits_exactly_the_dabs_it_always_did() {
+        for build_up in [false, true] {
+            for size in [2.0, 12.0, 80.0] {
+                for spacing in [0.02, 0.1, 0.25] {
+                    // Including a curve that reaches zero, which is the target
+                    // the floor must not lift, and a light pressure where a deep
+                    // stack makes the conversion do real work.
+                    for pressure in [0.0, 0.05, 0.5, 1.0] {
+                        let defaulted = Brush {
+                            build_up,
+                            pressure_opacity: true,
+                            opacity_curve: ResponseCurve::LINEAR,
+                            ..unsmoothed(size, spacing)
+                        };
+                        let explicit = Brush {
+                            flow: 1.0,
+                            ..defaulted
+                        };
+                        let dabs = |brush: Brush| {
+                            let mut s = StrokeBuilder::new();
+                            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+                            s.extend(InputPoint::new(vec2(150.0, 0.0), pressure, 0.1));
+                            s.drain_pending()
+                                .map(|d: Dab| d.coverage)
+                                .collect::<Vec<_>>()
+                        };
+                        let a = dabs(defaulted);
+                        let b = dabs(explicit);
+                        assert_eq!(
+                            a, b,
+                            "size {size}, spacing {spacing}, pressure {pressure},                              build_up {build_up}: naming flow 1.0 moved the dabs"
+                        );
+                        if pressure == 0.0 {
+                            assert!(
+                                a.iter().all(|c| *c == 0.0),
+                                "a curve at zero asked for nothing and the floor                                  turned it into a mark"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A dab a low flow would take under one level of the scratch is floored.
+    ///
+    /// The `R8Unorm` scratch cannot hold an increment below half a level, and a
+    /// *constant* one never moves the accumulator however many dabs land on it —
+    /// so the failure is a stroke that is absent rather than faint, which is what
+    /// `tip::SCRATCH_LEVEL` exists to bound. Flow multiplies after the
+    /// conversion, so it can push a dab back under that floor even though
+    /// `per_dab_for_stroke` had already lifted it over.
+    ///
+    /// A tight spacing and a faint mark, which is where the conversion divides
+    /// the mark down hardest, and then the lowest flow the rail offers on top.
+    #[test]
+    fn a_dab_a_low_flow_thins_is_still_something_the_scratch_can_hold() {
+        let brush = Brush {
+            build_up: true,
+            flow: Brush::MIN_FLOW,
+            pressure_opacity: true,
+            opacity_curve: ResponseCurve::LINEAR,
+            ..unsmoothed(80.0, 0.02)
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 0.05, 0.0));
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 0.05, 0.1));
+        for dab in s.drain_pending() {
+            assert!(
+                dab.coverage >= crate::tip::SCRATCH_LEVEL,
+                "a dab came back at {} — under one level, so the stroke is not                  faint but absent",
+                dab.coverage
+            );
+        }
+    }
+
     #[test]
     fn a_tap_lays_down_exactly_one_dab() {
         let mut s = StrokeBuilder::new();

@@ -1050,4 +1050,98 @@ mod tests {
         };
         assert_eq!(rake.off_heading(Vec2::X), rake.off_heading(Vec2::Y));
     }
+
+    /// Flow's default leaves every shipped preset on the pipeline it was on.
+    ///
+    /// The identity claim in the form that covers the whole library rather than
+    /// one fixture. `Brush::builds` is what picks the dab pipeline and what the
+    /// per-dab conversion asks, so a preset whose answer moved is a preset whose
+    /// every stroke now accumulates where it used to saturate — 252 marks
+    /// changed by a field nobody set.
+    ///
+    /// It reads `builds()` against `build_up` rather than asserting the flow
+    /// field alone, because those are two different ways to break it: a default
+    /// of 0.99 breaks the first, and a `builds()` written as `build_up || flow
+    /// <= 1.0` breaks the second while every flow in the file is still exactly
+    /// 1.0.
+    #[test]
+    fn every_shipped_preset_paints_on_the_path_it_always_did() {
+        let presets = crate::preset::builtin();
+        assert!(presets.len() > 200, "the library did not load");
+        for preset in presets {
+            let b = &preset.brush;
+            assert_eq!(
+                b.flow, 1.0,
+                "{} ships at a flow of {}, so it no longer paints as it did",
+                preset.name, b.flow
+            );
+            assert_eq!(
+                b.builds(),
+                b.build_up,
+                "{} changed dab pipeline without its build-up flag moving",
+                preset.name
+            );
+        }
+    }
+
+    /// A library written before flow existed still loads, at the identity.
+    ///
+    /// The container `#[serde(default)]` is what promises it and this is what
+    /// checks the promise, over text that names no flow at all — which is every
+    /// `brushes.ron` any painter currently has.
+    #[test]
+    fn a_preset_naming_no_flow_loads_at_the_identity() {
+        let brush: Brush = ron::from_str("(size: 20.0, opacity: 0.5)").unwrap();
+        assert_eq!(brush.flow, 1.0);
+        assert_eq!(brush.opacity, 0.5, "the fields beside it still read");
+        assert!(!brush.builds(), "and it is still on the max path");
+    }
+
+    /// Flow is bounded where it is read, not trusted at the rail.
+    ///
+    /// A hand-written preset may name anything. Nought is the one that matters:
+    /// read literally it is a brush that paints nothing at all, and `builds()`
+    /// would still put it on the accumulating pipeline, so the stroke would cost
+    /// a scratch and a blend to lay down nothing.
+    #[test]
+    fn a_flow_outside_its_bounds_is_read_at_them() {
+        let low = Brush {
+            flow: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(low.flow(), Brush::MIN_FLOW);
+        assert!(low.builds());
+
+        let high = Brush {
+            flow: 4.0,
+            ..Default::default()
+        };
+        assert_eq!(high.flow(), 1.0);
+        assert!(
+            !high.builds(),
+            "a flow above the ceiling is the identity, not an accumulation"
+        );
+    }
+
+    /// `MIN_FLOW` is a mark and the decade under it is not.
+    ///
+    /// The bound is chosen against the coverage scratch rather than picked for
+    /// looking round, so it is checked against the scratch: at the floor a dab
+    /// carrying the full mark is comfortably over one level of an `R8Unorm`
+    /// store, and a tenth of the floor is under half of one — where a *constant*
+    /// increment never moves the accumulator however many dabs land on it, which
+    /// is a rail whose bottom end paints nothing at all.
+    #[test]
+    fn the_lightest_flow_the_rail_offers_is_still_a_mark() {
+        let level = crate::tip::SCRATCH_LEVEL;
+        assert!(
+            Brush::MIN_FLOW > level,
+            "{} is under one level of the scratch",
+            Brush::MIN_FLOW
+        );
+        assert!(
+            Brush::MIN_FLOW / 10.0 < level / 2.0,
+            "the decade below the bound is still storable, so the bound is              costing granularity it does not buy"
+        );
+    }
 }
