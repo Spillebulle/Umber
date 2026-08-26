@@ -95,6 +95,13 @@ pub const RIM: f32 = 9.0;
 /// three that have to agree.
 pub const CELL: f32 = 2.0 * RADIUS / CELLS as f32;
 
+/// The rim has to be able to hide a whole cell of overhang, or the picture
+/// spills past the lens — which is what happened when the rim's radius was
+/// handed to `circle_stroke` as a mid-radius. A `const` assert rather than a
+/// sentence, for `effect::BUDGET_DERIVATION`'s reason: the failure is silent
+/// and directional, and only one of the two figures is likely to be edited.
+const _: () = assert!(RIM >= CELL, "the rim must hide a cell of overhang");
+
 /// What the loupe occupies: the grid plus its rim.
 pub const OUTER: f32 = RADIUS + RIM;
 

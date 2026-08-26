@@ -451,17 +451,23 @@ const ANT_SPEED: f32 = 2.0 * ANT_DASH;
 /// is one and a half device pixels. epaint draws a line that wide as a ridge
 /// whose fully opaque core is half a pixel across, straddling a pixel boundary,
 /// so no pixel centre is ever fully covered: the ants come out two device pixels
-/// wide at three quarters opacity each. That is the whole of "feathered and
-/// washed out", and it is invisible on the machines where anybody would look for
-/// it — measured over white paper, the darkest pixel of the dark half is 0 at
-/// 100% and at 200% scaling, and 64 at 150%.
+/// wide at three quarters opacity each.
+///
+/// **It bites at 150% and at 175% and nowhere else**, which is worth being exact
+/// about rather than saying "any fractional scale". The core is under-covered
+/// only where the nearest whole number of device pixels is *even* while the
+/// scale is not, and that is the interval from 150% up to 200%; 125% rounds to
+/// one, lands on a pixel centre and was already crisp. So this is invisible on
+/// the two settings anybody developing would look at. Measured over white paper:
+/// the darkest pixel of the dark half is 0 at 100%, 125% and 200%, and **64** at
+/// 150%, where the accent reads 160 against its own 192.
 ///
 /// Rounding the *width* to whole device pixels puts the opaque core back on a
-/// pixel centre at every scale, because epaint then rounds the position to a
+/// covered pixel at every scale, because epaint then rounds the position to a
 /// centre for an odd count and to a boundary for an even one, and the two agree.
 /// It changes nothing at 100% or 200%, where one point already is a whole number
-/// of pixels; at 125% it is a crisp single pixel where it was a soft one and a
-/// quarter.
+/// of pixels; at 125% it narrows 1.25 device pixels to 1, dropping a faint
+/// fringe rather than fixing a softness.
 ///
 /// It is asked of the *context* and not of `Editor::pixels_per_point`, which is
 /// written after the frame that used it and so is one frame stale — a marquee a
@@ -543,8 +549,8 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
     // Clipped to the canvas region: a selection scrolled under a panel must
     // not draw its outline across it.
     let painter = ui.painter().with_clip_rect(rect);
-    // See `ant_width`: one *point* is a soft, two-pixel line on any display
-    // whose scale is not a whole number, which is most laptops sold.
+    // See `ant_width`: one *point* is a soft, two-pixel line at 150% and 175%
+    // scaling, and 150% is what most Windows laptops ship set to.
     let width = ant_width(ui.ctx().pixels_per_point());
     // Field by field, so the buffers can be borrowed while the selection and
     // the draft are read. They are the editor's for the reason given there:
@@ -1448,8 +1454,12 @@ fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
 /// The bands are meshes, so nothing in them is antialiased by egui and this
 /// figure *is* the smoothness of every arc in the loupe. Ninety-six is under
 /// three points a segment at [`loupe::OUTER`], which is a fraction of a device
-/// pixel of sag at any scale a window runs at, and it is a few hundred
-/// triangles on the one frame in a session where somebody is picking a colour.
+/// pixel of sag at any scale a window runs at — 0.02 points, which is 0.07 of a
+/// device pixel even at 300%. What it costs is three meshes and 1,152 triangles,
+/// allocated per frame, on the frames of a session where somebody is holding the
+/// eyedropper down. That is an allocation on a drawing path and it is stated
+/// rather than hidden: the loupe exists only during a pick, where the frame
+/// already carries a screen read that waits on the compositor.
 const GLASS_SEGMENTS: usize = 96;
 
 /// Where the light falls on the lens, as an angle in the painter's y-down frame.
@@ -1573,8 +1583,10 @@ fn glass_facing(angle: f32, strength: f32) -> egui::Color32 {
 ///   the centre, and a lens with no such falloff is a hole.
 /// * **The rim**, an opaque band in `popover` covering the cell overhang.
 /// * **The catch-light**, a hairline of the light end right at the boundary,
-///   brightest where the edge faces [`GLASS_LIGHT`]. This is the thing that says
-///   at a glance that there is a surface here.
+///   brightest where the edge faces [`GLASS_LIGHT`] and with a second, tighter
+///   lobe on the side away from it. This is the thing that says at a glance that
+///   there is a surface here, and the second lobe is what says the surface is
+///   glass — see [`GLASS_EDGE`].
 /// * **The rim's shading**, turning from the light end at the top left to the
 ///   dark end at the bottom right, so the band reads as round.
 ///
@@ -1670,8 +1682,16 @@ fn loupe_glass(painter: &egui::Painter, p: &Palette, centre: egui::Pos2) {
 /// opaque rim then hides. One cell is the exact figure rather than a margin:
 /// the worst gap between a staircase of that pitch and its own circle is
 /// `sqrt(R² + 2Rc − c²) − R`, which at eleven cells is 5.1 of the 6 available.
-/// The cells past the boundary are drawn and covered, which costs about forty
-/// more rectangles on a frame where somebody is picking a colour.
+/// The cells past the boundary are drawn and covered, which costs **26** more
+/// rectangles on a frame where somebody is picking a colour: 87 before, 113
+/// now, counted by walking this loop rather than estimated beside it.
+///
+/// The reach is derived from *this patch's* cell and not from [`loupe::CELL`],
+/// so the coverage argument above holds for whatever size arrives. What the
+/// constant is for is the other half, which this function cannot enforce: the
+/// rim has to be at least a cell wide to hide the overhang, and `loupe.rs`
+/// asserts that against `CELL`. The two agree for the `loupe::CELLS`-wide patch
+/// both producers make.
 ///
 /// It returns the mark rather than drawing it, so [`loupe_overlay`] can put it
 /// over the glass. See there for why.
@@ -1683,7 +1703,7 @@ fn loupe_cells(
 ) -> Option<Rect> {
     let size = patch.size();
     let cell = 2.0 * loupe::RADIUS / size as f32;
-    let reach = loupe::RADIUS + loupe::CELL;
+    let reach = loupe::RADIUS + cell;
     let top_left = centre - vec2(loupe::RADIUS, loupe::RADIUS);
     let middle = patch.middle();
     let mut mark = None;
