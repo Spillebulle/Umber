@@ -125,10 +125,15 @@ impl Outline {
 
 /// How finely a curve is sampled: one segment per fifteen degrees.
 ///
-/// An icon is drawn between 14 and 22 px across, where a quarter circle is some
-/// five pixels of travel, so six segments across it are already finer than the
-/// display. Being generous costs a handful of points held once per icon for the
-/// life of the process.
+/// An icon is drawn between 10 and 32 px across — the panel header's grip at
+/// the bottom, the tool rail's button at the top — so a quarter circle is at
+/// most some eight pixels of travel and six segments across it are already
+/// finer than the display. The range only has to bound the *largest* instance
+/// for that to hold, so the small end costs nothing but is worth stating
+/// correctly: this comment said 14 to 22 while the grip was already 10, and
+/// `crate::ui::ICON_BUTTON_MARK`'s 12 has since put a large population under
+/// the old floor. Being generous costs a handful of points held once per icon
+/// for the life of the process.
 const ARC_STEP: f32 = std::f32::consts::PI / 12.0;
 
 /// Segments per cubic curve. Fixed rather than adaptive, for the same reason.

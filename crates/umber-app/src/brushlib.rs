@@ -2867,7 +2867,13 @@ fn rename_overlay(
     let edit = child.add(
         TextEdit::singleline(&mut field.text)
             .id(Id::new("brushlib-rename"))
-            .desired_width((inner.width() - 52.0).max(60.0))
+            // The tick and the cross to the right of it, and the gaps
+            // around them, rather than the 52 that was typed here when both
+            // were 18 points. A reserve stated as a number is one that goes on
+            // holding back the old size after the buttons have changed.
+            .desired_width(
+                (inner.width() - 2.0 * (crate::ui::ICON_BUTTON + metrics::BUTTON_GAP)).max(60.0),
+            )
             .font(FontId::proportional(text::CONTROL))
             .text_color(p.text_strong),
     );

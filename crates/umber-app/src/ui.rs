@@ -2413,7 +2413,63 @@ fn divider(ui: &mut egui::Ui, p: &Palette) {
     ui.painter().rect_filled(rect, 0.0, p.border);
 }
 
-/// A bare 18×18 icon that acts as a button. Shared with `panels.rs`.
+/// The side of an [`icon_button`], in points, and of the mark inside it.
+///
+/// This widget's own geometry, beside it rather than in `theme::metrics`, the
+/// arrangement `widgets::ICON_TOGGLE` and `PICK_AT`/`PICK_HIT`/`PICK_MARK`
+/// already keep. `pub` because `panels::remove_button` is the same square with
+/// a warning fill behind it and has to be drawn to the same size, and because
+/// the module header lays a strip of these out before its title and therefore
+/// has to know what one costs.
+///
+/// **These were 18 and 18 — the mark filling its whole hit target — and that
+/// is what made a module header's marks read as oversized.** The reading that
+/// carries it is the *close mark beside them*: `panels::remove_button` was a
+/// bare 18 square with `shrink(3.0)`, so one strip drew four marks at 18 and a
+/// fifth at 12. That is the inconsistency somebody sees before they can name
+/// it, and the mark is 12 now because 12 is what the close mark always was.
+///
+/// The supporting reading is the header's padding, and it is worth stating
+/// exactly rather than generously. [`metrics::PANEL_HEADER`] is 32 and its own
+/// doc describes it as the design's 8 px padding around an 11 px line — which
+/// sums to 27, not 32, so that sentence does not describe the constant and
+/// only its padding half is usable. Taking that half, a control drawn edge to
+/// edge in a 32-point header wants to sit inside 16. Nothing in the code
+/// enforces such a box: `panels::panel` builds the header at the full 32 and
+/// lays the strip into `header.top()..header.bottom()` with no vertical
+/// padding at all. So this is an argument from the design's prose about what
+/// *ought* to fit, not a bound the program keeps.
+///
+/// The tool rail is untouched and is not an inconsistency with this: its mark
+/// is 18 inside `metrics::TOOL_BUTTON`'s 32-point button, so it has a button's
+/// worth of air around it. A header mark has none, which is exactly why it
+/// cannot be the same size.
+///
+/// **The argument is header-shaped and the constant is not**, which is the
+/// thing to know before moving it again. Roughly twenty-seven call sites take
+/// it, and most are nowhere near a header: the library and stamp browsers'
+/// close marks, the brush rename row's tick and cross, the menu bar's cog, the
+/// Layers ticked strip. At 16 this is the **smallest interactive target in the
+/// interface**, under `widgets::PICK_HIT`'s 18 and `widgets::ICON_TOGGLE`'s 20,
+/// which sit in the same panel column. That is deliberate — these are marks
+/// with no chrome behind them, where those two are boxes — but it is a floor
+/// rather than somewhere with room beneath it.
+///
+/// **12 is also exactly where the stroke stops thinning.** `icons::draw` takes
+/// the weight as `(2 * size / 24).max(1.0)`, so an 18-point mark is stroked at
+/// 1.5 and a 12-point one at exactly 1.0: on the floor, not clamped by it.
+/// Anything smaller keeps the 1.0 and blots. Worth knowing beside
+/// `Palette::active_ink`'s note that this widget reads 1.43:1 on
+/// `control_active` in MediaBog — the mark is a third thinner than it was on a
+/// control already recorded as marginal there, which is a reason not to take it
+/// down again rather than a reason to put it back.
+pub const ICON_BUTTON: f32 = 16.0;
+
+/// The mark inside an [`ICON_BUTTON`]. See there.
+pub const ICON_BUTTON_MARK: f32 = 12.0;
+
+/// A bare icon that acts as a button, [`ICON_BUTTON`] square. Shared with
+/// `panels.rs`.
 ///
 /// A disabled one still hovers, and still shows its tooltip — matching
 /// [`crate::controls::icon_button`], and for the same reason. Several callers
@@ -2423,7 +2479,7 @@ fn divider(ui: &mut egui::Ui, p: &Palette) {
 /// screen: what was left was a greyed mark with nothing to say for itself.
 pub fn icon_button(ui: &mut egui::Ui, p: &Palette, icon: Icon, enabled: bool, tip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(
-        vec2(18.0, 18.0),
+        vec2(ICON_BUTTON, ICON_BUTTON),
         if enabled {
             Sense::click()
         } else {
@@ -2433,7 +2489,7 @@ pub fn icon_button(ui: &mut egui::Ui, p: &Palette, icon: Icon, enabled: bool, ti
     let hovered = enabled && response.hovered();
     icons::draw(
         ui.painter(),
-        rect,
+        Rect::from_center_size(rect.center(), vec2(ICON_BUTTON_MARK, ICON_BUTTON_MARK)),
         icon,
         if !enabled {
             p.text_dim.gamma_multiply(0.4)
