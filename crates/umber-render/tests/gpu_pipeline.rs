@@ -718,9 +718,9 @@ fn flow_crossing(h: &mut Harness, flow: f32) -> (u8, u8) {
     let dabs: Vec<Dab> = s.drain_pending().collect();
 
     // The style the stroke itself would be drawn under, rather than one the
-    // test picked. `Stroke::builds_up` is what `app.rs` builds its `DabStyle`
-    // from and it is `Brush::builds` verbatim, so asking the brush here is
-    // asking the shipped decision — a test that set the flag by hand would pass
+    // test picked. `StrokeBuilder::builds_up` is what `app.rs` builds its
+    // `DabStyle` from and it is `Brush::builds` on the stroke's own snapshotted
+    // brush, so asking the brush here is asking the shipped decision — a test that set the flag by hand would pass
     // just as happily with the two disagreeing, which is the failure that puts
     // a converted dab under the wrong blend.
     h.stamp_styled(

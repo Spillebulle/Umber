@@ -407,13 +407,14 @@ impl Brush {
     /// Whether this stroke's dabs **accumulate** coverage instead of saturating
     /// at the strongest of them.
     ///
-    /// The one statement of the question, asked by [`crate::stroke::Stroke`] for
-    /// the pipeline the renderer picks and by the conversion in
-    /// [`crate::stroke::StrokeBuilder`] that decides what a dab carries. One
-    /// function rather than two readings of two fields, because those two have
-    /// to agree for every frame of a stroke: a dab converted for a blend it is
+    /// The one statement of the question. [`crate::stroke::StrokeBuilder`] asks
+    /// it twice over the *same* snapshotted brush — once as `builds_up`, which
+    /// is what the renderer picks its dab pipeline from, and once in `emit`,
+    /// which decides what a dab carries — so the two cannot disagree for any
+    /// frame of a stroke. That matters because a dab converted for a blend it is
     /// not then drawn under is a mark at the wrong strength, and which way it is
-    /// wrong depends on which of the two was consulted.
+    /// wrong depends on which reading was consulted. One function over one field
+    /// is what makes that structural rather than a thing to remember.
     ///
     /// [`Brush::build_up`] is the author saying the dab is not solid — a sparse
     /// stamp, a grain — and [`Brush::flow`] below 1.0 is the author asking for
