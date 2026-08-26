@@ -200,14 +200,25 @@ const INSIDE: u8 = 128;
 
 /// How a selection outline is drawn.
 ///
-/// One tool with a mode rather than three tools: they produce the same thing
-/// and differ only in the gesture, so three entries in the rail would be three
+/// One tool with a mode rather than four tools: they produce the same thing
+/// and differ only in the gesture, so four entries in the rail would be four
 /// names for one selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SelectionMode {
-    /// Drag a box.
+    /// Drag a box. Its corners can be rounded — see
+    /// [`Selection::rounded_rectangle`].
     #[default]
     Rectangle,
+    /// Drag a box and take the ellipse inscribed in it.
+    ///
+    /// Deliberately its own mode rather than [`SelectionMode::Rectangle`] at
+    /// full roundness. A fully rounded *rectangle* is a stadium — two straight
+    /// flanks joined by half-discs — and only a square one is a circle, where
+    /// an ellipse is the curve through all four midpoints and is a different
+    /// shape everywhere the box is not square. Folding the two together would
+    /// mean the picker had no way to ask for the shape every other application
+    /// calls an elliptical marquee.
+    Ellipse,
     /// Freehand — the outline follows the pointer.
     Lasso,
     /// Click point to point; each click adds a straight edge. Usually called a
@@ -216,11 +227,19 @@ pub enum SelectionMode {
 }
 
 impl SelectionMode {
-    pub const ALL: [SelectionMode; 3] = [Self::Rectangle, Self::Lasso, Self::Polygon];
+    /// Every mode, in the order the picker lists them.
+    ///
+    /// Hand-written and therefore checkable rather than self-evident:
+    /// `every_mode_is_in_all_where_the_match_puts_it` indexes it from an
+    /// exhaustive match, so a variant added without a row here is a compile
+    /// error rather than a mode that exists and nothing can reach. A test that
+    /// walked `ALL` could only ever check what is already in it.
+    pub const ALL: [SelectionMode; 4] = [Self::Rectangle, Self::Ellipse, Self::Lasso, Self::Polygon];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Rectangle => "Rectangle",
+            Self::Ellipse => "Ellipse",
             Self::Lasso => "Lasso",
             Self::Polygon => "Polygon",
         }
@@ -230,6 +249,7 @@ impl SelectionMode {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Rectangle => "Drag a box.",
+            Self::Ellipse => "Drag a box; the ellipse inside it is selected.",
             Self::Lasso => "Draw round it freehand.",
             Self::Polygon => {
                 "Click point to point. Click the first point again, or press \
@@ -237,6 +257,38 @@ impl SelectionMode {
             }
         }
     }
+
+    /// The one setting this mode has of its own, if it has one.
+    ///
+    /// Two of the four do — the rectangle's corner roundness and the lasso's
+    /// stabiliser — and a strip that drew both whatever the mode would be two
+    /// controls doing nothing for half of what the picker offers. Which modes
+    /// have one is a property of the *gesture* rather than of the drawing (a
+    /// box has corners to round, a freehand line has tremor to damp), which is
+    /// why it is stated here and not in `ui.rs`.
+    ///
+    /// Exhaustive rather than a `matches!`, for the reason `EditKind::label`
+    /// is: a fifth mode must state whether it has one instead of silently
+    /// answering `None`.
+    pub fn extra(self) -> Option<ModeSetting> {
+        match self {
+            Self::Rectangle => Some(ModeSetting::Roundness),
+            Self::Ellipse => None,
+            Self::Lasso => Some(ModeSetting::Stabiliser),
+            Self::Polygon => None,
+        }
+    }
+}
+
+/// The one setting a [`SelectionMode`] has of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeSetting {
+    /// How far the rectangle's corners are rounded: `0.0` square through `1.0`
+    /// stadium. See [`Selection::rounded_rectangle`].
+    Roundness,
+    /// How heavily the lasso damps the hand: `0.0` off through
+    /// [`SelectionDraft::MAX_STABILISER`].
+    Stabiliser,
 }
 
 /// What a new shape does to the selection already standing.
@@ -355,6 +407,47 @@ impl Selection {
             ]],
             doc,
         )
+    }
+
+    /// An axis-aligned box with its corners rounded by `roundness`, `0.0`
+    /// square through `1.0`.
+    ///
+    /// The radius is `roundness × half the shorter side`, so `1.0` is the
+    /// largest round corner the box can hold: a circle where the box is
+    /// square, a stadium where it is not. Anything larger would make the two
+    /// arcs on the short side overlap, which is a shape with no boundary
+    /// rather than a rounder one.
+    ///
+    /// **A roundness at or below zero is the exact identity**, hard-wired to
+    /// [`Selection::rectangle`] rather than arrived at by an arc of zero
+    /// radius. Two reasons, and the second is the one that matters: a
+    /// zero-radius arc still emits its endpoints, so the ring would carry eight
+    /// coincident-in-pairs vertices where the ordinary rectangle carries four,
+    /// and the rectangle is the one shape [`rasterise`] is exact on *both* axes
+    /// for — a promise a degenerate ring is not obliged to keep. The commonest
+    /// selection there is therefore costs exactly what it did before this
+    /// existed.
+    ///
+    /// The ring runs clockwise in document space (y down), like
+    /// [`Selection::rectangle`]'s. The fill rule is nonzero winding, so the
+    /// direction does not change what is selected — but it does decide the sign
+    /// [`Selection::contains`] sums, and a ring that reversed halfway through
+    /// the roundness rail would be a hit test that answered differently either
+    /// side of it.
+    pub fn rounded_rectangle(a: Vec2, b: Vec2, roundness: f32, doc: UVec2) -> Option<Self> {
+        let mut ring = Vec::new();
+        rounded_rect_ring(a, b, roundness, &mut ring);
+        Self::from_rings(vec![ring], doc)
+    }
+
+    /// The ellipse inscribed in the box between two corners, in either order.
+    ///
+    /// Not a rounded rectangle at full roundness: see [`SelectionMode::Ellipse`]
+    /// for why the two are different shapes.
+    pub fn ellipse(a: Vec2, b: Vec2, doc: UVec2) -> Option<Self> {
+        let mut ring = Vec::new();
+        ellipse_ring(a, b, &mut ring);
+        Self::from_rings(vec![ring], doc)
     }
 
     /// One closed ring through `points`, which is what both the lasso and the
@@ -1171,6 +1264,170 @@ fn corners_only(ring: &[Vec2]) -> Vec<Vec2> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Curved outlines
+// ---------------------------------------------------------------------------
+
+/// The furthest a flattened arc may sit from the true curve, in document
+/// pixels.
+///
+/// A twentieth of a pixel. The mask cannot see it — [`SUB_SCANLINES`] resolves
+/// a quarter of a row and horizontal coverage is exact, so a deviation this far
+/// under a pixel moves at most one byte by one level — and the *marquee* can
+/// only see it once the camera is past 20:1, which is above the zoom anybody
+/// draws a selection at. Tighter buys nothing anybody can look at and costs
+/// vertices on a ring the outline walks every frame; looser is visible on a
+/// large circle at 1:1.
+const ARC_TOLERANCE: f32 = 0.05;
+
+/// The most segments one quarter-turn is ever flattened into.
+///
+/// The count is `O(sqrt(radius))` — about `(π/4)·sqrt(r / 2t)` — so a circle
+/// spanning `Document::MAX_EDGE`'s 32768 pixels asks for 450 segments a
+/// quarter, and this bound is never met by a shape anybody can draw. It exists
+/// because the radius reaches [`arc_steps`] from a drag in progress: an
+/// infinity there would otherwise be a `Vec` grown until the process died.
+const MAX_ARC_STEPS: u32 = 512;
+
+/// How many straight segments a quarter-turn of radius `r` needs to stay within
+/// [`ARC_TOLERANCE`].
+///
+/// The sagitta of a chord subtending `θ` on a circle of radius `r` is
+/// `r (1 − cos(θ/2))`, so holding it under `t` needs
+/// `θ ≤ 2 acos(1 − t/r)` and the count is `⌈(π/2) / θ⌉`. Derived rather than a
+/// fixed 16-per-quarter, because a fixed count is either wasteful on a small
+/// corner or visibly faceted on a large one, and a rounded rectangle draws four
+/// arcs whose radius the artist sets with a rail.
+///
+/// A radius at or under the tolerance is a corner nobody can see, so it is one
+/// segment.
+fn arc_steps(r: f32) -> u32 {
+    if !(r > ARC_TOLERANCE) {
+        return 1;
+    }
+    let theta = 2.0 * (1.0 - ARC_TOLERANCE / r).clamp(-1.0, 1.0).acos();
+    if !(theta > 0.0) {
+        return MAX_ARC_STEPS;
+    }
+    ((std::f32::consts::FRAC_PI_2 / theta).ceil() as u32).clamp(1, MAX_ARC_STEPS)
+}
+
+/// Append a quarter-turn about `centre` with radii `r`, from angle `from` to
+/// `from + FRAC_PI_2`, **without** its first point.
+///
+/// The first point is left out because every caller has just emitted it as the
+/// end of the straight run before the corner, and a ring carrying it twice is a
+/// zero-length edge the rasteriser walks on every sub-scanline it spans.
+fn push_quarter(out: &mut Vec<Vec2>, centre: Vec2, r: Vec2, from: f32, steps: u32) {
+    for k in 1..=steps {
+        let a = from + std::f32::consts::FRAC_PI_2 * (k as f32 / steps as f32);
+        let (s, c) = a.sin_cos();
+        out.push(centre + Vec2::new(c * r.x, s * r.y));
+    }
+}
+
+/// The ring of an axis-aligned box with corners rounded by `roundness`.
+///
+/// Cleared first, and clockwise in document space (y down) so it winds the same
+/// way [`Selection::rectangle`]'s four corners do at every roundness.
+///
+/// One function so that the outline drawn during the drag and the ring
+/// [`Selection::rounded_rectangle`] rasterises at the end of it are the same
+/// geometry rather than two implementations that have to agree — the rule
+/// `render_float` keeps between a transform's preview and its commit.
+fn rounded_rect_ring(a: Vec2, b: Vec2, roundness: f32, out: &mut Vec<Vec2>) {
+    out.clear();
+    let min = a.min(b);
+    let max = a.max(b);
+    let size = max - min;
+    let r = 0.5 * size.min_element() * roundness.clamp(0.0, 1.0);
+    if !(r > 0.0) {
+        out.extend_from_slice(&[
+            min,
+            Vec2::new(max.x, min.y),
+            max,
+            Vec2::new(min.x, max.y),
+        ]);
+        return;
+    }
+    let steps = arc_steps(r);
+    let rr = Vec2::splat(r);
+    use std::f32::consts::{FRAC_PI_2, PI};
+    // Top edge, then each corner as a quarter-turn whose first point is the end
+    // of the edge that led into it. Angles are measured with y *down*, so the
+    // sweep that looks anticlockwise on paper is the clockwise one here.
+    out.push(Vec2::new(min.x + r, min.y));
+    out.push(Vec2::new(max.x - r, min.y));
+    push_quarter(out, Vec2::new(max.x - r, min.y + r), rr, -FRAC_PI_2, steps);
+    out.push(Vec2::new(max.x, max.y - r));
+    push_quarter(out, Vec2::new(max.x - r, max.y - r), rr, 0.0, steps);
+    out.push(Vec2::new(min.x + r, max.y));
+    push_quarter(out, Vec2::new(min.x + r, max.y - r), rr, FRAC_PI_2, steps);
+    out.push(Vec2::new(min.x, min.y + r));
+    push_quarter(out, Vec2::new(min.x + r, min.y + r), rr, PI, steps);
+    // The last arc ends exactly where the ring began, so drop it: the closing
+    // edge is implicit and a repeated first point is a zero-length one.
+    out.pop();
+}
+
+/// The ring of the ellipse inscribed in the box between two corners.
+///
+/// Cleared first, and clockwise in document space like [`rounded_rect_ring`]'s.
+/// The segment count comes from the **longer** semi-axis, because that is where
+/// the curve is flattest against its chords and therefore where the tolerance
+/// binds.
+fn ellipse_ring(a: Vec2, b: Vec2, out: &mut Vec<Vec2>) {
+    out.clear();
+    let min = a.min(b);
+    let max = a.max(b);
+    let r = 0.5 * (max - min);
+    let centre = min + r;
+    let steps = arc_steps(r.max_element());
+    for k in 0..4 * steps {
+        let angle = std::f32::consts::TAU * (k as f32 / (4 * steps) as f32);
+        let (s, c) = angle.sin_cos();
+        out.push(centre + Vec2::new(c * r.x, s * r.y));
+    }
+}
+
+/// One corner-cutting pass over an **open** polyline, in place.
+///
+/// Chaikin: every interior vertex is replaced by the points a quarter and three
+/// quarters along its two edges, so each pass halves the turn at every corner
+/// and the sequence converges on a quadratic B-spline. The ends are pinned,
+/// which is what makes this the *open* form.
+///
+/// **Open rather than closed, and that is a decision about the gesture.** A
+/// lasso's ring is closed by an implicit edge from where the hand stopped back
+/// to where it started, and that edge is not something anybody drew — it is
+/// where the pen came off the glass. Cutting the corners either side of it
+/// would move the outline near the start and the end of the stroke away from
+/// the pixels the artist was looking at when they made them. Pinning the ends
+/// also means the preview and the finished shape share this function's answer
+/// exactly, since the preview draws the same polyline without the closing edge.
+///
+/// In place, growing backwards, because this runs on the drawing path: the
+/// outline is rebuilt every frame of a drag and the selection's own ring is
+/// walked every frame the marquee is on screen, so a scratch buffer here would
+/// be an allocation per frame.
+fn cut_corners(points: &mut Vec<Vec2>) {
+    let n = points.len();
+    if n < 3 {
+        return;
+    }
+    points.resize(2 * n, Vec2::ZERO);
+    let last = points[n - 1];
+    // Backwards, because the pair written for vertex `i` lands at `2i + 1` and
+    // `2i + 2`, both strictly past `i` — so nothing yet to be read is ever
+    // overwritten. Forwards would clobber `points[1]` before it was used.
+    for i in (0..n - 1).rev() {
+        let (from, to) = (points[i], points[i + 1]);
+        points[2 * i + 1] = from.lerp(to, 0.25);
+        points[2 * i + 2] = from.lerp(to, 0.75);
+    }
+    points[2 * n - 1] = last;
+}
+
 /// A selection being drawn: the gesture, before it becomes a [`Selection`].
 ///
 /// Lives here rather than in the interface because what each mode does with a
@@ -1187,29 +1444,84 @@ pub struct SelectionDraft {
     /// with the operation and for the same reason — see
     /// [`SelectionDraft::feathered`].
     feather: f32,
-    /// Rectangle: the corner the drag started at. Lasso: every sampled point.
-    /// Polygon: every vertex clicked so far.
+    /// How far the rectangle's corners are rounded, `0.0` through `1.0`.
+    /// Snapshotted with the operation and the feather, and for the same
+    /// reason — see [`SelectionDraft::rounded`].
+    roundness: f32,
+    /// How heavily the lasso damps the hand. Snapshotted with the rest.
+    stabiliser: f32,
+    /// The stabiliser's filter state: where the damped point stands after the
+    /// samples so far. Equal to the raw pointer position while the stabiliser
+    /// is off, which is what makes zero the exact identity.
+    smoothed: Vec2,
+    /// Rectangle and ellipse: the corner the drag started at. Lasso: every
+    /// sampled point. Polygon: every vertex clicked so far.
+    ///
+    /// **The lasso's are the raw samples**, not the smoothed outline.
+    /// [`SelectionDraft::lasso_ring`] is what turns them into the curve, and it
+    /// runs on the way out rather than on the way in so that the preview and
+    /// the finished shape are one answer rather than two.
     points: Vec<Vec2>,
-    /// Where the pointer is now. For the rectangle this is the opposite
-    /// corner; for the polygon it is the rubber-band end of the next edge.
+    /// Where the pointer is now. For the rectangle and the ellipse this is the
+    /// opposite corner; for the polygon it is the rubber-band end of the next
+    /// edge.
     cursor: Vec2,
 }
 
-/// The smallest step, in document pixels, between two recorded lasso points.
+/// How many corner-cutting passes a freehand lasso's samples get.
 ///
-/// A pointer at 1000 Hz over a canvas at 8x zoom reports hundreds of samples
-/// per document pixel, and every one of them is an edge the rasteriser walks on
-/// every sub-scanline it spans. Dropping the ones that say nothing costs
-/// nothing visible and bounds the shape.
-const LASSO_STEP: f32 = 1.0;
+/// **This is what fixes a lasso drawn zoomed out and inspected zoomed in**, and
+/// the mechanism is worth stating because "record the pointer more often" is
+/// the obvious repair and is not available. At zoom 0.1 one screen pixel *is*
+/// ten document pixels, so the finest polyline the pointer can describe already
+/// has a vertex only every ten document pixels; there is nothing finer to
+/// sample. Zoom back to 8:1 afterwards and each of those edges is 80 screen
+/// pixels of straight line meeting the next at a visible kink — the staircase
+/// the artist reported. Subdividing is the only thing that can put a curve
+/// there, because the information the samples lack has to be *interpolated*
+/// rather than measured.
+///
+/// Two passes, which is a measured trade rather than a round number. Each pass
+/// doubles the ring and quarters the turn at every vertex, so two take a
+/// ten-pixel sample spacing to two-and-a-half-pixel segments: invisible at the
+/// 2:1 or 4:1 somebody actually zooms back to, and still faintly faceted if
+/// they go from 0.1 straight to 8. Three would fix that case and cost eight
+/// times the vertices on a ring the marquee walks **every frame for as long as
+/// the selection stands** — `ui::selection_outline` draws one line segment per
+/// vertex under the dashes. If that ever needs revisiting the answer is to
+/// simplify the smoothed ring by curvature, not to smooth it less.
+///
+/// The two alternatives, and why not:
+/// - **Catmull-Rom through the samples** interpolates them, so it reproduces
+///   the screen lattice as a wave instead of removing it — smooth, and still
+///   half a screen pixel wrong at every sample — and it overshoots at a fast
+///   corner, putting the outline outside anything the hand went round.
+/// - **A symmetric (1, 2, 1) average in place** removes the lattice noise for
+///   nothing and adds no vertices, so it leaves the facets exactly where they
+///   were. It is the right instrument for the wrong half of the problem.
+const LASSO_SMOOTHING: u32 = 2;
 
 impl SelectionDraft {
+    /// The heaviest damping the lasso may be asked for.
+    ///
+    /// `Brush::MAX_STABILIZATION`'s figure and its argument: the filter is
+    /// `1 - stabiliser` clamped to at least `0.02`, so even 1.0 converges on
+    /// the pointer eventually — slowly enough to feel broken, which is the only
+    /// thing this bound is for. Stated here rather than imported because a
+    /// brush is not in this module's dependencies and a selection outline is
+    /// not a stroke; the two happening to agree is a coincidence worth leaving
+    /// visible rather than a shared constant worth inventing a home for.
+    pub const MAX_STABILISER: f32 = 0.95;
+
     /// Begin at `at`, in document space.
     pub fn new(mode: SelectionMode, at: Vec2) -> Self {
         Self {
             mode,
             op: SelectionOp::Replace,
             feather: 0.0,
+            roundness: 0.0,
+            stabiliser: 0.0,
+            smoothed: at,
             points: vec![at],
             cursor: at,
         }
@@ -1252,12 +1564,51 @@ impl SelectionDraft {
         self
     }
 
+    /// Round the finished rectangle's corners by `roundness`, `0.0` square
+    /// through `1.0`.
+    ///
+    /// Snapshotted at the start of the gesture, exactly as the operation and
+    /// the feather are and for the same reason — and unlike those two it is
+    /// visible in the preview, because the rounding is geometry rather than a
+    /// property of the mask.
+    ///
+    /// Ignored by every mode but [`SelectionMode::Rectangle`], which is
+    /// [`SelectionMode::extra`]'s statement rather than this function's: a
+    /// draft records what the strip was set to and the mode decides what to do
+    /// with it, so nothing here has to be kept in step with what the strip
+    /// happened to draw.
+    #[must_use]
+    pub fn rounded(mut self, roundness: f32) -> Self {
+        self.roundness = roundness;
+        self
+    }
+
+    /// Damp the hand by `stabiliser`, `0.0` off through
+    /// [`SelectionDraft::MAX_STABILISER`].
+    ///
+    /// Snapshotted with the rest. Ignored by every mode but
+    /// [`SelectionMode::Lasso`] — a rectangle and a polygon are defined by
+    /// clicks, and a click somebody aimed is not something to filter.
+    #[must_use]
+    pub fn stabilised(mut self, stabiliser: f32) -> Self {
+        self.stabiliser = stabiliser;
+        self
+    }
+
     pub fn op(&self) -> SelectionOp {
         self.op
     }
 
     pub fn feather(&self) -> f32 {
         self.feather
+    }
+
+    pub fn roundness(&self) -> f32 {
+        self.roundness
+    }
+
+    pub fn stabiliser(&self) -> f32 {
+        self.stabiliser
     }
 
     /// A press, after the first. Returns true when the shape is now closed and
@@ -1288,16 +1639,58 @@ impl SelectionDraft {
     }
 
     /// The pointer moved. For the lasso this may record a point.
-    pub fn moved(&mut self, at: Vec2) {
+    ///
+    /// `step` is the least distance between two recorded samples, in document
+    /// pixels, and it comes from the caller for exactly the reason
+    /// [`SelectionDraft::press`]'s `close_within` does: it is a **screen**
+    /// distance divided by the zoom.
+    ///
+    /// It used to be a constant document pixel, and that was wrong at both
+    /// ends. Zoomed in to 8:1 it threw away seven of every eight screen pixels
+    /// the hand travelled, which is a polyline with eight-pixel facets on the
+    /// very view somebody chose in order to be precise. Zoomed out to 0.1 it
+    /// never fired at all, because one screen pixel is already ten document
+    /// pixels — so it was a bound that bit hardest exactly where there was
+    /// least to bound. A screen distance bounds the recorded shape by how far
+    /// the hand actually moved on the glass, which is what the constant was
+    /// reaching for: a pointer at 1000 Hz resting still still records nothing,
+    /// and a pen reporting sub-pixel positions no longer records its own
+    /// jitter.
+    pub fn moved(&mut self, at: Vec2, step: f32) {
         self.cursor = at;
-        if self.mode == SelectionMode::Lasso
-            && self
-                .points
-                .last()
-                .is_none_or(|last| last.distance(at) >= LASSO_STEP)
+        if self.mode != SelectionMode::Lasso {
+            return;
+        }
+        let at = self.damped(at);
+        if self
+            .points
+            .last()
+            .is_none_or(|last| last.distance(at) >= step)
         {
             self.points.push(at);
         }
+    }
+
+    /// One sample through the stabiliser.
+    ///
+    /// Exponential smoothing, the filter `StrokeBuilder::extend` runs on a
+    /// stroke — the same instrument for the same complaint, so a hand that has
+    /// learnt what the brush's rail does knows what this one does.
+    ///
+    /// **Zero is the exact identity, and it is a branch rather than an alpha of
+    /// one.** `s + (a - s) * 1.0` is not `a` in floating point wherever `s` and
+    /// `a` are far apart in magnitude, so an alpha of one would move the odd
+    /// sample by an ulp and make "the default records what the pointer
+    /// reported" a claim about rounding rather than about behaviour.
+    /// `a_lasso_with_no_stabiliser_records_the_points_it_was_given` pins it.
+    fn damped(&mut self, at: Vec2) -> Vec2 {
+        if self.stabiliser <= 0.0 {
+            self.smoothed = at;
+            return at;
+        }
+        let alpha = (1.0 - self.stabiliser).clamp(0.02, 1.0);
+        self.smoothed += (at - self.smoothed) * alpha;
+        self.smoothed
     }
 
     /// A release. Returns true when the shape is complete.
@@ -1305,8 +1698,8 @@ impl SelectionDraft {
     /// The polygon is the one mode a release does not finish: its gesture is a
     /// sequence of clicks, and ending it on the first button-up would make it
     /// a two-point line every time.
-    pub fn release(&mut self, at: Vec2) -> bool {
-        self.moved(at);
+    pub fn release(&mut self, at: Vec2, step: f32) -> bool {
+        self.moved(at, step);
         self.mode != SelectionMode::Polygon
     }
 
@@ -1315,14 +1708,51 @@ impl SelectionDraft {
     /// A polygon with two vertices is a line, and a rectangle dragged nowhere
     /// is a point; neither is a selection, and both are what a stray click
     /// produces.
+    ///
+    /// Read off the **raw** samples for the lasso rather than the smoothed
+    /// ring: the smoothing doubles the count twice, so asking it here would
+    /// call a two-sample twitch closable.
     pub fn is_closable(&self) -> bool {
         match self.mode {
-            SelectionMode::Rectangle => {
+            SelectionMode::Rectangle | SelectionMode::Ellipse => {
                 let a = self.points[0];
                 (a.x - self.cursor.x).abs() >= 1.0 && (a.y - self.cursor.y).abs() >= 1.0
             }
             SelectionMode::Lasso => self.points.len() >= 3,
             SelectionMode::Polygon => self.points.len() >= 3,
+        }
+    }
+
+    /// Whether the outline [`SelectionDraft::outline_into`] writes closes back
+    /// on itself while the gesture is still in progress.
+    ///
+    /// A rectangle's four corners and an ellipse's ring *are* the shape at
+    /// every instant of the drag, so both are drawn shut. A lasso mid-drag and
+    /// a polygon two clicks in are paths, and drawing the edge back to the
+    /// start would promise a shape the next moment is going to change.
+    ///
+    /// Here rather than in `ui.rs` because it is a statement about the gesture,
+    /// and exhaustive rather than a `matches!` so that a fifth mode has to
+    /// answer it.
+    pub fn outline_closed(&self) -> bool {
+        match self.mode {
+            SelectionMode::Rectangle | SelectionMode::Ellipse => true,
+            SelectionMode::Lasso | SelectionMode::Polygon => false,
+        }
+    }
+
+    /// The lasso's samples, smoothed, into `out` — which is cleared first.
+    ///
+    /// **One statement of the smoothing, called by the preview and by the
+    /// finish.** Two would be two things to keep in step about a curve, and the
+    /// symptom of their drifting is the outline jumping the instant the pen
+    /// comes off the glass — the same failure `composite.wgsl` and
+    /// `commit.wgsl` share a file to avoid.
+    fn lasso_ring(&self, out: &mut Vec<Vec2>) {
+        out.clear();
+        out.extend_from_slice(&self.points);
+        for _ in 0..LASSO_SMOOTHING {
+            cut_corners(out);
         }
     }
 
@@ -1336,11 +1766,10 @@ impl SelectionDraft {
         out.clear();
         match self.mode {
             SelectionMode::Rectangle => {
-                let a = self.points[0];
-                let b = self.cursor;
-                out.extend_from_slice(&[a, Vec2::new(b.x, a.y), b, Vec2::new(a.x, b.y)]);
+                rounded_rect_ring(self.points[0], self.cursor, self.roundness, out);
             }
-            SelectionMode::Lasso => out.extend_from_slice(&self.points),
+            SelectionMode::Ellipse => ellipse_ring(self.points[0], self.cursor, out),
+            SelectionMode::Lasso => self.lasso_ring(out),
             // The rubber band is part of what the user is looking at: without
             // it the shape appears to lag one click behind the pointer.
             SelectionMode::Polygon => {
@@ -1357,8 +1786,18 @@ impl SelectionDraft {
     /// one pass over the mask it produced.
     pub fn finish(&self, doc: UVec2) -> Option<Selection> {
         let sharp = match self.mode {
-            SelectionMode::Rectangle => Selection::rectangle(self.points[0], self.cursor, doc),
-            SelectionMode::Lasso => Selection::polygon(&self.points, doc),
+            SelectionMode::Rectangle => {
+                Selection::rounded_rectangle(self.points[0], self.cursor, self.roundness, doc)
+            }
+            SelectionMode::Ellipse => Selection::ellipse(self.points[0], self.cursor, doc),
+            SelectionMode::Lasso => {
+                // A fresh buffer, once, at pointer-up: `outline_into`'s
+                // argument for taking the caller's is about the frame loop,
+                // and this is not on it.
+                let mut ring = Vec::new();
+                self.lasso_ring(&mut ring);
+                Selection::polygon(&ring, doc)
+            }
             SelectionMode::Polygon => Selection::polygon(&self.points, doc),
         };
         sharp?.feathered(self.feather, doc)
@@ -1371,6 +1810,14 @@ mod tests {
     use glam::vec2;
 
     const DOC: UVec2 = UVec2::splat(64);
+
+    /// The lasso step these tests hand `moved`.
+    ///
+    /// One document pixel, which is what one screen pixel is at zoom 1 — the
+    /// zoom every test here is implicitly at, since none of them has a
+    /// camera. Named rather than typed at each call so that a test about the
+    /// step says so by passing something else.
+    const STEP: f32 = 1.0;
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Selection {
         Selection::rectangle(vec2(x0, y0), vec2(x1, y1), DOC).expect("a rectangle")
@@ -1502,9 +1949,9 @@ mod tests {
     fn a_rectangle_draft_needs_a_drag_before_it_encloses_anything() {
         let mut draft = SelectionDraft::new(SelectionMode::Rectangle, vec2(10.0, 10.0));
         assert!(!draft.is_closable(), "a click is not a selection");
-        assert!(draft.release(vec2(10.2, 10.2)));
+        assert!(draft.release(vec2(10.2, 10.2), STEP));
         assert!(!draft.is_closable());
-        draft.moved(vec2(30.0, 30.0));
+        draft.moved(vec2(30.0, 30.0), STEP);
         assert!(draft.is_closable());
         assert!(draft.finish(DOC).is_some());
     }
@@ -1512,7 +1959,10 @@ mod tests {
     #[test]
     fn a_polygon_closes_on_a_click_back_at_its_first_vertex() {
         let mut draft = SelectionDraft::new(SelectionMode::Polygon, vec2(10.0, 10.0));
-        assert!(!draft.release(vec2(10.0, 10.0)), "a release is not a close");
+        assert!(
+            !draft.release(vec2(10.0, 10.0), STEP),
+            "a release is not a close"
+        );
         assert!(!draft.press(vec2(30.0, 10.0), 4.0));
         assert!(!draft.press(vec2(30.0, 30.0), 4.0));
         // Near the first vertex but not on it, which is what a real click is.
@@ -1538,10 +1988,10 @@ mod tests {
         // it spans, so the ones that repeat a position are dropped.
         let mut draft = SelectionDraft::new(SelectionMode::Lasso, vec2(10.0, 10.0));
         for _ in 0..100 {
-            draft.moved(vec2(10.05, 10.05));
+            draft.moved(vec2(10.05, 10.05), STEP);
         }
-        draft.moved(vec2(40.0, 10.0));
-        draft.moved(vec2(40.0, 40.0));
+        draft.moved(vec2(40.0, 10.0), STEP);
+        draft.moved(vec2(40.0, 40.0), STEP);
         assert_eq!(draft.finish(DOC).map(|s| s.bounds().width), Some(30));
     }
 
@@ -1850,7 +2300,7 @@ mod tests {
         // has to be cleared, or the outline grows a tail of last frame's.
         let mut buf = vec![Vec2::ZERO; 9];
         let mut draft = SelectionDraft::new(SelectionMode::Rectangle, vec2(10.0, 10.0));
-        draft.moved(vec2(30.0, 20.0));
+        draft.moved(vec2(30.0, 20.0), STEP);
         draft.outline_into(&mut buf);
         assert_eq!(
             buf,
@@ -1864,7 +2314,7 @@ mod tests {
 
         let mut poly = SelectionDraft::new(SelectionMode::Polygon, vec2(0.0, 0.0));
         poly.press(vec2(10.0, 0.0), 4.0);
-        poly.moved(vec2(10.0, 10.0));
+        poly.moved(vec2(10.0, 10.0), STEP);
         poly.outline_into(&mut buf);
         assert_eq!(buf.len(), 3, "the rubber band is part of the outline");
     }
@@ -2077,7 +2527,7 @@ mod tests {
         let mut draft =
             SelectionDraft::new(SelectionMode::Rectangle, vec2(10.0, 10.0)).feathered(4.0);
         assert_eq!(draft.feather(), 4.0);
-        draft.moved(vec2(30.0, 30.0));
+        draft.moved(vec2(30.0, 30.0), STEP);
         let s = draft.finish(DOC).expect("a soft box");
         assert_eq!(s.feather(), 4.0);
         assert!(s.coverage_at(9, 20) > 0, "the edge softened outwards");
