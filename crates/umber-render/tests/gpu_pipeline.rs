@@ -605,6 +605,18 @@ fn build_up_leaves_the_max_path_alone() {
 /// from the turn. Reading a crossing of two *different* limbs would have put a
 /// dab's falloff between the readings and made the difference an argument about
 /// geometry.
+///
+/// **What this pair does not catch, said out loud**: folding flow into the
+/// *mark* instead of into the dab — the "second opacity" mistake — still
+/// darkens a crossing here, because the conversion targets the mark for one
+/// pass and a crossing doubles the depth past it. Measured under that
+/// mutation the fixture reads 78/133 where it reads 100/161, both inside
+/// these bounds. The distinguishing property is what a **single** pass
+/// reaches: on the dab it follows the stack depth, on the mark it is `flow`
+/// whatever the spacing, which is what `Brush::opacity` already means.
+/// `flow_scales_the_dab_and_never_the_strokes_opacity` in `umber-core` is
+/// what fails on that mutation, and it fails decisively; this test is about
+/// the crossing and is blind to it.
 #[test]
 fn a_stroke_crossing_itself_darkens_where_it_crosses_at_a_low_flow() {
     let mut h = harness_or_skip!();

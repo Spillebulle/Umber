@@ -958,63 +958,103 @@ mod tests {
         assert_eq!(Brush { flow: 0.5, ..base }.opacity, 0.5);
     }
 
-    /// A stroke at flow 1.0 emits the dabs it always did, bit for bit.
+    /// The coverage a dab carried before `Brush::flow` existed, pinned.
     ///
-    /// Not "close to": the `max` path is what every pixel test in the suite is
-    /// written against, and `per_dab_for_stroke` goes to the trouble of an early
-    /// return for exactly this reason. A multiply by one is the identity in
-    /// floating point, so the guard is that flow's arm is **not taken** rather
-    /// than that it happens to be harmless — which is why the two cases
-    /// `per_dab_for_stroke` deliberately leaves unfloored are in the sweep. A
-    /// target of zero must stay zero and not become one level of the scratch,
-    /// and a stroke one dab deep must come back verbatim.
+    /// **These 120 figures were produced by a build with no flow field in it**,
+    /// at d0efaa3, by the same sweep run against the same `StrokeBuilder` — not
+    /// by this build and not by restating the conversion here. That is what
+    /// makes this an identity test rather than a tautology, and the first
+    /// attempt was the tautology: it compared a brush carrying the default flow
+    /// against one naming 1.0 by hand, which are the same brush, so every
+    /// mutation of the flow-1.0 path walked through it. Mutation found that;
+    /// re-reading the assertion would not have.
     ///
-    /// Driven against a stroke built from a brush carrying **no** flow field
-    /// value at all — `Brush::default()`'s — beside one set to 1.0 by hand, so
-    /// the default and the literal are pinned to agree.
+    /// Pure `f32` arithmetic, so unlike a pixel through a shader these *are*
+    /// bytes and CI may be held to them — no adapter is involved and IEEE
+    /// settles the rest.
+    ///
+    /// The sweep is `build_up` × size × spacing × pressure, in that nesting.
+    /// Three of the points are load-bearing and are here deliberately:
+    ///
+    /// - **pressure 0.0** is a curve asking for nothing, which the scratch floor
+    ///   must not lift into a mark.
+    /// - **pressure 0.002** is under one level of the scratch, which is the only
+    ///   place the floor is visible at all — at 0.05 a dab is already twelve
+    ///   levels up and flooring it changes nothing.
+    /// - **spacing 2.5** is an author asking for separated dabs, which two
+    ///   shipped presets do, and is the only way to reach a stack **one dab
+    ///   deep** — one of the two cases `per_dab_for_stroke` leaves unfloored, and
+    ///   therefore the one case where applying the floor at the default is
+    ///   visible. Without it the sweep never met the floor and a mutation
+    ///   widening flow's guard to `<= 1.0` survived.
+    #[rustfmt::skip]
+    const COVERAGE_BEFORE_FLOW: [f32; 120] = [
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 3.921569e-3, 8.512437e-3, 1.09101295e-1, 1e0,
+        0e0, 3.921569e-3, 8.512437e-3, 1.09101295e-1, 1e0,
+        0e0, 3.921569e-3, 1.6952455e-2, 2.0629948e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 3.921569e-3, 3.921569e-3, 1.846087e-2, 1e0,
+        0e0, 3.921569e-3, 6.5835714e-3, 8.539283e-2, 1e0,
+        0e0, 3.921569e-3, 1.6952455e-2, 2.0629948e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 3.921569e-3, 3.921569e-3, 1.7728329e-2, 1e0,
+        0e0, 3.921569e-3, 6.5835714e-3, 8.539283e-2, 1e0,
+        0e0, 3.921569e-3, 1.6952455e-2, 2.0629948e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+    ];
+
+    /// At flow 1.0 a dab carries exactly what it carried before flow existed.
+    ///
+    /// [`COVERAGE_BEFORE_FLOW`] is the reference and its docs say where it came
+    /// from. Bit for bit rather than nearly: the `max` path is what every pixel
+    /// test in the suite is written against, and `per_dab_for_stroke` goes to
+    /// the trouble of an early return to keep it exact.
     #[test]
-    fn flow_at_one_emits_exactly_the_dabs_it_always_did() {
+    fn flow_at_one_carries_exactly_what_a_build_without_it_carried() {
+        let mut i = 0;
         for build_up in [false, true] {
             for size in [2.0, 12.0, 80.0] {
-                for spacing in [0.02, 0.1, 0.25] {
-                    // Including a curve that reaches zero, which is the target
-                    // the floor must not lift, and a light pressure where a deep
-                    // stack makes the conversion do real work.
-                    for pressure in [0.0, 0.05, 0.5, 1.0] {
-                        let defaulted = Brush {
+                for spacing in [0.02, 0.1, 0.25, 2.5] {
+                    for pressure in [0.0, 0.002, 0.05, 0.5, 1.0] {
+                        let brush = Brush {
                             build_up,
                             pressure_opacity: true,
                             opacity_curve: ResponseCurve::LINEAR,
                             ..unsmoothed(size, spacing)
                         };
-                        let explicit = Brush {
-                            flow: 1.0,
-                            ..defaulted
-                        };
-                        let dabs = |brush: Brush| {
-                            let mut s = StrokeBuilder::new();
-                            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
-                            s.extend(InputPoint::new(vec2(150.0, 0.0), pressure, 0.1));
-                            s.drain_pending()
-                                .map(|d: Dab| d.coverage)
-                                .collect::<Vec<_>>()
-                        };
-                        let a = dabs(defaulted);
-                        let b = dabs(explicit);
+                        assert_eq!(brush.flow, 1.0, "the sweep is about the default");
+                        let mut s = StrokeBuilder::new();
+                        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+                        s.extend(InputPoint::new(vec2(150.0, 0.0), pressure, 0.1));
+                        let dabs: Vec<Dab> = s.drain_pending().collect();
+                        let mid = dabs[dabs.len() / 2].coverage;
                         assert_eq!(
-                            a, b,
-                            "size {size}, spacing {spacing}, pressure {pressure},                              build_up {build_up}: naming flow 1.0 moved the dabs"
+                            mid, COVERAGE_BEFORE_FLOW[i],
+                            "build_up {build_up}, size {size}, spacing {spacing},                              pressure {pressure}: flow 1.0 moved a dab that a build                              without the field left at {}",
+                            COVERAGE_BEFORE_FLOW[i]
                         );
-                        if pressure == 0.0 {
-                            assert!(
-                                a.iter().all(|c| *c == 0.0),
-                                "a curve at zero asked for nothing and the floor                                  turned it into a mark"
-                            );
-                        }
+                        i += 1;
                     }
                 }
             }
         }
+        assert_eq!(
+            i,
+            COVERAGE_BEFORE_FLOW.len(),
+            "the table and the sweep disagree"
+        );
     }
 
     /// A dab a low flow would take under one level of the scratch is floored.
