@@ -4501,6 +4501,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// A flow brush's row builds, exactly as its stroke on the canvas does.
+    ///
+    /// `preview_mark` is the one licensed second implementation of the coverage
+    /// rules, so it has to answer `Brush::builds` and not `Brush::build_up`:
+    /// what a dab carries is `StrokeBuilder`'s and `preview_dabs` runs the real
+    /// builder, so a flow brush arrives here already converted **for
+    /// accumulation**. Taking a `max` of those instead caps the row at roughly
+    /// `flow` — the mark at a third of its strength, on a row whose whole job is
+    /// to show what the brush does.
+    ///
+    /// Measured against the flow figure rather than against a pinned level: the
+    /// preview path crosses itself by construction, so a building row reaches
+    /// far past one dab's worth, and a `max` row cannot exceed it.
+    #[test]
+    fn a_flow_brushs_row_builds_rather_than_capping_at_one_dab() {
+        let flow = 0.3;
+        let brush = Brush {
+            spacing: 0.1,
+            opacity: 1.0,
+            hardness: 1.0,
+            pressure_size: false,
+            flow,
+            ..Default::default()
+        };
+        assert!(
+            brush.builds(),
+            "the fixture is not on the path being tested"
+        );
+        let peak = preview_of(&brush)
+            .coverage
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
+        assert!(
+            peak > flow + 0.25,
+            "the row peaked at {peak}, which is about the {flow} one dab carries              — it is taking a max of dabs already converted for accumulation"
+        );
+        assert!(peak <= 1.0 + 1e-5, "coverage compounded past solid: {peak}");
+    }
+
     /// Nothing may be freed by the pass that still draws it.
     ///
     /// The Brushes panel and the library browser show the same presets at two
