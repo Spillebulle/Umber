@@ -826,6 +826,23 @@ pub fn well_formed(entries: &[(u8, bool)]) -> bool {
     true
 }
 
+/// What [`LayerStack::add_named`] hands back.
+///
+/// Two numbers that answer different questions and are easy to confuse, which
+/// is why they travel together rather than as a bare `u32`. The **slot** is a
+/// slice of the texture array and is what the caller must clear on the GPU; the
+/// **id** is the entry's identity and is the only one of the two that a caller
+/// may hold across a gesture, because a slot says nothing about where the layer
+/// sits and an index stops meaning this layer the moment anything is reordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddedLayer {
+    /// The texture slice the layer took. Clear it: a recycled slot still holds
+    /// the last layer's pixels.
+    pub slot: u32,
+    /// [`Layer::id`], for a caller that has to find this entry again later.
+    pub id: u32,
+}
+
 /// Bottom-to-top stack of layers. Index 0 is the bottom.
 #[derive(Debug)]
 pub struct LayerStack {
@@ -1384,6 +1401,30 @@ impl LayerStack {
     /// made while a group is in hand, and it is also the only reading that lets
     /// somebody fill a folder they have just made without dragging.
     pub fn add(&mut self) -> Option<u32> {
+        let name = format!("Layer {}", self.next_name_number());
+        self.add_named(&name).map(|made| made.slot)
+    }
+
+    /// The same, under a name the caller chose.
+    ///
+    /// **This is not a rename**, and that distinction is the whole reason it is
+    /// safe to add. [`Layer::name`] is written where a layer is created or
+    /// imported and nowhere else — there is no `rename` on this type, because
+    /// undoing one needs an [`crate::EditBody`] arm that does not exist yet and
+    /// `docs/layer-rename.md` is the standing design for it. A name given at
+    /// *creation* is not a value anybody then changed, so it needs no such arm:
+    /// the only way back is the structural entry that takes the whole layer out,
+    /// and that entry carries the layer itself.
+    ///
+    /// Its caller is a text placement, which names the layer after the words on
+    /// it — see [`crate::textobj::layer_name`]. [`LayerStack::add`] is this with
+    /// the "Layer N" it has always used.
+    ///
+    /// Returns the slot **and the new entry's id**. The id is what a caller
+    /// holding on to the layer across a gesture has to keep: a slot is a slice
+    /// and an index is a position in a `Vec`, and only the id survives a
+    /// reorder.
+    pub fn add_named(&mut self, name: &str) -> Option<AddedLayer> {
         if self.layers.len() >= Self::MAX {
             return None;
         }
@@ -1401,8 +1442,8 @@ impl LayerStack {
         // [`SlotRoom`] — not to be handed a layer with nowhere to paint.
         let slot = self.take_slot()?;
         let number = slot.number();
-        let name = format!("Layer {}", self.next_name_number());
-        let mut layer = Layer::named(&name, self.take_id(), Some(slot));
+        let id = self.take_id();
+        let mut layer = Layer::named(name, id, Some(slot));
         layer.depth = depth;
         self.layers.insert(at, layer);
         debug_assert!(
@@ -1410,7 +1451,36 @@ impl LayerStack {
             "add left a malformed stack"
         );
         self.active = at;
-        Some(number)
+        Some(AddedLayer { slot: number, id })
+    }
+
+    /// Would a layer added right now come out locked?
+    ///
+    /// The `can_` beside [`LayerStack::add_named`], and it asks about the
+    /// *insertion point* rather than about the selected entry — which is the one
+    /// thing here that is easy to get backwards. A new layer carries no lock of
+    /// its own, so the only thing that can lock it is what encloses it:
+    ///
+    /// * with a **layer** selected the new one is its sibling, so what reaches
+    ///   it is that layer's ancestors and **not** that layer's own flag. A
+    ///   locked layer inside an unlocked folder is somewhere a new layer may
+    ///   perfectly well go, and reading [`LayerStack::active_is_locked`] here
+    ///   would refuse it;
+    /// * with a **folder** selected the new one goes inside it, so the folder's
+    ///   own flag counts too — which is exactly
+    ///   [`LayerStack::effective_locked`] of the folder.
+    ///
+    /// It exists because a text placement that makes its own layer is not gated
+    /// by the *selected* layer's lock at all, where one painting onto the
+    /// selected layer is. One predicate answering both would refuse an
+    /// operation the model allows, which is the control that lies in its other
+    /// direction.
+    pub fn new_layer_would_be_locked(&self) -> bool {
+        match self.layers.get(self.active) {
+            Some(l) if l.folder => self.effective_locked(self.active),
+            Some(_) => self.ancestors_of(self.active).any(|i| self.layers[i].locked),
+            None => false,
+        }
     }
 
     /// Hand out the next free slice, recycling before growing.
@@ -2455,6 +2525,55 @@ impl LayerStack {
             masks: Vec::new(),
             slice_bytes,
         }
+    }
+
+    /// The shape the stack had **before** the entry `made` was added, derived
+    /// from the stack as it stands now.
+    ///
+    /// [`LayerStack::shape`]'s twin for one caller: a text placement, which adds
+    /// its layer when the artist presses Place and records the entry when the
+    /// float is put down, several seconds and a whole drag later. The obvious
+    /// spelling is to snapshot `shape` at the add and carry it to the commit,
+    /// which is what [`LayerStack::add`]'s own caller does — and it would be
+    /// carrying a **stale** description of a stack the gesture had time to
+    /// change. Deriving it at the commit cannot be stale, because it is read off
+    /// what is there.
+    ///
+    /// `was_active` is the entry that was selected before the add, by id, so an
+    /// undo puts the selection back where the artist left it rather than on
+    /// whatever happens to sit where the text layer was. An id no longer in the
+    /// stack is harmless: [`LayerStack::restore_shape`] falls back on the first
+    /// row, which is what an unknown id has always meant there.
+    ///
+    /// `None` where `made` is not in the stack. That is not a state any live
+    /// path produces — every route that removes an entry commits the float
+    /// first — and answering it rather than asserting is what keeps a caller
+    /// that reached it recording an ordinary pixel entry instead of a shape
+    /// naming an entry that is gone, which [`LayerStack::restore_shape`] would
+    /// refuse whole.
+    pub fn shape_before_add(
+        &self,
+        made: u32,
+        was_active: u32,
+        slice_bytes: u64,
+    ) -> Option<StackShape> {
+        if !self.layers.iter().any(|l| l.id == made) {
+            return None;
+        }
+        Some(StackShape {
+            entries: self
+                .layers
+                .iter()
+                .filter(|l| l.id != made)
+                .map(|l| ShapeEntry::Kept {
+                    id: l.id,
+                    depth: l.depth,
+                })
+                .collect(),
+            active: was_active,
+            masks: Vec::new(),
+            slice_bytes,
+        })
     }
 
     /// The same, also recording the mask the entry at `index` has now.

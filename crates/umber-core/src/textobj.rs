@@ -833,6 +833,79 @@ fn clean_name(name: &str) -> String {
     out.trim().to_string()
 }
 
+/// The longest a layer named after its own text may be, in characters.
+///
+/// Characters and not bytes, unlike [`MAX_NAME_BYTES`], because this one is
+/// about how wide a row reads rather than about how much of a stranger's file to
+/// trust: a layer row is a fixed column, and what decides whether a name fits is
+/// how many letters are in it.
+///
+/// Twenty-four is a little past what `metrics::PANEL`'s layer row can draw, so a
+/// name egui has to truncate is one that was genuinely long rather than one this
+/// cut too fine.
+pub const MAX_LAYER_NAME_CHARS: usize = 24;
+
+/// What to call a layer made to hold a piece of text.
+///
+/// The first line with anything on it, whitespace collapsed, cut to
+/// [`MAX_LAYER_NAME_CHARS`] at a word boundary where there is one. So a caption
+/// reading "Chapter One" names its layer "Chapter One", which is the whole point:
+/// six captions filed as "Layer 4" through "Layer 9" is a stack nobody can read,
+/// and it is the reason placing text on its own layer is worth anything.
+///
+/// **Nothing marks a name that was cut, and that is decided rather than
+/// skipped.** The obvious mark is an ellipsis and Archivo carries no `…`; three
+/// full stops would be a mark inside somebody's layer *name*, which travels into
+/// the `.ora` and out to every other application that opens it. A name is not a
+/// readout, so it says less rather than announcing that it was shortened, and
+/// the whole string is on screen in the Text panel the moment the layer is
+/// selected.
+///
+/// It is a rule and therefore lives here rather than in the panel that calls it:
+/// testable with no window, exactly as `Clip::place` and `CanvasCopy::plan` are.
+///
+/// Total by construction. Text that is empty, all whitespace, or all control
+/// characters comes back as "Text". A placement of nothing is refused long
+/// before this, so the fallback is what stops this function having a second
+/// answer every caller would have to handle.
+pub fn layer_name(text: &str) -> String {
+    let line = text
+        .lines()
+        .find(|l| l.split_whitespace().next().is_some())
+        .unwrap_or_default();
+    // Collapsed rather than trimmed: a caption set with a tab between two words
+    // would otherwise carry the tab into `stack.xml`, and the run of spaces
+    // somebody used to indent a line is not part of what the line says.
+    let mut out = String::new();
+    for word in line.split_whitespace() {
+        let sep = usize::from(!out.is_empty());
+        if out.chars().count() + sep + word.chars().count() > MAX_LAYER_NAME_CHARS {
+            // The first word alone may be longer than the whole budget, and then
+            // there is no word boundary to cut at. A hard cut on a **character**
+            // boundary is the only answer left; slicing at a byte would panic in
+            // the middle of a multi-byte character, which is `clean_name`'s trap
+            // in its other form.
+            if out.is_empty() {
+                out.extend(word.chars().take(MAX_LAYER_NAME_CHARS));
+            }
+            break;
+        }
+        if sep == 1 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    // A control character is not whitespace, so a line made only of them
+    // survives `split_whitespace` and would name the layer with something no
+    // panel can draw. The same reading `clean_name` makes.
+    let out: String = out.chars().filter(|c| !c.is_control()).collect();
+    if out.is_empty() {
+        "Text".to_string()
+    } else {
+        out
+    }
+}
+
 fn rect_array(rect: PixelRect) -> [u32; 4] {
     [rect.x, rect.y, rect.width, rect.height]
 }
