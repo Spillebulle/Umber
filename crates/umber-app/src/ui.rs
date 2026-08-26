@@ -442,6 +442,36 @@ const ANT_DASH: f32 = 4.0;
 /// which is the whole point of the animation.
 const ANT_SPEED: f32 = 2.0 * ANT_DASH;
 
+/// The outline's width, in points, on a display at `pixels_per_point`.
+///
+/// **A whole number of device pixels, never one point.** egui already snaps an
+/// axis-aligned line's *position* to the pixel grid — `tessellate_line_segment`
+/// does it, and the dashes are `Shape::LineSegment`s so they get it too — but it
+/// can only snap what it is given, and a one-point stroke on a display at 150%
+/// is one and a half device pixels. epaint draws a line that wide as a ridge
+/// whose fully opaque core is half a pixel across, straddling a pixel boundary,
+/// so no pixel centre is ever fully covered: the ants come out two device pixels
+/// wide at three quarters opacity each. That is the whole of "feathered and
+/// washed out", and it is invisible on the machines where anybody would look for
+/// it — measured over white paper, the darkest pixel of the dark half is 0 at
+/// 100% and at 200% scaling, and 64 at 150%.
+///
+/// Rounding the *width* to whole device pixels puts the opaque core back on a
+/// pixel centre at every scale, because epaint then rounds the position to a
+/// centre for an odd count and to a boundary for an even one, and the two agree.
+/// It changes nothing at 100% or 200%, where one point already is a whole number
+/// of pixels; at 125% it is a crisp single pixel where it was a soft one and a
+/// quarter.
+///
+/// It is asked of the *context* and not of `Editor::pixels_per_point`, which is
+/// written after the frame that used it and so is one frame stale — a marquee a
+/// frame behind the scale is exactly the soft line this exists to prevent, on
+/// the frame somebody drags Umber onto their second monitor.
+fn ant_width(pixels_per_point: f32) -> f32 {
+    let ppp = pixels_per_point.max(1e-3);
+    ppp.round().max(1.0) / ppp
+}
+
 /// How often a frame is asked for while a selection is on screen.
 ///
 /// **This is the cost of the animation and it is the only thing paid for it.**
@@ -513,6 +543,9 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
     // Clipped to the canvas region: a selection scrolled under a panel must
     // not draw its outline across it.
     let painter = ui.painter().with_clip_rect(rect);
+    // See `ant_width`: one *point* is a soft, two-pixel line on any display
+    // whose scale is not a whole number, which is most laptops sold.
+    let width = ant_width(ui.ctx().pixels_per_point());
     // Field by field, so the buffers can be borrowed while the selection and
     // the draft are read. They are the editor's for the reason given there:
     // this path now runs several times a second for as long as the document is
@@ -537,12 +570,12 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         // Segment by segment rather than one `Shape::line`, which would want
         // the points by value and so a copy of them per ring per frame.
         for pair in screen.windows(2) {
-            painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.accent_underlay()));
+            painter.line_segment([pair[0], pair[1]], Stroke::new(width, p.accent_underlay()));
         }
         dashes.clear();
         egui::Shape::dashed_line_many_with_offset(
             screen,
-            Stroke::new(1.0, p.accent),
+            Stroke::new(width, p.accent),
             &[ANT_DASH],
             &[ANT_DASH],
             phase,
@@ -1324,13 +1357,15 @@ fn aiming_cursor(ui: &egui::Ui, ed: &Editor) {
 /// guard has to measure the shape that is drawn, so the rim is a figure of that
 /// module's rather than a number here.
 ///
-/// The cells are clipped to the circle *conservatively*, per row, so the grid
-/// never pokes past the ring; whatever gap that leaves shows the rim, which is
-/// why the rim is drawn first and is a whole surface colour rather than a
-/// hairline. A consequence worth stating rather than discovering: the grid is
-/// square and the window is round, so the outermost row, column and corners of
-/// the block are read and not shown. The block is that wide because a `BitBlt`
-/// of it costs what one pixel costs, not because every texel is on screen.
+/// The picture inside it is drawn to fill the disc and is then *covered* at the
+/// edge by the rim, so the boundary the eye sees is the rim's own feathered
+/// inner edge rather than the corner of whichever texel got there last. See
+/// [`loupe_cells`] and [`loupe_glass`]; before that it was a staircase of
+/// six-point steps, which is what a grid clipped cell by cell to a circle looks
+/// like. A consequence worth stating rather than discovering: the block is
+/// square and the window is round, so its corners are read and not shown. The
+/// block is that wide because a `BitBlt` of it costs what one pixel costs, not
+/// because every texel is on screen.
 fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
     let Some(seen) = ed.loupe.as_ref() else {
         return;
@@ -1362,14 +1397,19 @@ fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
         egui::Id::new("umber-loupe"),
     ));
 
+    // The body, under everything. It is what shows through where a texel could
+    // not be read, and its own edge is what gives the silhouette its
+    // antialiasing: a mesh has none, so the rim's shading above is laid over a
+    // feathered disc of the same colour rather than being asked to be the
+    // outline itself.
     painter.circle_filled(centre, loupe::OUTER, p.popover);
 
     let taken = seen.taken.map(|c| {
         let [r, g, b, _] = c.to_srgb_u8();
         egui::Color32::from_rgb(r, g, b)
     });
-    match seen.patch.as_ref() {
-        Some(patch) => loupe_cells(&painter, p, patch, centre, taken),
+    let mark = match seen.patch.as_ref() {
+        Some(patch) => loupe_cells(&painter, patch, centre, taken),
         // Only the one pixel could be read, so it is shown large rather than
         // magnified into a grid it never had. The alternative — a fake
         // neighbourhood — is the one thing this control may not do.
@@ -1377,28 +1417,273 @@ fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
             if let Some(fill) = taken {
                 painter.circle_filled(centre, loupe::RADIUS, fill);
             }
+            None
         }
-    }
+    };
 
-    // The ring last, over the cells, so the conservative clipping above cannot
-    // leave a stepped edge standing proud of it.
-    painter.circle_stroke(
-        centre,
-        loupe::OUTER - loupe::RIM * 0.5,
-        Stroke::new(1.0, p.popover_border),
-    );
+    loupe_glass(&painter, p, centre);
+
+    if let Some(rect) = mark {
+        // Over the glass rather than under it, because this is the one mark
+        // here that is aimed by rather than looked at, and the thickness wash
+        // would dim it. It sits in the middle of the disc where that wash is
+        // nothing anyway, so the order costs the look nothing either.
+        //
+        // Derived from the colour it sits on, so it reads on a white swatch and
+        // on a black one — the rule `theme::contrast` exists for, and the only
+        // way a fixed ink could work here would be if the loupe were never
+        // aimed at the theme's own extremes, which is exactly what it is for.
+        let on = taken.unwrap_or(p.popover);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.5, contrast::ink_on(on, Ink::Strong)),
+            egui::StrokeKind::Outside,
+        );
+    }
 }
 
-/// The grid inside the circle, and the mark on the cell a release would take.
+/// How many segments the lens and its rim are built from.
+///
+/// The bands are meshes, so nothing in them is antialiased by egui and this
+/// figure *is* the smoothness of every arc in the loupe. Ninety-six is under
+/// three points a segment at [`loupe::OUTER`], which is a fraction of a device
+/// pixel of sag at any scale a window runs at, and it is a few hundred
+/// triangles on the one frame in a session where somebody is picking a colour.
+const GLASS_SEGMENTS: usize = 96;
+
+/// Where the light falls on the lens, as an angle in the painter's y-down frame.
+///
+/// Up and to the left, which is where this design lights everything raised
+/// from. **Fixed rather than following the pointer**: a highlight that swung
+/// round as the hand moved would read as the picture sliding about under the
+/// glass rather than as a lens being carried over it.
+const GLASS_LIGHT: f32 = -3.0 * std::f32::consts::FRAC_PI_4;
+
+/// How dark the glass goes at its own edge, as a fraction of [`contrast::SHADE`].
+///
+/// This is the thickness of the lens: there is more glass to look through at the
+/// perimeter than at the middle. It has to stay low, because what is under it is
+/// the picture somebody is picking a colour out of — the wash reaches the outer
+/// texels and not the middle one, which is the one a release takes.
+const GLASS_THICKNESS: f32 = 0.17;
+
+/// The hairline the boundary catches: all the way round, facing the light, and
+/// on the far side.
+///
+/// Never zero on the away side: a real edge picks up something all the way
+/// round, and a highlight that stopped dead halfway would draw a seam across the
+/// lens instead of turning it.
+///
+/// **The third figure is what tells glass from plastic.** Light entering the top
+/// left of a lens leaves at the bottom right, so a real one is bright on the
+/// side *away* from the source as well as towards it — a single highlight with a
+/// dead opposite edge is how a moulded button reads. It is tighter than the main
+/// lobe as well as weaker, which is why they are raised to different powers in
+/// [`loupe_glass`].
+const GLASS_EDGE: (f32, f32, f32) = (0.10, 0.60, 0.38);
+
+/// How wide that hairline is, in points.
+const GLASS_EDGE_WIDTH: f32 = 2.2;
+
+/// How hard the rim turns from the light, at its inner edge, its middle and its
+/// outer edge.
+///
+/// Peaked in the middle, which is what makes it read as a bead rather than as a
+/// bevel: a band brightest against the picture is a chamfer, and one brightest
+/// in the middle is round.
+const GLASS_RIM: (f32, f32, f32) = (0.22, 0.66, 0.30);
+
+/// How far past [`loupe::OUTER`] the rim's shading fades out, in points.
+///
+/// A mesh has no feathering of its own, so without this the shading would stop
+/// at a polygon edge and put a stepped silhouette back on the one shape the body
+/// disc underneath is antialiased for. Half a point is under a device pixel
+/// everywhere and is enough to hand the edge back to the disc.
+const GLASS_FADE: f32 = 0.5;
+
+/// A band of triangles between a run of radii, coloured per corner.
+///
+/// The one shape the lens needs that a `Painter` has no method for: every part
+/// of it is a gradient across a band, and egui's circles and strokes are flat. A
+/// mesh also lets two bands abut with no seam, which two feathered fills laid
+/// against each other cannot — the same reason the cells below are `rect_filled`
+/// rather than polygons clipped to the circle.
+///
+/// `at(angle, stop)` is asked for every corner, so one call carries both the
+/// sweep of the highlight around the rim and the falloff across it.
+fn glass_band(
+    centre: egui::Pos2,
+    radii: &[f32],
+    at: impl Fn(f32, usize) -> egui::Color32,
+) -> egui::Shape {
+    let stops = radii.len();
+    let mut mesh = egui::Mesh::default();
+    mesh.reserve_vertices(stops * (GLASS_SEGMENTS + 1));
+    mesh.reserve_triangles(2 * (stops - 1) * GLASS_SEGMENTS);
+    for i in 0..=GLASS_SEGMENTS {
+        let angle = i as f32 / GLASS_SEGMENTS as f32 * std::f32::consts::TAU;
+        let (sin, cos) = angle.sin_cos();
+        for (stop, r) in radii.iter().enumerate() {
+            mesh.colored_vertex(centre + vec2(cos, sin) * *r, at(angle, stop));
+        }
+    }
+    for i in 0..GLASS_SEGMENTS as u32 {
+        let (here, next) = (i * stops as u32, (i + 1) * stops as u32);
+        for stop in 0..stops as u32 - 1 {
+            let (a, b) = (here + stop, next + stop);
+            mesh.add_triangle(a, b, a + 1);
+            mesh.add_triangle(b, b + 1, a + 1);
+        }
+    }
+    egui::Shape::Mesh(mesh.into())
+}
+
+/// One end of the lightness axis at a fraction of full.
+///
+/// Both ends rather than an ink chosen against a surface, because what the lens
+/// is drawn over is the artist's own picture — [`contrast::LIT`] carries the
+/// argument, which is `Palette::accent_underlay`'s landing the same way.
+fn glass_ink(lit: bool, strength: f32) -> egui::Color32 {
+    let c = if lit { contrast::LIT } else { contrast::SHADE };
+    let a = (strength.clamp(0.0, 1.0) * 255.0).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// The shading at a point on the rim facing `angle`, at `strength` of full.
+///
+/// The cosine of the angle to [`GLASS_LIGHT`] decides both which end of the axis
+/// is wanted and how much of it, which is Lambert's law for a bead lit from one
+/// side — so one number carries the highlight and the shadow opposite it, and
+/// the two cannot end up out of step. **Squared**, because a linear falloff
+/// reads as two flat halves with a seam down the middle, which is a painted ring
+/// rather than a turned surface.
+fn glass_facing(angle: f32, strength: f32) -> egui::Color32 {
+    let facing = (angle - GLASS_LIGHT).cos();
+    glass_ink(facing >= 0.0, facing * facing * strength)
+}
+
+/// The lens: what turns a grid of texels into something that reads as glass.
+///
+/// Four passes over the picture and the rim, and every one of them is a gradient
+/// rather than a line:
+///
+/// * **The thickness**, a wash of the dark end from the middle of the glass out
+///   to its edge. There is more glass to look through at the perimeter than at
+///   the centre, and a lens with no such falloff is a hole.
+/// * **The rim**, an opaque band in `popover` covering the cell overhang.
+/// * **The catch-light**, a hairline of the light end right at the boundary,
+///   brightest where the edge faces [`GLASS_LIGHT`]. This is the thing that says
+///   at a glance that there is a surface here.
+/// * **The rim's shading**, turning from the light end at the top left to the
+///   dark end at the bottom right, so the band reads as round.
+///
+/// **There is no black outline and deliberately no stroke of any kind that means
+/// one.** A hairline in `popover_border` used to be what separated the loupe
+/// from the canvas, and a hard dark ring is the one thing glass does not have;
+/// what separates it now is the rim's own shading, which is a surface rather
+/// than a border. The opaque band *is* drawn with `circle_stroke` — that is how
+/// egui spells a feathered annulus, and its inner feather is what antialiases
+/// the boundary of the picture — but nothing about it reads as a line.
+///
+/// **The magnification stays uniform to the very edge, and that is a refusal
+/// rather than an omission.** A real lens compresses what it shows at the
+/// perimeter. Copying that would make the outer cells narrower than the ones
+/// beside them while the block behind them is still read on a uniform grid, so a
+/// cell would stop standing for one screen pixel — which is the whole of what
+/// this control is aimed by. `loupe::CELLS`' own comment makes the same trade
+/// the other way: read more than is shown, never show more than was read.
+fn loupe_glass(painter: &egui::Painter, p: &Palette, centre: egui::Pos2) {
+    let (r, o) = (loupe::RADIUS, loupe::OUTER);
+
+    // The thickness. It starts well inside the boundary so the falloff is a
+    // gradient across half the lens rather than a ring somebody could point at,
+    // and it is bent at the middle stop rather than run straight: a linear ramp
+    // over that distance has a visible start, which is the ring this is trying
+    // not to be.
+    painter.add(glass_band(centre, &[r * 0.42, r * 0.78, r], |_, stop| {
+        let strength = match stop {
+            0 => 0.0,
+            1 => GLASS_THICKNESS * 0.22,
+            _ => GLASS_THICKNESS,
+        };
+        glass_ink(false, strength)
+    }));
+
+    // The rim, opaque, hiding the cell overhang. A `circle_stroke` rather than a
+    // mesh because epaint feathers a thick closed stroke on *both* edges, and
+    // the inner one is the boundary of the picture — the one edge in this whole
+    // control that has to be a smooth circle.
+    //
+    // **egui strokes a circle on the *outside* of its radius**, not centred on
+    // it: `tessellate_circle` calls `PathStroke::outside()`. So this band runs
+    // from `r` to `r + RIM` and the radius asked for is the boundary itself.
+    // Handing it the mid-radius, which is what a centred stroke would want, put
+    // the band at 37.5 to 46.5 and left the picture spilling four points past
+    // the lens.
+    painter.circle_stroke(centre, r, Stroke::new(o - r, p.popover));
+
+    // The catch-light, last of the things inside the glass, so it sits over the
+    // thickness rather than under it.
+    painter.add(glass_band(
+        centre,
+        &[r - GLASS_EDGE_WIDTH, r],
+        |angle, stop| {
+            if stop == 0 {
+                return glass_ink(true, 0.0);
+            }
+            let facing = (angle - GLASS_LIGHT).cos();
+            let towards = facing.max(0.0).powi(2);
+            let away = (-facing).max(0.0).powi(4);
+            glass_ink(
+                true,
+                GLASS_EDGE.0 + GLASS_EDGE.1 * towards + GLASS_EDGE.2 * away,
+            )
+        },
+    ));
+
+    // The rim's shading, peaked across the band and faded out past the
+    // silhouette so the edge pixel comes from the disc underneath.
+    painter.add(glass_band(
+        centre,
+        &[r, 0.5 * (r + o), o, o + GLASS_FADE],
+        |angle, stop| {
+            let strength = match stop {
+                0 => GLASS_RIM.0,
+                1 => GLASS_RIM.1,
+                2 => GLASS_RIM.2,
+                _ => 0.0,
+            };
+            glass_facing(angle, strength)
+        },
+    ));
+}
+
+/// The grid inside the circle, and where the mark on the cell a release would
+/// take belongs.
+///
+/// **The cells are clipped one whole cell past [`loupe::RADIUS`], not to it.**
+/// Clipping to the radius leaves the staircase *inside* the circle — the top row
+/// of a grid stepping by six points reaches nowhere near the top of the disc —
+/// and that is the stepped mosaic this used to draw. A generous clip covers the
+/// disc entirely and overhangs it by at most one cell, which [`loupe_glass`]'s
+/// opaque rim then hides. One cell is the exact figure rather than a margin:
+/// the worst gap between a staircase of that pitch and its own circle is
+/// `sqrt(R² + 2Rc − c²) − R`, which at eleven cells is 5.1 of the 6 available.
+/// The cells past the boundary are drawn and covered, which costs about forty
+/// more rectangles on a frame where somebody is picking a colour.
+///
+/// It returns the mark rather than drawing it, so [`loupe_overlay`] can put it
+/// over the glass. See there for why.
 fn loupe_cells(
     painter: &egui::Painter,
-    p: &Palette,
     patch: &loupe::Patch,
     centre: egui::Pos2,
     taken: Option<egui::Color32>,
-) {
+) -> Option<Rect> {
     let size = patch.size();
     let cell = 2.0 * loupe::RADIUS / size as f32;
+    let reach = loupe::RADIUS + loupe::CELL;
     let top_left = centre - vec2(loupe::RADIUS, loupe::RADIUS);
     let middle = patch.middle();
     let mut mark = None;
@@ -1408,13 +1693,14 @@ fn loupe_cells(
         let y1 = y0 + cell;
         // The row edge *further* from the centre, so the half-width is the
         // smaller of the two the row could claim and the cells stay strictly
-        // inside the circle. Reading it at the row's centre instead would let
-        // the top and bottom rows overhang the ring by half a cell.
+        // inside `reach`. Reading it at the row's centre instead would let the
+        // top and bottom rows overhang by half a cell more than the rim is
+        // wide, and the overhang would then show past it.
         let dy = (y0 - centre.y).abs().max((y1 - centre.y).abs());
-        if dy >= loupe::RADIUS {
+        if dy >= reach {
             continue;
         }
-        let half = (loupe::RADIUS * loupe::RADIUS - dy * dy).sqrt();
+        let half = (reach * reach - dy * dy).sqrt();
         for col in 0..size {
             let x0 = (top_left.x + col as f32 * cell).max(centre.x - half);
             let x1 = (top_left.x + (col + 1) as f32 * cell).min(centre.x + half);
@@ -1440,19 +1726,7 @@ fn loupe_cells(
         }
     }
 
-    if let Some(rect) = mark {
-        // Derived from the colour it sits on, so it reads on a white swatch and
-        // on a black one — the rule `theme::contrast` exists for, and the only
-        // way a fixed ink could work here would be if the loupe were never
-        // aimed at the theme's own extremes, which is exactly what it is for.
-        let on = taken.unwrap_or(p.popover);
-        painter.rect_stroke(
-            rect,
-            0.0,
-            Stroke::new(1.5, contrast::ink_on(on, Ink::Strong)),
-            egui::StrokeKind::Outside,
-        );
-    }
+    mark
 }
 
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
@@ -5362,7 +5636,9 @@ mod tests {
                 (egui::Color32::from_gray(128), "grey"),
                 (egui::Color32::BLACK, "black"),
             ] {
-                for ppp in [1.0f32, 2.0] {
+                // 1.5 is the case the reported softness lives in: a Windows
+                // display at 150%, which is what most laptops ship set to.
+                for ppp in [1.0f32, 1.5, 2.0] {
                     let mut ed =
                         editor_with_selection(doc, vec![rect_ring.clone(), blob.clone()], ppp);
                     ed.ui.theme = theme;

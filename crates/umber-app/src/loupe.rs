@@ -69,15 +69,31 @@ pub const CELLS: u32 = 11;
 /// The magnified grid's radius, in points.
 pub const RADIUS: f32 = 33.0;
 
-/// The band of surface colour around the grid, in points.
+/// The lens edge around the grid, in points.
 ///
 /// Here rather than in `ui::loupe_overlay` where it is painted, because
 /// [`place`] is handed [`OUTER`] and the guard has to measure the shape that is
 /// actually drawn. A rim that lived at the call site would make the clearance
-/// sweep three points optimistic about a circle it had never seen — which is
+/// sweep nine points optimistic about a circle it had never seen — which is
 /// the "measure the output, never restate the rule" failure this codebase
 /// records at four other call sites.
-pub const RIM: f32 = 3.0;
+///
+/// **It was three, and what widened it is that the rim is now a surface rather
+/// than a hairline.** `ui::loupe_glass` shades it from the light end of the
+/// axis at the top left to the dark end at the bottom right, which is what
+/// makes the thing read as a lens instead of as a disc with a border round it,
+/// and three points of that is a line pretending to be a bevel. It also has to
+/// be at least one [`CELL`] wide, because the grid is drawn a cell past
+/// [`RADIUS`] and this band is what hides the overhang — see `ui::loupe_cells`.
+pub const RIM: f32 = 9.0;
+
+/// One magnified texel, in points.
+///
+/// Named because three things need it and only one of them is the drawing: the
+/// grid steps by it, the clip that fills the disc is generous by exactly it,
+/// and [`RIM`] has to be at least it. A figure recomputed at each of those is
+/// three that have to agree.
+pub const CELL: f32 = 2.0 * RADIUS / CELLS as f32;
 
 /// What the loupe occupies: the grid plus its rim.
 pub const OUTER: f32 = RADIUS + RIM;
