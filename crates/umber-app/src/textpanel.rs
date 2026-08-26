@@ -669,21 +669,39 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     let refused = preview(ui, p, ed);
 
     ui.add_space(8.0);
+    own_layer_row(ui, p, ed, actions);
+    ui.add_space(4.0);
     if ed.text.editing.is_some() {
         edit_row(ui, p, ed, refused, actions);
+        // **Place is still offered here, and only because the switch is on.**
+        // With a layer of its own a placement does not touch the selected layer
+        // at all, so there is nothing for `begin_float` to refuse and Update is
+        // not doing this button's job — one sets *this* caption again, the other
+        // puts a second one down.
+        //
+        // Without it, placing a caption left the artist on the text layer they
+        // had just made with no way to place another but to go and select
+        // something else, and clearing the box to type the next one armed Update
+        // to overwrite the first. That is a trap this switch's own default
+        // created, so it is this switch that has to answer for it.
+        if ed.ui.text_own_layer {
+            ui.add_space(4.0);
+            place_row(ui, p, ed, refused, actions);
+        }
     } else {
         place_row(ui, p, ed, refused, actions);
     }
 }
 
-/// The two controls a **text layer** gets in place of Place.
+/// The two controls a **text layer** gets beside Place.
 ///
-/// Place is not drawn at all here rather than drawn disabled, which is the
-/// opposite call the style marks get and the same one a folder's missing
-/// opacity gets: there is something else in that place doing the job, so an
-/// extra dead button would be a control with nothing to say. `begin_float`
-/// still refuses a paste onto this layer, and says why — the gate catches the
-/// route that goes round the panel.
+/// With "On its own layer" off, Place is not drawn here at all rather than drawn
+/// disabled, which is the opposite call the style marks get and the same one a
+/// folder's missing opacity gets: `begin_float` genuinely refuses a paste onto a
+/// text layer, so a dead button would be a control with nothing to say. With the
+/// switch on there is no refusal to report — the placement makes its own layer —
+/// so the caller draws Place below these, and this comment is the whole of the
+/// difference between the two cases.
 fn edit_row(
     ui: &mut Ui,
     p: &Palette,
@@ -753,6 +771,34 @@ fn edit_row(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // **Place shares this line rather than taking one of its own**, and
+            // that is a measurement rather than a preference: a panel body is a
+            // `ScrollArea`, and at `metrics::PANEL`'s real height a fifth row put
+            // Place below the fold. The brush library's Edit mark being in the
+            // header is the same lesson — the first thing to scroll away is the
+            // last row of commands.
+            //
+            // It is offered at all only because the switch is on. With a layer of
+            // its own a placement does not touch this layer, so there is nothing
+            // for `begin_float` to refuse and Update is not doing this button's
+            // job: one sets *this* caption again, the other puts a second one
+            // down. Without it, placing a caption left the artist on the text
+            // layer they had just made with no way to place another but to go and
+            // select something else — and clearing the box to type the next one
+            // armed Update to overwrite the first. That trap is this switch's own
+            // default's doing, so it is the switch that has to answer for it.
+            if ed.ui.text_own_layer {
+                let place = place_state(
+                    Landing::of(ed),
+                    ed.text.block.text.trim().is_empty(),
+                    refused,
+                );
+                let response = controls::text_button(ui, p, "Place", true, place.enabled);
+                if response.clicked() {
+                    actions.place_text = true;
+                }
+                response.on_hover_text(place.tooltip.as_ref());
+            }
             // Gated on the lock like everything else that edits a layer. It
             // changes no pixel, and it changes what the file carries and what
             // may be painted here afterwards, which is what a lock is about.
@@ -1708,14 +1754,31 @@ fn place_row(
     refused: Option<TextError>,
     actions: &mut UiActions,
 ) {
-    // Read before the toggle is drawn, so the button and the switch describe the
-    // same frame: a toggle applied first would light Place on the strength of a
-    // layer this frame's readings say nothing about.
     let state = place_state(
         Landing::of(ed),
         ed.text.block.text.trim().is_empty(),
         refused,
     );
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let response = controls::text_button(ui, p, "Place", true, state.enabled);
+            if response.clicked() {
+                actions.place_text = true;
+            }
+            response.on_hover_text(state.tooltip.as_ref());
+        });
+    });
+}
+
+/// The switch that decides where the next placement lands.
+///
+/// **Drawn on every frame the module is open, including for a text layer**, and
+/// that is the rule the ticked-layers strip already keeps one panel along: a
+/// control that vanishes when you use it is one nobody can put back. It governs
+/// whether [`place_row`] is drawn at all below a text layer's own controls, so
+/// switching it off there takes the button away — and leaves this line, which is
+/// the way back.
+fn own_layer_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     let mut own = ed.ui.text_own_layer;
     let row = widgets::toggle_row(ui, p, "On its own layer", &mut own);
     if own != ed.ui.text_own_layer {
@@ -1729,15 +1792,6 @@ fn place_row(
          keeps text editable: Umber can only offer to set it again where it can \
          tell the words from the picture underneath.",
     );
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let response = controls::text_button(ui, p, "Place", true, state.enabled);
-            if response.clicked() {
-                actions.place_text = true;
-            }
-            response.on_hover_text(state.tooltip.as_ref());
-        });
-    });
 }
 
 /// Where a placement would land, and what stands in its way.
@@ -3394,13 +3448,18 @@ mod tests {
     }
 
     /// **The panel draws Update and Convert to paint for a text layer, and
-    /// Place for anything else** — one control in that place, never a dead
-    /// Place beside a live Update.
+    /// Place for anything else** — never a *dead* Place beside a live Update.
     ///
     /// Read off the shapes the real body emitted, because a test of
     /// `update_state` cannot see whether the row is drawn at all. That is the
     /// failure a critic found in this module before: the reading was right and
     /// the call site had been reverted.
+    ///
+    /// **The text-layer half is driven with the switch off**, which is the case
+    /// the "one control in that place" rule is actually about: with the switch
+    /// on there is no refusal for a dead Place to report, because the placement
+    /// makes its own layer and never touches this one. That case is
+    /// `a_text_layer_still_offers_place_when_the_next_one_gets_its_own_layer`.
     #[test]
     fn a_text_layer_gets_update_and_convert_where_an_ordinary_one_gets_place() {
         let ordinary = panel_text(|ed| ed.text.block.text = "Umber".to_string());
@@ -3409,6 +3468,7 @@ mod tests {
         assert!(!ordinary.contains("Convert to paint"), "{ordinary}");
 
         let text_layer = panel_text(|ed| {
+            ed.ui.text_own_layer = false;
             assert!(ed.layers.set_text(0, a_record("On the canvas")));
         });
         assert!(
@@ -3427,6 +3487,47 @@ mod tests {
         assert!(
             text_layer.contains("On the canvas"),
             "the panel drew a blank slate over a text layer: {text_layer}"
+        );
+    }
+
+    /// A second caption can be placed without leaving the first one's layer.
+    ///
+    /// **The trap this closes was made by the switch's own default.** Placing
+    /// text now selects the layer it made, so the panel is in editing mode
+    /// straight afterwards: with no Place there, the only way to put a second
+    /// caption down was to go and select some other layer, and clearing the box
+    /// to type the next one instead armed Update to overwrite the first. Both
+    /// halves are measured — that Place is drawn, and that Update is still there
+    /// beside it, because a Place that had replaced Update would have swapped
+    /// one missing command for another.
+    ///
+    /// The switch is what decides it, so the off case is asserted too rather
+    /// than described: with it off a placement really would land on this text
+    /// layer, which `begin_float` refuses, and the button is rightly absent.
+    #[test]
+    fn a_text_layer_still_offers_place_when_the_next_one_gets_its_own_layer() {
+        let on = panel_text(|ed| {
+            ed.ui.text_own_layer = true;
+            assert!(ed.layers.set_text(0, a_record("On the canvas")));
+        });
+        assert!(
+            on.contains("Place"),
+            "a second caption could not be placed without leaving this layer: {on}"
+        );
+        assert!(
+            on.contains("Update text"),
+            "Place replaced Update instead of joining it: {on}"
+        );
+        assert!(on.contains("On its own layer"), "the switch went: {on}");
+
+        let off = panel_text(|ed| {
+            ed.ui.text_own_layer = false;
+            assert!(ed.layers.set_text(0, a_record("On the canvas")));
+        });
+        assert!(!off.contains("Place"), "{off}");
+        assert!(
+            off.contains("On its own layer"),
+            "the switch that is the way back was drawn only while it was on: {off}"
         );
     }
 
@@ -3471,6 +3572,13 @@ mod tests {
         // refusal has to be readable under it with Place disabled. The sixth
         // names a family this machine does not have, which is the one notice
         // that is drawn between the pickers rather than under the preview.
+        //
+        // The seventh is a **text layer**, which is the one arrangement with
+        // four controls under the preview rather than one: Update, Colour in
+        // hand, Convert to paint, and Place below them. That is the column this
+        // panel is most likely to overrun, and it is a state no other shot
+        // reaches, because it needs a record on the layer rather than a block in
+        // the box.
         for (name, text, align, size, family) in [
             ("1-empty", "", Align::Left, 72.0, None),
             ("2-a-caption", "Umber", Align::Left, 72.0, None),
@@ -3502,6 +3610,7 @@ mod tests {
                 72.0,
                 Some("A Foundry Face Nobody Has"),
             ),
+            ("7-a-text-layer", "On the canvas", Align::Left, 72.0, None),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
@@ -3516,6 +3625,11 @@ mod tests {
             if let Some(family) = family {
                 ed.text.family = family.to_string();
             }
+            if name == "7-a-text-layer" {
+                // `sync_editing` loads the record into the box on the first
+                // frame, so what is typed above is only what the record carries.
+                assert!(ed.layers.set_text(0, a_record(text)));
+            }
             let palette = crate::theme::Palette::with_accent(ed.ui.theme, ed.ui.accent);
             let field = vec2(metrics::PANEL, 520.0);
             let rect = Rect::from_min_size(Pos2::ZERO, field);
@@ -3525,7 +3639,7 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 6 shots to {}", dir.display());
+        println!("wrote 7 shots to {}", dir.display());
     }
 
     /// The switch is on the panel, and the panel draws it.
@@ -3579,5 +3693,94 @@ mod tests {
             place_state(Landing::of(&ed), false, None).enabled,
             "the remedy the tooltip names does not work"
         );
+    }
+
+    /// Two buttons on one line of the Text panel do not touch.
+    ///
+    /// `brushlib`'s `no_two_buttons_in_the_library_browser_touch` is the same
+    /// guard for the same reason, and it is worth having twice: a text layer now
+    /// puts **four** commands on two lines, and a strip drawn with a bare
+    /// `with_layout` inherits whatever horizontal spacing the `Ui` above it
+    /// carries. The Text panel is not inside either of the two modals that set
+    /// that spacing to zero, which is why the rows here are still bare — this is
+    /// what would catch it if one ever were.
+    ///
+    /// **It measures the rectangles that were drawn.** Asserting that the panel
+    /// calls something would only agree with itself, which is the shape every
+    /// previous repair of this defect had.
+    #[test]
+    fn no_two_buttons_on_a_text_panel_line_touch() {
+        use crate::theme::metrics;
+        use egui::{Rect, pos2, vec2};
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                vec2(metrics::PANEL, 900.0),
+            )),
+            ..Default::default()
+        };
+        // Umber's own style, or this measures egui's spacing rather than the one
+        // the application draws with.
+        crate::theme::install_fonts(&ctx);
+        let palette = crate::theme::Palette::of(crate::theme::ThemeKind::Graphite);
+        crate::theme::apply(&ctx, &palette);
+
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        ed.ui.text_own_layer = true;
+        assert!(ed.layers.set_text(0, a_record("On the canvas")));
+
+        // Twice, for `panel_text`'s reason: a button is as wide as its label's
+        // galley and the first pass through a fresh context builds the atlas.
+        let mut rows: Vec<(f32, Vec<Rect>)> = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(input.clone(), |ui| {
+                let mut actions = UiActions::default();
+                panel(ui, &palette, &mut ed, &mut actions);
+            });
+            let mut found: Vec<Rect> = Vec::new();
+            for clipped in &out.shapes {
+                if let egui::Shape::Rect(rect) = &clipped.shape
+                    && (rect.rect.height() - metrics::TEXT_BUTTON).abs() < 0.5
+                    && !found.iter().any(|seen| {
+                        seen.min.distance(rect.rect.min) < 0.5
+                            && seen.max.distance(rect.rect.max) < 0.5
+                    })
+                {
+                    found.push(rect.rect);
+                }
+            }
+            rows.clear();
+            for rect in found {
+                match rows
+                    .iter_mut()
+                    .find(|(top, _)| (top - rect.top()).abs() < 1.0)
+                {
+                    Some((_, row)) => row.push(rect),
+                    None => rows.push((rect.top(), vec![rect])),
+                }
+            }
+        }
+
+        let pairs = rows.iter().filter(|(_, row)| row.len() > 1).count();
+        assert_eq!(
+            pairs, 2,
+            "a text layer draws Update beside Colour in hand and Convert beside \
+             Place; anything else means this measured the wrong panel"
+        );
+        for (top, row) in &mut rows {
+            row.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            for pair in row.windows(2) {
+                let gap = pair[1].left() - pair[0].right();
+                assert!(
+                    gap >= metrics::BUTTON_GAP - 0.5,
+                    "two buttons on the Text panel's line at y={top} are {gap} points \
+                     apart, where {} is the gap: they touch and read as one control",
+                    metrics::BUTTON_GAP
+                );
+            }
+        }
     }
 }
