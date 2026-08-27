@@ -425,6 +425,20 @@ pub(crate) fn release_finished_textures(
     }
 }
 
+/// What to say when the slot pool has nothing left for a text placement's layer.
+///
+/// One sentence, once, because it is raised from two arms of the same match and
+/// two copies of a notice is how the two come to read differently.
+fn no_slice_left() -> Notice {
+    Notice {
+        title: "There is no room for another layer".to_string(),
+        lines: vec![
+            "Umber has no texture slice left for one. Save and reopen the document              to pack them back down, though deleted layers cannot be brought back              afterwards."
+                .to_string(),
+        ],
+    }
+}
+
 impl UmberApp {
     /// Build the application around an event loop it can wake.
     ///
@@ -1717,11 +1731,30 @@ impl UmberApp {
     /// only giving the storage back — and, for a text placement that made a
     /// layer to land on, giving that back too.
     ///
-    /// **Escape stays free**, which is what the whole float design rests on: the
-    /// layer is empty until the commit writes into it, so taking it out again
-    /// puts the document exactly where it was. Nothing was recorded either, so
-    /// there is no entry to spend and none to clean up — which is why
-    /// [`Editor::unmake_layer`] drops the slice rather than parking it.
+    /// **Escape is free for a lift and a paste, and for a text placement it
+    /// costs the redo stack.** That distinction is worth stating rather than
+    /// glossing, because an earlier draft of this comment claimed the stronger
+    /// thing and it is not true. A lift and a paste record nothing until the
+    /// commit, so abandoning one really does put the document exactly where it
+    /// was. A placement records its entry when it *makes its layer* — it has to,
+    /// or a reorder in the middle of the gesture ends up above it on the undo
+    /// stack; see [`crate::editor::MadeLayer::entry_at`] — and
+    /// `History::record` drains the redo stack. [`Editor::unmake_layer`] pops
+    /// the entry again but cannot put redo back.
+    ///
+    /// So: undo a stroke, place a caption, press Escape, and the stroke can no
+    /// longer be redone. That is what *every* edit in Umber does to the redo
+    /// stack and a placement is an edit from the moment a layer appears; what
+    /// makes it worth a paragraph is only that this path looks like it changed
+    /// nothing. The way to give it back is to stop the reorder recording inside
+    /// the gesture at all — `App::record_move` could settle the float and the
+    /// Layers panel's drag could be collected into `UiActions` and settled here
+    /// — after which the entry can go back to the commit and Escape costs
+    /// nothing again. That is a change to two working call sites and it is not
+    /// made here.
+    ///
+    /// The layer itself is empty until the commit writes into it, which is why
+    /// [`Editor::unmake_layer`] drops its slice rather than parking it.
     fn cancel_transform(&mut self) -> bool {
         self.put_down_at = None;
         let Some(float) = self.editor.float.take() else {
@@ -2236,48 +2269,28 @@ impl UmberApp {
         if let Err(refused) = self.reserve_a_slice() {
             return Err(vram::slice_refused("a layer", &refused));
         }
-        let name = umber_core::textobj::layer_name(text);
-        let was_active = self
-            .editor
-            .layers
-            .get(self.editor.layers.active_index())
-            .map_or(0, |l| l.id());
-        // Before the add and after every refusal above, exactly as `add_layer`
-        // takes its own: a shape snapshotted before an add that then does not
-        // happen is an entry describing a change nobody made.
-        let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
-        let made = match self.editor.layers.add_named(&name) {
+        // **The model half, and the recording with it, is `Editor`'s.** Split
+        // there rather than written here so it can be driven with no window: a
+        // critic deleted the `record` call when it lived at this call site and
+        // all 856 tests stayed green, which is "a guard on a model is not a
+        // guard on the call site" with a crate boundary in the way.
+        let made = match self.editor.make_text_layer(text) {
             Some(made) => made,
             // A parked layer may be holding the last slice; give the oldest
             // entries up and try once more. Only the pool can be the reason by
-            // this point, because the other two refusals were answered above —
+            // this point, because the other two refusals were answered above -
             // `add_layer` states the same argument at length.
-            None if self.free_a_slot() => match self.editor.layers.add_named(&name) {
+            None if self.free_a_slot() => match self.editor.make_text_layer(text) {
                 Some(made) => made,
-                None => {
-                    return Err(Notice {
-                        title: "There is no room for another layer".to_string(),
-                        lines: vec![
-                            "Umber has no texture slice left for one. Save and reopen \
-                             the document to pack them back down, though deleted \
-                             layers cannot be brought back afterwards."
-                                .to_string(),
-                        ],
-                    });
-                }
+                None => return Err(no_slice_left()),
             },
-            None => {
-                return Err(Notice {
-                    title: "There is no room for another layer".to_string(),
-                    lines: vec![
-                        "Umber has no texture slice left for one. Save and reopen the \
-                         document to pack them back down, though deleted layers cannot \
-                         be brought back afterwards."
-                            .to_string(),
-                    ],
-                });
-            }
+            None => return Err(no_slice_left()),
         };
+        let slot = self
+            .editor
+            .layers
+            .get(self.editor.layers.active_index())
+            .and_then(umber_core::Layer::slot);
         let needed = self.editor.layers.slot_capacity_needed();
         let id = self.editor.session.active_id();
         if let Some(gfx) = self.gfx.as_mut()
@@ -2288,19 +2301,11 @@ impl UmberApp {
             // matters twice over: the commit decides whether to keep the record
             // by reading what the destination held, so a slice left dirty would
             // make a placement onto a brand new layer report itself as paint.
-            canvas.clear_layer(&gfx.gpu.queue, made.slot);
+            if let Some(slot) = slot {
+                canvas.clear_layer(&gfx.gpu.queue, slot);
+            }
         }
-        // **The placement's whole undo, recorded now.** See this function's docs
-        // for why it is here and not at the commit, and
-        // `crate::editor::MadeLayer::entry_at` for what the position buys.
-        self.editor
-            .history
-            .record(Edit::new(EditKind::AddLayer, before));
-        Ok(crate::editor::MadeLayer {
-            id: made.id,
-            was_active,
-            entry_at: self.editor.history.position(),
-        })
+        Ok(made)
     }
 
     /// Set the selected text layer again from what the Text panel is showing.
