@@ -385,14 +385,25 @@ impl Brush {
     /// The lightest flow the rails offer, and a bound on the *value* as well.
     ///
     /// A user-interface bound in the sense [`Brush::MAX_STABILIZATION`] is one,
-    /// and a pixel bound underneath it. At a mark of 1.0 a dab carries
-    /// `MIN_FLOW` straight into an `R8Unorm` scratch, so 0.01 is 2.55 levels of
-    /// 255: faint, and still a mark. The next decade down is not — 0.001 is a
-    /// quarter of a level, which the store rounds to nothing, and a *constant*
-    /// increment under half a level never moves the accumulator however many
-    /// dabs land on it. That is the invisible-stroke defect
+    /// and a pixel bound underneath it. **At a mark of 1.0** — which is what
+    /// [`Brush::coverage_at`] answers for any brush that does not ramp opacity
+    /// with pressure, and what 250 of the 258 shipped presets paint at — a dab
+    /// carries `MIN_FLOW` straight into an `R8Unorm` scratch, so 0.01 is 2.55
+    /// levels of 255: faint, and still a mark. The next decade down is not:
+    /// 0.001 is a quarter of a level, which the store rounds to nothing, and a
+    /// *constant* increment under half a level never moves the accumulator
+    /// however many dabs land on it. That is the invisible-stroke defect
     /// [`crate::tip::SCRATCH_LEVEL`] exists to bound, and a rail that reaches it
     /// is a control whose bottom end paints nothing at all.
+    ///
+    /// **The qualifier is load-bearing and the bound does not generalise past
+    /// it.** At a lower mark a dab carries `per_dab_for_stroke(mark, depth)`
+    /// times flow, and where that conversion has already floored — a faint
+    /// pressure ramp at a tight spacing — flow multiplies a pinned value and the
+    /// floor puts it straight back, so the whole rail produces one mark. That is
+    /// the eight-bit ceiling `a_dab_a_low_flow_thins_is_still_something_the_
+    /// scratch_can_hold` measures and states; no figure for `MIN_FLOW` avoids
+    /// it, because it is not a property of the bound.
     pub const MIN_FLOW: f32 = 0.01;
 
     /// [`Brush::flow`], bounded.
@@ -1057,7 +1068,7 @@ mod tests {
     /// The identity claim in the form that covers the whole library rather than
     /// one fixture. `Brush::builds` is what picks the dab pipeline and what the
     /// per-dab conversion asks, so a preset whose answer moved is a preset whose
-    /// every stroke now accumulates where it used to saturate — 252 marks
+    /// every stroke now accumulates where it used to saturate — 258 marks
     /// changed by a field nobody set.
     ///
     /// It reads `builds()` against `build_up` rather than asserting the flow

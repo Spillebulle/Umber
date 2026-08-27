@@ -652,7 +652,7 @@ fn a_stroke_crossing_itself_darkens_where_it_crosses_at_a_low_flow() {
 /// The same stroke at flow 1.0 is as even where it crosses itself as anywhere
 /// else.
 ///
-/// The identity half, and it is the half that guards the 252 shipped presets:
+/// The identity half, and it is the half that guards the 258 shipped presets:
 /// every one of them is at the default, so a flow that leaked onto the `max`
 /// path would darken every stroke in the library wherever it doubled back.
 /// `overlapping_dabs_do_not_compound` pins the same guarantee for bare dabs

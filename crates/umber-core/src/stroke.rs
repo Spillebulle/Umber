@@ -909,6 +909,76 @@ mod tests {
         }
     }
 
+    /// Flow moves the mark across its whole rail for an ordinary brush.
+    ///
+    /// The regime every shipped preset is in: a mark of 1.0, which is what
+    /// `coverage_at` answers for any brush that does not ramp opacity with
+    /// pressure, and which 250 of the 258 shipped presets paint at. Here the
+    /// conversion returns 1.0 unfloored, flow is what the dab carries outright,
+    /// and the rail is monotone end to end.
+    ///
+    /// Stated as *never lighter than the flow above it, and reaching many
+    /// distinct marks*, rather than as strictly decreasing. The first draft
+    /// asserted strict and failed at flow 0.75, correctly: at a tight spacing a
+    /// high flow still saturates within one pass, so the top of the rail is
+    /// legitimately flat and the travel is all underneath it. What must never
+    /// happen is the rail going flat *everywhere*, which is exactly what the
+    /// faint-mark case above loses and what this would catch.
+    ///
+    /// Each accumulation step is quantised to the scratch's own eight bits, or
+    /// this would be measuring exact arithmetic the canvas never performs.
+    #[test]
+    fn flow_moves_the_mark_across_its_whole_rail_for_an_ordinary_brush() {
+        let mut last = f32::INFINITY;
+        let mut seen = Vec::new();
+        for flow in [1.0, 0.75, 0.5, 0.25, 0.1, 0.05, Brush::MIN_FLOW] {
+            // The GPU pair's own fixture: wide enough that a pixel sees a
+            // handful of dabs rather than dozens, which is what leaves the rail
+            // somewhere to travel instead of saturating on the first pass.
+            let brush = Brush {
+                flow,
+                ..unsmoothed(8.0, 0.5)
+            };
+            assert_eq!(brush.coverage_at(1.0), 1.0, "the fixture must be solid");
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+            s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+            let dabs: Vec<Dab> = s.drain_pending().collect();
+            let cov = dabs[dabs.len() / 2].coverage;
+            let off = brush.off_heading(vec2(1.0, 0.0));
+            let depth = crate::tip::stack_depth(
+                brush.step_at(1.0, off),
+                brush.reach_at(1.0, off),
+                brush.hardness_at(1.0),
+                brush.radius_at(1.0),
+            );
+            let mut a = 0.0f32;
+            for _ in 0..(depth.round() as i32) {
+                a += cov * (1.0 - a);
+                a = (a * 255.0).round() / 255.0;
+            }
+            assert!(
+                a <= last,
+                "flow {flow} reached {a}, darker than the flow above it at \
+                 {last} — lowering flow must never lay down more"
+            );
+            last = a;
+            seen.push((a * 255.0).round() as u32);
+        }
+        seen.dedup();
+        assert!(
+            seen.len() >= 5,
+            "the rail produced only {} distinct marks ({seen:?}) — it has gone \
+             flat, which is a control that does nothing",
+            seen.len()
+        );
+        assert!(
+            last < 0.25,
+            "the bottom of the rail is still at {last}, so the sweep never \
+             showed flow doing anything"
+        );
+    }
+
     /// Flow scales what a dab carries and leaves the stroke's opacity alone.
     ///
     /// The two are different numbers and this is the guard that says so in the
@@ -1067,6 +1137,28 @@ mod tests {
     /// `tip::SCRATCH_LEVEL` exists to bound. Flow multiplies after the
     /// conversion, so it can push a dab back under that floor even though
     /// `per_dab_for_stroke` had already lifted it over.
+    ///
+    /// **This is a cap as well as a floor, and the cap is the more interesting
+    /// half.** A critic read the assertion below as a guarantee that flow works
+    /// at the faint end, and it is not one — it guarantees only that the stroke
+    /// is *there*. Where `per_dab_for_stroke` has already floored a dab, flow
+    /// multiplies a value that is pinned and the floor puts it straight back, so
+    /// the whole rail produces one mark. Measured through this very path, at
+    /// size 80 / spacing 0.02 / mark 0.05 every flow from 1.0 down to
+    /// `MIN_FLOW` emits the identical dab of 0.003922 and the identical stroke
+    /// of 39 levels; at 200 / 0.01 / 0.02 it is 78 levels throughout. At
+    /// 20 / 0.1 / 0.05 the rail works down to about 0.5 and is flat below it.
+    ///
+    /// That is not new and flow did not cause it: at flow 1.0 those two brushes
+    /// were *already* pinned at the floor, painting 39 and 78 levels where their
+    /// own curve asked for 12.8 and 5.1. It is `per_dab_for_stroke`'s documented
+    /// cap — "47 levels at 2% and 76 at 1%" — and what flow adds is only that a
+    /// control now points at it. The honest remedy is the wider scratch that
+    /// function already names, not a finer floor: halving it would halve the
+    /// threshold and not remove it.
+    ///
+    /// `flow_moves_the_mark_across_its_whole_rail_for_an_ordinary_brush` is the
+    /// other side, and is the regime every shipped preset is in.
     ///
     /// A tight spacing and a faint mark, which is where the conversion divides
     /// the mark down hardest, and then the lowest flow the rail offers on top.

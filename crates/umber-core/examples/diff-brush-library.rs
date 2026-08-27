@@ -128,6 +128,7 @@ fn differences(a: &Brush, b: &Brush) -> Vec<&'static str> {
         min_size_ratio,
         hardness,
         opacity,
+        flow,
         spacing,
         min_hardness_ratio,
         stabilization,

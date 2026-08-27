@@ -600,6 +600,7 @@ of them are:
 | `grain`, `grain_scale` | all but 6 | 6, all Krita presets whose texture is a plain Multiply | see "The paper texture" under the Krita reader |
 | `grain_pattern` | every one | none, and it cannot be otherwise: an import names its own tile through `BrushPreset::paper`, which overrides the enum | the enum is the *shipped* set, and an imported paper is never one of them |
 | `build_up` | 222 | none, and this row used to be 232/1 | see below |
+| `flow` | every one | none | added after this survey; every shipped preset is at the identity of 1.0 |
 | `stroke_span` | 166 | 37 read the `Stroke` input | 27 carry a span nothing reads; the editor draws it dead |
 | `stabilization` | 26 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
 
@@ -1674,12 +1675,56 @@ however long the stroke is.
 `a = cov + a(1 − cov)`, which is one dab compositing over the last. Five things
 about it:
 
+> **Since this section was written, `build_up` is no longer the only thing that
+> selects that blend.** `Brush::flow` below 1.0 selects it too, and the one
+> statement of the question is now `Brush::builds`, which is the `||` of the
+> two. Everything below still holds — it is still a blend-state change, nothing
+> downstream still sees it, and opacity is still applied exactly once — but read
+> "`build_up`" in the five points as "`builds()`". See "Flow" below.
+
 - **It is a blend-state change and nothing else.** The dab shader is byte for
   byte what it was, so the two paths cannot drift into stamping different
   shapes. That is the lesson the paint-versus-erase note in `CLAUDE.md` records.
 - **Nothing downstream sees it.** The scratch still holds coverage in 0..1, so
   `composite.wgsl` and `commit.wgsl` are untouched and `Brush::opacity` is still
   applied exactly once, at commit.
+
+### Flow
+
+`Brush::flow` is what one dab lays down, as a fraction of the mark the stroke
+builds to. Photoshop calls it Flow and Krita calls it the build-up painting
+mode. Below 1.0 a stroke arrives at its mark over several dabs instead of
+reaching it with the first, so it darkens where it crosses itself.
+
+It is **not** `Brush::opacity` and the two are different numbers on purpose.
+Opacity caps the finished stroke and is applied exactly once, at commit, over
+coverage the dab pass has already saturated. Flow is a statement about one dab
+and never reaches the commit at all. Halving opacity halves the finished stroke
+everywhere; halving flow leaves a well-travelled stroke at full strength and
+thins only its thin ends and its first few dabs.
+
+Four things about it:
+
+- **1.0 is the exact identity**, and it is checked against a build that has no
+  flow field in it rather than against this one. `stroke.rs`'s
+  `COVERAGE_BEFORE_FLOW` holds 120 figures produced at `d0efaa3`.
+- **It scales the converted per-dab figure, not the mark.** `per_dab_for_stroke`
+  answers "what must one dab carry for the stroke to arrive at `mark`"; flow is
+  the artist declining that answer and asking for less. Folded into the mark
+  instead it would be a second opacity, and the two are distinguishable: on the
+  dab a single pass reaches `1 − (1 − flow)^depth` and follows the spacing, on
+  the mark it reaches `flow` whatever the spacing.
+- **Below 1.0 it selects the accumulating blend.** Under the `max` a uniform
+  per-dab scale is not flow at all, because `max` is idempotent: every dab
+  writing `flow` caps the stroke at `flow` and the mark comes out uniformly
+  fainter and just as flat.
+- **There is an eight-bit ceiling on it, and it is not new.** Where
+  `per_dab_for_stroke` has already floored a dab at one level of the `R8Unorm`
+  scratch — a faint pressure ramp at a tight spacing — flow multiplies a pinned
+  value and the floor puts it straight back, so the whole rail produces one
+  mark. That is the cap this document already quotes for build-up (47 levels at
+  2% spacing, 76 at 1%); what flow adds is that a control now points at it. The
+  remedy is the wider scratch, not a finer floor.
   `a_building_stroke_still_applies_its_opacity_exactly_once` pins that.
 - **The `max` path is untouched.** It is the default, every pre-existing GPU
   test passes unchanged, and `build_up_leaves_the_max_path_alone` says so

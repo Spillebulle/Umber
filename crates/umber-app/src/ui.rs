@@ -1965,10 +1965,20 @@ mod strip_budget {
     /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn`.
     pub const STABILISER: f32 = 190.0;
     /// The flow rail: what one dab lays down, as against `OPACITY`, which
-    /// caps the finished stroke. A fourth `inline_slider` and costed as one —
-    /// the 90 point rail, the field reserving its widest figure ("100"), and a
-    /// label three characters *shorter* than "Opacity"'s, which is where the
-    /// difference from that constant comes from.
+    /// caps the finished stroke. A fourth `inline_slider` — the 90 point rail,
+    /// the field reserving its widest figure ("100"), and a label three
+    /// characters shorter than "Opacity"'s.
+    ///
+    /// **Bisected against the guard rather than derived**, which is what the
+    /// derivation was worth: the first figure here was 175, reasoned from
+    /// `OPACITY` less ten points for three fewer characters, and that
+    /// disagreed with `STABILISER`'s own reasoning (five points for three
+    /// *more*) in the same breath. Measured,
+    /// `every_rail_on_the_strip_fits_the_budget_that_lets_it_be_drawn` fails at
+    /// 140 and passes at 145, so what the rail needs is in `(140, 145]`. 150
+    /// is that with a font metric's worth of room on top — the margin a
+    /// glyph-width change moves by — and 175 was simply thirty points of
+    /// nothing, dropping the rail earlier than it had to on a narrow window.
     ///
     /// **It is drawn last and therefore dropped first**, which is a claim
     /// about what a painter is stuck without rather than about what matters.
@@ -1976,7 +1986,7 @@ mod strip_budget {
     /// setting adjusted *while* a line is being drawn. Flow is a statement
     /// about the brush's character, so it is the one of the four that can
     /// wait for the brush editor on a narrow window.
-    pub const FLOW: f32 = 175.0;
+    pub const FLOW: f32 = 150.0;
     /// The line naming the modifiers that add to, subtract from and intersect a
     /// selection, and say what the feather applies to.
     pub const COMBINE: f32 = 320.0;
@@ -3500,10 +3510,23 @@ fn brush_editor_texture(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
 
     widgets::toggle_row(ui, p, "Build up", &mut ed.brush.build_up);
+    // **The mark is already accumulating whenever flow is under 1.0**, because
+    // `Brush::builds` is an `||` over the two and nothing downstream reads
+    // `build_up` on its own. So the toggle genuinely does nothing here, and the
+    // "off" sentence below — which says a stroke is as even where it crosses
+    // itself as anywhere else — would be flatly contradicted by the Flow caption
+    // two rows up on the same screen. The toggle stays *live* rather than being
+    // disabled: it is still the field that will be saved, and it is what the
+    // brush goes back to accumulating by if flow is returned to 1.0. What
+    // changes is the sentence, which is the part that was lying.
     caption(
         ui,
         p,
-        if ed.brush.build_up {
+        if ed.brush.flow < 1.0 {
+            "Flow is already below 100%, so this brush accumulates whichever \
+             way this is set. It decides what happens when flow goes back to \
+             100%."
+        } else if ed.brush.build_up {
             "Each dab composites over the last, so a stroke deepens where it \
              overlaps itself and a faint stamp builds to solid. This is how \
              GIMP and Krita paint, and what a texture stamp needs."
