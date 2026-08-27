@@ -40,12 +40,17 @@
 //!
 //! Sampled on a grid rather than integrated, because the dabs overlap and
 //! scatter and there is no closed form for the union of a few hundred
-//! ellipses. Two things it cannot see, and both make it an **upper** bound on
-//! the change rather than a soft one: a bitmap tip's own mask is not applied,
-//! so a stamp brush is measured as the whole ellipse its stamp is stretched
-//! over; and the scatter RNG is a single stream, so two strokes with different
-//! dab counts draw different random numbers and a scattering brush's figure
-//! carries a few per cent of sampling noise in either direction.
+//! ellipses. Two things the **ink** figure cannot see, and both make it an
+//! upper bound on the change rather than a soft one: a bitmap tip's own mask is
+//! not applied, so a stamp brush is measured as the whole ellipse its stamp is
+//! stretched over and `u.tip_scale` is not applied to that ellipse either; and
+//! the scatter RNG is a single stream, so two strokes with different dab counts
+//! draw different random numbers and a scattering brush's figure carries a few
+//! per cent of sampling noise in either direction.
+//!
+//! The **fill** figure does apply `tip_scale`, because it is a count of
+//! fragments rather than of ground covered and 23 of the 25 shipped tips are
+//! non-square — leaving it out reported `gdquest-cloud-builder` 8 % heavy.
 
 use glam::Vec2;
 use umber_core::brush::Brush;
@@ -73,11 +78,23 @@ const SAMPLE_HZ: f64 = 120.0;
 /// The frame the per-frame figures are per.
 const FRAME_HZ: f32 = 60.0;
 
-/// Grid spacing for the area sample, as a fraction of the brush's radius.
+/// Grid spacing for the area sample, as a fraction of a dab's semi-axis.
 ///
-/// A twelfth of the radius puts about 24 samples across a dab, which settles
-/// the union area to well inside the one per cent the conclusions here turn on.
+/// A twelfth of it puts about 24 samples across the dab. Taken from the
+/// **short** semi-axis of the dabs actually emitted rather than from
+/// `Brush::size`, which was the first reading and was wrong for every chisel:
+/// on a 20:1 nib a twelfth of the long radius is one sample across the short
+/// axis, and the two rows the argument leans on hardest — `tanda/texture-06`
+/// and `ramon/rs-blendop` — were both in that group.
+///
+/// Bounded at [`FINEST_STEP`] of the long radius, because resolving the short
+/// axis of a 20:1 dab unbounded is 400 times the cells. At that bound a
+/// four-times-finer grid moves the mean ink by 0.001 and the worst row by 0.03,
+/// which is what says the conclusions do not turn on it.
 const SAMPLE_STEP: f32 = 1.0 / 12.0;
+
+/// How much finer than [`SAMPLE_STEP`] of the long radius the grid may go.
+const FINEST_STEP: f32 = 1.0 / 48.0;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -157,6 +174,20 @@ fn main() {
     );
     let mean = rows.iter().map(|r| r.ink_ratio).sum::<f32>() / rows.len() as f32;
     println!("mean ink multiplier: {mean:.3}x");
+    // Printed rather than left to be eyeballed off the table, because a figure
+    // transcribed out of a listing is a figure that gets quoted wrongly — this
+    // one already was, as the count of a different group entirely.
+    for within in [0.05, 0.10] {
+        let n = rows
+            .iter()
+            .filter(|r| (r.ink_ratio - 1.0).abs() <= within)
+            .count();
+        println!(
+            "  {n} of {} lay within {:.0}% of the ink they laid before",
+            rows.len(),
+            within * 100.0
+        );
+    }
 
     // The split a scatter-based exemption would have been drawn on, printed so
     // that `build-brush-library.rs`'s refusal of one can be re-argued from
@@ -225,7 +256,7 @@ fn measure(was: &Brush, now: &BrushPreset) -> Row {
         dab_ratio: after.len() as f32 / before.len().max(1) as f32,
         ink_ratio: ink_after / ink_before.max(1e-6),
         dabs_per_frame,
-        fill_per_frame: dabs_per_frame * mean_quad_area(&after),
+        fill_per_frame: dabs_per_frame * mean_quad_area(&after, tip_scale(now)),
     }
 }
 
@@ -233,7 +264,10 @@ fn measure(was: &Brush, now: &BrushPreset) -> Row {
 ///
 /// Straight because the question is about spacing along a line: a curve would
 /// bring the heading into it, which `Brush::step_at` already has its own tests
-/// for. Full pressure because that is where `Brush::size` is stated.
+/// for. Full pressure because it is one end of the range and the same end for
+/// both sides of the comparison — **not** because it is where `Brush::size` is
+/// stated, which is only true of a brush whose size curve rises: `rs-blendop`'s
+/// descends, so `radius_at(1.0)` is 43 % of its `size`.
 fn lay_a_stroke(brush: &Brush) -> Vec<Dab> {
     let length = brush.size * STROKE_DIAMETERS;
     let mut builder = StrokeBuilder::new();
@@ -263,17 +297,32 @@ fn lay_a_stroke(brush: &Brush) -> Vec<Dab> {
 ///
 /// The quad and not the ellipse inside it: the dab pass rasterises a quad and
 /// discards nothing, so every fragment in it is shaded whether or not the
-/// falloff leaves it at zero. The vertex shader gives the quad the dab's own
-/// proportions, so it is `2r` by `2r / aspect`.
-fn mean_quad_area(dabs: &[Dab]) -> f32 {
+/// falloff leaves it at zero. The vertex shader scales the corner by the dab's
+/// radius, its short semi-axis and `u.tip_scale`, so the quad is `2r * tsx` by
+/// `(2r / aspect) * tsy` — and `tip_scale` is not 1 for 23 of the 25 shipped
+/// tips, which is why it is a parameter here rather than an assumption.
+fn mean_quad_area(dabs: &[Dab], tip_scale: (f32, f32)) -> f32 {
     if dabs.is_empty() {
         return 0.0;
     }
     let total: f32 = dabs
         .iter()
-        .map(|d| 4.0 * d.radius * d.radius / d.aspect.max(1.0))
+        .map(|d| 4.0 * d.radius * d.radius / d.aspect.max(1.0) * tip_scale.0 * tip_scale.1)
         .sum();
     total / dabs.len() as f32
+}
+
+/// What the dab pass would bind as `u.tip_scale` for this preset.
+///
+/// `TipMask::aspect` is the one statement of it — the mask's dimensions with
+/// the longer normalised to 1 — and a preset with no tip, or one naming a tip
+/// this build does not embed, scales by nothing.
+fn tip_scale(preset: &BrushPreset) -> (f32, f32) {
+    preset
+        .tip
+        .as_deref()
+        .and_then(umber_core::tip::builtin)
+        .map_or((1.0, 1.0), |mask| mask.aspect())
 }
 
 /// Ground covered by the union of the dabs' supports, in document pixels.
@@ -281,7 +330,14 @@ fn ink(dabs: &[Dab], brush: &Brush) -> f32 {
     if dabs.is_empty() {
         return 0.0;
     }
-    let step = (brush.size * 0.5 * SAMPLE_STEP).max(0.05);
+    // The short semi-axis of the narrowest dab, floored so a very elliptical
+    // one cannot explode the cell count. See `SAMPLE_STEP`.
+    let short = dabs
+        .iter()
+        .map(|d| d.radius / d.aspect.max(1.0))
+        .fold(f32::MAX, f32::min);
+    let floor = brush.size * 0.5 * FINEST_STEP;
+    let step = (short * SAMPLE_STEP).max(floor).max(0.05);
     let mut min = Vec2::new(f32::MAX, f32::MAX);
     let mut max = Vec2::new(f32::MIN, f32::MIN);
     for dab in dabs {

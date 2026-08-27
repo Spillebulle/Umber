@@ -88,6 +88,24 @@ pub const SHIPPED_SPACING_CAP: f32 = 0.1;
 /// a rule rather than a list of names: it is derived from the dab's own
 /// geometry, and it is exactly the difference between smoothing a stroke and
 /// replacing a row of dots with a line.
+///
+/// **It reads the spacing an author wrote, and the dab that is actually
+/// stamped can come apart below it.** [`Brush::reach_at`] takes the *nominal*
+/// [`Brush::dab_ratio`], while [`crate::stroke::StrokeBuilder`] stamps
+/// `dab_ratio + m.ratio` — so a `Ratio` modulation that narrows the dab leaves
+/// the step measured against a mark wider than the one drawn. One shipped
+/// preset does it: `mypaint/ramon/rs-blendop` is a 1.375:1 nib whose pressure
+/// modulation takes it to 10:1, so at its author's 0.218 it stepped 2.42 px on
+/// a dab reaching 0.76, and every pair of dabs stood 0.90 px apart.
+///
+/// **Reading the real aspect here would therefore be wrong**, which is worth
+/// saying because it is the obvious repair. It would have *exempted*
+/// rs-blendop — and that brush was gapping by accident, not by intent, which
+/// is precisely the complaint the cap was asked to fix; at the cap its dabs
+/// overlap and the line closes. A spacing at or above this figure is a
+/// statement no author makes by accident, and that is what the exemption is
+/// keyed on. The same reasoning [`Brush::step_at`] already gives for taking
+/// the nominal ratio rather than the per-dab one.
 pub const DABS_COME_APART_AT: f32 = 1.0;
 
 /// The on-disk library format version. Bumped only when a change would make an
@@ -1986,6 +2004,7 @@ pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>, PresetError> {
 mod tests {
     use super::*;
     use crate::brush::BrushMode;
+    use glam::Vec2;
 
     /// A scratch data directory in the OS temp directory, removed on drop, so
     /// the tests never touch the developer's real brush collection.
@@ -2073,6 +2092,34 @@ mod tests {
         }
     }
 
+    /// **The two figures the spacing cap is, pinned.**
+    ///
+    /// Both guards below are stated in terms of these constants, so on their
+    /// own they move with them: raise the cap to 0.25, regenerate, and the
+    /// library ships at the "step of a quarter of the mark" that produced the
+    /// complaint in the first place, with every assertion still green. That is
+    /// the hazard `the_serialised_names_of_a_blend_mode_are_these_exact_strings`
+    /// exists for, and the same remedy — write the figure down twice, so that
+    /// moving it is a decision somebody made rather than a refactor.
+    ///
+    /// Deliberately **not** tied to [`Brush::default`]'s spacing, though they
+    /// are the same number and the cap's own documentation says so. They answer
+    /// different questions, and a test asserting they agree would be pinning a
+    /// coincidence.
+    #[test]
+    fn the_spacing_cap_is_these_two_figures() {
+        assert_eq!(
+            SHIPPED_SPACING_CAP, 0.1,
+            "the shipped library's spacing ceiling; changing it repaints every brush \
+             in the library and is not a refactor"
+        );
+        assert_eq!(
+            DABS_COME_APART_AT, 1.0,
+            "the spacing at which a dab stops overlapping the one before it; that is \
+             the dab's own geometry and not a tunable"
+        );
+    }
+
     /// **No shipped brush steps further than [`SHIPPED_SPACING_CAP`] unless its
     /// dabs have come apart altogether.**
     ///
@@ -2080,21 +2127,36 @@ mod tests {
     /// asset, so regenerating the library without it fails here rather than
     /// shipping scalloped strokes. Demonstrated by mutation: taking the
     /// `.min()` out of the generator and regenerating puts 103 presets over the
-    /// cap and this test names the worst of them.
+    /// cap and this test names the first of them.
     ///
-    /// Both halves of the rule are asserted to be **live**, because a cap
-    /// nothing exceeds and an exemption nothing uses are guards that have
-    /// stopped measuring anything and would go on passing in silence. The
-    /// exemption is what the two presets above the boundary rely on, and the
-    /// cap being reached is what says the generator ran at all.
+    /// **The exemption is checked against the dabs rather than against its own
+    /// constant**, which is the half that took two attempts. Asserting that a
+    /// preset at or above [`DABS_COME_APART_AT`] is exempt is a spelling of the
+    /// generator's own `if`, and it agrees with any boundary at all: lower that
+    /// constant to 0.4, regenerate, and a library full of half-spaced brushes
+    /// passes. So every exempt preset is driven through
+    /// [`crate::stroke::StrokeBuilder`] instead and its dabs are required to be
+    /// really, measurably disjoint — which a brush at 0.5 is not.
+    ///
+    /// **Only the exempt direction.** The converse — that a capped brush lays a
+    /// continuous mark — is *false* of the shipped library, and not because of
+    /// the cap: five presets gap at 0.1 anyway, for reasons of their own
+    /// (`step_at`'s quarter-pixel floor under a one-pixel nib, a `Size`
+    /// modulation shrinking the dab the step was measured against). Asserting
+    /// it would need a list of five names, which is the thing the exemption is
+    /// a rule instead of.
+    ///
+    /// Both halves are also asserted to be **live**, because a cap nothing
+    /// reaches and an exemption nothing uses are guards that have stopped
+    /// measuring anything and would go on passing in silence.
     #[test]
     fn no_shipped_brush_steps_further_than_the_cap_unless_its_dabs_come_apart() {
         let mut at_the_cap = 0;
-        let mut came_apart: Vec<&str> = Vec::new();
+        let mut exempt: Vec<&BrushPreset> = Vec::new();
         for preset in builtin() {
             let spacing = preset.brush.spacing;
             if spacing >= DABS_COME_APART_AT {
-                came_apart.push(&preset.id);
+                exempt.push(preset);
                 continue;
             }
             assert!(
@@ -2112,20 +2174,118 @@ mod tests {
             "nothing sits at the cap, so this test is measuring nothing"
         );
         assert!(
-            !came_apart.is_empty(),
+            !exempt.is_empty(),
             "nothing is exempt, so the exemption is untested"
         );
+
+        for preset in exempt {
+            let dabs = straight_stroke(&preset.brush);
+            assert!(
+                dabs.len() > 1,
+                "{} laid one dab, so nothing was measured",
+                preset.id
+            );
+            for pair in dabs.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                let gap = Vec2::new(b.pos[0] - a.pos[0], b.pos[1] - a.pos[1]);
+                let apart = gap.length();
+                let heading = gap.y.atan2(gap.x);
+                let touching = dab_reach(a, heading) + dab_reach(b, heading);
+                assert!(
+                    apart > touching,
+                    "{} is exempt from the spacing cap, but two of its dabs stand \
+                     {apart} apart and reach {touching} — they overlap, so its gaps \
+                     are not its mark and it should have been capped",
+                    preset.id
+                );
+            }
+        }
     }
 
-    /// **A shipped stamp or paper still wants the build-up it was given**, read
-    /// at the spacing it actually ships at.
+    /// One straight stroke at full pressure, and every dab it emitted.
+    ///
+    /// The hand is the one `examples/measure-spacing.rs` uses and the figures
+    /// are argued there; nothing here depends on them beyond their being a real
+    /// stroke rather than a single tap.
+    fn straight_stroke(brush: &Brush) -> Vec<crate::stroke::Dab> {
+        let length = brush.size * 12.0;
+        let mut builder = crate::stroke::StrokeBuilder::new();
+        let mut dabs = Vec::new();
+        builder.begin(
+            *brush,
+            [1.0; 3],
+            crate::input::InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+        );
+        dabs.extend(builder.drain_pending());
+        let steps = (length / (500.0 / 120.0)).ceil().max(1.0) as usize;
+        for i in 1..=steps {
+            let f = i as f32 / steps as f32;
+            builder.extend(crate::input::InputPoint::new(
+                Vec2::new(length * f, 0.0),
+                1.0,
+                f64::from(f) * f64::from(length / 500.0),
+            ));
+            dabs.extend(builder.drain_pending());
+        }
+        builder.end();
+        dabs.extend(builder.drain_pending());
+        dabs
+    }
+
+    /// How far a dab reaches from its own centre along `heading`.
+    ///
+    /// [`Brush::reach_at`] is the one statement of that formula and this calls
+    /// it, with a brush shaped like the dab: `pressure_size` off makes
+    /// `radius_at` hand back half the size, so the long semi-axis is the dab's
+    /// own, and `dab_ratio` carries whatever aspect a modulation moved it to.
+    /// Reading the preset's brush directly would read the **nominal** ratio,
+    /// which is exactly what this must not do — see [`DABS_COME_APART_AT`].
+    ///
+    /// `radius_at` floors at half a pixel, so this overstates the reach of a
+    /// dab smaller than that. It is used on the exempt presets alone, whose
+    /// dabs are 13 px and 85 px across, and overstating the reach only makes
+    /// the assertion above stricter.
+    fn dab_reach(dab: &crate::stroke::Dab, heading: f32) -> f32 {
+        Brush {
+            size: dab.radius * 2.0,
+            pressure_size: false,
+            dab_ratio: dab.aspect,
+            ..Brush::default()
+        }
+        .reach_at(1.0, dab.angle - heading)
+    }
+
+    /// **A shipped stamp or paper still wants the build-up it was given**, and
+    /// would want it at any spacing it could have been shipped at.
     ///
     /// The importers decide `build_up` from the mask, before
-    /// `SHIPPED_SPACING_CAP` moves the spacing under it, and closer dabs build
+    /// [`SHIPPED_SPACING_CAP`] moves the spacing under it, and closer dabs build
     /// higher — so a cap can in principle push a borderline stamp across the
     /// threshold and leave it painting at a fraction of the mark its author
-    /// drew. Measured, none does; this is what keeps that true rather than a
-    /// sentence saying it was checked once.
+    /// drew.
+    ///
+    /// **Reading each stamp at its shipped spacing alone does not test that**,
+    /// which is the correction this carries. Every shipped bitmap sits far from
+    /// `needs_build_up`'s 0.98, so a version of this that pinned one spacing
+    /// agreed with the flag for a reason that had nothing to do with the cap.
+    /// What is asserted instead is the property the cap actually needs. **The
+    /// cap only ever lowers a spacing** — `min` — and closer dabs build higher,
+    /// which is the direction that turns a verdict from false to true. So the
+    /// verdict has to hold at every spacing **at or below** the one the preset
+    /// ships at, not merely at that one.
+    ///
+    /// The sweep stops there rather than running up past it, and that bound is
+    /// measured rather than tidy: `umber/stipple-chalk` genuinely answers
+    /// differently at a spacing of 1.0, where its dabs are so far apart that
+    /// few of them reach a pixel and a `max` agrees with a build-up after all.
+    /// It is one of Umber's own presets, spaced at 0.06, and the cap does not
+    /// govern it — so sweeping upwards asked a question no shipped brush faces.
+    ///
+    /// What this cannot see is the *author's* spacing, which the cap replaced
+    /// and which is therefore not in the committed file at all. That the
+    /// verdict did not move across the cap for any of the five stamped presets
+    /// it touched is a reading off the generator run, recorded in
+    /// `docs/brushes.md`.
     ///
     /// Derived afresh from the committed bitmap rather than compared against
     /// the importer's own arithmetic, so it is a reading of the shipped library
@@ -2134,29 +2294,32 @@ mod tests {
     fn every_shipped_stamp_still_wants_the_build_up_it_ships_with() {
         let mut read = 0;
         for preset in builtin() {
-            let tip = preset
-                .tip
-                .as_deref()
-                .and_then(crate::tip::builtin)
-                .map(|mask| crate::tip::stroke_coverage(mask, preset.brush.spacing));
+            let tip = preset.tip.as_deref().and_then(crate::tip::builtin);
             let paper = preset
                 .paper
                 .as_deref()
-                .and_then(|name| crate::tip::pattern(name).or_else(|| crate::tip::builtin(name)))
-                .map(|tile| {
-                    crate::tip::grain_coverage(tile, preset.brush.grain, preset.brush.spacing)
-                });
+                .and_then(|name| crate::tip::pattern(name).or_else(|| crate::tip::builtin(name)));
             if tip.is_none() && paper.is_none() {
                 continue;
             }
             read += 1;
-            let wants = tip.is_some_and(|c| c.needs_build_up())
-                || paper.is_some_and(|c| c.needs_build_up());
-            assert_eq!(
-                wants, preset.brush.build_up,
-                "{} ships with build_up {} at a spacing of {}, and its own bitmaps say {wants}",
-                preset.id, preset.brush.build_up, preset.brush.spacing
-            );
+            // Down from the shipped spacing to the tightest any reader
+            // produces. `0.01` is every reader's own lower clamp.
+            let shipped = preset.brush.spacing;
+            let sweep = (0..=8).map(|i| shipped + (0.01 - shipped) * i as f32 / 8.0);
+            for spacing in sweep {
+                let wants = tip.is_some_and(|mask| {
+                    crate::tip::stroke_coverage(mask, spacing).needs_build_up()
+                }) || paper.is_some_and(|tile| {
+                    crate::tip::grain_coverage(tile, preset.brush.grain, spacing).needs_build_up()
+                });
+                assert_eq!(
+                    wants, preset.brush.build_up,
+                    "{} ships with build_up {}, and its own bitmaps say {wants} at a \
+                     spacing of {spacing}",
+                    preset.id, preset.brush.build_up
+                );
+            }
         }
         assert!(read > 0, "no shipped preset carries a bitmap to read");
     }

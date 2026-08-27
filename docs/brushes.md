@@ -144,14 +144,17 @@ figure is no longer in the shipped file.
 Under a `max` a stroke's mark is the **union** of its dabs' footprints, so
 inserting more dabs between overlapping ones covers the same ground and only
 fills in the scallops. Over the 101 presets the cap moved, the mean ink
-multiplier is **1.10x** and 82 of them sit within a few per cent of 1.0.
+multiplier is **1.10x**, and 83 of them lay within 5 % of the ink they laid
+before. Both figures are printed by the harness rather than counted off its
+table, because the second had already been quoted wrongly once: 82 is the size
+of a different group entirely.
 
 | | |
 |---|---|
 | presets respaced | 101 of 252 |
 | worst dab multiplier | 5.00x, `tanda/splatter-02`, 23 to 115 dabs over a stroke |
 | most dabs in one stroke | 2964, `gdquest-cloud-builder`, which is 5 a frame at 60 Hz |
-| most fragments shaded a frame | 813k, 0.39x a 1920x1080 window |
+| most fragments shaded a frame | 751k, 0.36x a 1920x1080 window |
 | mean ink multiplier | 1.10x |
 | worst ink multiplier | 2.57x, `tanda/splatter-02` |
 
@@ -176,16 +179,35 @@ row of dots with a line.
 Two presets are up there and keep their author's figure exactly: Raghukamath's
 "Pack01 Dots" at 5.12 and GDQuest's "Special Shadow" at 1.47. Capping them
 would have laid 40x and 13x the dabs and covered 5.8x and 1.8x the ground.
+Those four need the exemption lifted to reproduce, since `measure-spacing` only
+reports a preset whose spacing moved: drop the `if` in the generator,
+regenerate, and run it.
+
+**It reads the author's figure, not the dab that is actually stamped**, and
+that is decided rather than overlooked. `Brush::reach_at` takes the nominal
+`dab_ratio` while a `Ratio` modulation can narrow the real dab, so a preset
+below 1.0 can already be gapping, and `ramon/rs-blendop` was, by 0.90 px.
+Reading the real aspect here is the obvious repair and would have **exempted**
+that brush, which was gapping by accident and is exactly what the artist asked
+to have fixed. A spacing at or above 1.0 is a statement no author makes by
+accident, and that is what the exemption keys on.
 
 **A scatter clause was measured and refused.** It looks like the same idea — a
 dab thrown clear of the line is one whose count sets a density rather than a
 smoothness — and it does not separate the library. Mean ink is 1.38x for
 `scatter >= 1` against 1.04x for the rest, the distributions overlap, and the
-worst non-exempt case is `tanda/texture-06` at 2.10x with **no scatter at
-all**: it is a 20:1 chisel whose angle rolls through a full turn along the
-stroke, which no scatter reading can see. A rule wide enough to catch every
-per-dab variation would exempt most of the library and leave the strokes
-choppy.
+two worst non-exempt cases have **no scatter at all**:
+
+- `tanda/texture-06`, 2.07x. A 20:1 chisel whose `Angle` modulation rolls it
+  through a full turn along the stroke, so more dabs sweep more angles.
+- `ramon/rs-blendop`, 1.82x. A fixed nib whose `Ratio` modulation takes a
+  nominal 1.375:1 to 10:1 at full pressure. `Brush::step_at` reads the nominal
+  ratio, so it measured a 2.42 px step against a dab reaching 0.76 px, and
+  **every pair of its dabs stood 0.90 px apart**. That is not a cost of the
+  cap. It is a brush that was gapping by accident, and the cap closes it.
+
+A rule wide enough to catch those two would have to read every modulation's
+envelope, which exempts most of the library and leaves the strokes choppy.
 
 ### Two things the cap deliberately does not touch
 
@@ -199,8 +221,18 @@ choppy.
   threshold and leave it painting at a fraction of the mark its author drew.
   Measured, none does — and
   `every_shipped_stamp_still_wants_the_build_up_it_ships_with` re-derives the
-  verdict from the committed bitmaps at the spacing they ship at, so that stays
-  true rather than being a sentence saying it was checked once.
+  verdict from the committed bitmaps across every spacing at or below the one
+  they ship at, which is the direction the cap moves things, so that stays true
+  rather than being a sentence saying it was checked once.
+
+And there is a stronger statement available than either, worth having because
+it covers the whole library at once rather than one field at a time: **a shipped
+brush's stroke strength is spacing-independent by construction.** A plain
+brush's is, because the `max` saturates. A build-up brush's is too, for a
+different reason: `StrokeBuilder` re-derives its per-dab coverage every dab from
+`tip::stack_depth(step_at(..), reach_at(..), ..)`, so laying the dabs closer
+lowers each one's contribution by exactly as much. The cap changes how smooth a
+stroke is. It cannot change how dark it is.
 
 ## What is in it today
 

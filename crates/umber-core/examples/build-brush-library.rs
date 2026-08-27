@@ -390,16 +390,26 @@ fn main() {
                 // choppy strokes. 103 of the 252 converted presets sat above
                 // the cap; the median was already exactly at it.
                 //
-                // **It costs nothing in ink and it is not a judgement.** Under
-                // a `max` a stroke's mark is the *union* of its dabs'
+                // **It costs almost nothing in ink, and that is measured.**
+                // Under a `max` a stroke's mark is the *union* of its dabs'
                 // footprints, so inserting more dabs between overlapping ones
                 // covers the same ground and only fills in the scallops.
-                // Measured over every preset this touches by
-                // `examples/measure-spacing.rs`: mean ink 1.10x, and the cases
-                // above 1.5x are all brushes whose dabs already vary per dab —
-                // scatter, a rolling angle, a random size — where the count was
-                // always a density control and the author's own engine spaced
-                // them the same way.
+                // `examples/measure-spacing.rs` over every preset this touches:
+                // mean 1.10x, and 83 of the 101 within 5% of the ink they laid
+                // before.
+                //
+                // Nine move by more than 1.45x. Seven are scattering brushes,
+                // where the dabs never made a line and the count has always set
+                // the density of a spray. The other two are the interesting
+                // ones and neither has any scatter at all: `tanda/texture-06`
+                // is a 20:1 chisel whose `Angle` modulation rolls it through a
+                // full turn along the stroke, so more dabs sweep more angles;
+                // and `ramon/rs-blendop` is a fixed nib whose `Ratio`
+                // modulation takes a nominal 1.375:1 to 10:1, so `step_at`
+                // measured its step against a dab far wider than the one drawn
+                // and **its dabs were 0.90 px apart before this**. That one is
+                // not a cost of the cap, it is the cap doing the job it was
+                // asked to do.
                 //
                 // **The exemption is geometric rather than a list of names.**
                 // `Brush::step_at` is `reach × 2 × spacing`, so at
@@ -407,22 +417,32 @@ fn main() {
                 // consecutive dabs stop touching: below it the spacing decides
                 // how smooth one continuous mark is, at or above it the gaps
                 // *are* the mark. Two presets are up there — Raghukamath's
-                // "Dots" at 5.12 and GDquest's "Special Shadow" at 1.47 — and
-                // capping them would lay 40x and 13x the dabs and cover 5.8x
-                // and 1.8x the ground, which is a row of dots replaced by a
-                // line. Nothing between the cap and that boundary is sparse in
-                // that sense, because by construction those dabs still overlap.
+                // "Pack01 Dots" at 5.12 and GDquest's "Special Shadow" at
+                // 1.47 — and capping them would lay 40x and 13x the dabs and
+                // cover 5.8x and 1.8x the ground, which is a row of dots
+                // replaced by a line. Those four figures need the exemption
+                // lifted to reproduce, because `measure-spacing` only reports a
+                // preset whose spacing actually moved: drop the `if` below,
+                // regenerate, and run it. Nothing between the cap and that
+                // boundary is sparse in that sense, because by construction
+                // those dabs still overlap.
+                //
+                // **It reads the author's figure, not the dab actually
+                // stamped**, and `DABS_COME_APART_AT` has the argument: reading
+                // the real aspect would have exempted `rs-blendop`, whose dabs
+                // were gapping by accident and are the complaint rather than
+                // the exception to it.
                 //
                 // A **scatter** clause was measured and refused. It looks like
                 // the same idea — a dab thrown clear of the line is one whose
                 // count sets a density — but it does not separate the library:
-                // the mean ink change is 1.38x for `scatter >= 1` against 1.10x
-                // for the rest, the distributions overlap, and the worst
-                // non-exempt case (`tanda/texture-06`, 2.10x) has no scatter at
-                // all. It is a chisel whose angle rolls through a full turn
-                // along the stroke, which no scatter reading can see. A rule
-                // wide enough to catch every per-dab variation would exempt
-                // most of the library and leave the strokes choppy.
+                // the mean ink change is 1.38x for `scatter >= 1` against 1.04x
+                // for the rest, the distributions overlap, and the two worst
+                // non-exempt cases (`tanda/texture-06` at 2.07x and
+                // `ramon/rs-blendop` at 1.82x) have no scatter at all. A rule
+                // wide enough to catch what those two do would have to read
+                // every modulation's envelope, which exempts most of the
+                // library and leaves the strokes choppy.
                 //
                 // Applied **after** the refusals, so which brushes ship is
                 // untouched — and the faintness gate above already reads the
