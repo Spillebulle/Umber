@@ -591,6 +591,150 @@ fn build_up_leaves_the_max_path_alone() {
     );
 }
 
+/// A stroke that crosses itself darkens where it crosses, once flow is below 1.
+///
+/// The feature's whole reason for existing, measured end to end: a real `Brush`
+/// through the real `StrokeBuilder`, the pipeline the stroke's own
+/// `builds_up()` selects, and the ordinary commit. Nothing here restates the
+/// conversion — the test knows only that one part of the mark was painted over
+/// twice and the other was not.
+///
+/// The stroke is an "L" that doubles back along its own line, so the two
+/// readings are on the **same** row of the same mark: `x = 20` is walked once
+/// and `x = 44` is walked twice, both at `y = 32`, both far from the ends and
+/// from the turn. Reading a crossing of two *different* limbs would have put a
+/// dab's falloff between the readings and made the difference an argument about
+/// geometry.
+///
+/// **What this pair does not catch, said out loud**: folding flow into the
+/// *mark* instead of into the dab — the "second opacity" mistake — still
+/// darkens a crossing here, because the conversion targets the mark for one
+/// pass and a crossing doubles the depth past it. Measured under that
+/// mutation the fixture reads 78/133 where it reads 100/161, both inside
+/// these bounds. The distinguishing property is what a **single** pass
+/// reaches: on the dab it follows the stack depth, on the mark it is `flow`
+/// whatever the spacing, which is what `Brush::opacity` already means.
+/// `flow_scales_the_dab_and_never_the_strokes_opacity` in `umber-core` is
+/// what fails on that mutation, and it fails decisively; this test is about
+/// the crossing and is blind to it.
+#[test]
+fn a_stroke_crossing_itself_darkens_where_it_crosses_at_a_low_flow() {
+    let mut h = harness_or_skip!();
+
+    // 0.3 rather than something fainter because both readings have to stay off
+    // the rails. Measured on this fixture, the pair walks 35/65 at flow 0.1 up
+    // to 156/216 at 0.5, so anywhere in the middle would do; what is not
+    // available is either end, where the single pass is a handful of levels or
+    // the crossing is already against the ceiling.
+    let (single, crossed) = flow_crossing(&mut h, 0.3);
+
+    // Both ends have to be off the rails, or the test is measuring a clamp. The
+    // single-pass reading must be well short of solid for there to be anything
+    // left to build, and the crossed one well short of it too, so what is being
+    // read is the accumulation and not the ceiling.
+    assert!(
+        (75..135).contains(&single),
+        "single pass came back at {single}, not the ~100 this fixture measures: \
+         nothing to build from, so the crossing reading below proves nothing"
+    );
+    assert!(
+        crossed > single + 40,
+        "crossed {crossed} against {single} on one pass — a stroke at flow 0.3 \
+         is not darkening where it goes over itself"
+    );
+    assert!(
+        crossed < 220,
+        "crossed {crossed}: at the ceiling, so this would pass even if flow were \
+         being ignored and every dab wrote solid"
+    );
+}
+
+/// The same stroke at flow 1.0 is as even where it crosses itself as anywhere
+/// else.
+///
+/// The identity half, and it is the half that guards the 258 shipped presets:
+/// every one of them is at the default, so a flow that leaked onto the `max`
+/// path would darken every stroke in the library wherever it doubled back.
+/// `overlapping_dabs_do_not_compound` pins the same guarantee for bare dabs
+/// through the bare pipeline; this pins it for a whole brush, which is the
+/// level at which flow could break it.
+///
+/// **The two readings genuinely disagree at flow 0.15**, which is what stops
+/// this being a test that agrees for the wrong reason: it is the same fixture,
+/// the same brush and the same two pixels as the test above, differing only in
+/// the field, and above it the gap is tens of levels.
+#[test]
+fn a_stroke_crossing_itself_at_full_flow_is_as_even_where_it_crosses() {
+    let mut h = harness_or_skip!();
+
+    let (single, crossed) = flow_crossing(&mut h, 1.0);
+
+    assert!(
+        single > 250,
+        "a default brush should paint solid on one pass, got {single}"
+    );
+    // Not a byte: both readings are an antialiased falloff through a shader, so
+    // this compares alpha and allows the level the store may round by — the
+    // rule for every assertion here that is not over a hard-edged fill.
+    assert!(
+        crossed.abs_diff(single) <= 1,
+        "crossed {crossed} against {single} on one pass — flow 1.0 has stopped \
+         being the identity and every preset in the library now compounds"
+    );
+}
+
+/// Walk an L-shaped stroke that doubles back along its own line and read one
+/// pixel from each half.
+///
+/// Returns `(walked once, walked twice)`, both on `y = 32`.
+fn flow_crossing(h: &mut Harness, flow: f32) -> (u8, u8) {
+    let brush = Brush {
+        size: 8.0,
+        // Wide, so a pixel sees a handful of dabs rather than dozens: at flow
+        // 0.15 a hundred-deep stack would saturate on the first pass and the
+        // crossing would have nothing left to show.
+        spacing: 0.5,
+        hardness: 1.0,
+        opacity: 1.0,
+        // Off, or the dabs land where the filter has got to rather than where
+        // the test put them, and the doubled span would not line up with the
+        // single one.
+        stabilization: 0.0,
+        pressure_size: false,
+        flow,
+        ..Default::default()
+    };
+
+    let mut s = StrokeBuilder::new();
+    s.begin(
+        brush,
+        [1.0, 1.0, 1.0],
+        InputPoint::new(Vec2::new(12.0, 32.0), 1.0, 0.0),
+    );
+    // Out to the far end...
+    s.extend(InputPoint::new(Vec2::new(52.0, 32.0), 1.0, 0.1));
+    // ...and back over the right-hand half of what was just painted.
+    s.extend(InputPoint::new(Vec2::new(32.0, 32.0), 1.0, 0.2));
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+
+    // The style the stroke itself would be drawn under, rather than one the
+    // test picked. `StrokeBuilder::builds_up` is what `app.rs` builds its
+    // `DabStyle` from and it is `Brush::builds` on the stroke's own snapshotted
+    // brush, so asking the brush here is asking the shipped decision — a test that set the flag by hand would pass
+    // just as happily with the two disagreeing, which is the failure that puts
+    // a converted dab under the wrong blend.
+    h.stamp_styled(
+        &dabs,
+        DabStyle {
+            per_dab_color: false,
+            build_up: brush.builds(),
+        },
+    );
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    (h.pixel(20, 32)[3], h.pixel(44, 32)[3])
+}
+
 #[test]
 fn a_building_stroke_still_applies_its_opacity_exactly_once() {
     // Build-up must not become a second place stroke opacity is folded in.

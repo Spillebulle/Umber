@@ -103,10 +103,16 @@
 //!   rather than the dab — above [`NEGLIGIBLE_MASK_NOISE`], below which they
 //!   are a difference of two or three levels of alpha.
 //! - **Flow build-up.** Krita composites each dab, so flow below 1 darkens
-//!   where a stroke crosses itself. Umber takes a `max` of coverage and applies
-//!   opacity once at commit — the wet-layer design in `CLAUDE.md` — so flow is
-//!   folded into stroke opacity instead. Same trade, and the same reason, as
-//!   `opaque_linearize` in [`super::mypaint`].
+//!   where a stroke crosses itself. It is still folded into stroke opacity
+//!   here, and the *reason* has changed: it used to be that Umber had nowhere
+//!   to put it, and Umber now has [`crate::Brush::flow`], which means exactly
+//!   this. What stops the reader simply passing it through is that flow below
+//!   1.0 puts the brush on the accumulating pipeline, so routing it would change
+//!   how every imported Krita brush paints — a mark that builds along its length
+//!   instead of arriving — and that is a decision to take against measurements
+//!   of the pack rather than as a side effect of the field existing. Until then
+//!   this is the same trade, and now a different reason, as `opaque_linearize`
+//!   in [`super::mypaint`].
 //! - **Auto-spacing.** `useAutoSpacing` asks Krita to derive spacing from the
 //!   tip; the recorded `spacing` is used instead of guessing at the formula.
 //! - **Sensors Umber has no input for**, which after the section below are

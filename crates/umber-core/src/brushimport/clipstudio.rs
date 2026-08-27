@@ -1757,6 +1757,14 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
     // the brush editor for a brush whose pressure does nothing — the same mark,
     // a different brush, and a control that then takes coverage from full to full
     // when it is clicked.
+    // Folded into the opacity curve rather than into `Brush::flow`, which now
+    // exists and means exactly what `BrushFlow` means. The field is not the
+    // blocker; the pipeline is. A flow under 1.0 puts the brush on the
+    // accumulating blend, so passing this through would change how every
+    // imported Clip Studio brush paints — building along its length rather than
+    // arriving — and that is a decision to take against measurements of real
+    // files, not one to fall into because a field appeared. `dab_stack_alpha`
+    // keeps the mark the author set on the pipeline the brush is already on.
     let flow = settings.percent("BrushFlow").unwrap_or(1.0);
     let stacked = |per_dab: f32| tip::dab_stack_alpha(per_dab, brush.spacing, brush.hardness);
     if brush.pressure_opacity {

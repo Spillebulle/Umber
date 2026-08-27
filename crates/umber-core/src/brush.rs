@@ -226,6 +226,36 @@ pub struct Brush {
     /// It is a **blend-state** change and nothing else — the dab shader is
     /// untouched, so the two paths cannot drift into stamping different shapes.
     pub build_up: bool,
+    /// What one dab lays down, as a fraction of the mark the stroke builds to.
+    ///
+    /// Photoshop's Flow and Krita's build-up painting mode. Below `1.0` a dab
+    /// carries less than the finished mark, so the stroke *arrives* at that
+    /// mark over several dabs instead of reaching it with the first — and a
+    /// stroke that crosses itself goes over the same pixels twice and comes out
+    /// darker there, which is the thing a painter reaches for this to get.
+    ///
+    /// **It is not [`Brush::opacity`] and the two are different numbers on
+    /// purpose.** Opacity caps the *finished stroke* and is applied exactly
+    /// once, at commit, over coverage the dab pass has already saturated —
+    /// folding it into a dab is the compounding bug the whole wet-layer scheme
+    /// exists to prevent, and [`crate::stroke`] says so at the line that would
+    /// do it. Flow is the opposite end: it is a statement about one dab, it
+    /// never reaches the commit, and the scratch still holds coverage in `0..1`
+    /// so composite and commit are untouched. Halving opacity halves the
+    /// finished stroke everywhere; halving flow leaves a well-travelled stroke
+    /// at full strength and thins only its thin ends and its first few dabs.
+    ///
+    /// **`1.0` is the exact identity and every shipped preset depends on it.**
+    /// Nothing multiplies by it on the `max` path — [`Brush::builds`] answers
+    /// false, so the conversion is not reached at all.
+    ///
+    /// **Below `1.0` it selects the accumulating blend**, through
+    /// [`Brush::builds`]. Under the `max` a uniform per-dab scale is not flow at
+    /// all: `max` is idempotent, so every dab writing `flow` caps the stroke at
+    /// `flow` and the mark comes out uniformly fainter and just as flat, with
+    /// crossing still doing nothing. There is nothing to build with until the
+    /// blend composites.
+    pub flow: f32,
     /// How strongly a tiling grain texture bites into dab coverage, `0.0`
     /// (none) to `1.0` (the grain's dark texels erase the dab entirely).
     ///
@@ -305,6 +335,7 @@ impl Default for Brush {
             scatter_curve: ResponseCurve::LINEAR,
             radius_jitter: 0.0,
             build_up: false,
+            flow: 1.0,
             grain: 0.0,
             grain_scale: 256.0,
             grain_pattern: GrainPattern::Tooth,
@@ -350,6 +381,59 @@ impl Brush {
     /// what an import can produce, and an imported brush above the rail's top
     /// is one whose setting cannot be put back where it was found.
     pub const MAX_STABILIZATION: f32 = 0.95;
+
+    /// The lightest flow the rails offer, and a bound on the *value* as well.
+    ///
+    /// A user-interface bound in the sense [`Brush::MAX_STABILIZATION`] is one,
+    /// and a pixel bound underneath it. **At a mark of 1.0** — which is what
+    /// [`Brush::coverage_at`] answers for any brush that does not ramp opacity
+    /// with pressure, and what 250 of the 258 shipped presets paint at — a dab
+    /// carries `MIN_FLOW` straight into an `R8Unorm` scratch, so 0.01 is 2.55
+    /// levels of 255: faint, and still a mark. The next decade down is not:
+    /// 0.001 is a quarter of a level, which the store rounds to nothing, and a
+    /// *constant* increment under half a level never moves the accumulator
+    /// however many dabs land on it. That is the invisible-stroke defect
+    /// [`crate::tip::SCRATCH_LEVEL`] exists to bound, and a rail that reaches it
+    /// is a control whose bottom end paints nothing at all.
+    ///
+    /// **The qualifier is load-bearing and the bound does not generalise past
+    /// it.** At a lower mark a dab carries `per_dab_for_stroke(mark, depth)`
+    /// times flow, and where that conversion has already floored — a faint
+    /// pressure ramp at a tight spacing — flow multiplies a pinned value and the
+    /// floor puts it straight back, so the whole rail produces one mark. That is
+    /// the eight-bit ceiling `a_dab_a_low_flow_thins_is_still_something_the_
+    /// scratch_can_hold` measures and states; no figure for `MIN_FLOW` avoids
+    /// it, because it is not a property of the bound.
+    pub const MIN_FLOW: f32 = 0.01;
+
+    /// [`Brush::flow`], bounded.
+    ///
+    /// The field is public and a hand-written preset may name anything, so the
+    /// bound is applied where it is *read* rather than trusted at the rail —
+    /// the same arrangement `grain` and `stabilization` keep.
+    pub fn flow(&self) -> f32 {
+        self.flow.clamp(Self::MIN_FLOW, 1.0)
+    }
+
+    /// Whether this stroke's dabs **accumulate** coverage instead of saturating
+    /// at the strongest of them.
+    ///
+    /// The one statement of the question. [`crate::stroke::StrokeBuilder`] asks
+    /// it twice over the *same* snapshotted brush — once as `builds_up`, which
+    /// is what the renderer picks its dab pipeline from, and once in `emit`,
+    /// which decides what a dab carries — so the two cannot disagree for any
+    /// frame of a stroke. That matters because a dab converted for a blend it is
+    /// not then drawn under is a mark at the wrong strength, and which way it is
+    /// wrong depends on which reading was consulted. One function over one field
+    /// is what makes that structural rather than a thing to remember.
+    ///
+    /// [`Brush::build_up`] is the author saying the dab is not solid — a sparse
+    /// stamp, a grain — and [`Brush::flow`] below 1.0 is the author asking for
+    /// less than the mark per dab. Either needs the accumulating blend and
+    /// neither implies the other, so this is an `||` and not a single field.
+    pub fn builds(&self) -> bool {
+        self.build_up || self.flow() < 1.0
+    }
 
     /// Dab radius for a given pressure, in document pixels.
     pub fn radius_at(&self, pressure: f32) -> f32 {
@@ -977,5 +1061,100 @@ mod tests {
             ..nib
         };
         assert_eq!(rake.off_heading(Vec2::X), rake.off_heading(Vec2::Y));
+    }
+
+    /// Flow's default leaves every shipped preset on the pipeline it was on.
+    ///
+    /// The identity claim in the form that covers the whole library rather than
+    /// one fixture. `Brush::builds` is what picks the dab pipeline and what the
+    /// per-dab conversion asks, so a preset whose answer moved is a preset whose
+    /// every stroke now accumulates where it used to saturate — 258 marks
+    /// changed by a field nobody set.
+    ///
+    /// It reads `builds()` against `build_up` rather than asserting the flow
+    /// field alone, because those are two different ways to break it: a default
+    /// of 0.99 breaks the first, and a `builds()` written as `build_up || flow
+    /// <= 1.0` breaks the second while every flow in the file is still exactly
+    /// 1.0.
+    #[test]
+    fn every_shipped_preset_paints_on_the_path_it_always_did() {
+        let presets = crate::preset::builtin();
+        assert!(presets.len() > 200, "the library did not load");
+        for preset in presets {
+            let b = &preset.brush;
+            assert_eq!(
+                b.flow, 1.0,
+                "{} ships at a flow of {}, so it no longer paints as it did",
+                preset.name, b.flow
+            );
+            assert_eq!(
+                b.builds(),
+                b.build_up,
+                "{} changed dab pipeline without its build-up flag moving",
+                preset.name
+            );
+        }
+    }
+
+    /// A library written before flow existed still loads, at the identity.
+    ///
+    /// The container `#[serde(default)]` is what promises it and this is what
+    /// checks the promise, over text that names no flow at all — which is every
+    /// `brushes.ron` any painter currently has.
+    #[test]
+    fn a_preset_naming_no_flow_loads_at_the_identity() {
+        let brush: Brush = ron::from_str("(size: 20.0, opacity: 0.5)").unwrap();
+        assert_eq!(brush.flow, 1.0);
+        assert_eq!(brush.opacity, 0.5, "the fields beside it still read");
+        assert!(!brush.builds(), "and it is still on the max path");
+    }
+
+    /// Flow is bounded where it is read, not trusted at the rail.
+    ///
+    /// A hand-written preset may name anything. Nought is the one that matters:
+    /// read literally it is a brush that paints nothing at all, and `builds()`
+    /// would still put it on the accumulating pipeline, so the stroke would cost
+    /// a scratch and a blend to lay down nothing.
+    #[test]
+    fn a_flow_outside_its_bounds_is_read_at_them() {
+        let low = Brush {
+            flow: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(low.flow(), Brush::MIN_FLOW);
+        assert!(low.builds());
+
+        let high = Brush {
+            flow: 4.0,
+            ..Default::default()
+        };
+        assert_eq!(high.flow(), 1.0);
+        assert!(
+            !high.builds(),
+            "a flow above the ceiling is the identity, not an accumulation"
+        );
+    }
+
+    /// `MIN_FLOW` is a mark and the decade under it is not.
+    ///
+    /// The bound is chosen against the coverage scratch rather than picked for
+    /// looking round, so it is checked against the scratch: at the floor a dab
+    /// carrying the full mark is comfortably over one level of an `R8Unorm`
+    /// store, and a tenth of the floor is under half of one — where a *constant*
+    /// increment never moves the accumulator however many dabs land on it, which
+    /// is a rail whose bottom end paints nothing at all.
+    #[test]
+    fn the_lightest_flow_the_rail_offers_is_still_a_mark() {
+        let level = crate::tip::SCRATCH_LEVEL;
+        assert!(
+            Brush::MIN_FLOW > level,
+            "{} is under one level of the scratch",
+            Brush::MIN_FLOW
+        );
+        assert!(
+            Brush::MIN_FLOW / 10.0 < level / 2.0,
+            "the decade below the bound is still storable, so the bound is \
+             costing granularity it does not buy"
+        );
     }
 }

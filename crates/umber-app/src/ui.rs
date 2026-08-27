@@ -2288,6 +2288,29 @@ mod strip_budget {
     /// the one showing; all three of these were re-measured against that by
     /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn`.
     pub const STABILISER: f32 = 190.0;
+    /// The flow rail: what one dab lays down, as against `OPACITY`, which
+    /// caps the finished stroke. A fourth `inline_slider` — the 90 point rail,
+    /// the field reserving its widest figure ("100"), and a label three
+    /// characters shorter than "Opacity"'s.
+    ///
+    /// **Bisected against the guard rather than derived**, which is what the
+    /// derivation was worth: the first figure here was 175, reasoned from
+    /// `OPACITY` less ten points for three fewer characters, and that
+    /// disagreed with `STABILISER`'s own reasoning (five points for three
+    /// *more*) in the same breath. Measured,
+    /// `every_rail_on_the_strip_fits_the_budget_that_lets_it_be_drawn` fails at
+    /// 140 and passes at 145, so what the rail needs is in `(140, 145]`. 150
+    /// is that with a font metric's worth of room on top — the margin a
+    /// glyph-width change moves by — and 175 was simply thirty points of
+    /// nothing, dropping the rail earlier than it had to on a narrow window.
+    ///
+    /// **It is drawn last and therefore dropped first**, which is a claim
+    /// about what a painter is stuck without rather than about what matters.
+    /// Size and opacity are reached for constantly; the stabiliser is the one
+    /// setting adjusted *while* a line is being drawn. Flow is a statement
+    /// about the brush's character, so it is the one of the four that can
+    /// wait for the brush editor on a narrow window.
+    pub const FLOW: f32 = 150.0;
     /// The line naming the modifiers that add to, subtract from and intersect a
     /// selection, and say what the feather applies to.
     pub const COMBINE: f32 = 320.0;
@@ -2462,6 +2485,26 @@ pub(crate) fn strip_percent_rail(label: &'static str, top: f32) -> widgets::Rail
     }
 }
 
+/// The brush's flow rail.
+///
+/// [`strip_percent_rail`] is not reusable here: its span starts at zero and
+/// flow's starts at [`Brush::MIN_FLOW`], because a flow of zero paints nothing
+/// and the decade under the bound is a dab the `R8Unorm` scratch rounds away.
+/// `limit` matches `span`, so a typed figure is held to the same floor the drag
+/// is — the one place a rail may legitimately differ is brush size, and it says
+/// so.
+pub(crate) fn strip_flow_rail() -> widgets::Rail<'static> {
+    widgets::Rail {
+        label: "Flow",
+        span: Brush::MIN_FLOW..=1.0,
+        limit: Brush::MIN_FLOW..=1.0,
+        log: false,
+        snap: 0.0,
+        deferred: false,
+        figure: widgets::Figure::new(100.0, "", 0),
+    }
+}
+
 /// The Select tool's feather rail.
 ///
 /// Its figure can be typed exactly as the brush rails' can — `inline_slider` is
@@ -2531,6 +2574,25 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     &mut ed.brush.stabilization,
                     &strip_percent_rail("Stabiliser", Brush::MAX_STABILIZATION),
                 );
+            }
+            if room
+                >= strip_budget::SIZE
+                    + strip_budget::OPACITY
+                    + strip_budget::STABILISER
+                    + strip_budget::FLOW
+            {
+                // Beside Opacity because that is the pair a painter reasons
+                // about together, and the two are genuinely different numbers:
+                // opacity caps the finished stroke once, flow meters what each
+                // dab lays down on the way to it. Photoshop puts them side by
+                // side on its own options bar for the same reason.
+                //
+                // The rail bottoms out at `Brush::MIN_FLOW` rather than at zero,
+                // unlike Opacity's: a flow of zero is a brush that paints
+                // nothing, and the decade below the bound is a dab too faint for
+                // the scratch to store at all — a control whose bottom end is
+                // indistinguishable from a broken one.
+                widgets::inline_slider(ui, p, &mut ed.brush.flow, &strip_flow_rail());
             }
         } else if ed.ui.tool == Tool::Transform {
             // What the tool actually does, said plainly, because none of it is
@@ -3215,8 +3277,42 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             false,
             percent,
         );
+        // Beside Opacity, because the two are the pair people confuse and the
+        // only way to learn the difference is to see them together. The floor is
+        // `Brush::MIN_FLOW` and not zero: a flow of zero paints nothing, and
+        // under the bound a dab is fainter than one level of the coverage
+        // scratch, which does not move the accumulator at all.
         widgets::slider_row(
             &mut c[1],
+            p,
+            "Flow",
+            &mut ed.brush.flow,
+            Brush::MIN_FLOW..=1.0,
+            false,
+            percent,
+        );
+    });
+    // Said out loud because the control is otherwise indistinguishable from a
+    // second opacity, and reads as one until somebody paints a stroke back over
+    // itself. The two sentences are the two states rather than one sentence
+    // hedging, so the row at rest says plainly that it is doing nothing.
+    caption(
+        ui,
+        p,
+        if ed.brush.flow < 1.0 {
+            "Each dab lays down less than the finished mark, so the stroke \
+             builds towards it and darkens where it crosses itself. Opacity \
+             still caps the whole stroke, once."
+        } else {
+            "Every dab carries the full mark, so the stroke is as strong at \
+             its first dab as anywhere else and crossing it changes nothing. \
+             Lower this to make a stroke build."
+        },
+    );
+    ui.add_space(4.0);
+    ui.columns(2, |c| {
+        widgets::slider_row(
+            &mut c[0],
             p,
             "Spacing",
             &mut ed.brush.spacing,
@@ -3794,10 +3890,23 @@ fn brush_editor_texture(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
 
     widgets::toggle_row(ui, p, "Build up", &mut ed.brush.build_up);
+    // **The mark is already accumulating whenever flow is under 1.0**, because
+    // `Brush::builds` is an `||` over the two and nothing downstream reads
+    // `build_up` on its own. So the toggle genuinely does nothing here, and the
+    // "off" sentence below — which says a stroke is as even where it crosses
+    // itself as anywhere else — would be flatly contradicted by the Flow caption
+    // two rows up on the same screen. The toggle stays *live* rather than being
+    // disabled: it is still the field that will be saved, and it is what the
+    // brush goes back to accumulating by if flow is returned to 1.0. What
+    // changes is the sentence, which is the part that was lying.
     caption(
         ui,
         p,
-        if ed.brush.build_up {
+        if ed.brush.flow < 1.0 {
+            "Flow is already below 100%, so this brush accumulates whichever \
+             way this is set. It decides what happens when flow goes back to \
+             100%."
+        } else if ed.brush.build_up {
             "Each dab composites over the last, so a stroke deepens where it \
              overlaps itself and a faint stamp builds to solid. This is how \
              GIMP and Krita paint, and what a texture stamp needs."
@@ -4645,7 +4754,7 @@ mod tests {
         crate::theme::install_fonts(&ctx);
         crate::theme::apply(&ctx, &palette);
 
-        for (tool, last) in [(Tool::Brush, "Stabiliser")] {
+        for (tool, last) in [(Tool::Brush, "Flow")] {
             let mut worst: Option<(f32, f32)> = None;
             let mut ever_drew_the_last = false;
             for step in 0..760 {

@@ -2072,7 +2072,7 @@ fn smoothstep(from: f32, to: f32, x: f32) -> f32 {
 ///
 /// **This is a deliberate second implementation of the coverage rules, for a
 /// thumbnail, and it holds to all three of them.** Dabs saturate under a `max`
-/// — or accumulate, where [`Brush::build_up`] asks them to, which is a choice
+/// — or accumulate, where [`Brush::builds`] asks them to, which is a choice
 /// of accumulation and not a different shape. `Brush::opacity` is applied
 /// exactly once, afterwards, in [`preview_image`], and never folded into a
 /// dab's coverage. And the falloff, the antialiasing margin sized from the
@@ -2156,7 +2156,17 @@ fn preview_mark(brush: &Brush, tip: Option<&TipThumb>, at: &MarkBox) -> Mark {
                     continue;
                 }
                 let at = y * at.width + x;
-                if brush.build_up {
+                // `builds()` and not `build_up`, so a brush carrying only a
+                // flow under 1.0 previews on the same accumulating rule the
+                // canvas will draw it under. Reading the flag alone left the
+                // row taking a `max` of dabs the stroke builder had already
+                // converted *for* accumulation, which is the mark at a
+                // fraction of its strength — a row that lies about the one
+                // number the control exists to set. What a dab carries is
+                // `StrokeBuilder`'s and is already right here: `preview_dabs`
+                // runs the real builder, so flow reaches this buffer without
+                // a second statement of the conversion.
+                if brush.builds() {
                     mark.coverage[at] += cov * (1.0 - mark.coverage[at]);
                 } else {
                     mark.coverage[at] = mark.coverage[at].max(cov);
@@ -4489,6 +4499,46 @@ pub(crate) mod tests {
             // Which is the opacity asked for, once, and not once per overlap.
             assert!((peak * brush.opacity - 0.4).abs() < 1e-4);
         }
+    }
+
+    /// A flow brush's row builds, exactly as its stroke on the canvas does.
+    ///
+    /// `preview_mark` is the one licensed second implementation of the coverage
+    /// rules, so it has to answer `Brush::builds` and not `Brush::build_up`:
+    /// what a dab carries is `StrokeBuilder`'s and `preview_dabs` runs the real
+    /// builder, so a flow brush arrives here already converted **for
+    /// accumulation**. Taking a `max` of those instead caps the row at roughly
+    /// `flow` — the mark at a third of its strength, on a row whose whole job is
+    /// to show what the brush does.
+    ///
+    /// Measured against the flow figure rather than against a pinned level: the
+    /// preview path crosses itself by construction, so a building row reaches
+    /// far past one dab's worth, and a `max` row cannot exceed it.
+    #[test]
+    fn a_flow_brushs_row_builds_rather_than_capping_at_one_dab() {
+        let flow = 0.3;
+        let brush = Brush {
+            spacing: 0.1,
+            opacity: 1.0,
+            hardness: 1.0,
+            pressure_size: false,
+            flow,
+            ..Default::default()
+        };
+        assert!(
+            brush.builds(),
+            "the fixture is not on the path being tested"
+        );
+        let peak = preview_of(&brush)
+            .coverage
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
+        assert!(
+            peak > flow + 0.25,
+            "the row peaked at {peak}, which is about the {flow} one dab carries              — it is taking a max of dabs already converted for accumulation"
+        );
+        assert!(peak <= 1.0 + 1e-5, "coverage compounded past solid: {peak}");
     }
 
     /// Nothing may be freed by the pass that still draws it.

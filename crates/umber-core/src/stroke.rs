@@ -256,13 +256,20 @@ impl StrokeBuilder {
 
     /// Whether this stroke's dabs accumulate coverage instead of saturating.
     ///
+    /// [`Brush::builds`] is the whole of the question — [`Brush::build_up`] or a
+    /// [`Brush::flow`] under 1.0 — and asking it there rather than here is what
+    /// keeps this and the per-dab conversion in `emit` from answering
+    /// differently. A dab converted for the accumulating blend and then drawn
+    /// under the `max` is a mark at a fraction of its strength; the reverse is a
+    /// mark far past it.
+    ///
     /// Read off the brush snapshotted at [`Self::begin`] rather than off the
     /// live one, for the same reason the colour is: the dab pass picks a
     /// pipeline from this every frame, and a stroke that changed pipeline
     /// halfway would have its first half drawn under one rule and its second
     /// under the other.
     pub fn builds_up(&self) -> bool {
-        self.brush.build_up
+        self.brush.builds()
     }
 
     /// The grain this stroke bites through, as `(strength, tile size)`.
@@ -671,7 +678,7 @@ impl StrokeBuilder {
         // the most recent dabs. `preview_mark` mirrors it, so the row and the
         // canvas still agree, and no shipped preset combines the three; it is
         // named here because the alternative is somebody finding it.
-        let coverage = if self.brush.build_up {
+        let coverage = if self.brush.builds() {
             // The step and the reach from the brush's own two functions rather
             // than from the spacing: `step_at` floors the step at a quarter of a
             // pixel, so on a small dab the floor and not the spacing decides how
@@ -689,7 +696,48 @@ impl StrokeBuilder {
                 // number the vertex shader builds the quad from.
                 radius / aspect.max(1.0),
             );
-            tip::per_dab_for_stroke(mark, depth)
+            let per_dab = tip::per_dab_for_stroke(mark, depth);
+            // **Flow scales the dab and never the mark**, which is the whole of
+            // what makes it Photoshop's Flow rather than a second opacity. The
+            // conversion above answers "what must one dab carry for the stroke
+            // to *arrive* at `mark`"; flow is the artist declining that answer
+            // and asking for less, so the stroke builds towards the mark over
+            // several dabs and goes past it where it crosses itself. It is
+            // therefore the one thing that deliberately breaks the reaches-its-
+            // mark promise `per_dab_for_stroke` exists to keep, which is why it
+            // multiplies the converted figure rather than being folded into
+            // `mark` up beside the modulation: folded in there it would be a cap
+            // on the finished stroke, indistinguishable from `Brush::opacity`
+            // and reaching the commit through the same door the wet-layer scheme
+            // keeps shut.
+            //
+            // `flow()` and not the field, because a hand-written preset may name
+            // anything and `builds()` above has already been asked the bounded
+            // question — the two reading the field differently is a dab
+            // converted for one blend and drawn under the other.
+            let flow = self.brush.flow();
+            if flow < 1.0 {
+                // The floor is re-applied because flow can take a converted dab
+                // back under one level of an `R8Unorm` scratch, where a
+                // *constant* increment never moves the accumulator at all and
+                // the stroke is not faint but absent. `Brush::MIN_FLOW` bounds
+                // the rail against the same thing; this bounds the arithmetic,
+                // because `mark` may already be small when flow multiplies it.
+                //
+                // Guarded on `flow < 1.0` and on the value being positive, so
+                // flow 1.0 is the **exact** identity — including for the two
+                // cases `per_dab_for_stroke` deliberately leaves unfloored: a
+                // target of zero, which must stay nothing painted rather than
+                // becoming a level, and a stroke only one dab deep, which
+                // returns its target verbatim.
+                if per_dab > 0.0 {
+                    (per_dab * flow).max(tip::SCRATCH_LEVEL)
+                } else {
+                    0.0
+                }
+            } else {
+                per_dab
+            }
         } else {
             mark
         };
@@ -858,6 +906,281 @@ mod tests {
             stabilization: 0.0,
             pressure_size: false,
             ..Default::default()
+        }
+    }
+
+    /// Flow moves the mark across its whole rail for an ordinary brush.
+    ///
+    /// The regime every shipped preset is in: a mark of 1.0, which is what
+    /// `coverage_at` answers for any brush that does not ramp opacity with
+    /// pressure, and which 250 of the 258 shipped presets paint at. Here the
+    /// conversion returns 1.0 unfloored, flow is what the dab carries outright,
+    /// and the rail is monotone end to end.
+    ///
+    /// Stated as *never lighter than the flow above it, and reaching many
+    /// distinct marks*, rather than as strictly decreasing. The first draft
+    /// asserted strict and failed at flow 0.75, correctly: at a tight spacing a
+    /// high flow still saturates within one pass, so the top of the rail is
+    /// legitimately flat and the travel is all underneath it. What must never
+    /// happen is the rail going flat *everywhere*, which is exactly what the
+    /// faint-mark case above loses and what this would catch.
+    ///
+    /// Each accumulation step is quantised to the scratch's own eight bits, or
+    /// this would be measuring exact arithmetic the canvas never performs.
+    #[test]
+    fn flow_moves_the_mark_across_its_whole_rail_for_an_ordinary_brush() {
+        let mut last = f32::INFINITY;
+        let mut seen = Vec::new();
+        for flow in [1.0, 0.75, 0.5, 0.25, 0.1, 0.05, Brush::MIN_FLOW] {
+            // The GPU pair's own fixture: wide enough that a pixel sees a
+            // handful of dabs rather than dozens, which is what leaves the rail
+            // somewhere to travel instead of saturating on the first pass.
+            let brush = Brush {
+                flow,
+                ..unsmoothed(8.0, 0.5)
+            };
+            assert_eq!(brush.coverage_at(1.0), 1.0, "the fixture must be solid");
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+            s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+            let dabs: Vec<Dab> = s.drain_pending().collect();
+            let cov = dabs[dabs.len() / 2].coverage;
+            let off = brush.off_heading(vec2(1.0, 0.0));
+            let depth = crate::tip::stack_depth(
+                brush.step_at(1.0, off),
+                brush.reach_at(1.0, off),
+                brush.hardness_at(1.0),
+                brush.radius_at(1.0),
+            );
+            let mut a = 0.0f32;
+            for _ in 0..(depth.round() as i32) {
+                a += cov * (1.0 - a);
+                a = (a * 255.0).round() / 255.0;
+            }
+            assert!(
+                a <= last,
+                "flow {flow} reached {a}, darker than the flow above it at \
+                 {last} — lowering flow must never lay down more"
+            );
+            last = a;
+            seen.push((a * 255.0).round() as u32);
+        }
+        seen.dedup();
+        assert!(
+            seen.len() >= 5,
+            "the rail produced only {} distinct marks ({seen:?}) — it has gone \
+             flat, which is a control that does nothing",
+            seen.len()
+        );
+        assert!(
+            last < 0.25,
+            "the bottom of the rail is still at {last}, so the sweep never \
+             showed flow doing anything"
+        );
+    }
+
+    /// Flow scales what a dab carries and leaves the stroke's opacity alone.
+    ///
+    /// The two are different numbers and this is the guard that says so in the
+    /// emitted dabs rather than in a comment. `Brush::opacity` is applied once
+    /// at commit over coverage the dab pass has saturated; folding it into a dab
+    /// is the compounding bug the wet-layer scheme exists to prevent. So halving
+    /// flow must halve what a dab writes and must not touch `opacity` at all —
+    /// and halving `opacity` must not touch what a dab writes.
+    ///
+    /// `build_up` is on throughout, so the *pipeline* is the same in every
+    /// reading and what is being measured is the conversion alone. Left off, the
+    /// flow arm would also be moving between the `max` path and the accumulating
+    /// one and the ratio would be measuring both changes at once.
+    #[test]
+    fn flow_scales_the_dab_and_never_the_strokes_opacity() {
+        let base = Brush {
+            build_up: true,
+            opacity: 0.5,
+            ..unsmoothed(12.0, 0.1)
+        };
+        let coverage = |brush: Brush| {
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+            s.extend(InputPoint::new(vec2(120.0, 0.0), 1.0, 0.1));
+            let dabs: Vec<Dab> = s.drain_pending().collect();
+            dabs[dabs.len() / 2].coverage
+        };
+
+        let full = coverage(base);
+        let half = coverage(Brush { flow: 0.5, ..base });
+        assert!(
+            (half - full * 0.5).abs() < 1e-6,
+            "flow 0.5 carried {half} where half of {full} was asked for"
+        );
+
+        // The other direction, and the one that would go quiet: opacity moving
+        // must leave the dab where it was.
+        let dimmer = coverage(Brush {
+            opacity: 0.25,
+            ..base
+        });
+        assert_eq!(
+            dimmer, full,
+            "stroke opacity reached the dab, which is the compounding bug"
+        );
+        // And flow does not write itself back onto opacity on the way past.
+        assert_eq!(Brush { flow: 0.5, ..base }.opacity, 0.5);
+    }
+
+    /// The coverage a dab carried before `Brush::flow` existed, pinned.
+    ///
+    /// **These 120 figures were produced by a build with no flow field in it**,
+    /// at d0efaa3, by the same sweep run against the same `StrokeBuilder` — not
+    /// by this build and not by restating the conversion here. That is what
+    /// makes this an identity test rather than a tautology, and the first
+    /// attempt was the tautology: it compared a brush carrying the default flow
+    /// against one naming 1.0 by hand, which are the same brush, so every
+    /// mutation of the flow-1.0 path walked through it. Mutation found that;
+    /// re-reading the assertion would not have.
+    ///
+    /// Pure `f32` arithmetic, so unlike a pixel through a shader these *are*
+    /// bytes and CI may be held to them — no adapter is involved and IEEE
+    /// settles the rest.
+    ///
+    /// The sweep is `build_up` × size × spacing × pressure, in that nesting.
+    /// Three of the points are load-bearing and are here deliberately:
+    ///
+    /// - **pressure 0.0** is a curve asking for nothing, which the scratch floor
+    ///   must not lift into a mark.
+    /// - **pressure 0.002** is under one level of the scratch, which is the only
+    ///   place the floor is visible at all — at 0.05 a dab is already twelve
+    ///   levels up and flooring it changes nothing.
+    /// - **spacing 2.5** is an author asking for separated dabs, which two
+    ///   shipped presets do, and is the only way to reach a stack **one dab
+    ///   deep** — one of the two cases `per_dab_for_stroke` leaves unfloored, and
+    ///   therefore the one case where applying the floor at the default is
+    ///   visible. Without it the sweep never met the floor and a mutation
+    ///   widening flow's guard to `<= 1.0` survived.
+    #[rustfmt::skip]
+    const COVERAGE_BEFORE_FLOW: [f32; 120] = [
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 3.921569e-3, 8.512437e-3, 1.09101295e-1, 1e0,
+        0e0, 3.921569e-3, 8.512437e-3, 1.09101295e-1, 1e0,
+        0e0, 3.921569e-3, 1.6952455e-2, 2.0629948e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 3.921569e-3, 3.921569e-3, 1.846087e-2, 1e0,
+        0e0, 3.921569e-3, 6.5835714e-3, 8.539283e-2, 1e0,
+        0e0, 3.921569e-3, 1.6952455e-2, 2.0629948e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+        0e0, 3.921569e-3, 3.921569e-3, 1.7728329e-2, 1e0,
+        0e0, 3.921569e-3, 6.5835714e-3, 8.539283e-2, 1e0,
+        0e0, 3.921569e-3, 1.6952455e-2, 2.0629948e-1, 1e0,
+        0e0, 2e-3, 5e-2, 5e-1, 1e0,
+    ];
+
+    /// At flow 1.0 a dab carries exactly what it carried before flow existed.
+    ///
+    /// [`COVERAGE_BEFORE_FLOW`] is the reference and its docs say where it came
+    /// from. Bit for bit rather than nearly: the `max` path is what every pixel
+    /// test in the suite is written against, and `per_dab_for_stroke` goes to
+    /// the trouble of an early return to keep it exact.
+    #[test]
+    fn flow_at_one_carries_exactly_what_a_build_without_it_carried() {
+        let mut i = 0;
+        for build_up in [false, true] {
+            for size in [2.0, 12.0, 80.0] {
+                for spacing in [0.02, 0.1, 0.25, 2.5] {
+                    for pressure in [0.0, 0.002, 0.05, 0.5, 1.0] {
+                        let brush = Brush {
+                            build_up,
+                            pressure_opacity: true,
+                            opacity_curve: ResponseCurve::LINEAR,
+                            ..unsmoothed(size, spacing)
+                        };
+                        assert_eq!(brush.flow, 1.0, "the sweep is about the default");
+                        let mut s = StrokeBuilder::new();
+                        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+                        s.extend(InputPoint::new(vec2(150.0, 0.0), pressure, 0.1));
+                        let dabs: Vec<Dab> = s.drain_pending().collect();
+                        let mid = dabs[dabs.len() / 2].coverage;
+                        assert_eq!(
+                            mid, COVERAGE_BEFORE_FLOW[i],
+                            "build_up {build_up}, size {size}, spacing \
+                             {spacing}, pressure {pressure}: flow 1.0 moved a \
+                             dab that a build without the field left at {}",
+                            COVERAGE_BEFORE_FLOW[i]
+                        );
+                        i += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            i,
+            COVERAGE_BEFORE_FLOW.len(),
+            "the table and the sweep disagree"
+        );
+    }
+
+    /// A dab a low flow would take under one level of the scratch is floored.
+    ///
+    /// The `R8Unorm` scratch cannot hold an increment below half a level, and a
+    /// *constant* one never moves the accumulator however many dabs land on it —
+    /// so the failure is a stroke that is absent rather than faint, which is what
+    /// `tip::SCRATCH_LEVEL` exists to bound. Flow multiplies after the
+    /// conversion, so it can push a dab back under that floor even though
+    /// `per_dab_for_stroke` had already lifted it over.
+    ///
+    /// **This is a cap as well as a floor, and the cap is the more interesting
+    /// half.** A critic read the assertion below as a guarantee that flow works
+    /// at the faint end, and it is not one — it guarantees only that the stroke
+    /// is *there*. Where `per_dab_for_stroke` has already floored a dab, flow
+    /// multiplies a value that is pinned and the floor puts it straight back, so
+    /// the whole rail produces one mark. Measured through this very path, at
+    /// size 80 / spacing 0.02 / mark 0.05 every flow from 1.0 down to
+    /// `MIN_FLOW` emits the identical dab of 0.003922 and the identical stroke
+    /// of 39 levels; at 200 / 0.01 / 0.02 it is 78 levels throughout. At
+    /// 20 / 0.1 / 0.05 the rail works down to about 0.5 and is flat below it.
+    ///
+    /// That is not new and flow did not cause it: at flow 1.0 those two brushes
+    /// were *already* pinned at the floor, painting 39 and 78 levels where their
+    /// own curve asked for 12.8 and 5.1. It is `per_dab_for_stroke`'s documented
+    /// cap — "47 levels at 2% and 76 at 1%" — and what flow adds is only that a
+    /// control now points at it. The honest remedy is the wider scratch that
+    /// function already names, not a finer floor: halving it would halve the
+    /// threshold and not remove it.
+    ///
+    /// `flow_moves_the_mark_across_its_whole_rail_for_an_ordinary_brush` is the
+    /// other side, and is the regime every shipped preset is in.
+    ///
+    /// A tight spacing and a faint mark, which is where the conversion divides
+    /// the mark down hardest, and then the lowest flow the rail offers on top.
+    #[test]
+    fn a_dab_a_low_flow_thins_is_still_something_the_scratch_can_hold() {
+        let brush = Brush {
+            build_up: true,
+            flow: Brush::MIN_FLOW,
+            pressure_opacity: true,
+            opacity_curve: ResponseCurve::LINEAR,
+            ..unsmoothed(80.0, 0.02)
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 0.05, 0.0));
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 0.05, 0.1));
+        for dab in s.drain_pending() {
+            assert!(
+                dab.coverage >= crate::tip::SCRATCH_LEVEL,
+                "a dab came back at {} — under one level, so the stroke is not \
+                 faint but absent",
+                dab.coverage
+            );
         }
     }
 
