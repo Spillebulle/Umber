@@ -155,9 +155,13 @@ pub struct UiActions {
     /// instead, so `App::record_move` is the one place a reorder is settled,
     /// snapshotted and recorded, whichever control asked for it.
     ///
-    /// A `Copy` triple rather than `layerdrag::Drop`, because [`UiActions`] is
-    /// `Copy`; the panel has already asked `LayerStack::can_reorder`, and
-    /// `reorder_to` asks again, so a stale index is refused rather than obeyed.
+    /// A plain triple rather than `layerdrag::Aim` plus the row it came from —
+    /// which would also be `Copy`, so that is taste and not a constraint: three
+    /// numbers is what `record_move` needs and nothing about aiming survives the
+    /// frame. **What makes a stale drop safe is not stated here**: `reorder_to`
+    /// re-asks `plan_reorder`, so an *illegal* one is refused, and the reachable
+    /// case — the settle having taken a row out from under these positions — is
+    /// `App::record_move`'s own length comparison.
     pub reorder_layer: Option<(usize, usize, u8)>,
     /// Give the selected layer a mask, or take its mask off. The caller's,
     /// because a new mask has to be filled white on the GPU and both have to be

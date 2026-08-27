@@ -736,10 +736,15 @@ pub struct Editor {
     /// What the floating pixels were **set from**, where they were set rather
     /// than pasted or lifted.
     ///
-    /// Beside [`Editor::float`] rather than a field on `Floating`, which is
-    /// `Copy` and read by value at three call sites; a `TextBlock` holds a
-    /// `String`, so folding it in would take the `Copy` away from all of them
-    /// for a field only the commit reads.
+    /// Beside [`Editor::float`] rather than a field on `Floating`, and **the
+    /// reason it used to give has expired**: `Floating` was `Copy` and read by
+    /// value, so a `TextBlock`'s `String` folded into it would have cost every
+    /// reader that. `MadeLayer` carries a `StackShape` now, so `Floating` is
+    /// merely `Clone` and folding this in would cost nothing structural. What
+    /// keeps it out here is the paragraph below: this is cleared by
+    /// `App::begin_float` and deliberately *not* by `App::cancel_transform`,
+    /// which is the opposite of what `Floating::made` needs, and one field
+    /// cannot have both lifetimes.
     ///
     /// **`App::begin_float` clears it unconditionally as it installs a float,
     /// and that one line is the whole guarantee.** `App::place_text` sets it
@@ -1495,9 +1500,15 @@ impl Editor {
         // other two sites that take a float. By this line the stacks have
         // already been swapped, so the layer a float made belongs to a document
         // that is no longer here and the id would resolve — if it resolved at
-        // all — against the incoming one. Doing nothing leaves an empty layer in
-        // the outgoing document with the entry that removes it; reaching for
-        // that layer here would remove somebody else's.
+        // all — against the incoming one. Reaching for that layer here would
+        // remove somebody else's.
+        //
+        // What doing nothing leaves is an empty layer in the outgoing document
+        // and **no entry that removes it**, which used to be the other way
+        // round: a placement recorded when its layer appeared, and this comment
+        // said so. It records at the commit now, so the litter has nothing to
+        // take it off. Still the better of the two, and still unreachable —
+        // every caller commits the float before the swap.
         self.float = None;
         // The stroke that was in flight, if any, was finished by the caller
         // before the swap; this only stops a stale slot from the *previous*

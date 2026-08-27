@@ -1466,9 +1466,15 @@ impl UmberApp {
         // absence of one — a full-canvas caption on a 10000² document would be
         // 400 MB of patch and a blocking read at the moment the artist lets go.
         //
-        // **Taken here and recorded below, once the commit is certain.** Every
-        // return above this point goes through `Editor::unmake_layer` instead,
-        // and there is deliberately no route that records and then gives up:
+        // **Taken here and recorded below, once the commit is certain.** The
+        // `nowhere` gate above is the one return that can be reached with a
+        // placement in hand, and it goes through `Editor::unmake_layer`; the two
+        // `let ... else` returns between it and here are **unreachable** while
+        // `nowhere` is false, because it is built from exactly the readings they
+        // test. Said out loud rather than relied on quietly, since what a
+        // record-then-give-up would leave behind has changed: it used to be a
+        // layer plus the entry that removes it, and it would now be an orphan
+        // with nothing to take it off. There is deliberately no such route, and
         // that is what lets Escape cost the history nothing at all. See
         // `crate::editor::MadeLayer::before`.
         let made = float.made.take();
@@ -2191,8 +2197,8 @@ impl UmberApp {
         }
     }
 
-    /// Add the layer a text placement puts its words on, and record the one
-    /// entry the whole placement gets.
+    /// Add the layer a text placement puts its words on, and carry the shape
+    /// its one undo entry will be made of.
     ///
     /// [`Self::add_layer`], with the name taken from the text and with what it
     /// hands back. **One entry is the placement's whole undo**, and that is the
@@ -2256,11 +2262,13 @@ impl UmberApp {
         if let Err(refused) = self.reserve_a_slice() {
             return Err(vram::slice_refused("a layer", &refused));
         }
-        // **The model half, and the recording with it, is `Editor`'s.** Split
-        // there rather than written here so it can be driven with no window: a
-        // critic deleted the `record` call when it lived at this call site and
-        // all 856 tests stayed green, which is "a guard on a model is not a
-        // guard on the call site" with a crate boundary in the way.
+        // **The model half is `Editor`'s, and so is the recording that follows
+        // it a gesture later.** Split there rather than written here so both can
+        // be driven with no window: a critic deleted the recording when it lived
+        // at this call site and all 856 tests stayed green, which is "a guard on
+        // a model is not a guard on the call site" with a crate boundary in the
+        // way. Nothing is recorded at this point; `Editor::commit_made_layer` is
+        // what does it, from `finish_transform`.
         let made = match self.editor.make_text_layer(text) {
             Some(made) => made,
             // A parked layer may be holding the last slice; give the oldest
@@ -2869,8 +2877,9 @@ impl UmberApp {
         // nothing. Settling here is what buys that back. See
         // `crate::editor::MadeLayer::before`.
         //
-        // The cost is one frame's worth of surprise: a click on a chevron with a
-        // box in the air puts the picture down. Adding a layer, deleting one,
+        // The cost is one frame's worth of surprise, and it is both controls:
+        // a click on a chevron, or a row dragged in the Layers panel, with a box
+        // in the air puts the picture down. Adding a layer, deleting one,
         // grouping and both mask commands have always done exactly that.
         //
         // **And the settle can itself move the rows this move names**, which is
@@ -2883,6 +2892,12 @@ impl UmberApp {
         // nothing at all, and the artist drags the row again. Comparing the
         // count is enough because removing a layer is the only way settling
         // touches the stack.
+        //
+        // **Nothing guards these two lines, and a critic proved it** by deleting
+        // them and watching the whole suite stay green. Reaching this needs an
+        // `EventLoopProxy` and therefore an event loop, and the scan below can
+        // see the settle but not what follows it. Reasoned rather than measured,
+        // and recorded as such rather than left to look tested.
         let rows = self.editor.layers.len();
         self.finish_transform();
         if self.editor.layers.len() != rows {
@@ -6835,8 +6850,18 @@ mod tests {
     ///
     /// The two that were missing were the Layers panel's chevrons and its drag.
     /// The drag reaches `record_move` through `UiActions::reorder_layer` because
-    /// settling needs the renderer, so the second half of this guard is that
-    /// `panels.rs` records nothing at all.
+    /// settling needs the renderer, so the other two halves of this guard are
+    /// that **`panels.rs` and `editor.rs` record nothing** — the two types that
+    /// hold an `Editor` and not an `App`, and therefore cannot settle. A critic
+    /// added `Editor::sneaky_group` and every test stayed green, which is this
+    /// guard's own failure class one file along; `commit_made_layer` is the one
+    /// allowed site and is named rather than pattern-matched.
+    ///
+    /// **What a text scan cannot see, said out loud rather than left implied.**
+    /// A settle inside `if false { … }` satisfies it; so does `let h = &mut
+    /// ed.history; h.record(…)` in a panel, which is the removed bug spelled
+    /// differently. Both were demonstrated. This catches the change somebody
+    /// makes on purpose, not one made to get past it.
     ///
     /// Sentinels are built with `concat!` so the scan cannot match its own
     /// source — "a source-text guard must not match its own source", the rule
@@ -6850,7 +6875,8 @@ mod tests {
         // The whole of what `EditBody::Structure` is recorded for. A seventh
         // structural kind means a seventh entry here, which is the point: the
         // failure this guards against is a new one being written without the
-        // settling, not the six that exist drifting.
+        // settling, not the six that exist drifting. A canvas flip is not among
+        // them because `EditBody::Flip` carries no shape at all.
         let kinds = [
             concat!("EditKind::", "AddLayer,"),
             concat!("EditKind::", "MoveLayer,"),
@@ -6859,20 +6885,38 @@ mod tests {
             concat!("EditKind::", "AddMask,"),
             concat!("EditKind::", "RemoveMask,"),
         ];
-        // Only the shipped half of the file: the tests below build histories by
-        // hand and are not edits anybody makes.
-        let body = source
-            .split(concat!("#[cfg(", "test)]"))
-            .next()
-            .expect("a first half");
+        // Only the shipped half of each file: the tests build histories by hand
+        // and are not edits anybody makes.
+        let shipped = |text: &'static str| {
+            text.split(concat!("#[cfg(", "test)]"))
+                .next()
+                .expect("a first half")
+        };
 
         let mut seen = 0;
+        // **Bounded to `impl UmberApp`, and that is not tidiness.** `open` used
+        // to be set by any method indented four and never cleared, so a record
+        // in a free function at indent zero was blamed on whichever method had
+        // been seen last - a critic got a failure naming `merged`, four hundred
+        // lines away. Worse, it *passed* as soon as any later indent-4 method
+        // happened to contain the sentinel. Anything outside the impl is now a
+        // failure that says so.
+        let mut in_app = false;
         let mut open: Option<(&str, bool)> = None;
-        for line in body.lines() {
+        for line in shipped(source).lines() {
             let trimmed = line.trim_start();
             let indent = line.len() - trimmed.len();
+            // A *blank* line is column zero too, and reading one as leaving the
+            // impl is how the first draft of this failed on its own source.
+            if indent == 0 && !trimmed.is_empty() && !trimmed.starts_with("//") {
+                in_app = trimmed.starts_with(concat!("impl Umber", "App {"));
+                open = None;
+            }
             // A method of `impl UmberApp`, which this file indents by four.
-            if indent == 4 && (trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")) {
+            if in_app
+                && indent == 4
+                && (trimmed.starts_with("fn ") || trimmed.starts_with("pub fn "))
+            {
                 open = Some((trimmed, false));
             }
             if trimmed.starts_with("//") {
@@ -6887,7 +6931,10 @@ mod tests {
                 continue;
             }
             let Some((name, settled)) = open else {
-                panic!("a structural record outside any method: {trimmed}");
+                panic!(
+                    "a structural entry is recorded outside `impl UmberApp`, where \
+                     nothing can put a float down first: {trimmed}"
+                );
             };
             seen += 1;
             assert!(
@@ -6907,22 +6954,38 @@ mod tests {
              and a missing one means this scan is no longer looking at them."
         );
 
-        // The other half: a panel holds the `Editor` and not the `App`, so it
-        // cannot settle a float and therefore may not record. The Layers panel's
-        // drag used to; it hands the move to `UiActions::reorder_layer` now.
-        let panels = include_str!("panels.rs");
+        // The other two halves: a type holding the `Editor` and not the `App`
+        // cannot settle a float, so it may not record. The Layers panel's drag
+        // used to; it hands the move to `UiActions::reorder_layer` now.
+        // `Editor::commit_made_layer` is the single exception, and it is
+        // exempted by name because it runs from `finish_transform`, where the
+        // commit is what is happening.
         let record = concat!("history", ".record(");
-        for line in panels.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
-                continue;
+        let allowed = concat!("fn commit_made_", "layer");
+        for (what, text) in [
+            ("panels.rs", shipped(include_str!("panels.rs"))),
+            ("editor.rs", shipped(include_str!("editor.rs"))),
+        ] {
+            let mut owner = "";
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                let indent = line.len() - trimmed.len();
+                if (indent == 0 || indent == 4)
+                    && (trimmed.starts_with("fn ") || trimmed.starts_with("pub fn "))
+                {
+                    owner = trimmed;
+                }
+                if trimmed.starts_with("//") || !trimmed.contains(record) {
+                    continue;
+                }
+                assert!(
+                    // `contains`, because the allowed one is `pub fn`.
+                    owner.contains(allowed),
+                    "`{what}` records a history entry in `{owner}`: {trimmed}. \
+                     Neither of these files can put a float down first, so what \
+                     they want recorded goes through `UiActions` and `App` does it."
+                );
             }
-            assert!(
-                !trimmed.contains(record),
-                "`panels.rs` records a history entry: {trimmed}. A panel cannot put \
-                 a float down first, so what it wants recorded goes through \
-                 `UiActions` and `App` does it."
-            );
         }
     }
 
