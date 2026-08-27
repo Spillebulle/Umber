@@ -492,16 +492,33 @@ impl<'a> Lexer<'a> {
     fn number(&mut self) -> f32 {
         self.skip();
         let mut end = 0;
+        let mut point = false;
+        let mut exponent = false;
         for (index, c) in self.rest.char_indices() {
             let leading_sign = (c == '-' || c == '+') && index == 0;
             let exponent_sign = (c == '-' || c == '+') && self.rest[..index].ends_with(['e', 'E']);
-            if c.is_ascii_digit()
-                || c == '.'
-                || c == 'e'
-                || c == 'E'
-                || leading_sign
-                || exponent_sign
-            {
+            let take = if c.is_ascii_digit() {
+                true
+            } else if c == '.' {
+                // A second point ends the number before it, which is what makes
+                // `.4.4` two numbers rather than one. Taking both would leave a
+                // token that does not parse, and `unwrap_or` below would answer
+                // 0.0 -- a plausible coordinate, so the mark comes out quietly
+                // deformed rather than absent. Six of Umber's icons are written
+                // that way and `pipette` was visibly wrong on the canvas.
+                !point && !exponent && {
+                    point = true;
+                    true
+                }
+            } else if c == 'e' || c == 'E' {
+                !exponent && {
+                    exponent = true;
+                    true
+                }
+            } else {
+                leading_sign || exponent_sign
+            };
+            if take {
                 end = index + c.len_utf8();
             } else {
                 break;
@@ -513,9 +530,48 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Every number token in `d`, as [`Lexer`] scans them, unparsed.
+///
+/// The scan and the parse are one line apart in [`Lexer::number`] and the
+/// `unwrap_or` between them is what makes a scanning bug invisible: a token
+/// that does not parse becomes 0.0, which is a plausible coordinate. This hands
+/// the tokens back so a guard can ask the question that `unwrap_or` answers
+/// away. See `icons::tests::every_number_in_every_icon_parses`.
+pub fn number_tokens(d: &str) -> Vec<String> {
+    let mut lexer = Lexer::new(d);
+    let mut out = Vec::new();
+    loop {
+        if lexer.command().is_some() {
+            continue;
+        }
+        if !lexer.at_number() {
+            break;
+        }
+        let before = lexer.rest;
+        lexer.number();
+        out.push(before[..before.len() - lexer.rest.len()].trim().to_string());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second point ends the number before it, which is what makes `.4.4`
+    /// two numbers. Taking both leaves a token that does not parse, and the
+    /// `unwrap_or` then answers 0.0 -- a plausible coordinate, so the mark
+    /// comes out deformed rather than absent. Six of Umber's icons are written
+    /// this way and `pipette` was visibly wrong.
+    #[test]
+    fn a_second_point_ends_the_number_before_it() {
+        let mut lexer = Lexer::new(".4.4 3.4-3.4");
+        for want in [0.4, 0.4, 3.4, -3.4] {
+            let got = lexer.number();
+            assert!((got - want).abs() < 0.0001, "wanted {want}, got {got}");
+        }
+        assert_eq!(number_tokens("m18 9 .4.4"), ["18", "9", ".4", ".4"]);
+    }
 
     /// A number list where the signs do the separating.
     #[test]

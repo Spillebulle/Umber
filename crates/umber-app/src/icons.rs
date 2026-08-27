@@ -1379,4 +1379,40 @@ mod tests {
             println!("wrote {}", out.display());
         }
     }
+
+    /// Every number in every icon's path data parses.
+    ///
+    /// The scan and the parse are one line apart in `lucide::Lexer::number`,
+    /// and the `unwrap_or(0.0)` between them is what let a scanning bug ship: a
+    /// token that does not parse becomes a coordinate of zero, which is
+    /// *plausible*, so the mark comes out quietly deformed rather than missing
+    /// or panicking. `pipette` was wrong on the canvas for exactly that reason —
+    /// `.4.4` is two numbers in SVG's grammar and the lexer took it as one — and
+    /// `link`, `pencil`, `file`, `copy` and `lasso-select` were wrong in ways
+    /// that still read as themselves, which is worse.
+    ///
+    /// `every_icon_fills_its_box` cannot see this: a zero lands inside the box,
+    /// so the bounds stay legal. Nor can a round trip through the same lexer,
+    /// which would agree with itself. What catches it is asking the *tokens*
+    /// whether Rust can parse them, which is the one question the `unwrap_or`
+    /// answers away.
+    #[test]
+    fn every_number_in_every_icon_parses() {
+        for icon in Icon::ALL {
+            let Art::Lucide(nodes) = icon.art() else {
+                continue;
+            };
+            for node in nodes {
+                let Node::Path(d) = node else {
+                    continue;
+                };
+                for token in crate::lucide::number_tokens(d) {
+                    assert!(
+                        token.parse::<f32>().is_ok(),
+                        "{icon:?} scans {token:?} out of {d:?}, which is not a number:                          it would reach the geometry as 0.0"
+                    );
+                }
+            }
+        }
+    }
 }
