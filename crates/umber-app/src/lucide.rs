@@ -537,6 +537,7 @@ impl<'a> Lexer<'a> {
 /// that does not parse becomes 0.0, which is a plausible coordinate. This hands
 /// the tokens back so a guard can ask the question that `unwrap_or` answers
 /// away. See `icons::tests::every_number_in_every_icon_parses`.
+#[cfg(test)]
 pub fn number_tokens(d: &str) -> Vec<String> {
     let mut lexer = Lexer::new(d);
     let mut out = Vec::new();
