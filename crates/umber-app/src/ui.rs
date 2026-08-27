@@ -2295,7 +2295,7 @@ mod strip_budget {
     /// rather than a painted readout since it became typable, which means it is
     /// as wide as the widest figure the rail can show rather than as wide as
     /// the one showing; all three of these were re-measured against that by
-    /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn`.
+    /// `every_rail_on_the_strip_fits_the_budget_that_lets_it_be_drawn`.
     pub const STABILISER: f32 = 190.0;
     /// The flow rail: what one dab lays down, as against `OPACITY`, which
     /// caps the finished stroke. A fourth `inline_slider` — the 90 point rail,
@@ -2332,7 +2332,7 @@ mod strip_budget {
     /// widest figure the rail can produce ("250" plus a digit's room for the
     /// caret), which is about twenty points more. Widened by hand rather than
     /// measured, because the Select strip is the one
-    /// `every_brush_rail_fits_the_budget_that_lets_it_be_drawn` declines to
+    /// `every_rail_on_the_strip_fits_the_budget_that_lets_it_be_drawn` declines to
     /// sweep and says why.
     pub const FEATHER: f32 = 185.0;
     /// The one rail the current selection mode owns: the rectangle's Roundness

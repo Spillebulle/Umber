@@ -4618,7 +4618,7 @@ pub(crate) mod tests {
             .fold(0.0f32, f32::max);
         assert!(
             peak > flow + 0.25,
-            "the row peaked at {peak}, which is about the {flow} one dab carries              — it is taking a max of dabs already converted for accumulation"
+            "the row peaked at {peak}, which is about the {flow} one dab carries — it is taking a max of dabs already converted for accumulation"
         );
         assert!(peak <= 1.0 + 1e-5, "coverage compounded past solid: {peak}");
     }

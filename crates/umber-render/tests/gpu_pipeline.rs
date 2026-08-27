@@ -718,16 +718,22 @@ fn flow_crossing(h: &mut Harness, flow: f32) -> (u8, u8) {
     let dabs: Vec<Dab> = s.drain_pending().collect();
 
     // The style the stroke itself would be drawn under, rather than one the
-    // test picked. `StrokeBuilder::builds_up` is what `app.rs` builds its
-    // `DabStyle` from and it is `Brush::builds` on the stroke's own snapshotted
-    // brush, so asking the brush here is asking the shipped decision — a test that set the flag by hand would pass
+    // test picked. `app.rs` builds its `DabStyle` from
+    // `StrokeBuilder::builds_up`, so that is what this asks — asking the
+    // *brush* here would be asking a second reader of the same question, and a
+    // test that reads the flag from anywhere but the one `app.rs` reads passes
     // just as happily with the two disagreeing, which is the failure that puts
-    // a converted dab under the wrong blend.
+    // a converted dab under the wrong blend. It was written that way and the
+    // gap was real: `builds_up`'s body could be changed to `self.brush
+    // .build_up` with all 2,277 tests green, which is a flow-only brush having
+    // its dabs converted for accumulation and then drawn under the `max` — a
+    // stroke capped at one converted dab, a fraction of the mark, while the
+    // library row (which *is* guarded) drew the correct darker one.
     h.stamp_styled(
         &dabs,
         DabStyle {
             per_dab_color: false,
-            build_up: brush.builds(),
+            build_up: s.builds_up(),
         },
     );
     h.commit(Color::WHITE, 1.0, BrushMode::Paint);
