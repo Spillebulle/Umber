@@ -329,6 +329,33 @@ pub enum Icon {
     /// a shadow under the mark. The pipette alone is what Photoshop, GIMP,
     /// Krita and Affinity all draw, so it is a shape somebody already knows.
     Eyedropper,
+    // Which outline the selection tool draws. At the end for the reason every
+    // group above it is — this enum is shared, and inserting into the middle of
+    // it is a merge that compiles and draws the wrong marks.
+    //
+    // There is no `SelectRectangle`: that mode's mark is [`Icon::Select`], the
+    // tool's own `square-dashed`, which is the marquee itself and the shape the
+    // gesture leaves. It does mean the tool glyph and the mode trigger draw the
+    // same mark while the default mode is in force, and that is agreement
+    // rather than duplication — a second dashed square invented to avoid it
+    // would be a mark meaning "rectangle" that nothing else in the interface
+    // uses, sitting beside the one that already does.
+    /// Lucide `circle-dashed`: the elliptical marquee, [`Icon::Select`]'s pair
+    /// and drawn in the same dashes for the same reason — it is a picture of
+    /// what lands on the canvas.
+    SelectEllipse,
+    /// Lucide `lasso-select`: a loop with a grab handle, which is the mark
+    /// Photoshop, GIMP and Affinity all use for freehand selection.
+    SelectLasso,
+    /// Lucide `pentagon`: a closed shape with straight edges and visible
+    /// corners, which is what clicking point to point leaves.
+    ///
+    /// Not `spline`, which was the other candidate: that is two nodes joined by
+    /// a *curve*, and this is the one mode in the set that cannot draw one.
+    /// Not `pen-tool` either — that is the bezier pen of a vector program, and
+    /// Umber has no vector tool for it to be confused with yet, which is
+    /// exactly why it should not be spent here.
+    SelectPolygon,
 }
 
 /// Where a mark's geometry comes from.
@@ -380,7 +407,7 @@ impl Icon {
     /// Hand-written and therefore checkable rather than self-evident: a test
     /// indexes it from an exhaustive match, so a variant added without a row
     /// here is a compile error rather than an icon nothing ever looks at.
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 54] = [
         Self::Brush,
         Self::Eraser,
         Self::Select,
@@ -432,6 +459,9 @@ impl Icon {
         Self::Bold,
         Self::Italic,
         Self::Eyedropper,
+        Self::SelectEllipse,
+        Self::SelectLasso,
+        Self::SelectPolygon,
     ];
 
     /// The icon's elements, copied from Lucide 1.34.0 unchanged.
@@ -904,6 +934,33 @@ impl Icon {
                 ),
                 Node::Path("m2 22 .414-.414"),
             ]),
+            // circle-dashed
+            Self::SelectEllipse => Art::Lucide(&[
+                Node::Path("M10.1 2.182a10 10 0 0 1 3.8 0"),
+                Node::Path("M13.9 21.818a10 10 0 0 1-3.8 0"),
+                Node::Path("M17.609 3.721a10 10 0 0 1 2.69 2.7"),
+                Node::Path("M2.182 13.9a10 10 0 0 1 0-3.8"),
+                Node::Path("M20.279 17.609a10 10 0 0 1-2.7 2.69"),
+                Node::Path("M21.818 10.1a10 10 0 0 1 0 3.8"),
+                Node::Path("M3.721 6.391a10 10 0 0 1 2.7-2.69"),
+                Node::Path("M6.391 20.279a10 10 0 0 1-2.69-2.7"),
+            ]),
+            // lasso-select
+            Self::SelectLasso => Art::Lucide(&[
+                Node::Path("M7 22a5 5 0 0 1-2-4"),
+                Node::Path("M7 16.93c.96.43 1.96.74 2.99.91"),
+                Node::Path(
+                    "M3.34 14A6.8 6.8 0 0 1 2 10c0-4.42 4.48-8 10-8s10 3.58 10 8a7.19 7.19 0 0 1-.33 2",
+                ),
+                Node::Path("M5 18a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"),
+                Node::Path(
+                    "M14.33 22h-.09a.35.35 0 0 1-.24-.32v-10a.34.34 0 0 1 .33-.34c.08 0 .15.03.21.08l7.34 6a.33.33 0 0 1-.21.59h-4.49l-2.57 3.85a.35.35 0 0 1-.28.14z",
+                ),
+            ]),
+            // pentagon
+            Self::SelectPolygon => Art::Lucide(&[Node::Path(
+                "M10.83 2.38a2 2 0 0 1 2.34 0l8 5.74a2 2 0 0 1 .73 2.25l-3.04 9.26a2 2 0 0 1-1.9 1.37H7.04a2 2 0 0 1-1.9-1.37L2.1 10.37a2 2 0 0 1 .73-2.25z",
+            )]),
         }
     }
 }
@@ -1131,6 +1188,9 @@ mod tests {
                 Icon::Bold => 48,
                 Icon::Italic => 49,
                 Icon::Eyedropper => 50,
+                Icon::SelectEllipse => 51,
+                Icon::SelectLasso => 52,
+                Icon::SelectPolygon => 53,
             }
         };
         for icon in Icon::ALL {
@@ -1183,7 +1243,9 @@ mod tests {
     /// somebody notices later.
     #[test]
     fn every_command_is_one_the_parser_knows() {
-        const KNOWN: [char; 12] = ['M', 'm', 'L', 'l', 'H', 'h', 'V', 'v', 'C', 'c', 'A', 'a'];
+        const KNOWN: [char; 14] = [
+            'M', 'm', 'L', 'l', 'H', 'h', 'V', 'v', 'C', 'c', 'S', 's', 'A', 'a',
+        ];
         for icon in Icon::ALL {
             let Art::Lucide(nodes) = icon.art() else {
                 continue;

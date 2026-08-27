@@ -23,6 +23,15 @@ use umber_render::{LayerDraw, LayerEffects, StrokeStyle};
 /// *screen* pixels. Divided by the zoom at the point of use.
 const SELECT_CLOSE_PIXELS: f32 = 10.0;
 
+/// How far the pointer has to travel before the lasso records another sample,
+/// in *screen* pixels. Divided by the zoom at the point of use.
+///
+/// One pixel, which is the finest the screen can distinguish and therefore the
+/// finest the hand can ask for. It used to be one *document* pixel, which was a
+/// bound that bit hardest where there was least to bound — see
+/// `SelectionDraft::moved`.
+const SELECT_SAMPLE_PIXELS: f32 = 1.0;
+
 /// What the pointer is currently doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interaction {
@@ -204,7 +213,7 @@ pub struct UiState {
     pub pressure_open: bool,
     pub tool: Tool,
     /// Which outline the selection tool draws. One tool with a mode rather
-    /// than three tools: see `umber_core::selection`.
+    /// than four tools: see `umber_core::selection`.
     pub selection_mode: SelectionMode,
     /// What a gesture does to the selection already standing, when no modifier
     /// says otherwise.
@@ -219,6 +228,25 @@ pub struct UiState {
     /// gesture will draw, exactly as the mode above does, and the radius a
     /// selection actually carries lives on the `Selection` itself.
     pub selection_feather: f32,
+    /// How far a rectangular selection's corners are rounded, `0.0` square
+    /// through `1.0` stadium.
+    ///
+    /// Interface state on the same footing as the feather, and drawn only in
+    /// the mode that answers to it — `SelectionMode::extra`. It is kept while
+    /// another mode is in hand rather than reset, for the reason the feather
+    /// is: a setting the artist chose is theirs until they change it, and a
+    /// rail that emptied itself when they went to the lasso and back would be
+    /// one they had to set twice.
+    pub selection_roundness: f32,
+    /// How heavily the lasso damps the hand, `0.0` off through
+    /// `SelectionDraft::MAX_STABILISER`.
+    ///
+    /// Zero by default, unlike `Brush::stabilization`. A brush stroke is a mark
+    /// somebody wants smooth; a selection outline is a boundary they are aiming
+    /// at, and one that trails the pointer is one that lands somewhere they did
+    /// not point. So the default is the behaviour that was there before this
+    /// control existed, exactly.
+    pub selection_stabiliser: f32,
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
     /// Whether the wheel's triangle turns to follow the hue. Meaningless for the
@@ -398,6 +426,8 @@ impl Default for UiState {
             selection_mode: SelectionMode::Rectangle,
             selection_op: SelectionOp::Replace,
             selection_feather: 0.0,
+            selection_roundness: 0.0,
+            selection_stabiliser: 0.0,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
             // What the picker has always done, and what the design draws.
@@ -1792,7 +1822,7 @@ impl Editor {
 
     /// A press on the canvas with the selection tool in hand.
     ///
-    /// Only the polygon can see a second press: the other two modes are one
+    /// Only the polygon can see a second press: the other three modes are one
     /// press, a drag and a release, and their draft is gone by the time
     /// another arrives.
     ///
@@ -1814,23 +1844,46 @@ impl Editor {
                 }
             }
             None => {
+                // Every setting the strip carries is snapshotted here, in one
+                // place, for the reason the operation is: a polygon spans
+                // several clicks and a rail dragged between two of them must
+                // not change what the gesture already under way turns out to
+                // have meant. `SelectionMode::extra` decides which of the last
+                // two the strip actually drew, and the draft records both
+                // regardless — the mode is what ignores the one it has no use
+                // for, so nothing here has to be kept in step with the strip.
                 self.selection_draft = Some(
                     SelectionDraft::new(self.ui.selection_mode, doc)
                         .combining(op)
-                        .feathered(self.ui.selection_feather),
+                        .feathered(self.ui.selection_feather)
+                        .rounded(self.ui.selection_roundness)
+                        .stabilised(self.ui.selection_stabiliser),
                 );
                 self.interaction = Interaction::Selecting;
             }
         }
     }
 
+    /// How far the pointer must travel before the lasso records another sample,
+    /// in document pixels.
+    ///
+    /// A screen distance divided by the zoom, exactly as
+    /// [`Editor::handle_tolerance`] and `selection_press`'s `close` are — and
+    /// read afresh on every event rather than snapshotted at the press, because
+    /// the wheel still zooms while a polygon is half drawn.
+    fn lasso_step(&self) -> f32 {
+        SELECT_SAMPLE_PIXELS / self.camera.zoom.max(1e-3)
+    }
+
     pub fn selection_moved(&mut self, doc: Vec2) {
+        let step = self.lasso_step();
         if let Some(draft) = self.selection_draft.as_mut() {
-            draft.moved(doc);
+            draft.moved(doc, step);
         }
     }
 
     pub fn selection_release(&mut self, doc: Vec2) {
+        let step = self.lasso_step();
         let Some(draft) = self.selection_draft.as_mut() else {
             // The draft went while the button was down — Escape, or a tool
             // shortcut. The button coming up is then what ends the gesture,
@@ -1839,7 +1892,7 @@ impl Editor {
             self.interaction = Interaction::Idle;
             return;
         };
-        if draft.release(doc) {
+        if draft.release(doc, step) {
             self.finish_selection();
         }
     }
@@ -3326,5 +3379,181 @@ mod tests {
             "the folder's lock has to reach it"
         );
         assert_eq!(ed.interaction, Interaction::Idle);
+    }
+
+    // --- what the options strip's settings actually reach ------------------
+
+    /// One rectangular gesture, made the way the pointer makes one.
+    fn drag_a_box(ed: &mut Editor, a: Vec2, b: Vec2) {
+        ed.selection_press(a, SelectionOp::Replace);
+        ed.selection_moved(b);
+        ed.selection_release(b);
+    }
+
+    /// **Every setting on the Select strip reaches the selection a gesture
+    /// makes**, which is the half `umber-core`'s own guards cannot see.
+    ///
+    /// `SelectionDraft`'s tests drive the draft directly, so all four would
+    /// stay green if `selection_press` stopped reading one of these fields —
+    /// the `docs` rule that a guard on a model is not a guard on the panel,
+    /// one level down from the panel. Each is measured off the finished
+    /// `Selection` rather than read back off the draft.
+    ///
+    /// **The feather is here because it was reported as doing nothing**, and
+    /// this is the evidence that it does: a rectangle drawn with the rail at
+    /// four softens outwards over a band eight pixels wide, and the same
+    /// rectangle with the rail at zero is hard at its own edge. What the artist
+    /// could not see is real and is not this: the *marquee* is the rings, and
+    /// the rings are deliberately left exactly where they were, so a feathered
+    /// selection looks identical to a sharp one until something is painted
+    /// through it.
+    #[test]
+    fn every_setting_on_the_select_strip_reaches_the_selection_it_makes() {
+        let mut ed = Editor::default();
+        ed.ui.tool = Tool::Select;
+
+        // Feather. A pixel outside the box is untouched by a sharp gesture and
+        // partly selected by a soft one, and the soft one's own edge has come
+        // down off full coverage.
+        ed.ui.selection_mode = SelectionMode::Rectangle;
+        drag_a_box(&mut ed, Vec2::new(20.0, 20.0), Vec2::new(60.0, 60.0));
+        let sharp = ed.selection.clone().expect("a rectangle");
+        assert_eq!(sharp.feather(), 0.0);
+        assert_eq!(sharp.coverage_at(19, 40), 0);
+        assert_eq!(sharp.coverage_at(20, 40), 255);
+
+        ed.ui.selection_feather = 4.0;
+        drag_a_box(&mut ed, Vec2::new(20.0, 20.0), Vec2::new(60.0, 60.0));
+        let soft = ed.selection.clone().expect("a soft rectangle");
+        assert_eq!(soft.feather(), 4.0, "the rail never reached the gesture");
+        assert!(
+            soft.coverage_at(19, 40) > 0,
+            "the edge did not soften outwards"
+        );
+        assert!(
+            soft.coverage_at(20, 40) < 255,
+            "the edge did not soften inwards"
+        );
+        assert!(soft.bounds().x < sharp.bounds().x, "the box did not grow");
+        ed.ui.selection_feather = 0.0;
+
+        // Roundness. The corner of the box is inside a square selection and
+        // outside a rounded one.
+        assert_eq!(sharp.coverage_at(20, 20), 255);
+        ed.ui.selection_roundness = 1.0;
+        drag_a_box(&mut ed, Vec2::new(20.0, 20.0), Vec2::new(60.0, 60.0));
+        let round = ed.selection.clone().expect("a disc");
+        assert_eq!(
+            round.coverage_at(20, 20),
+            0,
+            "the roundness rail never reached the gesture"
+        );
+        assert_eq!(round.coverage_at(40, 40), 255, "the middle went missing");
+        ed.ui.selection_roundness = 0.0;
+
+        // Stabiliser. The same freehand path, with and without: damped, the
+        // recorded outline never reaches the corner the hand went round.
+        ed.ui.selection_mode = SelectionMode::Lasso;
+        let corner = Vec2::new(60.0, 20.0);
+        // Fifteen reports a leg, so each is about two and a half pixels — which
+        // is what a hand moving at any speed a stabiliser is for actually
+        // produces, and coarse enough that the filter's four-report lag is
+        // pixels rather than fractions of one.
+        let path = |ed: &mut Editor| {
+            ed.selection_press(Vec2::new(20.0, 20.0), SelectionOp::Replace);
+            for k in 1..=15 {
+                ed.selection_moved(Vec2::new(20.0, 20.0).lerp(corner, k as f32 / 15.0));
+            }
+            for k in 1..=15 {
+                ed.selection_moved(corner.lerp(Vec2::new(60.0, 60.0), k as f32 / 15.0));
+            }
+            ed.selection_moved(Vec2::new(20.0, 60.0));
+            ed.selection_release(Vec2::new(20.0, 60.0));
+            ed.selection.clone().expect("a lasso")
+        };
+        let loose = path(&mut ed);
+        ed.ui.selection_stabiliser = 0.8;
+        let damped = path(&mut ed);
+        let nearest = |s: &Selection| {
+            s.rings()[0]
+                .iter()
+                .map(|p| p.distance(corner))
+                .fold(f32::MAX, f32::min)
+        };
+        assert!(
+            nearest(&loose) < 1.0,
+            "the raw outline did not go round the corner"
+        );
+        assert!(
+            nearest(&damped) > 2.5,
+            "the stabiliser rail never reached the gesture: the outline came \
+             within {:.1} px of the corner",
+            nearest(&damped)
+        );
+    }
+
+    /// The lasso's sampling step follows the camera, which is half of the fix
+    /// for the reported staircase — the half that decides how much of the hand
+    /// is recorded in the first place.
+    ///
+    /// **One document path, drawn at two zooms.** That is what isolates the
+    /// step: the pointer reports the same positions either way, so any
+    /// difference in what comes back is `selection_moved` having asked the
+    /// camera. Reports a third of a pixel apart, which the old constant
+    /// document pixel threw two out of every three of away at any zoom, and
+    /// which 4:1 keeps whole.
+    ///
+    /// The vertex count is what is measured, and the bound is deliberately only
+    /// "more" rather than a ratio, because the two halves of the fix pull
+    /// against each other here: the 1:1 gesture keeps a third of the reports
+    /// and is then subdivided once for having pixel-wide gaps, where the 4:1
+    /// one keeps all of them and needs no subdivision at all. Measured, that is
+    /// 481 vertices against 314 rather than the threefold difference the
+    /// sampling alone would give. What the comparison still cannot be fooled by
+    /// is a step that ignores the camera, which would make the two equal.
+    ///
+    /// It also pins where the reading happens. A step worked out at the press
+    /// and snapshotted would pass a test that never moved the camera, and would
+    /// be wrong the moment somebody rolled the wheel with a polygon half drawn.
+    #[test]
+    fn the_lasso_records_a_finer_line_the_closer_the_camera_is() {
+        let corners = [
+            Vec2::new(20.0, 20.0),
+            Vec2::new(60.0, 20.0),
+            Vec2::new(60.0, 60.0),
+            Vec2::new(20.0, 60.0),
+        ];
+        let mut path = Vec::new();
+        for leg in [
+            (corners[0], corners[1]),
+            (corners[1], corners[2]),
+            (corners[2], corners[3]),
+            (corners[3], corners[0]),
+        ] {
+            let steps = 120; // 40 document pixels in thirds of one.
+            for k in 1..=steps {
+                path.push(leg.0.lerp(leg.1, k as f32 / steps as f32));
+            }
+        }
+
+        let recorded_at = |zoom: f32| {
+            let mut ed = Editor::default();
+            ed.ui.tool = Tool::Select;
+            ed.ui.selection_mode = SelectionMode::Lasso;
+            ed.camera.zoom = zoom;
+            ed.selection_press(corners[0], SelectionOp::Replace);
+            for p in &path {
+                ed.selection_moved(*p);
+            }
+            ed.selection_release(*path.last().expect("a path"));
+            ed.selection.clone().expect("a lasso").rings()[0].len()
+        };
+        let coarse = recorded_at(1.0);
+        let fine = recorded_at(4.0);
+        assert!(
+            fine > coarse,
+            "the same path recorded {fine} vertices at 4:1 and {coarse} at 1:1, \
+             which is not the step following the camera"
+        );
     }
 }

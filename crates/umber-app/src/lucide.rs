@@ -203,12 +203,22 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Outline {
 /// Walk one `d` attribute, appending an outline per subpath.
 ///
 /// The subset of SVG's path grammar Lucide uses: moves, lines in all four
-/// spellings, cubic curves, elliptical arcs and closes, absolute and relative,
-/// with the implicit repeat that lets `m13.41 10.59 5.66-5.66` mean a move and
-/// then a line. Quadratics and the smooth forms are not implemented, because no
-/// icon here uses one — and a path that did would draw a straight line where a
-/// curve belongs, which is why [`crate::icons`] has a test that walks every
-/// icon and fails on a command this does not know.
+/// spellings, cubic curves both plain and smooth, elliptical arcs and closes,
+/// absolute and relative, with the implicit repeat that lets
+/// `m13.41 10.59 5.66-5.66` mean a move and then a line. Quadratics and the
+/// smooth quadratic are not implemented, because no icon here uses one — and a
+/// path that did would draw a straight line where a curve belongs, which is why
+/// [`crate::icons`] has a test that walks every icon and fails on a command
+/// this does not know.
+///
+/// **The smooth cubic was added rather than the icon that wanted it being
+/// dropped**, which is worth recording because the trade is not obvious. `S` is
+/// not a curve of its own: it is a `C` whose first control point is *derived*,
+/// so it adds no geometry and no second flattening — four lines and the same
+/// [`curve`]. Against that, `lasso-select` is the mark every application draws
+/// for freehand selection and the set carries no second candidate, so refusing
+/// the whole icon over a shorthand for a curve this file already draws would
+/// have been paying a great deal to avoid paying a little.
 fn path(d: &str, out: &mut Vec<Outline>) {
     let mut lexer = Lexer::new(d);
     let mut points: Vec<Pos2> = Vec::new();
@@ -216,6 +226,13 @@ fn path(d: &str, out: &mut Vec<Outline>) {
     let mut cursor = pos2(0.0, 0.0);
     let mut start = cursor;
     let mut command = ' ';
+    // The second control point of the cubic just drawn, which is the only thing
+    // `S` needs and the only thing it needs from any earlier command. Cleared
+    // by everything that is not a cubic, which is what the specification says
+    // makes `S`'s first control point the current point — a curve leaving in
+    // the direction it arrived, rather than one bent by a control point left
+    // lying about three commands ago.
+    let mut last_control: Option<Pos2> = None;
 
     loop {
         // A command letter, or a number, which repeats the last command. `M`
@@ -239,6 +256,10 @@ fn path(d: &str, out: &mut Vec<Outline>) {
 
         let relative = command.is_ascii_lowercase();
         let here = cursor;
+        // Taken and cleared before the match, so only the two arms that end in
+        // a cubic put it back. Clearing at every other arm instead is the
+        // "forgotten at the sixth call site" failure in miniature.
+        let previous_control = last_control.take();
         match command.to_ascii_uppercase() {
             'M' => {
                 cursor = place(here, lexer.number(), lexer.number(), relative);
@@ -264,6 +285,19 @@ fn path(d: &str, out: &mut Vec<Outline>) {
                 let two = place(here, lexer.number(), lexer.number(), relative);
                 let to = place(here, lexer.number(), lexer.number(), relative);
                 curve(here, one, two, to, &mut points);
+                last_control = Some(two);
+                cursor = to;
+            }
+            'S' => {
+                // The first control point is the previous curve's second,
+                // reflected about the current point — which is what makes the
+                // join smooth and is the whole of what the shorthand says.
+                let one =
+                    previous_control.map_or(here, |c| pos2(2.0 * here.x - c.x, 2.0 * here.y - c.y));
+                let two = place(here, lexer.number(), lexer.number(), relative);
+                let to = place(here, lexer.number(), lexer.number(), relative);
+                curve(here, one, two, to, &mut points);
+                last_control = Some(two);
                 cursor = to;
             }
             'A' => {
@@ -521,6 +555,105 @@ mod tests {
         );
         let last = only.points.last().expect("an end");
         assert!((last.x - 12.0).abs() < 0.01 && (last.y - 6.0).abs() < 0.01);
+    }
+
+    /// A smooth cubic leaves the way the curve before it arrived.
+    ///
+    /// That is the whole of what `S` means, and it is what the reflection is
+    /// for — so the tangent is what this measures rather than the control
+    /// points, which are not in the output. `lasso-select`'s big oval is
+    /// exactly this shape: a `c` bending one way and an `s` continuing it.
+    ///
+    /// The reflection is only visible where the two segments would otherwise
+    /// disagree, so the fixture is a `c` that arrives *steeply* and an `s`
+    /// whose own control point is far away — read as a plain cubic the join
+    /// would corner by about 45 degrees.
+    #[test]
+    fn a_smooth_cubic_continues_the_curve_before_it() {
+        let mut out = Vec::new();
+        path("M0 0c4 0 6 2 6 6s6 2 10 2", &mut out);
+        let [only] = out.as_slice() else {
+            panic!("one subpath, got {}", out.len());
+        };
+        // The join is at (6, 6): the last point of the first curve and the
+        // first of the second.
+        let join = only
+            .points
+            .iter()
+            .position(|p| (p.x - 6.0).abs() < 0.01 && (p.y - 6.0).abs() < 0.01)
+            .expect("the two curves meet at (6, 6)");
+        let arriving = (only.points[join] - only.points[join - 1]).normalized();
+        let leaving = (only.points[join + 1] - only.points[join]).normalized();
+        let turn = arriving.dot(leaving).clamp(-1.0, 1.0).acos().to_degrees();
+        // A few degrees rather than none: what is compared is two *chords* of a
+        // twelve-step flattening, and a chord leans off the tangent by the
+        // curvature over its own length — so an exactly smooth join still reads
+        // 5.3 degrees here. The number that matters is the one below it.
+        assert!(
+            turn < 10.0,
+            "the join corners by {turn:.1} degrees, so the control point was not \
+             reflected"
+        );
+
+        // And the same numbers read as a plain cubic really would corner,
+        // which is what makes the line above a test of the reflection rather
+        // than of a fixture that was smooth anyway.
+        let mut plain = Vec::new();
+        path("M0 0c4 0 6 2 6 6c6 2 10 2 10 2", &mut plain);
+        let [plain] = plain.as_slice() else {
+            panic!("one subpath");
+        };
+        let join = plain
+            .points
+            .iter()
+            .position(|p| (p.x - 6.0).abs() < 0.01 && (p.y - 6.0).abs() < 0.01)
+            .expect("the two curves meet at (6, 6)");
+        let arriving = (plain.points[join] - plain.points[join - 1]).normalized();
+        let leaving = (plain.points[join + 1] - plain.points[join]).normalized();
+        let turn = arriving.dot(leaving).clamp(-1.0, 1.0).acos().to_degrees();
+        assert!(
+            turn > 30.0,
+            "the fixture is smooth however it is read, so this proved nothing"
+        );
+    }
+
+    /// An `s` with nothing to reflect leaves along the line to its own control
+    /// point.
+    ///
+    /// The specification's answer for a smooth cubic that does not follow one:
+    /// the first control point coincides with the current point. Worth pinning
+    /// because the tempting alternative — carrying whatever control point was
+    /// last seen, several commands ago — is what a `last_control` that is never
+    /// cleared does, and it bends a curve in a direction nothing asked for.
+    #[test]
+    fn a_smooth_cubic_after_a_line_starts_from_where_it_is() {
+        // **There has to be a cubic earlier in the path**, or a `last_control`
+        // that is never cleared holds `None` anyway and the mutation this test
+        // is about is invisible. So: a curve, a line away from it, then the
+        // smooth cubic — which is the shape that makes a stale control point
+        // reachable at all. Demonstrated by mutation; the first draft of this
+        // fixture had no `c` in it and passed with the clearing removed.
+        let mut out = Vec::new();
+        path("M0 0c4 0 6 2 6 6L16 6s0 6 6 6", &mut out);
+        let [only] = out.as_slice() else {
+            panic!("one subpath, got {}", out.len());
+        };
+        let join = only
+            .points
+            .iter()
+            .position(|p| (p.x - 16.0).abs() < 0.01 && (p.y - 6.0).abs() < 0.01)
+            .expect("the line ends at (16, 6)");
+        // With no cubic immediately before it the first control point is the
+        // current point, so with the second at (16, 12) the curve leaves
+        // straight down the y axis. Carrying the earlier `c`'s own second
+        // control point instead reflects (6, 2) about (16, 6) and sends it out
+        // to the right — measured, [0.9, 0.4].
+        let leaving = (only.points[join + 1] - only.points[join]).normalized();
+        assert!(
+            leaving.y > 0.9,
+            "it left along {leaving:?} rather than downwards, so a control point \
+             from earlier in the path was reflected"
+        );
     }
 
     /// A `<line>` is two points and nothing else, and a filled `<circle>` is a

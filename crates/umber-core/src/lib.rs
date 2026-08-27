@@ -99,7 +99,7 @@ pub use overlay::{Side, Strip};
 // last. Callers say `palette::Palette` and alias it, which reads as what it is.
 pub use palette::{PaletteError, PaletteLibrary, Swatch};
 pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
-pub use selection::{Selection, SelectionDraft, SelectionMode, SelectionOp};
+pub use selection::{ModeSetting, Selection, SelectionDraft, SelectionMode, SelectionOp};
 pub use stroke::{Dab, StrokeBuilder};
 pub use text::{Align, Setting, TextBlock, TextError};
 pub use textobj::{Placement, TextFace, TextObject};

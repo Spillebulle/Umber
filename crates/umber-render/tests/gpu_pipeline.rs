@@ -2688,6 +2688,71 @@ fn a_selection_edge_is_antialiased() {
 }
 
 #[test]
+fn a_stroke_through_a_feathered_selection_comes_out_soft() {
+    // **The feather was reported as doing nothing, and this is the evidence
+    // that it does.** It reaches the canvas by exactly the route a hard
+    // selection does — the mask is softened in `umber-core` and the dab pass
+    // multiplies coverage by it, so neither a shader nor a blend state knows a
+    // feather from a straight edge — which is why nothing here is about
+    // feathering as such and everything is about the paint.
+    //
+    // What the artist could not see is real and is not this: the *marquee* is
+    // drawn from the rings, and a feather deliberately leaves the rings exactly
+    // where they were, so a feathered selection looks identical to a sharp one
+    // until something is painted through it. `Selection::feathered`'s docs have
+    // the argument.
+    let mut h = harness_or_skip!();
+
+    let radius = 6u32;
+    let sel = Selection::rectangle(
+        Vec2::new(0.0, 0.0),
+        Vec2::new(32.0, DOC as f32),
+        UVec2::splat(DOC),
+    )
+    .expect("a selection")
+    .feathered(radius as f32, UVec2::splat(DOC))
+    .expect("a soft selection");
+    h.set_selection(Some(sel));
+    // One dab wide enough to cover the band on both sides of the edge, at full
+    // coverage — so every level read below is the *mask's* and not the dab's
+    // own falloff.
+    h.stamp(&[dab(32.0, 32.0, 28.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    // A ramp rather than a step: still solid a band's width inside, gone a
+    // band's width outside, and about half at the edge the rings are still
+    // drawn along. Alpha is linear 8-bit even in an sRGB layer, and the levels
+    // are read with slack because they have been through a shader.
+    let inside = h.pixel(32 - radius - 2, 32)[3];
+    let outside = h.pixel(32 + radius + 1, 32)[3];
+    let edge = h.pixel(32, 32)[3];
+    assert_eq!(
+        inside, 255,
+        "the selection stopped being solid inside itself"
+    );
+    assert_eq!(outside, 0, "the feather reached past its own radius");
+    assert!(
+        (100..=155).contains(&edge),
+        "expected about half coverage where the outline is, got {edge}"
+    );
+
+    // And it falls the whole way rather than stepping once, which is the half
+    // that a pair of samples either side of the edge cannot tell from a hard
+    // edge one pixel out of place.
+    let across: Vec<u8> = (26..=38).map(|x| h.pixel(x, 32)[3]).collect();
+    assert!(
+        across.windows(2).all(|w| w[0] >= w[1]),
+        "the falloff is not monotone: {across:?}"
+    );
+    let partial = across.iter().filter(|a| (1u8..255).contains(a)).count();
+    assert!(
+        partial >= 8,
+        "only {partial} pixels of the band are partly selected, which is a hard \
+         edge with a soft pixel on it rather than a feather: {across:?}"
+    );
+}
+
+#[test]
 fn a_clipped_stroke_still_saturates_under_overlap() {
     // The wet-layer guarantee has to survive the selection exactly as it
     // survived the tip and the paper. The mask modulates coverage; it does not

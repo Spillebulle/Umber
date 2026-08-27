@@ -481,6 +481,71 @@ fn dropdown_furniture(icon: bool, trailing: Option<f32>, pad: f32) -> f32 {
         + pad
 }
 
+/// How much of a trigger `width` points wide its label may have.
+///
+/// [`dropdown`]'s own elide reads this, and it is `pub(crate)` so that a
+/// [`DropdownWidth::Exact`] picker can be *checked* against the labels it has to
+/// hold. Exact is exact: a width a few points short does not grow the trigger,
+/// it clips the word, which is how the layer row's blend picker came to draw
+/// "Luminosit" when `BlendMode` went from five variants to twenty-three. A
+/// guard subtracting its own guess at the furniture would be a second statement
+/// of this, agreeing with a rule the widget need not follow; calling the same
+/// function the widget calls is what makes it a measurement.
+pub(crate) fn dropdown_label_room(width: f32, icon: bool, trailing: Option<f32>, pad: f32) -> f32 {
+    width - dropdown_furniture(icon, trailing, pad)
+}
+
+/// One row of a [`dropdown`]'s menu, with a mark before its label.
+///
+/// `egui::Ui::selectable_label` is what every other menu here draws and it has
+/// no room for a mark, so this is the version for a picker whose choices *are*
+/// shapes — the selection tool's modes, where the outline the gesture leaves is
+/// a better answer to "which one is that" than its name is.
+///
+/// The row takes the whole width the menu is offering rather than sizing to its
+/// own contents, so every entry's highlight is the same width and the list
+/// reads as a column. That only works where the trigger is
+/// [`DropdownWidth::Exact`] and wide enough for the longest label — a menu is
+/// as wide as its trigger — which is what [`dropdown_label_room`] is for.
+///
+/// The ink on the chosen row is [`Palette::active_ink`] and never the accent:
+/// `control_active` is tinted towards the accent in two themes and taken from
+/// another application's selection colour in four, where an accent mark on it
+/// reads as low as 1.88:1.
+pub fn menu_choice(ui: &mut Ui, p: &Palette, icon: Icon, label: &str, chosen: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), metrics::DROPDOWN),
+        Sense::click(),
+    );
+    let painter = ui.painter();
+    let ink = if chosen {
+        painter.rect_filled(rect, metrics::RADIUS, p.control_active);
+        p.active_ink()
+    } else if response.hovered() {
+        painter.rect_filled(rect, metrics::RADIUS, p.control);
+        p.text_strong
+    } else {
+        p.text
+    };
+    icons::draw(
+        painter,
+        Rect::from_min_size(
+            pos2(rect.left(), rect.top()),
+            vec2(DROPDOWN_ICON, rect.height()),
+        ),
+        icon,
+        ink,
+    );
+    painter.text(
+        pos2(rect.left() + dropdown_lead(true, 0.0), rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(text::TINY),
+        ink,
+    );
+    response.clicked()
+}
+
 /// The dropdown. One trigger, one menu, everywhere in the interface.
 ///
 /// The look is the Colour panel's picker-type switch: dim text that comes up to
@@ -618,7 +683,12 @@ pub fn dropdown<R>(
             rect.center().y,
         ),
         Align2::LEFT_CENTER,
-        elide(painter, trigger.label, text::TINY, width - furniture),
+        elide(
+            painter,
+            trigger.label,
+            text::TINY,
+            dropdown_label_room(width, trigger.icon.is_some(), trailing_w, pad),
+        ),
         font,
         ink,
     );
@@ -4677,6 +4747,57 @@ pub(crate) mod tests {
                 assert!(
                     !seen.contains(&p.accent),
                     "{kind:?}: the selected tool still draws the accent",
+                );
+            }
+        }
+    }
+
+    /// The chosen row of a mark-and-label menu is inked in
+    /// [`Palette::active_ink`], in the theme where that is the accent *and* in
+    /// one where it is not.
+    ///
+    /// The tool button's guard above, applied to the second control that draws
+    /// on `control_active`. A critic predicted that swapping this one line for
+    /// `p.accent` would fail nothing, and it was right: `theme`'s
+    /// `an_active_mark_reads_on_the_fill_it_is_drawn_on` measures the palette
+    /// and cannot see whether anything calls it, and the menu itself lives
+    /// inside an `egui::Popup` that no headless pass opens. So this drives
+    /// [`menu_choice`] directly.
+    ///
+    /// **It is a guard on the widget and not on the picker**, which is the
+    /// honest limit: nothing here can see that `ui::selection_mode_switch`
+    /// calls this rather than `selectable_label`.
+    #[test]
+    fn the_chosen_menu_row_is_inked_in_what_reads_on_its_fill() {
+        use crate::theme::ThemeKind;
+
+        for kind in [ThemeKind::Graphite, ThemeKind::MediaBog] {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            crate::theme::install_fonts(&ctx);
+            // Twice: the first pass through a fresh context builds the font
+            // atlas, and a row whose label has not been laid out draws no ink.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen = inks_drawn(&ctx, vec2(200.0, 200.0), |ui| {
+                    menu_choice(ui, &p, Icon::Select, "Rectangle", true);
+                });
+            }
+            assert!(
+                seen.contains(&p.control_active),
+                "{kind:?}: the chosen row drew no selected fill, so what the ink \
+                 below is drawn *on* is not what this claims"
+            );
+            assert!(
+                seen.contains(&p.active_ink()),
+                "{kind:?}: the chosen row did not draw {:?}",
+                p.active_ink(),
+            );
+            if p.active_ink() != p.accent {
+                assert!(
+                    !seen.contains(&p.accent),
+                    "{kind:?}: the chosen row still draws the accent, which is \
+                     1.88:1 on this theme's selection fill",
                 );
             }
         }
