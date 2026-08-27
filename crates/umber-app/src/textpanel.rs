@@ -669,21 +669,30 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     let refused = preview(ui, p, ed);
 
     ui.add_space(8.0);
+    own_layer_row(ui, p, ed, actions);
+    ui.add_space(4.0);
     if ed.text.editing.is_some() {
+        // **A text layer's Place is `edit_row`'s, on its second line**, and it
+        // was drawn *here as well* for one commit: two live controls one row
+        // apart setting the same flag. Neither guard caught it — one asked
+        // whether Place was drawn at all, which two of them satisfy, and the
+        // button-gap one counts *pairs* on a line, which a second row holding a
+        // single button satisfies as well.
         edit_row(ui, p, ed, refused, actions);
     } else {
         place_row(ui, p, ed, refused, actions);
     }
 }
 
-/// The two controls a **text layer** gets in place of Place.
+/// The two controls a **text layer** gets beside Place.
 ///
-/// Place is not drawn at all here rather than drawn disabled, which is the
-/// opposite call the style marks get and the same one a folder's missing
-/// opacity gets: there is something else in that place doing the job, so an
-/// extra dead button would be a control with nothing to say. `begin_float`
-/// still refuses a paste onto this layer, and says why — the gate catches the
-/// route that goes round the panel.
+/// With "On its own layer" off, Place is not drawn here at all rather than drawn
+/// disabled, which is the opposite call the style marks get and the same one a
+/// folder's missing opacity gets: `begin_float` genuinely refuses a paste onto a
+/// text layer, so a dead button would be a control with nothing to say. With the
+/// switch on there is no refusal to report — the placement makes its own layer —
+/// so the caller draws Place below these, and this comment is the whole of the
+/// difference between the two cases.
 fn edit_row(
     ui: &mut Ui,
     p: &Palette,
@@ -753,6 +762,34 @@ fn edit_row(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // **Place shares this line rather than taking one of its own**, and
+            // that is a measurement rather than a preference: a panel body is a
+            // `ScrollArea`, and at `metrics::PANEL`'s real height a fifth row put
+            // Place below the fold. The brush library's Edit mark being in the
+            // header is the same lesson — the first thing to scroll away is the
+            // last row of commands.
+            //
+            // It is offered at all only because the switch is on. With a layer of
+            // its own a placement does not touch this layer, so there is nothing
+            // for `begin_float` to refuse and Update is not doing this button's
+            // job: one sets *this* caption again, the other puts a second one
+            // down. Without it, placing a caption left the artist on the text
+            // layer they had just made with no way to place another but to go and
+            // select something else — and clearing the box to type the next one
+            // armed Update to overwrite the first. That trap is this switch's own
+            // default's doing, so it is the switch that has to answer for it.
+            if ed.ui.text_own_layer {
+                let place = place_state(
+                    Landing::of(ed),
+                    ed.text.block.text.trim().is_empty(),
+                    refused,
+                );
+                let response = controls::text_button(ui, p, "Place", true, place.enabled);
+                if response.clicked() {
+                    actions.place_text = true;
+                }
+                response.on_hover_text(place.tooltip.as_ref());
+            }
             // Gated on the lock like everything else that edits a layer. It
             // changes no pixel, and it changes what the file carries and what
             // may be painted here afterwards, which is what a lock is about.
@@ -1709,8 +1746,7 @@ fn place_row(
     actions: &mut UiActions,
 ) {
     let state = place_state(
-        ed.layers.active_is_locked(),
-        ed.layers.active_slot().is_none(),
+        Landing::of(ed),
         ed.text.block.text.trim().is_empty(),
         refused,
     );
@@ -1725,9 +1761,93 @@ fn place_row(
     });
 }
 
+/// The switch that decides where the next placement lands.
+///
+/// **Drawn on every frame the module is open, including for a text layer**, and
+/// that is the rule the ticked-layers strip already keeps one panel along: a
+/// control that vanishes when you use it is one nobody can put back. It governs
+/// whether [`place_row`] is drawn at all below a text layer's own controls, so
+/// switching it off there takes the button away — and leaves this line, which is
+/// the way back.
+fn own_layer_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
+    let mut own = ed.ui.text_own_layer;
+    let row = widgets::toggle_row(ui, p, "On its own layer", &mut own);
+    if own != ed.ui.text_own_layer {
+        // Collected rather than written, for the reason every other control in
+        // this panel is collected: the panel holds `&Editor` and `app.rs` is the
+        // one writer, so a frame cannot draw one answer and act on another.
+        actions.text_own_layer = Some(own);
+    }
+    row.on_hover_text(
+        "Each placement makes a layer named after its own words. That is what \
+         keeps text editable: Umber can only offer to set it again where it can \
+         tell the words from the picture underneath.",
+    );
+}
+
+/// Where a placement would land, and what stands in its way.
+///
+/// **Which readings even apply depends on the mode**, which is the whole reason
+/// this is a struct rather than three more positional booleans. A placement that
+/// makes its own layer is not gated by the selected layer's lock at all — the
+/// new layer carries no lock — and it *is* gated by whether the stack has room,
+/// which a placement onto the selected layer never is. Handing
+/// [`place_state`] one set of flags whose meaning silently changed with a fourth
+/// would be the partially-exhaustive reading this codebase records elsewhere,
+/// wearing a boolean's clothes.
+#[derive(Clone, Copy, Debug)]
+struct Landing {
+    /// `Editor::ui.text_own_layer`.
+    own_layer: bool,
+    /// Is the place the text would go locked?
+    ///
+    /// The *place*, not the selected entry: with `own_layer` on this is
+    /// `LayerStack::new_layer_would_be_locked`, which asks about what would
+    /// enclose the new layer, and with it off it is the selected layer's own
+    /// effective lock. See that method for why the two differ.
+    locked: bool,
+    /// A folder is selected and the text would have to land on it. Only
+    /// reachable with `own_layer` off: with it on the new layer goes *inside*
+    /// the folder, which is where every application puts one.
+    folder: bool,
+    /// Why a new layer cannot be had, where it cannot. Only ever `Some` with
+    /// `own_layer` on.
+    ///
+    /// **The reason, not a `bool`, because the two remedies differ** — which is
+    /// the whole point of `LayerStack::add_refusal` answering an enum. It was
+    /// flattened to a `bool` here first, and the single sentence that survived
+    /// told somebody whose folder was merely nested too deep to go and delete a
+    /// layer: word for word the failure that method's own docs say it exists to
+    /// prevent, in the control that is meant to be dead *ahead* of the gate that
+    /// gets it right.
+    no_room: Option<umber_core::AddRefusal>,
+}
+
+impl Landing {
+    fn of(ed: &Editor) -> Self {
+        let own_layer = ed.ui.text_own_layer;
+        Self {
+            own_layer,
+            locked: if own_layer {
+                ed.layers.new_layer_would_be_locked()
+            } else {
+                ed.layers.active_is_locked()
+            },
+            folder: !own_layer && ed.layers.active_slot().is_none(),
+            // **`LayerStack::add_refusal`'s answer, and the answer *whole*
+            // rather than whether there was one.** The button has to be dead
+            // exactly where `App::add_text_layer` will refuse and to say the
+            // same thing it will say; two spellings of "is there room" is how a
+            // control comes to promise what the model declines, and flattening
+            // the reason away is how it comes to prescribe the wrong remedy.
+            no_room: own_layer.then(|| ed.layers.add_refusal()).flatten(),
+        }
+    }
+}
+
 /// Whether Place may be pressed, and what to say about it.
 ///
-/// A pure function of four readings, and separate from [`place_row`] for the
+/// A pure function of its readings, and separate from [`place_row`] for the
 /// reason `gesture::press` and `dock`'s drop rules are separate from what draws
 /// them: this is the whole of the decision, and the decision is the part that
 /// was wrong. Reading it out of a running window is not a test anybody can run
@@ -1739,23 +1859,68 @@ struct Place {
 
 /// See [`Place`].
 ///
-/// The order of the refusals is deliberate. The lock and the folder come first
-/// because they are about *where* the text would go, and somebody whose layer
-/// is locked is not helped by also being told about the size; `empty` comes
-/// before the block's own refusal because the preview does not rebuild for an
-/// empty block, so `refused` may be describing what was there a keystroke ago.
-fn place_state(locked: bool, folder: bool, empty: bool, refused: Option<TextError>) -> Place {
+/// The order of the refusals is deliberate. The ones about *where* the text
+/// would go come first, because somebody whose layer is locked is not helped by
+/// also being told about the size; `empty` comes before the block's own refusal
+/// because the preview does not rebuild for an empty block, so `refused` may be
+/// describing what was there a keystroke ago.
+fn place_state(landing: Landing, empty: bool, refused: Option<TextError>) -> Place {
+    // **Destructured, so a fifth reading is a compile error rather than a
+    // silence.** That is the trap [`Landing`]'s own docs invoke and the remedy
+    // `palimport::Losses::sentences` already uses: a function that reached into
+    // the struct field by field would go on compiling with a new field it never
+    // consulted, which is a refusal the model makes and the button does not.
+    let Landing {
+        own_layer,
+        locked,
+        folder,
+        no_room,
+    } = landing;
     if locked {
         return Place {
             enabled: false,
-            tooltip: "The layer is locked. Unlock it in the Layers panel, or select another."
-                .into(),
+            // Two sentences, because with a layer of its own the lock the artist
+            // has to find is not the one on the row they are looking at: it is
+            // on a folder somewhere above it, and "the layer is locked" would
+            // send them to unlock a layer that is not the problem.
+            tooltip: if own_layer {
+                "The folder this would go in is locked. Unlock it in the Layers panel, \
+                 or select a layer outside it."
+                    .into()
+            } else {
+                "The layer is locked. Unlock it in the Layers panel, or select another.".into()
+            },
         };
     }
     if folder {
         return Place {
             enabled: false,
-            tooltip: "A folder is selected. A folder holds no pixels, so select a layer.".into(),
+            tooltip: "A folder is selected. A folder holds no pixels, so select a layer, \
+                      or switch on \"On its own layer\"."
+                .into(),
+        };
+    }
+    if let Some(why) = no_room {
+        // **A sentence per reason**, the same pair `App::add_text_layer` raises,
+        // so the dead button and the notice behind it cannot say different
+        // things. One sentence for both is what this had first, and it told
+        // somebody whose folder was merely nested too deep to go and delete a
+        // layer, which would not have helped.
+        return Place {
+            enabled: false,
+            tooltip: match why {
+                umber_core::AddRefusal::StackFull => {
+                    "There is nowhere to put another layer. Delete one, or switch off \
+                     \"On its own layer\" to set the words on the layer that is selected."
+                        .into()
+                }
+                umber_core::AddRefusal::TooDeep => {
+                    "That folder is nested as deep as it goes, so a layer inside it \
+                     would be one level too deep. Select a layer outside it, or switch \
+                     off \"On its own layer\"."
+                        .into()
+                }
+            },
         };
     }
     if empty {
@@ -1775,9 +1940,18 @@ fn place_state(locked: bool, folder: bool, empty: bool, refused: Option<TextErro
     }
     Place {
         enabled: true,
-        tooltip: "Put the text on the canvas, where the transform tool can move, scale \
-                  and turn it before it is committed"
-            .into(),
+        // It names *where* as well as what, because that is the half the switch
+        // above it changes and a button whose outcome depends on a control
+        // beside it should say which way that control is set.
+        tooltip: if own_layer {
+            "Put the text on a layer of its own, where the transform tool can move, \
+             scale and turn it before it is committed"
+                .into()
+        } else {
+            "Put the text on the selected layer, where the transform tool can move, \
+             scale and turn it before it is committed"
+                .into()
+        },
     }
 }
 
@@ -2112,39 +2286,218 @@ mod tests {
             width: 9000,
             height: 9000,
         };
-        for (locked, folder, empty, refused) in [
-            (true, false, false, None),
-            (false, true, false, None),
-            (false, false, true, None),
-            (false, false, false, Some(too_large)),
-            (false, false, false, Some(TextError::NoInk)),
-            (false, false, false, Some(TextError::Unreadable)),
-            (true, true, true, Some(too_large)),
-        ] {
-            let state = place_state(locked, folder, empty, refused);
-            assert!(
-                !state.enabled,
-                "Place was live for ({locked}, {folder}, {empty}, {refused:?})"
+        // The whole matrix is swept **in both modes**, because which readings
+        // even apply changes with the mode: `folder` is unreachable with a layer
+        // of its own and `no_room` is unreachable without one, and a sweep in
+        // one mode alone would be testing whichever half it happened to pick.
+        for own_layer in [false, true] {
+            let clear = Landing {
+                own_layer,
+                locked: false,
+                folder: false,
+                no_room: None,
+            };
+            for (landing, why) in [
+                (
+                    Landing {
+                        locked: true,
+                        ..clear
+                    },
+                    "locked",
+                ),
+                (
+                    Landing {
+                        folder: true,
+                        ..clear
+                    },
+                    "a folder",
+                ),
+                (
+                    Landing {
+                        no_room: Some(umber_core::AddRefusal::StackFull),
+                        ..clear
+                    },
+                    "a full stack",
+                ),
+                (
+                    Landing {
+                        no_room: Some(umber_core::AddRefusal::TooDeep),
+                        ..clear
+                    },
+                    "a folder at the depth cap",
+                ),
+            ] {
+                let state = place_state(landing, false, None);
+                assert!(!state.enabled, "Place was live for {why} ({own_layer})");
+                assert!(!state.tooltip.is_empty());
+            }
+            for refused in [
+                Some(too_large),
+                Some(TextError::NoInk),
+                Some(TextError::Unreadable),
+            ] {
+                assert!(!place_state(clear, false, refused).enabled);
+            }
+            assert!(!place_state(clear, true, None).enabled, "an empty block");
+
+            // And the one case that must be live.
+            let state = place_state(clear, false, None);
+            assert!(state.enabled, "Place was refused with nothing wrong");
+            assert!(state.tooltip.contains("Put the text on"));
+
+            // The refusal's tooltip is the note's sentence, from `refusal`, so
+            // the two cannot say different things about one block.
+            assert_eq!(
+                place_state(clear, false, Some(too_large)).tooltip,
+                refusal(too_large)
             );
-            assert!(!state.tooltip.is_empty());
+            // A lock outranks the size: the artist is not helped by being told
+            // about both, and the layer is the thing to fix first.
+            let locked = Landing {
+                locked: true,
+                ..clear
+            };
+            assert_eq!(
+                place_state(locked, false, Some(too_large)).tooltip,
+                place_state(locked, false, None).tooltip
+            );
         }
+    }
 
-        // And the one case that must be live.
-        let state = place_state(false, false, false, None);
-        assert!(state.enabled, "Place was refused with nothing wrong");
-        assert!(state.tooltip.contains("Put the text on the canvas"));
-
-        // The refusal's tooltip is the note's sentence, from `refusal`, so the
-        // two cannot say different things about one block.
-        assert_eq!(
-            place_state(false, false, false, Some(too_large)).tooltip,
-            refusal(too_large)
+    /// The button says where the text will go, and the two answers differ.
+    ///
+    /// A tooltip that read the same either way would be a control whose outcome
+    /// depends on a switch beside it saying nothing about which way that switch
+    /// is set — and the *lock* refusal has the same shape, sending somebody to
+    /// unlock the row they are looking at when the lock is on a folder above it.
+    #[test]
+    fn place_says_which_layer_the_text_is_going_on() {
+        let own = Landing {
+            own_layer: true,
+            locked: false,
+            folder: false,
+            no_room: None,
+        };
+        let here = Landing {
+            own_layer: false,
+            ..own
+        };
+        assert_ne!(
+            place_state(own, false, None).tooltip,
+            place_state(here, false, None).tooltip,
+            "the button promised the same thing in both modes"
         );
-        // A lock outranks the size: the artist is not helped by being told
-        // about both, and the layer is the thing to fix first.
-        assert_eq!(
-            place_state(true, false, false, Some(too_large)).tooltip,
-            place_state(true, false, false, None).tooltip
+        assert!(place_state(own, false, None).tooltip.contains("its own"));
+        assert!(place_state(here, false, None).tooltip.contains("selected"));
+
+        let locked_own = Landing {
+            locked: true,
+            ..own
+        };
+        let locked_here = Landing {
+            locked: true,
+            ..here
+        };
+        assert!(
+            locked_own.locked && locked_here.locked,
+            "both readings are of a locked landing"
+        );
+        assert!(
+            place_state(locked_own, false, None)
+                .tooltip
+                .contains("folder"),
+            "with a layer of its own, the lock to find is on a folder"
+        );
+        assert!(
+            place_state(locked_here, false, None)
+                .tooltip
+                .contains("The layer is locked"),
+        );
+    }
+
+    /// The two ways a layer cannot be had get two remedies, because only one of
+    /// them is "delete a layer".
+    ///
+    /// `LayerStack::add_refusal`'s own docs say this is what it exists to
+    /// prevent, and the panel flattened it to a `bool` first: the single
+    /// sentence that survived told somebody whose folder was merely nested as
+    /// deep as one goes to go and delete a layer, which would not have helped.
+    /// `App::add_text_layer` got it right at the gate; the control meant to be
+    /// dead *ahead* of the gate did not.
+    ///
+    /// The `TooDeep` half is reachable on a stack nowhere near full, so it is
+    /// not a case the full-stack guard can stand in for.
+    #[test]
+    fn a_folder_too_deep_is_not_told_to_delete_a_layer() {
+        let clear = Landing {
+            own_layer: true,
+            locked: false,
+            folder: false,
+            no_room: None,
+        };
+        let full = place_state(
+            Landing {
+                no_room: Some(umber_core::AddRefusal::StackFull),
+                ..clear
+            },
+            false,
+            None,
+        );
+        let deep = place_state(
+            Landing {
+                no_room: Some(umber_core::AddRefusal::TooDeep),
+                ..clear
+            },
+            false,
+            None,
+        );
+        assert!(!full.enabled && !deep.enabled);
+        assert_ne!(
+            full.tooltip, deep.tooltip,
+            "both refusals prescribed the same remedy"
+        );
+        assert!(
+            full.tooltip.contains("Delete one"),
+            "a full stack must say what to delete: {}",
+            full.tooltip
+        );
+        assert!(
+            !deep.tooltip.contains("Delete"),
+            "a folder at the depth cap was told to delete a layer, which would not \
+             have helped: {}",
+            deep.tooltip
+        );
+        assert!(
+            deep.tooltip.contains("outside it"),
+            "the remedy that does work was not named: {}",
+            deep.tooltip
+        );
+    }
+
+    /// The two readings of "is the landing locked" disagree, and the panel takes
+    /// the one that matches what the placement will do.
+    ///
+    /// This is the guard on the *panel* rather than on the model: deleting the
+    /// `own_layer` branch of `Landing::of` and reading `active_is_locked` in
+    /// both leaves `only_what_encloses_a_new_layer_can_lock_it` perfectly green,
+    /// because that one drives `LayerStack` and cannot see what calls it.
+    #[test]
+    fn the_panel_reads_the_lock_that_belongs_to_the_mode() {
+        let mut ed = Editor::default();
+        ed.layers.add();
+        // The selected layer is locked; nothing encloses it.
+        let at = ed.layers.active_index();
+        ed.layers.get_mut(at).unwrap().locked = true;
+
+        ed.ui.text_own_layer = false;
+        assert!(
+            Landing::of(&ed).locked,
+            "placing onto the locked layer itself is refused"
+        );
+        ed.ui.text_own_layer = true;
+        assert!(
+            !Landing::of(&ed).locked,
+            "a new layer beside a locked one is not itself locked"
         );
     }
 
@@ -3187,13 +3540,18 @@ mod tests {
     }
 
     /// **The panel draws Update and Convert to paint for a text layer, and
-    /// Place for anything else** — one control in that place, never a dead
-    /// Place beside a live Update.
+    /// Place for anything else** — never a *dead* Place beside a live Update.
     ///
     /// Read off the shapes the real body emitted, because a test of
     /// `update_state` cannot see whether the row is drawn at all. That is the
     /// failure a critic found in this module before: the reading was right and
     /// the call site had been reverted.
+    ///
+    /// **The text-layer half is driven with the switch off**, which is the case
+    /// the "one control in that place" rule is actually about: with the switch
+    /// on there is no refusal for a dead Place to report, because the placement
+    /// makes its own layer and never touches this one. That case is
+    /// `a_text_layer_still_offers_place_when_the_next_one_gets_its_own_layer`.
     #[test]
     fn a_text_layer_gets_update_and_convert_where_an_ordinary_one_gets_place() {
         let ordinary = panel_text(|ed| ed.text.block.text = "Umber".to_string());
@@ -3202,6 +3560,7 @@ mod tests {
         assert!(!ordinary.contains("Convert to paint"), "{ordinary}");
 
         let text_layer = panel_text(|ed| {
+            ed.ui.text_own_layer = false;
             assert!(ed.layers.set_text(0, a_record("On the canvas")));
         });
         assert!(
@@ -3220,6 +3579,54 @@ mod tests {
         assert!(
             text_layer.contains("On the canvas"),
             "the panel drew a blank slate over a text layer: {text_layer}"
+        );
+    }
+
+    /// A second caption can be placed without leaving the first one's layer.
+    ///
+    /// **The trap this closes was made by the switch's own default.** Placing
+    /// text now selects the layer it made, so the panel is in editing mode
+    /// straight afterwards: with no Place there, the only way to put a second
+    /// caption down was to go and select some other layer, and clearing the box
+    /// to type the next one instead armed Update to overwrite the first. Both
+    /// halves are measured — that Place is drawn, and that Update is still there
+    /// beside it, because a Place that had replaced Update would have swapped
+    /// one missing command for another.
+    ///
+    /// The switch is what decides it, so the off case is asserted too rather
+    /// than described: with it off a placement really would land on this text
+    /// layer, which `begin_float` refuses, and the button is rightly absent.
+    #[test]
+    fn a_text_layer_still_offers_place_when_the_next_one_gets_its_own_layer() {
+        let on = panel_text(|ed| {
+            ed.ui.text_own_layer = true;
+            assert!(ed.layers.set_text(0, a_record("On the canvas")));
+        });
+        // **Counted, not merely found.** `contains` is true for one Place and
+        // for two, and two is what shipped for a commit: the row was added to
+        // `edit_row` and the standalone one under it was never taken away, so a
+        // text layer drew two live buttons one row apart setting the same flag.
+        // Every other guard here was satisfied by it.
+        assert_eq!(
+            on.matches("Place").count(),
+            1,
+            "a text layer drew {} Place buttons: {on}",
+            on.matches("Place").count()
+        );
+        assert!(
+            on.contains("Update text"),
+            "Place replaced Update instead of joining it: {on}"
+        );
+        assert!(on.contains("On its own layer"), "the switch went: {on}");
+
+        let off = panel_text(|ed| {
+            ed.ui.text_own_layer = false;
+            assert!(ed.layers.set_text(0, a_record("On the canvas")));
+        });
+        assert!(!off.contains("Place"), "{off}");
+        assert!(
+            off.contains("On its own layer"),
+            "the switch that is the way back was drawn only while it was on: {off}"
         );
     }
 
@@ -3264,6 +3671,13 @@ mod tests {
         // refusal has to be readable under it with Place disabled. The sixth
         // names a family this machine does not have, which is the one notice
         // that is drawn between the pickers rather than under the preview.
+        //
+        // The seventh is a **text layer**, which is the one arrangement with
+        // four controls under the preview rather than one: Update, Colour in
+        // hand, Convert to paint, and Place below them. That is the column this
+        // panel is most likely to overrun, and it is a state no other shot
+        // reaches, because it needs a record on the layer rather than a block in
+        // the box.
         for (name, text, align, size, family) in [
             ("1-empty", "", Align::Left, 72.0, None),
             ("2-a-caption", "Umber", Align::Left, 72.0, None),
@@ -3295,6 +3709,7 @@ mod tests {
                 72.0,
                 Some("A Foundry Face Nobody Has"),
             ),
+            ("7-a-text-layer", "On the canvas", Align::Left, 72.0, None),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
@@ -3309,6 +3724,11 @@ mod tests {
             if let Some(family) = family {
                 ed.text.family = family.to_string();
             }
+            if name == "7-a-text-layer" {
+                // `sync_editing` loads the record into the box on the first
+                // frame, so what is typed above is only what the record carries.
+                assert!(ed.layers.set_text(0, a_record(text)));
+            }
             let palette = crate::theme::Palette::with_accent(ed.ui.theme, ed.ui.accent);
             let field = vec2(metrics::PANEL, 520.0);
             let rect = Rect::from_min_size(Pos2::ZERO, field);
@@ -3318,6 +3738,148 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 6 shots to {}", dir.display());
+        println!("wrote 7 shots to {}", dir.display());
+    }
+
+    /// The switch is on the panel, and the panel draws it.
+    ///
+    /// **A guard on `Landing` is not a guard on the panel**, which is this
+    /// codebase's own lesson and the reason this one reads the text egui
+    /// actually drew: `place_state` could be perfect and the row could be
+    /// missing, and every assertion above it would stay green. Deleting the
+    /// `toggle_row` call is what this fails on.
+    #[test]
+    fn the_text_panel_draws_the_own_layer_switch() {
+        let drawn = panel_text(|ed| {
+            ed.text.block.text = "Chapter One".to_string();
+        });
+        assert!(
+            drawn.contains("On its own layer"),
+            "the switch that decides where a placement lands was not drawn: {drawn}"
+        );
+        assert!(drawn.contains("Place"), "{drawn}");
+    }
+
+    /// Place goes dead where the stack cannot take another layer, and comes back
+    /// the moment the artist switches the mode off.
+    ///
+    /// The pair is the point. A control that was merely dead would be one an
+    /// artist at sixty-four layers could do nothing about, and the tooltip that
+    /// names the remedy is only honest if the remedy works — so both halves are
+    /// measured rather than one asserted and the other described.
+    #[test]
+    fn a_full_stack_kills_place_only_while_the_text_wants_its_own_layer() {
+        let mut ed = Editor::default();
+        while ed.layers.len() < umber_core::LayerStack::MAX {
+            ed.layers.add().expect("under the cap");
+        }
+        ed.text.block.text = "Chapter One".to_string();
+
+        ed.ui.text_own_layer = true;
+        let full = place_state(Landing::of(&ed), false, None);
+        assert!(
+            !full.enabled,
+            "Place promised a layer the model would refuse"
+        );
+        assert!(
+            full.tooltip.contains("On its own layer"),
+            "the remedy does not name the control that fixes it: {}",
+            full.tooltip
+        );
+
+        ed.ui.text_own_layer = false;
+        assert!(
+            place_state(Landing::of(&ed), false, None).enabled,
+            "the remedy the tooltip names does not work"
+        );
+    }
+
+    /// Two buttons on one line of the Text panel do not touch.
+    ///
+    /// `brushlib`'s `no_two_buttons_in_the_library_browser_touch` is the same
+    /// guard for the same reason, and it is worth having twice: a text layer now
+    /// puts **four** commands on two lines, and a strip drawn with a bare
+    /// `with_layout` inherits whatever horizontal spacing the `Ui` above it
+    /// carries. The Text panel is not inside either of the two modals that set
+    /// that spacing to zero, which is why the rows here are still bare — this is
+    /// what would catch it if one ever were.
+    ///
+    /// **It measures the rectangles that were drawn.** Asserting that the panel
+    /// calls something would only agree with itself, which is the shape every
+    /// previous repair of this defect had.
+    #[test]
+    fn no_two_buttons_on_a_text_panel_line_touch() {
+        use crate::theme::metrics;
+        use egui::{Rect, pos2, vec2};
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                vec2(metrics::PANEL, 900.0),
+            )),
+            ..Default::default()
+        };
+        // Umber's own style, or this measures egui's spacing rather than the one
+        // the application draws with.
+        crate::theme::install_fonts(&ctx);
+        let palette = crate::theme::Palette::of(crate::theme::ThemeKind::Graphite);
+        crate::theme::apply(&ctx, &palette);
+
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        ed.ui.text_own_layer = true;
+        assert!(ed.layers.set_text(0, a_record("On the canvas")));
+
+        // Twice, for `panel_text`'s reason: a button is as wide as its label's
+        // galley and the first pass through a fresh context builds the atlas.
+        let mut rows: Vec<(f32, Vec<Rect>)> = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(input.clone(), |ui| {
+                let mut actions = UiActions::default();
+                panel(ui, &palette, &mut ed, &mut actions);
+            });
+            let mut found: Vec<Rect> = Vec::new();
+            for clipped in &out.shapes {
+                if let egui::Shape::Rect(rect) = &clipped.shape
+                    && (rect.rect.height() - metrics::TEXT_BUTTON).abs() < 0.5
+                    && !found.iter().any(|seen| {
+                        seen.min.distance(rect.rect.min) < 0.5
+                            && seen.max.distance(rect.rect.max) < 0.5
+                    })
+                {
+                    found.push(rect.rect);
+                }
+            }
+            rows.clear();
+            for rect in found {
+                match rows
+                    .iter_mut()
+                    .find(|(top, _)| (top - rect.top()).abs() < 1.0)
+                {
+                    Some((_, row)) => row.push(rect),
+                    None => rows.push((rect.top(), vec![rect])),
+                }
+            }
+        }
+
+        let pairs = rows.iter().filter(|(_, row)| row.len() > 1).count();
+        assert_eq!(
+            pairs, 2,
+            "a text layer draws Update beside Colour in hand and Convert beside \
+             Place; anything else means this measured the wrong panel"
+        );
+        for (top, row) in &mut rows {
+            row.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            for pair in row.windows(2) {
+                let gap = pair[1].left() - pair[0].right();
+                assert!(
+                    gap >= metrics::BUTTON_GAP - 0.5,
+                    "two buttons on the Text panel's line at y={top} are {gap} points \
+                     apart, where {} is the gap: they touch and read as one control",
+                    metrics::BUTTON_GAP
+                );
+            }
+        }
     }
 }

@@ -174,6 +174,15 @@ pub struct Prefs {
     pub wheel_angles: WheelAngles,
     /// Whether a saved document carries its undo history.
     pub save_history: bool,
+    /// Whether placing text makes a layer of its own to hold it.
+    ///
+    /// See [`crate::editor::UiState::text_own_layer`] for what it buys. Absent
+    /// from a file written before the setting existed, which reads as the
+    /// default — **on**, unlike every other absent flag here, because what those
+    /// builds did is exactly the behaviour this setting exists to replace. A
+    /// preferences file is not a record of what a previous build drew; it is a
+    /// record of what its owner chose, and nobody chose this.
+    pub text_own_layer: bool,
     /// A directory of the user's own fonts, scanned beside the machine's own.
     ///
     /// The third of `umber_core::fonts`' three sources, and the one somebody
@@ -234,6 +243,7 @@ impl Default for Prefs {
             harmony: Harmony::default(),
             wheel_angles: WheelAngles::default(),
             save_history: true,
+            text_own_layer: true,
             font_folder: None,
             // Exactly what every build before the setting existed held, so a
             // missing or older preferences file changes nobody's behaviour.
@@ -435,6 +445,7 @@ pub fn to_text(prefs: &Prefs) -> String {
         ));
     }
     out.push_str(&format!("save_history = {}\n", prefs.save_history));
+    out.push_str(&format!("text_own_layer = {}\n", prefs.text_own_layer));
     // Written only when there is one, so a preferences file from a session that
     // never set it is byte for byte what it was before this key existed.
     if let Some(folder) = &prefs.font_folder {
@@ -573,6 +584,11 @@ pub fn from_text(text: &str) -> Prefs {
             "save_history" => {
                 if let Some(v) = parse_bool(value) {
                     prefs.save_history = v;
+                }
+            }
+            "text_own_layer" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.text_own_layer = v;
                 }
             }
             // Taken verbatim, and deliberately not checked for existence here:
@@ -834,6 +850,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         harmony: ed.ui.harmony,
         wheel_angles: ed.ui.wheel_angles,
         save_history: ed.ui.save_history,
+        text_own_layer: ed.ui.text_own_layer,
         font_folder: ed.font_folder.clone(),
         // Read off the live history, like every other value here is read off
         // the thing that uses it, so the file cannot come to disagree with what
@@ -915,6 +932,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.harmony = prefs.harmony;
     ed.ui.wheel_angles = prefs.wheel_angles;
     ed.ui.save_history = prefs.save_history;
+    ed.ui.text_own_layer = prefs.text_own_layer;
     set_font_folder(ed, prefs.font_folder.clone());
     set_undo_budget(ed, prefs.undo_budget_mb);
     ed.autosave.enabled = prefs.autosave;
@@ -1472,6 +1490,10 @@ mod tests {
             wheel_mirrored: true,
             wheel_angles: turned(30.0, 200.0),
             save_history: false,
+            // Off, which is not the default either: on is what the setting
+            // ships as, so a file that never wrote the key would read back
+            // as `true` and this assertion would pass having tested nothing.
+            text_own_layer: false,
             font_folder: Some(PathBuf::from("/home/painter/type/My Foundry")),
             undo_budget_mb: 1024,
             autosave: false,
@@ -1503,6 +1525,7 @@ mod tests {
         assert_eq!(back.wheel_shape, prefs.wheel_shape);
         assert_eq!(back.wheel_angles, prefs.wheel_angles);
         assert_eq!(back.save_history, prefs.save_history);
+        assert_eq!(back.text_own_layer, prefs.text_own_layer);
         // A path with a space in it, because the file is `key = value` split on
         // the first `=` and a folder somebody actually has is not one word.
         assert_eq!(back.font_folder, prefs.font_folder);

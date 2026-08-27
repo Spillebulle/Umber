@@ -231,7 +231,18 @@ pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
 /// Here rather than beside its callers because two modules now draw one, and a
 /// second copy is how the pill ends up a different size in the Colour panel
 /// than in the brush editor.
-pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) {
+/// Returns the **row's** response, not the pill's, so a caller can hang a
+/// tooltip on the label as well as on the pill — a tooltip on the pill alone is
+/// one a pointer resting on the words that name the setting never finds.
+///
+/// **Not on the whole line**, which an earlier draft of this sentence claimed.
+/// egui stops its hover search at the topmost *interactive* widget, so with the
+/// pointer over the pill the row reads as not-hovered and the caller's tooltip
+/// does not appear. What it covers is the label and the gap; the pill is its
+/// own. Hanging a *second* tooltip on the pill would fix that and would also be
+/// the two-controls-one-question shape this file refuses elsewhere, so the
+/// honest answer is that the words carry the sentence.
+pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) -> Response {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(label)
@@ -241,7 +252,8 @@ pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             toggle(ui, p, value);
         });
-    });
+    })
+    .response
 }
 
 /// A row of mutually exclusive choices inside an inset well.

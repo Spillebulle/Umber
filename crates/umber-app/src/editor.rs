@@ -150,6 +150,76 @@ pub struct Floating {
     /// Absolute against that point rather than accumulated per event — see
     /// [`Transform::drag`].
     pub drag: Option<(Handle, Vec2)>,
+    /// The layer this float **made for itself**, where it made one.
+    ///
+    /// Only a text placement does, and only where `Editor::ui.text_own_layer` is
+    /// on. It rides on the float rather than beside [`Editor::float_text`] on
+    /// purpose, and the reason is that field's own docs read backwards:
+    /// `float_text` is cleared by `App::begin_float` and deliberately *not* by
+    /// `App::cancel_transform`, so a duty hung on it would be a duty the cancel
+    /// path forgets — and what would be forgotten here is an empty layer left in
+    /// somebody's stack every time they press Escape. Every path that abandons a
+    /// float takes `float` itself, so this is the one place that cannot be
+    /// missed.
+    ///
+    /// [`MadeLayer`] is plain numbers so [`Floating`] stays `Copy`, which it has
+    /// to: it is read by value at three call sites.
+    pub made: Option<MadeLayer>,
+}
+
+/// A layer a float created for itself, what was selected before it did, and
+/// where its undo entry sits.
+///
+/// The first two are [`umber_core::Layer::id`]s, never indices and never slots:
+/// this is written at the placement and read a whole gesture later, and an index
+/// stops meaning this layer the moment anything is reordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MadeLayer {
+    /// The entry the placement added.
+    pub id: u32,
+    /// The entry that was selected before it, so an undo puts the selection back
+    /// where the artist left it rather than on whatever now sits in that row.
+    pub was_active: u32,
+    /// What [`umber_core::History::position`] read the instant the add's entry
+    /// was recorded.
+    ///
+    /// **The entry is recorded at the add and not at the commit, and this is what
+    /// makes abandoning the placement able to take it off again.** Recording it
+    /// at the commit was the first shape and it was wrong in a way only a
+    /// sequence finds: the layer is in the stack for the whole gesture, and a
+    /// reorder in that window — the Layers panel's chevrons, or a drag, neither
+    /// of which puts a float down first — records a `MoveLayer` whose shape names
+    /// that layer. The placement's own entry, recorded afterwards, is undone
+    /// *first*, which takes the layer out; the reorder's shape then names an
+    /// entry that is gone, `LayerStack::restore_shape` refuses it, and the undo
+    /// spends the entry without moving the picture. Recorded at the add, the two
+    /// are in the order the artist made them and every shape is placeable when it
+    /// is reached.
+    ///
+    /// What that costs is this field and the one below it. Escape has to take
+    /// the entry back off, and it may only do so while the entry is still the
+    /// newest one. Where something did record in between, **the layer and its
+    /// entry both stay** and one Ctrl+Z removes the layer — an honest outcome
+    /// rather than a pop that would take somebody else's edit.
+    ///
+    /// **Removing the layer is conditional on the same reading, and that is the
+    /// half that was wrong first.** The layer used to go unconditionally while
+    /// only the entry was conditional, which is the interleaving defect this
+    /// field exists to prevent arriving through the *cancel* path instead of the
+    /// commit path: the reorder's shape names the layer, so taking the layer out
+    /// and leaving that shape standing makes it unplaceable — a `debug_assert`
+    /// in `LayerStack::restore_shape` in a development build, and in a release
+    /// build an undo that spends the entry and moves nothing.
+    pub entry_at: usize,
+    /// What [`umber_core::History::dropped`] read at the same instant.
+    ///
+    /// **`position()` alone is not an identity test**, and an eviction is what
+    /// breaks it: one entry evicted while another is recorded leaves the count
+    /// exactly where it was, so the equality can hold with somebody else's edit
+    /// on top. It is reachable rather than theoretical — `App::begin_float`
+    /// calls `free_headroom`, which evicts with a floor of zero, and it runs
+    /// *after* this is read. `dropped` only ever grows, so the pair is exact.
+    pub dropped_at: usize,
 }
 
 /// "one text layer" or "3 text layers", for a notice that has to count them.
@@ -311,6 +381,25 @@ pub struct UiState {
     /// and because the cost is bounded at both ends — see
     /// `umber_core::docformat::history`.
     pub save_history: bool,
+    /// Whether placing text makes a layer of its own to hold it.
+    ///
+    /// **On by default, and the default is the whole feature.** A placement only
+    /// keeps its [`umber_core::TextObject`] where it lands on nothing — see
+    /// `App::finish_transform` — so text put down over a picture is paint from
+    /// the moment it touches the canvas and can never be set again. Its own
+    /// layer makes "lands on nothing" true by construction, which is what turns
+    /// "text you can edit again" from something that depends on where you
+    /// clicked into something that simply holds.
+    ///
+    /// It is a preference and not a fixed policy because placing a caption
+    /// straight onto the layer under it is a real way to work — somebody
+    /// flattening as they go — and because at `LayerStack::MAX` there is no new
+    /// layer to be had and the artist needs a way through. Its control is on the
+    /// Text panel beside Place rather than in the settings dialog, which is
+    /// `Prefs::wheel_rotates`' arrangement and its argument: where a setting is
+    /// changed does not decide whether it should still be true tomorrow, and the
+    /// only place this one means anything is the button it governs.
+    pub text_own_layer: bool,
 }
 
 /// Tabs of the brush editor dialog.
@@ -448,6 +537,7 @@ impl Default for UiState {
             quit_prompt: false,
             modulation: 0,
             save_history: true,
+            text_own_layer: true,
         }
     }
 }
@@ -1134,6 +1224,112 @@ impl Editor {
         self.text.editing.as_ref().map_or(self.color, |e| e.colour)
     }
 
+    /// Make the layer a text placement puts its words on, and record the one
+    /// entry the whole placement gets.
+    ///
+    /// The model half of `App::add_text_layer` — the stack, the name and the
+    /// history, and nothing that needs a device. It is here rather than there
+    /// **so that it can be driven with no window**: a critic deleted the `record`
+    /// call at the call site and all 856 tests stayed green, which is the
+    /// "a guard on a model is not a guard on the call site" failure with a crate
+    /// boundary in the way. Split like this, the recording *is* the model.
+    ///
+    /// `None` where the stack would not take another layer. The caller has
+    /// already asked `LayerStack::add_refusal` in order to say *why*, so this
+    /// answering at all is the belt to that gate's braces.
+    pub fn make_text_layer(&mut self, text: &str) -> Option<MadeLayer> {
+        let name = umber_core::textobj::layer_name(text);
+        let was_active = self
+            .layers
+            .get(self.layers.active_index())
+            .map_or(0, |l| l.id());
+        // Before the add, so a refusal records nothing at all.
+        let before = self.layers.shape(self.doc.layer_bytes());
+        let made = self.layers.add_named(&name)?;
+        self.history.record(umber_core::Edit::new(
+            umber_core::EditKind::AddLayer,
+            before,
+        ));
+        Some(MadeLayer {
+            id: made.id,
+            was_active,
+            entry_at: self.history.position(),
+            dropped_at: self.history.dropped(),
+        })
+    }
+
+    /// Take back a layer a text placement made, and the entry that made it.
+    ///
+    /// The counterpart to [`Editor::make_text_layer`], for every way a placement
+    /// can end without committing: Escape, a float that was refused, and a block
+    /// dragged entirely off the canvas. The layer is empty on all three, because
+    /// nothing was written to it until the commit.
+    ///
+    /// **Both go, or neither does**, and that pairing is the whole of this
+    /// function. Taking the layer while leaving the entry was the first shape and
+    /// it is the interleaving defect arriving through the cancel path: a
+    /// `MoveLayer` recorded during the gesture carries a shape that *names* this
+    /// layer, so removing the layer leaves that shape unplaceable —
+    /// `LayerStack::restore_shape`'s `debug_assert` in a development build, and
+    /// in a release build an undo that spends the entry and moves nothing. See
+    /// [`MadeLayer::entry_at`].
+    ///
+    /// So the test is whether this placement's entry is still the newest, and it
+    /// is [`MadeLayer::dropped_at`]'s job that the test is exact. Where something
+    /// else recorded in between — a reorder is the reachable case, since neither
+    /// chevron nor the Layers panel's drag puts a float down first — the layer
+    /// and its entry both stay, and one Ctrl+Z removes the layer. That leaves an
+    /// empty layer named after words nobody put down, which is litter; it is a
+    /// great deal better than a crash or a phantom undo, and it is what somebody
+    /// who reordered their stack in the middle of placing a caption gets.
+    ///
+    /// **The layer is dropped rather than parked**, and that is the one
+    /// difference from `App::delete_entries`. A parked slice is held alive by the
+    /// undo entry that could put the layer back; the entry goes here too, so
+    /// parking would leak a canvas-sized slice per abandoned placement — 400 MB
+    /// apiece on a 10000² document, for pressing Escape.
+    ///
+    /// By **id**, never by index: this runs a whole gesture after the add.
+    pub fn unmake_layer(&mut self, made: Option<MadeLayer>) {
+        let Some(made) = made else {
+            return;
+        };
+        // **Read before anything moves.** `dropped` only ever grows and
+        // `position` can be restored by an eviction landing beside a record, so
+        // it takes both to know the top of the stack is still this placement's.
+        if self.history.position() != made.entry_at || self.history.dropped() != made.dropped_at {
+            return;
+        }
+        let Some(at) = self.layers.layers().iter().position(|l| l.id() == made.id) else {
+            return;
+        };
+        if self.layers.remove(at).is_none() {
+            // `remove` refuses to leave a document with nowhere to paint. A
+            // placement adds its layer *beside* one that already exists, so this
+            // cannot fire; logged rather than asserted because the outcome if it
+            // ever did is one extra empty layer, which is a great deal better
+            // than a panic on a path the artist reached by pressing Escape.
+            //
+            // The entry is left alone on this path deliberately: the layer is
+            // still in the stack, and that entry is the only thing that could
+            // take it out.
+            log::warn!("a placement's own layer could not be taken back");
+            return;
+        }
+        // **After the removal, never before.** The entry is what the artist's
+        // last resort would be if the removal above refused, so it may only be
+        // given up once the layer it describes has actually gone.
+        self.history.take_undo();
+        if let Some(back) = self
+            .layers
+            .layers()
+            .iter()
+            .position(|l| l.id() == made.was_active)
+        {
+            self.layers.set_active(back);
+        }
+    }
+
     /// Point the picker at a colour chosen elsewhere, preserving hue for greys.
     pub fn set_color(&mut self, color: Color) {
         let next = color.to_hsv();
@@ -1290,6 +1486,14 @@ impl Editor {
         // a layer in a tab nobody is looking at. `app.rs` commits it before
         // every one of these; clearing it here means a path that forgot leaves
         // an abandoned transform rather than a corrupted one.
+        //
+        // **[`Editor::unmake_layer`] is deliberately not called**, unlike at the
+        // other two sites that take a float. By this line the stacks have
+        // already been swapped, so the layer a float made belongs to a document
+        // that is no longer here and the id would resolve — if it resolved at
+        // all — against the incoming one. Doing nothing leaves an empty layer in
+        // the outgoing document with the entry that removes it; reaching for
+        // that layer here would remove somebody else's.
         self.float = None;
         // The stroke that was in flight, if any, was finished by the caller
         // before the swap; this only stops a stale slot from the *previous*
@@ -3555,5 +3759,300 @@ mod tests {
             "the same path recorded {fine} vertices at 4:1 and {coarse} at 1:1, \
              which is not the step following the camera"
         );
+    }
+    /// A placement makes its layer and records its entry together.
+    ///
+    /// **Driven through `make_text_layer` rather than built from its parts**,
+    /// which is the whole reason that function is on `Editor`: a critic deleted
+    /// the `record` call when it lived at the `App` call site and all 856 tests
+    /// stayed green, because every guard here assembled the entry itself. A
+    /// placement with no undo entry at all is one Ctrl+Z cannot take back.
+    #[test]
+    fn a_placement_makes_its_layer_and_records_the_entry_that_undoes_it() {
+        let mut ed = Editor::default();
+        let was_active = ed.layers.get(ed.layers.active_index()).unwrap().id();
+        let position = ed.history.position();
+
+        let made = ed.make_text_layer("Chapter One").expect("room for one");
+        assert_eq!(ed.layers.len(), 2);
+        assert_eq!(
+            ed.layers.get(ed.layers.active_index()).unwrap().name,
+            "Chapter One",
+            "the layer is not named after its words"
+        );
+        assert_eq!(
+            ed.history.position(),
+            position + 1,
+            "the placement recorded no entry, so one Ctrl+Z cannot take it back"
+        );
+        assert_eq!(made.was_active, was_active);
+        assert_eq!(made.entry_at, position + 1);
+    }
+
+    /// Abandoning a placement takes back its layer, its slice and its entry.
+    ///
+    /// Three readings, each catching a different mistake. The **stack** comes
+    /// back to its length, which any implementation gets right. The **slot pool**
+    /// is what sees a slice parked rather than released: a park is held alive by
+    /// the entry that could restore the layer, and the entry goes here, so
+    /// parking would leak a canvas-sized slice for pressing Escape with nothing
+    /// about the stack saying so. And the **history** comes back to its position,
+    /// or Escape leaves an entry that would undo a layer nobody can see.
+    #[test]
+    fn abandoning_a_placement_takes_back_its_layer_its_slice_and_its_entry() {
+        let mut ed = Editor::default();
+        let was_active = ed.layers.get(ed.layers.active_index()).unwrap().id();
+        let ceiling = ed.layers.live_slot_ceiling();
+        let position = ed.history.position();
+
+        let made = ed.make_text_layer("Caption").expect("room for one");
+        assert!(ed.layers.live_slot_ceiling() > ceiling, "it took a slice");
+
+        ed.unmake_layer(Some(made));
+        assert_eq!(ed.layers.len(), 1, "the layer went");
+        assert_eq!(
+            ed.layers.live_slot_ceiling(),
+            ceiling,
+            "the slice was parked rather than given back"
+        );
+        assert_eq!(
+            ed.history.position(),
+            position,
+            "the entry was left behind and would undo a layer that has gone"
+        );
+        assert_eq!(
+            ed.layers.get(ed.layers.active_index()).unwrap().id(),
+            was_active,
+            "the selection went back where the artist left it"
+        );
+    }
+
+    /// **An edit recorded between the placement and the Escape keeps its own
+    /// entry, and the layer stays with it.**
+    ///
+    /// Both halves, and the second is the one that was wrong. Popping the newest
+    /// entry unconditionally would take the reorder, which is somebody else's
+    /// edit, silently. Removing the *layer* unconditionally is worse: the
+    /// reorder's shape names that layer, so what is left standing is a shape
+    /// `LayerStack::restore_shape` refuses, which is a `debug_assert` in a
+    /// development build and an undo that spends the entry and moves nothing in a
+    /// release one. So neither goes, and one Ctrl+Z removes the layer.
+    #[test]
+    fn an_edit_between_the_placement_and_the_escape_leaves_both_alone() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("a second layer");
+
+        let made = ed.make_text_layer("Caption").expect("a third");
+
+        // The artist drags a row in the Layers panel while the box is up.
+        // Neither chevron nor that drag puts a float down first, which is what
+        // makes this reachable rather than hypothetical.
+        let move_before = ed.layers.shape(ed.doc.layer_bytes());
+        assert!(ed.layers.reorder_to(0, 1, 0), "the drag moved something");
+        ed.history.record(umber_core::Edit::new(
+            umber_core::EditKind::MoveLayer,
+            move_before,
+        ));
+        let after_move = ed.history.position();
+
+        ed.unmake_layer(Some(made));
+        assert_eq!(
+            ed.history.position(),
+            after_move,
+            "the reorder's entry was taken instead of the placement's"
+        );
+        assert!(
+            ed.layers.layers().iter().any(|l| l.id() == made.id),
+            "the layer went while the reorder's shape still named it, which leaves \
+             a shape restore_shape refuses"
+        );
+
+        // And the two undos still work, in the order the artist made them.
+        let move_entry = ed.history.take_undo().expect("the reorder");
+        let umber_core::EditBody::Structure(shape) = move_entry.body else {
+            panic!("a reorder records a shape");
+        };
+        ed.layers.restore_shape(*shape);
+        assert!(
+            ed.layers.layers().iter().any(|l| l.id() == made.id),
+            "undoing the reorder was refused"
+        );
+        let add_entry = ed.history.take_undo().expect("the placement");
+        assert_eq!(add_entry.kind, umber_core::EditKind::AddLayer);
+        let umber_core::EditBody::Structure(shape) = add_entry.body else {
+            panic!("a placement records a shape");
+        };
+        ed.layers.restore_shape(*shape);
+        assert!(
+            !ed.layers.layers().iter().any(|l| l.id() == made.id),
+            "one Ctrl+Z did not remove the layer that was left behind"
+        );
+    }
+
+    /// An eviction landing beside a record restores `position`, so the pair has
+    /// to carry `dropped` too.
+    ///
+    /// `position() == entry_at` alone is not an identity test: one entry evicted
+    /// while another is recorded leaves the count exactly where it was, and the
+    /// newest entry is then somebody else's. It is reachable rather than
+    /// theoretical, because `App::begin_float` calls `free_headroom`, which
+    /// evicts with a floor of zero, and it runs *after* the placement's entry is
+    /// recorded.
+    #[test]
+    fn an_eviction_beside_a_record_does_not_look_like_the_placements_own_entry() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("a second layer");
+        let made = ed.make_text_layer("Caption").expect("a third");
+
+        // The stack as it would be after an eviction took the oldest entry and a
+        // reorder added a newer one: `position` is back where it was.
+        let move_before = ed.layers.shape(ed.doc.layer_bytes());
+        assert!(ed.layers.reorder_to(0, 1, 0));
+        ed.history.record(umber_core::Edit::new(
+            umber_core::EditKind::MoveLayer,
+            move_before,
+        ));
+        // Exactly one, so the count lands back on `entry_at` instead of at
+        // zero. `free_until` asks before each drop, so answering true on the
+        // second call gives up one entry.
+        let asked = std::cell::Cell::new(0u32);
+        ed.history.free_until(|| {
+            let n = asked.get();
+            asked.set(n + 1);
+            n >= 1
+        });
+        assert_eq!(
+            ed.history.position(),
+            made.entry_at,
+            "the fixture must put the count back, or it is testing the easy case"
+        );
+        assert_ne!(
+            ed.history.dropped(),
+            made.dropped_at,
+            "an eviction is what makes the count lie"
+        );
+
+        let held = ed.history.position();
+        ed.unmake_layer(Some(made));
+        assert_eq!(
+            ed.history.position(),
+            held,
+            "the count agreed and somebody else's entry was taken"
+        );
+    }
+
+    /// **A reorder made between Place and the commit still undoes.**
+    ///
+    /// This is the sequence a critic found, and it is why the placement's entry
+    /// is recorded at the *add*. The layer stands in the stack for the whole
+    /// gesture, and neither the Layers panel's chevrons nor its drag puts a
+    /// float down first, so a `MoveLayer` really can land in the middle of a
+    /// placement — and that entry's shape names the layer the placement made.
+    ///
+    /// Recorded at the commit, the placement's entry would sit *above* the
+    /// reorder's: undo takes the layer out first, the reorder's shape then names
+    /// an entry that is gone, `LayerStack::restore_shape` refuses it whole and
+    /// hands the target straight back — and `App::reverse` reads that as `Ok`,
+    /// so the cursor walks past an edit the picture never took. The history
+    /// moves and the document does not, which is exactly the damage the flip's
+    /// `Err` arm exists to prevent one variant along.
+    ///
+    /// Recorded at the add, the two are in the order the artist made them and
+    /// every shape is placeable when it is reached. Driven as the real sequence
+    /// rather than asserted about: both undos are carried out, and what is
+    /// measured is that the second one actually *moved the stack* rather than
+    /// being handed back unchanged.
+    #[test]
+    fn a_reorder_between_a_placement_and_its_commit_still_undoes() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("a second layer");
+        let bottom = ed.layers.get(0).unwrap().id();
+        let was_active = ed.layers.get(ed.layers.active_index()).unwrap().id();
+
+        // Place: the layer appears and its entry is recorded together.
+        let before = ed.layers.shape(ed.doc.layer_bytes());
+        let made = ed.layers.add_named("Caption").expect("a third");
+        ed.history.record(umber_core::Edit::new(
+            umber_core::EditKind::AddLayer,
+            before,
+        ));
+
+        // The artist drags a row while the box is still up.
+        let move_before = ed.layers.shape(ed.doc.layer_bytes());
+        assert!(ed.layers.reorder_to(0, 1, 0), "the drag moved something");
+        ed.history.record(umber_core::Edit::new(
+            umber_core::EditKind::MoveLayer,
+            move_before,
+        ));
+        let moved: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
+        assert_ne!(moved[0], bottom, "the fixture did not reorder anything");
+
+        // Ctrl+Z, twice, newest first — which is the order `App::undo` walks.
+        let move_entry = ed.history.take_undo().expect("the reorder");
+        // **The sharpest statement of what this guards.** Recorded at the commit,
+        // the placement's entry is the newest and this pop is *it* — which is the
+        // whole defect in one line, because undoing it takes the layer out from
+        // under the reorder's shape.
+        assert_eq!(
+            move_entry.kind,
+            umber_core::EditKind::MoveLayer,
+            "the placement's entry was recorded above the reorder's, so the first \
+             undo reaches the placement and takes its layer out first"
+        );
+        let umber_core::EditBody::Structure(shape) = move_entry.body else {
+            panic!("a reorder records a shape");
+        };
+        let back = ed.layers.restore_shape(*shape);
+        let after: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
+        assert_eq!(
+            after[0], bottom,
+            "the reorder's undo was refused: the history moved and the picture did not"
+        );
+        assert!(
+            after.contains(&made.id),
+            "undoing the reorder must not lose the caption's layer"
+        );
+        // Redoing it has to be possible too, or the walk is one-way.
+        drop(back);
+
+        let add_entry = ed.history.take_undo().expect("the placement");
+        assert_eq!(add_entry.kind, umber_core::EditKind::AddLayer);
+        let umber_core::EditBody::Structure(shape) = add_entry.body else {
+            panic!("a placement records a shape");
+        };
+        let redo = ed.layers.restore_shape(*shape);
+        assert!(
+            !ed.layers.layers().iter().any(|l| l.id() == made.id),
+            "the second undo did not take the caption's layer out"
+        );
+        assert_eq!(
+            ed.layers.get(ed.layers.active_index()).unwrap().id(),
+            was_active,
+            "the selection went back where the artist left it"
+        );
+
+        // And redo puts it back with its slice, which is what makes the pixels
+        // the commit wrote come back with it.
+        ed.layers.restore_shape(redo);
+        let at = ed
+            .layers
+            .layers()
+            .iter()
+            .position(|l| l.id() == made.id)
+            .expect("the layer came back");
+        assert_eq!(ed.layers.get(at).unwrap().slot(), Some(made.slot));
+        assert_eq!(ed.layers.get(at).unwrap().name, "Caption");
+    }
+
+    /// Nothing was made, so nothing is taken back. The case every ordinary
+    /// paste and every lift goes down.
+    #[test]
+    fn a_float_that_made_no_layer_takes_none_away() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("a second layer");
+        let before: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
+        ed.unmake_layer(None);
+        let after: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
+        assert_eq!(before, after);
     }
 }

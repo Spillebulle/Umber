@@ -826,6 +826,37 @@ pub fn well_formed(entries: &[(u8, bool)]) -> bool {
     true
 }
 
+/// Why a layer cannot be added. See [`LayerStack::add_refusal`].
+///
+/// An enum rather than a `bool` because the two have different remedies and a
+/// caller that says "there is no room" to somebody whose folder is merely too
+/// deep has sent them to delete a layer that would not have helped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddRefusal {
+    /// The stack already holds [`LayerStack::MAX`] entries, folders included.
+    StackFull,
+    /// The selected folder is at [`LayerStack::MAX_DEPTH`], so a layer inside it
+    /// would be one level too deep.
+    TooDeep,
+}
+
+/// What [`LayerStack::add_named`] hands back.
+///
+/// Two numbers that answer different questions and are easy to confuse, which
+/// is why they travel together rather than as a bare `u32`. The **slot** is a
+/// slice of the texture array and is what the caller must clear on the GPU; the
+/// **id** is the entry's identity and is the only one of the two that a caller
+/// may hold across a gesture, because a slot says nothing about where the layer
+/// sits and an index stops meaning this layer the moment anything is reordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddedLayer {
+    /// The texture slice the layer took. Clear it: a recycled slot still holds
+    /// the last layer's pixels.
+    pub slot: u32,
+    /// [`Layer::id`], for a caller that has to find this entry again later.
+    pub id: u32,
+}
+
 /// Bottom-to-top stack of layers. Index 0 is the bottom.
 #[derive(Debug)]
 pub struct LayerStack {
@@ -1384,6 +1415,30 @@ impl LayerStack {
     /// made while a group is in hand, and it is also the only reading that lets
     /// somebody fill a folder they have just made without dragging.
     pub fn add(&mut self) -> Option<u32> {
+        let name = format!("Layer {}", self.next_name_number());
+        self.add_named(&name).map(|made| made.slot)
+    }
+
+    /// The same, under a name the caller chose.
+    ///
+    /// **This is not a rename**, and that distinction is the whole reason it is
+    /// safe to add. [`Layer::name`] is written where a layer is created or
+    /// imported and nowhere else — there is no `rename` on this type, because
+    /// undoing one needs an [`crate::EditBody`] arm that does not exist yet and
+    /// `docs/layer-rename.md` is the standing design for it. A name given at
+    /// *creation* is not a value anybody then changed, so it needs no such arm:
+    /// the only way back is the structural entry that takes the whole layer out,
+    /// and that entry carries the layer itself.
+    ///
+    /// Its caller is a text placement, which names the layer after the words on
+    /// it — see [`crate::textobj::layer_name`]. [`LayerStack::add`] is this with
+    /// the "Layer N" it has always used.
+    ///
+    /// Returns the slot **and the new entry's id**. The id is what a caller
+    /// holding on to the layer across a gesture has to keep: a slot is a slice
+    /// and an index is a position in a `Vec`, and only the id survives a
+    /// reorder.
+    pub fn add_named(&mut self, name: &str) -> Option<AddedLayer> {
         if self.layers.len() >= Self::MAX {
             return None;
         }
@@ -1401,8 +1456,8 @@ impl LayerStack {
         // [`SlotRoom`] — not to be handed a layer with nowhere to paint.
         let slot = self.take_slot()?;
         let number = slot.number();
-        let name = format!("Layer {}", self.next_name_number());
-        let mut layer = Layer::named(&name, self.take_id(), Some(slot));
+        let id = self.take_id();
+        let mut layer = Layer::named(name, id, Some(slot));
         layer.depth = depth;
         self.layers.insert(at, layer);
         debug_assert!(
@@ -1410,7 +1465,76 @@ impl LayerStack {
             "add left a malformed stack"
         );
         self.active = at;
-        Some(number)
+        Some(AddedLayer { slot: number, id })
+    }
+
+    /// Why a layer added right now would be refused, or `None` where it would
+    /// go ahead.
+    ///
+    /// One of two `can_`s beside [`LayerStack::add_named`], and it names the two
+    /// refusals **no released slice can mend** — a stack that is already as long
+    /// as Umber holds, and a folder nested as deep as one goes. Deliberately not
+    /// the pool: `add_named` answers `None` for that too, and the caller's
+    /// remedy there is to give a parked slice back and ask again, which is a
+    /// step rather than a verdict.
+    ///
+    /// It exists because three places have to agree about it and used to state
+    /// it twice: `App::add_layer` refuses before reserving a slice, so that a
+    /// full stack is not answered with a sentence about graphics memory;
+    /// `App::add_text_layer` refuses with a sentence *per reason*, because the
+    /// remedies differ; and the Text panel disables Place ahead of both, so the
+    /// button cannot promise what the model will decline. A predicate the
+    /// control and the gate each spell out for themselves is one they will
+    /// eventually spell differently — and one that answers a `bool` is one they
+    /// will eventually prescribe different remedies from, which is why this
+    /// answers *which*.
+    ///
+    /// **It fails closed on an index off the end**, which is
+    /// [`LayerStack::refusal_at`]'s stated rule and is not merely tidiness here:
+    /// [`LayerStack::add_named`] indexes `self.active` directly, so a caller
+    /// that read `None` as "go ahead" in that state would reach a panic. The
+    /// state is unreachable — a stack always has a valid selection — which is
+    /// exactly why the answer costs nothing.
+    pub fn add_refusal(&self) -> Option<AddRefusal> {
+        if self.layers.len() >= Self::MAX {
+            return Some(AddRefusal::StackFull);
+        }
+        match self.layers.get(self.active) {
+            Some(l) if l.folder && l.depth >= Self::MAX_DEPTH => Some(AddRefusal::TooDeep),
+            Some(_) => None,
+            None => Some(AddRefusal::StackFull),
+        }
+    }
+
+    /// Would a layer added right now come out locked?
+    ///
+    /// The other `can_` beside [`LayerStack::add_named`], and it asks about the
+    /// *insertion point* rather than about the selected entry — which is the one
+    /// thing here that is easy to get backwards. A new layer carries no lock of
+    /// its own, so the only thing that can lock it is what encloses it:
+    ///
+    /// * with a **layer** selected the new one is its sibling, so what reaches
+    ///   it is that layer's ancestors and **not** that layer's own flag. A
+    ///   locked layer inside an unlocked folder is somewhere a new layer may
+    ///   perfectly well go, and reading [`LayerStack::active_is_locked`] here
+    ///   would refuse it;
+    /// * with a **folder** selected the new one goes inside it, so the folder's
+    ///   own flag counts too — which is exactly
+    ///   [`LayerStack::effective_locked`] of the folder.
+    ///
+    /// It exists because a text placement that makes its own layer is not gated
+    /// by the *selected* layer's lock at all, where one painting onto the
+    /// selected layer is. One predicate answering both would refuse an
+    /// operation the model allows, which is the control that lies in its other
+    /// direction.
+    pub fn new_layer_would_be_locked(&self) -> bool {
+        match self.layers.get(self.active) {
+            Some(l) if l.folder => self.effective_locked(self.active),
+            Some(_) => self
+                .ancestors_of(self.active)
+                .any(|i| self.layers[i].locked),
+            None => false,
+        }
     }
 
     /// Hand out the next free slice, recycling before growing.
@@ -5022,5 +5146,124 @@ mod tests {
         assert_eq!(s.get(0).unwrap().effects(), [Effect::outline()]);
         assert!(s.get(1).unwrap().effects().is_empty());
         assert!(s.get(2).unwrap().effects().is_empty());
+    }
+
+    /// **A new layer is not locked by the layer it is put beside.** The two
+    /// readings a control could take here disagree on this fixture and agree on
+    /// nearly every other, which is what makes it worth writing: a locked layer
+    /// inside an unlocked folder is a place a new layer may perfectly well go,
+    /// and `active_is_locked` — the predicate the Place button used before there
+    /// was anywhere else for text to land — answers that it may not.
+    ///
+    /// The folder half is the one that must still refuse: a new layer made with
+    /// a locked folder selected goes *inside* it and inherits the lock.
+    #[test]
+    fn only_what_encloses_a_new_layer_can_lock_it() {
+        let mut s = grouped();
+        // "Layer 2", inside the unlocked "Group 1".
+        s.set_active(1);
+        s.get_mut(1).unwrap().locked = true;
+        assert!(s.active_is_locked(), "the fixture's own layer is locked");
+        assert!(
+            !s.new_layer_would_be_locked(),
+            "a sibling of a locked layer is not itself locked"
+        );
+
+        // The folder round it, selected. Now the new layer goes inside.
+        s.get_mut(1).unwrap().locked = false;
+        s.set_active(3);
+        s.get_mut(3).unwrap().locked = true;
+        assert!(
+            s.new_layer_would_be_locked(),
+            "a layer added inside a locked folder inherits the lock"
+        );
+
+        // And the ancestor case with a layer selected: the folder is locked and
+        // the sibling is not, so the new layer is locked all the same.
+        s.set_active(1);
+        assert!(
+            s.new_layer_would_be_locked(),
+            "an unlocked layer inside a locked folder is still a locked place"
+        );
+    }
+
+    /// A layer added under a name of its own keeps it, and hands back both
+    /// numbers.
+    ///
+    /// The id is the half worth checking: it is what a caller holds across a
+    /// gesture, and a fixture of one layer could not tell it from the slot,
+    /// because on a fresh stack both count from the same place. Two adds and a
+    /// reorder is what makes them disagree.
+    #[test]
+    fn a_layer_added_by_name_keeps_it_and_says_which_entry_it_is() {
+        let mut s = LayerStack::new();
+        s.add();
+        let made = s.add_named("Chapter One").expect("room for a third layer");
+        assert_eq!(s.get(s.active_index()).unwrap().name, "Chapter One");
+        assert_eq!(made.slot, 2);
+        s.reorder(2, 0);
+        assert_eq!(
+            s.layers().iter().position(|l| l.id == made.id),
+            Some(0),
+            "the id finds the layer where the index no longer would"
+        );
+        assert_eq!(s.get(0).unwrap().name, "Chapter One");
+    }
+
+    /// `add_refusal` names both bounds, and `add_named` agrees with it.
+    ///
+    /// The agreement is the half worth measuring rather than the arithmetic:
+    /// three callers read this predicate to decide whether to *offer* an add,
+    /// and a predicate that answered `None` where `add_named` then said no would
+    /// be a control promising what the model declines. Driven against the real
+    /// `add_named` in both cases, not restated.
+    #[test]
+    fn the_two_refusals_no_slice_can_mend_are_named_and_agree_with_the_add() {
+        let mut s = LayerStack::new();
+        assert_eq!(s.add_refusal(), None, "a fresh stack has room");
+
+        while s.len() < LayerStack::MAX {
+            s.add_named("filler").expect("under the cap");
+        }
+        assert_eq!(s.add_refusal(), Some(AddRefusal::StackFull));
+        assert!(
+            s.add_named("one too many").is_none(),
+            "the model let through what the predicate refused"
+        );
+
+        // A folder nested as deep as one goes, which is a different refusal with
+        // a different remedy - and reachable on a stack that is nowhere near
+        // full, so the two cannot be told apart by the length alone.
+        //
+        // **Built the way a real one arrives, which is an import.** `group`
+        // cannot reach this state: it puts the contents one level deeper than
+        // the folder it makes, so the deepest folder it can produce is at
+        // `MAX_DEPTH - 1` with a layer at `MAX_DEPTH` inside it. What does reach
+        // it is `flatten_ill_formed`, which caps an over-nested source document
+        // at `MAX_DEPTH`, the folder included. Setting `depth` by hand would
+        // have been a malformed stack answering the question - and since the
+        // predicate reads the selected entry alone, it would have passed without
+        // the state ever being one Umber could hold.
+        let mut deep = LayerStack::new();
+        for depth in (0..=LayerStack::MAX_DEPTH).rev() {
+            deep.push_imported(true, depth, format!("Group at {depth}"));
+        }
+        assert!(
+            well_formed(&deep.shape_pairs()),
+            "the fixture is not a stack Umber would ever hold"
+        );
+        let innermost = deep
+            .layers()
+            .iter()
+            .position(|l| l.depth == LayerStack::MAX_DEPTH)
+            .expect("a folder at the cap");
+        deep.set_active(innermost);
+        assert!(deep.get(innermost).unwrap().is_folder());
+        assert!(deep.len() < LayerStack::MAX, "not full, merely deep");
+        assert_eq!(deep.add_refusal(), Some(AddRefusal::TooDeep));
+        assert!(
+            deep.add_named("too deep").is_none(),
+            "the model let through what the predicate refused"
+        );
     }
 }

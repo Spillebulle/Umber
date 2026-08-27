@@ -833,6 +833,86 @@ fn clean_name(name: &str) -> String {
     out.trim().to_string()
 }
 
+/// The longest a layer named after its own text may be, in characters.
+///
+/// Characters and not bytes, unlike [`MAX_NAME_BYTES`], because this one is
+/// about how wide a row reads rather than about how much of a stranger's file to
+/// trust: a layer row is a fixed column, and what decides whether a name fits is
+/// how many letters are in it.
+///
+/// Twenty-four is a little past what `metrics::PANEL`'s layer row can draw, so a
+/// name egui has to truncate is one that was genuinely long rather than one this
+/// cut too fine.
+pub const MAX_LAYER_NAME_CHARS: usize = 24;
+
+/// What to call a layer made to hold a piece of text.
+///
+/// The first line with anything on it, whitespace collapsed, cut to
+/// [`MAX_LAYER_NAME_CHARS`] at a word boundary where there is one. So a caption
+/// reading "Chapter One" names its layer "Chapter One", which is the whole point:
+/// six captions filed as "Layer 4" through "Layer 9" is a stack nobody can read,
+/// and it is the reason placing text on its own layer is worth anything.
+///
+/// **Nothing marks a name that was cut, and that is decided rather than
+/// skipped.** The obvious mark is an ellipsis and Archivo carries no `…`; three
+/// full stops would be a mark inside somebody's layer *name*, which travels into
+/// the `.ora` and out to every other application that opens it. A name is not a
+/// readout, so it says less rather than announcing that it was shortened, and
+/// the whole string is on screen in the Text panel the moment the layer is
+/// selected.
+///
+/// It is a rule and therefore lives here rather than in the panel that calls it:
+/// testable with no window, exactly as `Clip::place` and `CanvasCopy::plan` are.
+///
+/// Total by construction. Text that is empty, all whitespace, or all control
+/// characters comes back as "Text". A placement of nothing is refused long
+/// before this, so the fallback is what stops this function having a second
+/// answer every caller would have to handle.
+pub fn layer_name(text: &str) -> String {
+    let line = text
+        .lines()
+        .find(|l| l.split_whitespace().next().is_some())
+        .unwrap_or_default();
+    // Collapsed rather than trimmed: a caption set with a tab between two words
+    // would otherwise carry the tab into `stack.xml`, and the run of spaces
+    // somebody used to indent a line is not part of what the line says.
+    let mut out = String::new();
+    for word in line.split_whitespace() {
+        // **Cleaned before it is measured, not after.** A control character is
+        // not whitespace, so it survives `split_whitespace` and would otherwise
+        // be spent out of a budget it can never draw a glyph from - enough of
+        // them ahead of a caption took the whole allowance and named the layer
+        // "Text". The same reading [`clean_name`] makes, one step earlier.
+        let word: String = word.chars().filter(|c| !c.is_control()).collect();
+        if word.is_empty() {
+            continue;
+        }
+        let sep = usize::from(!out.is_empty());
+        if out.chars().count() + sep + word.chars().count() > MAX_LAYER_NAME_CHARS {
+            // The first word alone may be longer than the whole budget, and then
+            // there is no word boundary to cut at. A hard cut on a **character**
+            // boundary is the only answer left; slicing at a byte would panic in
+            // the middle of a multi-byte character, which is `clean_name`'s trap
+            // in its other form. It can still split a grapheme cluster, so a name
+            // may end on a lone combining mark - a cosmetic cost on a string
+            // nothing parses, against a segmentation crate for a layer name.
+            if out.is_empty() {
+                out.extend(word.chars().take(MAX_LAYER_NAME_CHARS));
+            }
+            break;
+        }
+        if sep == 1 {
+            out.push(' ');
+        }
+        out.push_str(&word);
+    }
+    if out.is_empty() {
+        "Text".to_string()
+    } else {
+        out
+    }
+}
+
 fn rect_array(rect: PixelRect) -> [u32; 4] {
     [rect.x, rect.y, rect.width, rect.height]
 }
@@ -1256,5 +1336,104 @@ mod tests {
         let name = postscript_name(&font);
         assert!(!name.is_empty(), "Archivo carries one");
         assert!(!name.contains(' '), "a PostScript name has no spaces");
+    }
+
+    /// The name is the words, and the four ways that can go wrong.
+    ///
+    /// Each case is one somebody's caption really produces.
+    #[test]
+    fn a_layer_is_named_after_the_words_on_it() {
+        assert_eq!(layer_name("Chapter One"), "Chapter One");
+        // The first line with anything on it, not the first line.
+        assert_eq!(layer_name("\n\n  Chapter One\nand more"), "Chapter One");
+        // Whitespace collapsed, so a tab never reaches `stack.xml`.
+        assert_eq!(layer_name("Chapter\tOne   again"), "Chapter One again");
+        // Cut at a word boundary, with no mark saying so.
+        let long = "The quick brown fox jumps over the lazy dog";
+        assert_eq!(layer_name(long), "The quick brown fox");
+        assert!(
+            !layer_name(long).contains('.'),
+            "nothing marks a name that was cut"
+        );
+    }
+
+    /// A single word past the budget has no word boundary to cut at, and the cut
+    /// has to be on a character.
+    ///
+    /// Driven with a multi-byte word deliberately: at `MAX_LAYER_NAME_CHARS`
+    /// *bytes* this string is cut in the middle of a character, which is a panic
+    /// rather than a wrong answer — the trap `clean_name` already names — so a
+    /// test over ASCII alone would agree with a broken implementation.
+    #[test]
+    fn a_word_longer_than_the_whole_budget_is_cut_on_a_character() {
+        let long = "\u{e5}".repeat(60);
+        let name = layer_name(&long);
+        assert_eq!(name.chars().count(), MAX_LAYER_NAME_CHARS);
+        assert_eq!(name, "\u{e5}".repeat(MAX_LAYER_NAME_CHARS));
+    }
+
+    /// Total, so no caller has a second answer to draw.
+    ///
+    /// The control-character line is the one that is not obvious: `\u{7}` is not
+    /// whitespace, so it survives `split_whitespace` and would otherwise name a
+    /// layer with something no panel can draw. That is exactly the bug
+    /// `palette::clean_line` was written for, one module along.
+    #[test]
+    fn text_with_nothing_drawable_in_it_still_names_its_layer() {
+        assert_eq!(layer_name(""), "Text");
+        assert_eq!(layer_name("   \n\t  \n"), "Text");
+        assert_eq!(layer_name("\u{7}\u{7}"), "Text");
+        assert_eq!(layer_name("\u{7}Hi\u{7}"), "Hi");
+    }
+
+    /// A control character may not spend budget it can never draw with.
+    ///
+    /// It is not whitespace, so it survives `split_whitespace` and used to be
+    /// counted before it was filtered: enough of them ahead of a caption took the
+    /// whole allowance and the layer came back called "Text". The fixture needs
+    /// *more than the budget* of them, which is why the count is written against
+    /// [`MAX_LAYER_NAME_CHARS`] rather than as a literal.
+    #[test]
+    fn control_characters_do_not_spend_the_name_budget() {
+        let noise = "\u{7}".repeat(MAX_LAYER_NAME_CHARS + 4);
+        assert_eq!(layer_name(&format!("{noise} Chapter One")), "Chapter One");
+        assert_eq!(layer_name(&format!("Chapter{noise} One")), "Chapter One");
+    }
+
+    /// The budget is the figure the constant says.
+    ///
+    /// **Two fixtures, because either one alone can only see the constant move
+    /// in one direction.** Words of four letters put their boundaries at 4, 9,
+    /// 14, 19, 24, 29, so 24 sits exactly on one and a budget of 25 through 28
+    /// produces the identical name; words of one letter put them at every odd
+    /// number, so 24 and 23 produce the identical name there. Between them the
+    /// pair pins 24 and nothing else, which the neighbouring tests do not:
+    /// `a_layer_is_named_after_the_words_on_it` passes for any budget from 19 to
+    /// 24, and `a_word_longer_than_the_whole_budget...` asserts against the
+    /// constant itself and is vacuous about its value.
+    #[test]
+    fn the_name_budget_is_the_figure_it_says() {
+        let wide = std::iter::repeat_n("abcd", 12)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = layer_name(&wide);
+        assert!(
+            name.chars().count() <= MAX_LAYER_NAME_CHARS,
+            "{name:?} is past the budget"
+        );
+        // The next whole word would not have fitted, which is what makes the cut
+        // a *word boundary* rather than an arbitrary stop.
+        assert!(
+            name.chars().count() + 5 > MAX_LAYER_NAME_CHARS,
+            "{name:?} stopped short with a word still to spend"
+        );
+        assert_eq!(name, "abcd abcd abcd abcd abcd", "a smaller budget");
+
+        let narrow = std::iter::repeat_n("a", 20).collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            layer_name(&narrow),
+            "a a a a a a a a a a a a",
+            "a larger budget"
+        );
     }
 }

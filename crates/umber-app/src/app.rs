@@ -425,6 +425,20 @@ pub(crate) fn release_finished_textures(
     }
 }
 
+/// What to say when the slot pool has nothing left for a text placement's layer.
+///
+/// One sentence, once, because it is raised from two arms of the same match and
+/// two copies of a notice is how the two come to read differently.
+fn no_slice_left() -> Notice {
+    Notice {
+        title: "There is no room for another layer".to_string(),
+        lines: vec![
+            "Umber has no texture slice left for one. Save and reopen the document              to pack them back down, though deleted layers cannot be brought back              afterwards."
+                .to_string(),
+        ],
+    }
+}
+
 impl UmberApp {
     /// Build the application around an event loop it can wake.
     ///
@@ -1332,6 +1346,12 @@ impl UmberApp {
             slot,
             lifted: pixels.is_none(),
             drag: None,
+            // Nothing here made a layer. A text placement that did fills this in
+            // immediately afterwards, exactly as it fills `float_text` in — and
+            // this line is that field's guarantee applied to the other half: a
+            // float installed by any other route cannot inherit an abandoned
+            // placement's claim on somebody's layer.
+            made: None,
         });
         true
     }
@@ -1405,21 +1425,62 @@ impl UmberApp {
         let damage = float.xf.damage(doc, float.lifted).filter(|_| !unchanged);
 
         let id = self.editor.session.active_id();
-        let Some(gfx) = self.gfx.as_mut() else {
+        // **The three ways out that write nothing, gathered before the renderer
+        // is borrowed.** They were three early returns, and each of them is now
+        // also the moment a placement's own layer has to be given back: a block
+        // dragged entirely off the canvas has no damage, and a document with no
+        // graphics has nowhere for the commit to go. Leaving the layer on either
+        // path leaves an add with no entry that could undo it, which is the one
+        // outcome worse than the empty layer itself. Gathered here rather than
+        // repeated at each because the third would have been the one forgotten.
+        let nowhere = damage.is_none()
+            || !self
+                .gfx
+                .as_ref()
+                .is_some_and(|gfx| gfx.canvases.contains_key(&id));
+        if nowhere {
+            self.editor.unmake_layer(float.made);
+            if let Some(gfx) = self.gfx.as_mut()
+                && let Some(canvas) = gfx.canvases.get_mut(&id)
+            {
+                canvas.end_float(&gfx.gpu.queue);
+            }
+            return;
+        }
+        let (Some(gfx), Some(damage)) = (self.gfx.as_mut(), damage) else {
             return;
         };
         let Some(canvas) = gfx.canvases.get_mut(&id) else {
             return;
         };
-        let Some(damage) = damage else {
-            canvas.end_float(&gfx.gpu.queue);
-            return;
-        };
+
+        // **A placement onto a layer it made itself is undone by taking that
+        // layer back out**, which is one entry for one thing the artist did and
+        // is what makes "text you placed is text you can edit" hold rather than
+        // depend on where the click landed.
+        //
+        // It needs no patch and no readback at all: removing the layer removes
+        // its pixels, because a `ShapeEntry::Gone` carries the whole layer and
+        // its slice, so redoing hands back the very texels the commit is about
+        // to write. That is not an optimisation of the patch path, it is the
+        // absence of one — a full-canvas caption on a 10000² document would be
+        // 400 MB of patch and a blocking read at the moment the artist lets go.
+        //
+        // **The entry itself was recorded at the add**, by `add_text_layer`, and
+        // this is only the reading that says so. It has to be that way round:
+        // the layer stands in the stack for the whole gesture, so an entry
+        // recorded here would sit on the undo stack above a reorder made in
+        // between — and undoing top-down would take the layer out before that
+        // reorder's shape, which names it, was ever reached. See
+        // `crate::editor::MadeLayer::entry_at`.
+        let own_layer = float.made.is_some();
 
         // Blocks on the GPU, and is submitted on its own encoder so it observes
         // the layer before the commit below touches it. Once per gesture, at
-        // pointer-up, exactly as a stroke's is.
-        let before = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, float.slot, damage);
+        // pointer-up, exactly as a stroke's is. Skipped entirely for the case
+        // above, which has nothing to put in a patch and knows what it landed on.
+        let before = (!own_layer)
+            .then(|| canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, float.slot, damage));
         // **A placement becomes a record only where it lands on nothing**, and
         // the reading is free: `before` is the pixels the commit is about to
         // write over, which for a paste is the destination rectangle alone.
@@ -1435,7 +1496,17 @@ impl UmberApp {
         // The layer's own form — sRGB with alpha premultiplied in linear space —
         // and alpha is the fourth byte. A zero there is the one value that
         // cannot be hiding a colour, whichever way the alpha is carried.
-        let landed_on_nothing = before.as_chunks::<4>().0.iter().all(|px| px[3] == 0);
+        //
+        // A layer made for this placement is that case **by construction** —
+        // `add_text_layer` clears the slice — so it answers without a reading,
+        // which is the whole reason the readback above could be skipped. An
+        // empty `before` would answer the same way through `all`, and saying so
+        // in the type rather than leaning on that is what stops "nothing was
+        // read" from being mistaken for "nothing was there".
+        let landed_on_nothing = match &before {
+            Some(bytes) => bytes.as_chunks::<4>().0.iter().all(|px| px[3] == 0),
+            None => true,
+        };
         // **Taken before the filter, because `record.is_none()` is two different
         // things.** It is true when a *placement* was refused the record, and
         // equally true for every ordinary paste and every lift, which carry no
@@ -1465,6 +1536,17 @@ impl UmberApp {
         });
         // Only the paint case, because the crop already has a notice of its own
         // and two dialogs for one click is worse than either.
+        //
+        // **The cropped case says nothing about editability, and that is now
+        // worth naming rather than leaving to the crop notice.** A placement
+        // onto its own layer that was cropped produces a layer named after the
+        // artist's words that is *not* text — the only sign being an Update
+        // button that is not offered — and the crop notice talks about the
+        // canvas rather than about that. It is not raised here because two
+        // dialogs for one click is still worse; what closes it properly is the
+        // crop sentence saying both, which is `float_a_clip`'s to say and needs
+        // to know a placement is what it is carrying. Left as a gap on purpose,
+        // and it is a gap: `docs/text-tool.md` is where the repair belongs.
         let placed_over_paint = was_text && record.is_none() && whole;
         // A lift off a text layer moves the pixels and leaves the record naming
         // where they used to be, so the record goes with them. It is dropped
@@ -1483,25 +1565,66 @@ impl UmberApp {
             })
             .flatten()
             .and_then(|at| self.editor.layers.take_text(at));
-        let patch = PixelPatch::new(damage, float.slot, before);
-        // The record and the pixels go into **one** entry, so an undo cannot
-        // take the text off the canvas and leave the layer claiming it, or put
-        // a lifted caption back without the record that describes it — see
-        // `EditBody::Text`. `was` is what the layer held: nothing for a
-        // placement, and the record a lift has just taken off.
         let took_a_record = lifted_text.is_some();
-        let carries_text = record.is_some() || took_a_record;
-        self.editor.history.record(Edit::new(
-            EditKind::Transform,
-            if carries_text {
-                EditBody::Text {
-                    patch,
-                    was: lifted_text,
-                }
-            } else {
-                EditBody::Pixels(patch)
-            },
-        ));
+        // **Nothing at all is recorded for a placement onto its own layer**, and
+        // that is the whole of its undo rather than a gap in it: `add_text_layer`
+        // recorded the entry when the layer appeared, and taking that layer back
+        // out takes the pixels this commit is about to write with it, because a
+        // `ShapeEntry::Gone` carries the whole `Layer` and its `SlotClaim`. So
+        // one Ctrl+Z takes back the layer, the words and the record together.
+        //
+        // The kind is `EditKind::AddLayer` rather than a variant of its own,
+        // because that row undoes exactly as an add does and two rows that undo
+        // identically must not have two names — the rule that already files a
+        // paste under Transform and a cut under Erase. It also means no
+        // `history::VERSION` bump and nothing new in the file, since
+        // `SaveHistory::new` skips every structural entry already.
+        //
+        // A lift can never be in this case: `made` is set by `place_text` alone
+        // and a placement is a paste, so `lifted` is false. Stated rather than
+        // asserted, because `take_text` has already run by here and a record
+        // dropped on this path would be one the artist could not get back — the
+        // `is_none` below is what keeps that structural instead of hopeful.
+        if let Some(before) = before {
+            debug_assert!(
+                !own_layer,
+                "a float that made its own layer also captured a patch"
+            );
+            let patch = PixelPatch::new(damage, float.slot, before);
+            // The record and the pixels go into **one** entry, so an undo cannot
+            // take the text off the canvas and leave the layer claiming it, or
+            // put a lifted caption back without the record that describes it —
+            // see `EditBody::Text`. `was` is what the layer held: nothing for a
+            // placement, and the record a lift has just taken off.
+            let carries_text = record.is_some() || took_a_record;
+            self.editor.history.record(Edit::new(
+                EditKind::Transform,
+                if carries_text {
+                    EditBody::Text {
+                        patch,
+                        was: lifted_text,
+                    }
+                } else {
+                    EditBody::Pixels(patch)
+                },
+            ));
+        } else if took_a_record {
+            // Unreachable by the paragraph above, and it is put back rather than
+            // dropped: a record thrown away here is a caption the artist cannot
+            // get back by any route, where putting it back is merely a layer
+            // that stayed text.
+            log::error!("a float made its own layer and also lifted a record");
+            if let Some(at) = self
+                .editor
+                .layers
+                .layers()
+                .iter()
+                .position(|l| l.slot() == Some(float.slot))
+                && let Some(was) = lifted_text
+            {
+                self.editor.layers.set_text(at, *was);
+            }
+        }
         if let Some(record) = record {
             // By the float's own **slot**, not by the selected row: the slot was
             // snapshotted when the float began, exactly so that selecting
@@ -1555,10 +1678,17 @@ impl UmberApp {
             self.editor.notice = Some(Notice {
                 title: "The text was placed as paint".to_string(),
                 lines: vec![
+                    // **The remedy names the switch, because the switch is now
+                    // what got them here.** It used to say "add a layer and
+                    // place it there", which was the only route when every
+                    // placement went onto the selected layer; with "On its own
+                    // layer" on by default, the only way to reach this sentence
+                    // is to have turned that off, so sending somebody to add a
+                    // layer by hand would be advice about the long way round.
                     "It landed on a layer that already had something on it, so Umber \
                      cannot tell the text from the picture underneath and will not offer \
-                     to set it again. Undo, add a layer, and place it there to keep it \
-                     editable."
+                     to set it again. Undo, switch on \"On its own layer\" under the \
+                     Text panel, and place it again to keep it editable."
                         .to_string(),
                 ],
             });
@@ -1598,12 +1728,39 @@ impl UmberApp {
     }
 
     /// Abandon a floating transform. The layer was never written to, so this is
-    /// only giving the storage back.
+    /// only giving the storage back — and, for a text placement that made a
+    /// layer to land on, giving that back too.
+    ///
+    /// **Escape is free for a lift and a paste, and for a text placement it
+    /// costs the redo stack.** That distinction is worth stating rather than
+    /// glossing, because an earlier draft of this comment claimed the stronger
+    /// thing and it is not true. A lift and a paste record nothing until the
+    /// commit, so abandoning one really does put the document exactly where it
+    /// was. A placement records its entry when it *makes its layer* — it has to,
+    /// or a reorder in the middle of the gesture ends up above it on the undo
+    /// stack; see [`crate::editor::MadeLayer::entry_at`] — and
+    /// `History::record` drains the redo stack. [`Editor::unmake_layer`] pops
+    /// the entry again but cannot put redo back.
+    ///
+    /// So: undo a stroke, place a caption, press Escape, and the stroke can no
+    /// longer be redone. That is what *every* edit in Umber does to the redo
+    /// stack and a placement is an edit from the moment a layer appears; what
+    /// makes it worth a paragraph is only that this path looks like it changed
+    /// nothing. The way to give it back is to stop the reorder recording inside
+    /// the gesture at all — `App::record_move` could settle the float and the
+    /// Layers panel's drag could be collected into `UiActions` and settled here
+    /// — after which the entry can go back to the commit and Escape costs
+    /// nothing again. That is a change to two working call sites and it is not
+    /// made here.
+    ///
+    /// The layer itself is empty until the commit writes into it, which is why
+    /// [`Editor::unmake_layer`] drops its slice rather than parking it.
     fn cancel_transform(&mut self) -> bool {
         self.put_down_at = None;
-        if self.editor.float.take().is_none() {
+        let Some(float) = self.editor.float.take() else {
             return false;
-        }
+        };
+        self.editor.unmake_layer(float.made);
         let id = self.editor.session.active_id();
         if let Some(gfx) = self.gfx.as_mut()
             && let Some(canvas) = gfx.canvases.get_mut(&id)
@@ -1984,6 +2141,28 @@ impl UmberApp {
             return;
         };
         let block = self.editor.text.block.clone();
+
+        // **Before the layer is made, not by `float_a_clip` afterwards.** That
+        // function opens by settling whatever is already in flight, and a
+        // previous float committing *after* this add would record its entry
+        // after the add it knows nothing about. Settling here makes the order
+        // what it reads as. Both are no-ops by the time `float_a_clip` repeats
+        // them, which is why it may go on doing so.
+        self.finish_transform();
+        self.finish_stroke();
+
+        let made = if self.editor.ui.text_own_layer {
+            match self.add_text_layer(&block.text) {
+                Ok(made) => Some(made),
+                Err(notice) => {
+                    self.editor.notice = Some(notice);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         if self.float_a_clip(&clip, "set") {
             // **After** the float, never before: `begin_float` clears this as
             // it installs one, so setting it first would be thrown away, and a
@@ -1995,7 +2174,138 @@ impl UmberApp {
                 colour,
                 size: clip.size(),
             }));
+            match self.editor.float.as_mut() {
+                // The claim on the layer travels with the float rather than
+                // beside it, so every path that abandons one gives the layer
+                // back. See `Floating::made`.
+                Some(float) => float.made = made,
+                // Unreachable: `float_a_clip` answering true means `begin_float`
+                // installed one. Written as the other arm rather than as a
+                // silent `if let` so that "no path leaves the layer behind" is
+                // structural — a `None` that quietly dropped `made` would leave
+                // a layer whose claim nothing holds, which is the one thing this
+                // field exists to make impossible.
+                None => self.editor.unmake_layer(made),
+            }
+        } else if let Some(made) = made {
+            // The float was refused after the layer was made — no spare slice
+            // to preview into, or a clip that landed entirely off the canvas.
+            // Nothing was recorded, so the layer has to go back rather than be
+            // left in the stack with no entry that could take it out.
+            self.editor.unmake_layer(Some(made));
         }
+    }
+
+    /// Add the layer a text placement puts its words on, and record the one
+    /// entry the whole placement gets.
+    ///
+    /// [`Self::add_layer`], with the name taken from the text and with what it
+    /// hands back. **The entry is the placement's whole undo**, and that is the
+    /// design rather than a coincidence: the layer is new, so taking it back out
+    /// takes its pixels with it — a `ShapeEntry::Gone` carries the whole `Layer`
+    /// with its `SlotClaim` — and `finish_transform` therefore records nothing at
+    /// all for this case, captures no patch, and does not block on a readback.
+    /// One Ctrl+Z takes back the layer, the words on it and its record together,
+    /// which is one entry for one thing the artist did.
+    ///
+    /// **Recorded here rather than at the commit**, which is the part that was
+    /// wrong first and is worth stating at the code: the layer stands in the
+    /// stack for the whole gesture, so an entry recorded at the *end* of it sits
+    /// on the undo stack above anything recorded in between — and a reorder in
+    /// that window records a shape naming this layer. Undoing top-down would
+    /// then take the layer out before the reorder's shape was reached, and
+    /// `LayerStack::restore_shape` refuses a shape naming an entry that is gone.
+    /// See [`crate::editor::MadeLayer::entry_at`].
+    ///
+    /// Escape is still free: the layer is empty until the commit writes into it,
+    /// and [`Editor::unmake_layer`] takes the layer and the entry back off
+    /// together.
+    ///
+    /// It deliberately does **not** `mark_modified`. The window between Place
+    /// and the commit ends either in a commit, which marks it, or in a cancel,
+    /// which leaves the document exactly as it was found — and a dot claiming
+    /// unsaved work after an Escape that changed nothing is a claim about the
+    /// document that is not true.
+    ///
+    /// `Err` carries the sentence to show. Both refusals are ones the Place
+    /// button is already disabled for, so this catches a route that goes round
+    /// the button — the arrangement the lock keeps in `begin_float`.
+    fn add_text_layer(&mut self, text: &str) -> Result<crate::editor::MadeLayer, Notice> {
+        // **The stack's own limits before the device's**, `add_layer`'s order
+        // and for `add_layer`'s reason: reserving ahead of a refusal the model
+        // is about to make grows the texture array for a layer that will not
+        // exist, and answers a full stack with a sentence about graphics memory.
+        //
+        // A sentence per reason, which is the whole point of `add_refusal`
+        // answering an enum: "there is no room" told to somebody whose folder is
+        // merely nested too deep sends them to delete a layer that would not
+        // have helped.
+        match self.editor.layers.add_refusal() {
+            Some(umber_core::AddRefusal::StackFull) => {
+                return Err(Notice {
+                    title: "There is no room for another layer".to_string(),
+                    lines: vec![format!(
+                        "This document already has {} entries, which is all Umber holds. \
+                         Delete a layer to make room, or switch off \"On its own layer\" \
+                         under the Text panel to set the words on the layer that is \
+                         selected.",
+                        umber_core::LayerStack::MAX
+                    )],
+                });
+            }
+            Some(umber_core::AddRefusal::TooDeep) => {
+                return Err(Notice {
+                    title: "That folder is nested as deep as it goes".to_string(),
+                    lines: vec![
+                        "A layer inside it would be one level too deep. Select a layer \
+                         outside it, or switch off \"On its own layer\" under the Text \
+                         panel."
+                            .to_string(),
+                    ],
+                });
+            }
+            None => {}
+        }
+        if let Err(refused) = self.reserve_a_slice() {
+            return Err(vram::slice_refused("a layer", &refused));
+        }
+        // **The model half, and the recording with it, is `Editor`'s.** Split
+        // there rather than written here so it can be driven with no window: a
+        // critic deleted the `record` call when it lived at this call site and
+        // all 856 tests stayed green, which is "a guard on a model is not a
+        // guard on the call site" with a crate boundary in the way.
+        let made = match self.editor.make_text_layer(text) {
+            Some(made) => made,
+            // A parked layer may be holding the last slice; give the oldest
+            // entries up and try once more. Only the pool can be the reason by
+            // this point, because the other two refusals were answered above -
+            // `add_layer` states the same argument at length.
+            None if self.free_a_slot() => match self.editor.make_text_layer(text) {
+                Some(made) => made,
+                None => return Err(no_slice_left()),
+            },
+            None => return Err(no_slice_left()),
+        };
+        let slot = self
+            .editor
+            .layers
+            .get(self.editor.layers.active_index())
+            .and_then(umber_core::Layer::slot);
+        let needed = self.editor.layers.slot_capacity_needed();
+        let id = self.editor.session.active_id();
+        if let Some(gfx) = self.gfx.as_mut()
+            && let Some(canvas) = gfx.canvases.get_mut(&id)
+        {
+            canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
+            // A recycled slot still holds the last layer's pixels, and here that
+            // matters twice over: the commit decides whether to keep the record
+            // by reading what the destination held, so a slice left dirty would
+            // make a placement onto a brand new layer report itself as paint.
+            if let Some(slot) = slot {
+                canvas.clear_layer(&gfx.gpu.queue, slot);
+            }
+        }
+        Ok(made)
     }
 
     /// Set the selected text layer again from what the Text panel is showing.
@@ -2424,19 +2734,6 @@ impl UmberApp {
         self.editor.history.free_until(move || room.has_headroom())
     }
 
-    /// Would a new layer inside the selected folder be nested too deep?
-    ///
-    /// The second of `LayerStack::add`'s two refusals that a released slice
-    /// cannot mend. Read here rather than asked of the stack, because it is a
-    /// statement about what *this* add would do and the stack's own answer is
-    /// the `None` we are already looking at.
-    fn selected_folder_is_full(&self) -> bool {
-        self.editor
-            .layers
-            .get(self.editor.layers.active_index())
-            .is_some_and(|l| l.is_folder() && l.depth >= umber_core::LayerStack::MAX_DEPTH)
-    }
-
     fn add_layer(&mut self) {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
@@ -2453,10 +2750,12 @@ impl UmberApp {
         // The two conditions are the ones the retry arm below used to state, so
         // this is where they were rather than a second copy of them: hoisted,
         // that arm's "only where a slice is the plausible reason" becomes
-        // automatic instead of restated.
-        if self.editor.layers.len() >= umber_core::LayerStack::MAX || self.selected_folder_is_full()
-        {
-            log::warn!("layer limit reached");
+        // automatic instead of restated. They are `LayerStack::add_refusal`'s
+        // now rather than spelled out here, because a text placement and the
+        // Text panel's Place button both have to agree with this and three
+        // spellings of one rule is three chances to write it differently.
+        if let Some(why) = self.editor.layers.add_refusal() {
+            log::warn!("layer limit reached: {why:?}");
             return;
         }
         // **Before the add**, for the reason `install_import` reserves before it
@@ -2566,6 +2865,15 @@ impl UmberApp {
     /// nothing undo. The drag in the layers panel does the same thing at its
     /// own call site, because it holds the `Editor` and not the `App`.
     fn record_move(&mut self, moved: impl FnOnce(&mut umber_core::LayerStack) -> bool) {
+        // **This does not put a float down first, unlike every other structural
+        // edit here**, and that is deliberate rather than forgotten: a reorder
+        // moves an entry in a `Vec` and a float is bound to a *slot*, so the
+        // preview goes on naming the right slice whatever row it now sits in.
+        // What it costs is that a `MoveLayer` really can land in the middle of a
+        // gesture, which is why a text placement records its own entry when the
+        // layer appears rather than when the float is put down. See
+        // `crate::editor::MadeLayer::entry_at`; the layer-list drag in
+        // `panels.rs` is the same shape and the same argument.
         let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         if !moved(&mut self.editor.layers) {
             return;
@@ -4283,6 +4591,17 @@ impl UmberApp {
                 self.close_document(index);
             }
         }
+        // **Before the click, not after**, and the order is the one the Colour
+        // panel's settings keep: a switch moved this frame has to be in force by
+        // the time the button beside it is acted on, or the artist's first press
+        // after flipping it does the opposite of what the switch says. Both were
+        // drawn from the same frame's readings, so the click cannot be one the
+        // new setting would have refused — `place_state` was computed before the
+        // toggle and `add_text_layer` gates for real either way.
+        if let Some(own) = actions.text_own_layer {
+            self.editor.ui.text_own_layer = own;
+            crate::prefs::mark_dirty();
+        }
         if actions.place_text {
             self.place_text();
         }
@@ -5594,7 +5913,15 @@ impl ApplicationHandler<Wake> for UmberApp {
         // committed, because committing needs the GPU that is being taken
         // away — the same bargain the pixels themselves have always struck on
         // this path.
-        self.editor.float = None;
+        //
+        // **A layer the float made for itself goes with it**, and this is the
+        // third of the three sites `Floating::made` claims cannot be missed —
+        // taking the float and dropping it is exactly how one is missed, and
+        // this line is what makes that claim true rather than hopeful. The
+        // pixels are lost either way, so a layer left behind would be an empty
+        // one named after words the artist never got to put down.
+        let float = self.editor.float.take();
+        self.editor.unmake_layer(float.and_then(|f| f.made));
         self.gfx = None;
     }
 
@@ -6466,6 +6793,60 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 
 #[cfg(test)]
 mod tests {
+
+    /// **Every path that takes a float gives back the layer a placement made.**
+    ///
+    /// A source scan, and it says so rather than pretending to be more. The
+    /// thing it guards is a *call site* on `UmberApp`, which needs an
+    /// `EventLoopProxy` and therefore an event loop, so there is no way to drive
+    /// it here; a critic deleted all three calls and the whole suite stayed
+    /// green. `Editor::unmake_layer` itself is guarded properly, in `editor.rs`,
+    /// and what is missing is only that somebody calls it.
+    ///
+    /// The rule is `Floating::made`'s: a float carries the claim on its layer, so
+    /// anything that takes the float and does not commit it owes the layer back.
+    /// There are exactly three such places and the scan names them, so a fourth
+    /// is a failure here rather than an empty layer nobody can account for.
+    ///
+    /// The sentinel is built with `concat!` because a scan that matches its own
+    /// source is one that stops at this test and reads as complete - "a
+    /// source-text guard must not match its own source", the rule `try_reserve`'s
+    /// scan already lives by.
+    #[test]
+    fn every_path_that_abandons_a_float_gives_its_layer_back() {
+        let source = include_str!("app.rs");
+        let call = concat!("editor.", "unmake_layer(");
+        // Comments and rustdoc reference the function by name, and this file
+        // argues about it at length; only lines that actually call it count.
+        let calls = source
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(call)
+            })
+            .count();
+        assert_eq!(
+            calls, 5,
+            "the number of places that give a placement's layer back moved. \
+             They are: `finish_transform`'s `nowhere` gate, `cancel_transform`, \
+             `suspended`, and `place_text`'s two arms - the float it was refused \
+             and the one `begin_float` cannot have failed to install. Adding a \
+             path that takes `Editor::float` without committing means adding a \
+             call and this count; losing one means an empty layer left in \
+             somebody's stack."
+        );
+        for owner in [
+            concat!("fn finish_", "transform"),
+            concat!("fn cancel_", "transform"),
+            concat!("fn suspend", "ed"),
+            concat!("fn place_", "text"),
+        ] {
+            assert!(
+                source.contains(owner),
+                "{owner} is gone, so the count above is about something else"
+            );
+        }
+    }
     use super::*;
 
     /// **What spending a flip entry on a mirror that did not happen costs the
