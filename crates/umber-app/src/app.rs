@@ -6793,6 +6793,60 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 
 #[cfg(test)]
 mod tests {
+
+    /// **Every path that takes a float gives back the layer a placement made.**
+    ///
+    /// A source scan, and it says so rather than pretending to be more. The
+    /// thing it guards is a *call site* on `UmberApp`, which needs an
+    /// `EventLoopProxy` and therefore an event loop, so there is no way to drive
+    /// it here; a critic deleted all three calls and the whole suite stayed
+    /// green. `Editor::unmake_layer` itself is guarded properly, in `editor.rs`,
+    /// and what is missing is only that somebody calls it.
+    ///
+    /// The rule is `Floating::made`'s: a float carries the claim on its layer, so
+    /// anything that takes the float and does not commit it owes the layer back.
+    /// There are exactly three such places and the scan names them, so a fourth
+    /// is a failure here rather than an empty layer nobody can account for.
+    ///
+    /// The sentinel is built with `concat!` because a scan that matches its own
+    /// source is one that stops at this test and reads as complete - "a
+    /// source-text guard must not match its own source", the rule `try_reserve`'s
+    /// scan already lives by.
+    #[test]
+    fn every_path_that_abandons_a_float_gives_its_layer_back() {
+        let source = include_str!("app.rs");
+        let call = concat!("editor.", "unmake_layer(");
+        // Comments and rustdoc reference the function by name, and this file
+        // argues about it at length; only lines that actually call it count.
+        let calls = source
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(call)
+            })
+            .count();
+        assert_eq!(
+            calls, 5,
+            "the number of places that give a placement's layer back moved. \
+             They are: `finish_transform`'s `nowhere` gate, `cancel_transform`, \
+             `suspended`, and `place_text`'s two arms - the float it was refused \
+             and the one `begin_float` cannot have failed to install. Adding a \
+             path that takes `Editor::float` without committing means adding a \
+             call and this count; losing one means an empty layer left in \
+             somebody's stack."
+        );
+        for owner in [
+            concat!("fn finish_", "transform"),
+            concat!("fn cancel_", "transform"),
+            concat!("fn suspend", "ed"),
+            concat!("fn place_", "text"),
+        ] {
+            assert!(
+                source.contains(owner),
+                "{owner} is gone, so the count above is about something else"
+            );
+        }
+    }
     use super::*;
 
     /// **What spending a flip entry on a mirror that did not happen costs the
