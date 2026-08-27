@@ -2597,6 +2597,18 @@ mod tests {
             "the outline was rounded {nearest:.2} px away from a corner the hand \
              slowed right down to draw"
         );
+
+        // **What this catches, demonstrated rather than claimed.** Mutating
+        // `cut_corners` to cut at 0.45/0.55 instead of 0.25/0.75 leaves it
+        // green, and so does a fixed three-pixel cut clamped to half an edge.
+        // That is not a gap; it is the property itself, because any cut
+        // expressed as a fraction of a vertex's *own* edges is invisible
+        // where those edges are a fifth of a pixel. What does fail it is a
+        // smoother whose reach is the gesture's rather than the edge's:
+        // resampling the finished ring at a uniform three pixels rounds this
+        // corner 0.81 px off. That is the change this exists to refuse, since
+        // it is the obvious thing somebody would reach for if
+        // `MAX_LASSO_RING` ever needed more headroom.
     }
 
     #[test]
