@@ -4702,6 +4702,57 @@ pub(crate) mod tests {
         }
     }
 
+    /// The chosen row of a mark-and-label menu is inked in
+    /// [`Palette::active_ink`], in the theme where that is the accent *and* in
+    /// one where it is not.
+    ///
+    /// The tool button's guard above, applied to the second control that draws
+    /// on `control_active`. A critic predicted that swapping this one line for
+    /// `p.accent` would fail nothing, and it was right: `theme`'s
+    /// `an_active_mark_reads_on_the_fill_it_is_drawn_on` measures the palette
+    /// and cannot see whether anything calls it, and the menu itself lives
+    /// inside an `egui::Popup` that no headless pass opens. So this drives
+    /// [`menu_choice`] directly.
+    ///
+    /// **It is a guard on the widget and not on the picker**, which is the
+    /// honest limit: nothing here can see that `ui::selection_mode_switch`
+    /// calls this rather than `selectable_label`.
+    #[test]
+    fn the_chosen_menu_row_is_inked_in_what_reads_on_its_fill() {
+        use crate::theme::ThemeKind;
+
+        for kind in [ThemeKind::Graphite, ThemeKind::MediaBog] {
+            let ctx = egui::Context::default();
+            let p = Palette::of(kind);
+            crate::theme::install_fonts(&ctx);
+            // Twice: the first pass through a fresh context builds the font
+            // atlas, and a row whose label has not been laid out draws no ink.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen = inks_drawn(&ctx, vec2(200.0, 200.0), |ui| {
+                    menu_choice(ui, &p, Icon::Select, "Rectangle", true);
+                });
+            }
+            assert!(
+                seen.contains(&p.control_active),
+                "{kind:?}: the chosen row drew no selected fill, so what the ink \
+                 below is drawn *on* is not what this claims"
+            );
+            assert!(
+                seen.contains(&p.active_ink()),
+                "{kind:?}: the chosen row did not draw {:?}",
+                p.active_ink(),
+            );
+            if p.active_ink() != p.accent {
+                assert!(
+                    !seen.contains(&p.accent),
+                    "{kind:?}: the chosen row still draws the accent, which is \
+                     1.88:1 on this theme's selection fill",
+                );
+            }
+        }
+    }
+
     /// The canvas scrollbar's thumb reads against the pit it lies on, in every
     /// theme — measured off the pass rather than off the palette.
     ///
