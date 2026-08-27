@@ -74,6 +74,8 @@ cargo run -p umber-core --example build-brush-library
 cargo fmt --all                  # tip_table.rs is source, and is written raw
 cargo run -p umber-core --example diff-brush-library -- \
     /tmp/before.ron crates/umber-core/assets/builtin-brushes.ron
+cargo run -p umber-core --release --example measure-spacing -- \
+    /tmp/before.ron crates/umber-core/assets/builtin-brushes.ron
 cargo run -p umber-core --example survey-mypaint   # the tables below
 ```
 
@@ -109,6 +111,128 @@ bugs.
 Preview thumbnails are never downloaded. In the MyPaint pack the brush
 *settings* are CC0 but some of the previews are CC-BY, and not having the files
 is the surest way not to ship them.
+
+## The spacing cap
+
+The generator changes exactly one setting on the brushes it converts, and this
+is it. Everything else is transcribed or the brush is refused.
+
+`spacing` does not mean the same thing here as it does in the applications
+these presets were written for. MyPaint, Krita and Clip Studio all **composite
+every dab**, so a step of a quarter of the mark reads as a continuous line: the
+dips between dab centres are filled in by the neighbours piling up. Umber
+saturates coverage with a `max`, which is the anti-compounding guarantee the
+whole wet-layer scheme rests on, so nothing piles up and the same step leaves
+the edge visibly scalloped. Transcribing the author's own figure faithfully
+therefore produced a brush that paints *unlike* their brush, which is the
+failure the generator exists to prevent, and it is what an artist reported as
+choppy strokes.
+
+So `preset::SHIPPED_SPACING_CAP` is 10 %, and `build-brush-library.rs` applies
+it. 103 of the 252 converted presets were above it; the median was already
+exactly at it. **The importers do not cap**, and must not: a brush somebody
+imports through *Import brushes…* is theirs and keeps the number its author
+wrote.
+
+### What it costs, and what it does not
+
+The cap adds dabs and adds almost no ink, and both halves are measured by
+`examples/measure-spacing.rs` — which takes a before and an after library the
+way `diff-brush-library` does, because once the generator has run the author's
+figure is no longer in the shipped file.
+
+Under a `max` a stroke's mark is the **union** of its dabs' footprints, so
+inserting more dabs between overlapping ones covers the same ground and only
+fills in the scallops. Over the 101 presets the cap moved, the mean ink
+multiplier is **1.10x**, and 83 of them lay within 5 % of the ink they laid
+before. Both figures are printed by the harness rather than counted off its
+table, because the second had already been quoted wrongly once: 82 is the size
+of a different group entirely.
+
+| | |
+|---|---|
+| presets respaced | 101 of 252 |
+| worst dab multiplier | 5.00x, `tanda/splatter-02`, 23 to 115 dabs over a stroke |
+| most dabs in one stroke | 2964, `gdquest-cloud-builder`, which is 5 a frame at 60 Hz |
+| most fragments shaded a frame | 751k, 0.36x a 1920x1080 window |
+| mean ink multiplier | 1.10x |
+| worst ink multiplier | 2.57x, `tanda/splatter-02` |
+
+Nothing in the frame budget cares. The dab pass is one draw call for N
+instances of a four-vertex quad, and the figures above are per **frame** rather
+than per stroke: the heaviest brush in the library, at an unhurried 500 px/s,
+hands it five dabs a frame covering four tenths of a window.
+
+Some presets do not move at all, and `classic/marker-small` is the one to know
+about: `Brush::step_at` floors the step at a quarter of a pixel, so a 5.4 px
+nib at 8:1 was already stepping at the floor and 213 dabs come out as 213.
+
+### The exemption is geometric
+
+`Brush::step_at` is `reach x 2 x spacing`, so at `preset::DABS_COME_APART_AT` —
+1.0 — the step is the dab's whole width and consecutive dabs stop touching.
+Below it the spacing decides how smooth one continuous mark is; at or above it
+the **gaps are the mark**. That is why the boundary is a rule rather than a list
+of names, and it is the difference between smoothing a stroke and replacing a
+row of dots with a line.
+
+Two presets are up there and keep their author's figure exactly: Raghukamath's
+"Pack01 Dots" at 5.12 and GDQuest's "Special Shadow" at 1.47. Capping them
+would have laid 40x and 13x the dabs and covered 5.8x and 1.8x the ground.
+Those four need the exemption lifted to reproduce, since `measure-spacing` only
+reports a preset whose spacing moved: drop the `if` in the generator,
+regenerate, and run it.
+
+**It reads the author's figure, not the dab that is actually stamped**, and
+that is decided rather than overlooked. `Brush::reach_at` takes the nominal
+`dab_ratio` while a `Ratio` modulation can narrow the real dab, so a preset
+below 1.0 can already be gapping, and `ramon/rs-blendop` was, by 0.90 px.
+Reading the real aspect here is the obvious repair and would have **exempted**
+that brush, which was gapping by accident and is exactly what the artist asked
+to have fixed. A spacing at or above 1.0 is a statement no author makes by
+accident, and that is what the exemption keys on.
+
+**A scatter clause was measured and refused.** It looks like the same idea — a
+dab thrown clear of the line is one whose count sets a density rather than a
+smoothness — and it does not separate the library. Mean ink is 1.38x for
+`scatter >= 1` against 1.04x for the rest, the distributions overlap, and the
+two worst non-exempt cases have **no scatter at all**:
+
+- `tanda/texture-06`, 2.07x. A 20:1 chisel whose `Angle` modulation rolls it
+  through a full turn along the stroke, so more dabs sweep more angles.
+- `ramon/rs-blendop`, 1.82x. A fixed nib whose `Ratio` modulation takes a
+  nominal 1.375:1 to 10:1 at full pressure. `Brush::step_at` reads the nominal
+  ratio, so it measured a 2.42 px step against a dab reaching 0.76 px, and
+  **every pair of its dabs stood 0.90 px apart**. That is not a cost of the
+  cap. It is a brush that was gapping by accident, and the cap closes it.
+
+A rule wide enough to catch those two would have to read every modulation's
+envelope, which exempts most of the library and leaves the strokes choppy.
+
+### Two things the cap deliberately does not touch
+
+- **A MyPaint brush's converted opacity.** `tip::dab_stack_alpha` turns a
+  per-dab alpha into the stroke opacity that reproduces it **in MyPaint**,
+  which is a question about the author's spacing in the author's engine.
+  Umber's own opacity is applied once at commit and is spacing-independent by
+  construction, so there is nothing to recompute.
+- **`build_up`.** That one *does* depend on Umber's spacing, and closer dabs
+  build higher, so a cap could in principle push a borderline stamp across the
+  threshold and leave it painting at a fraction of the mark its author drew.
+  Measured, none does — and
+  `every_shipped_stamp_still_wants_the_build_up_it_ships_with` re-derives the
+  verdict from the committed bitmaps across every spacing at or below the one
+  they ship at, which is the direction the cap moves things, so that stays true
+  rather than being a sentence saying it was checked once.
+
+And there is a stronger statement available than either, worth having because
+it covers the whole library at once rather than one field at a time: **a shipped
+brush's stroke strength is spacing-independent by construction.** A plain
+brush's is, because the `max` saturates. A build-up brush's is too, for a
+different reason: `StrokeBuilder` re-derives its per-dab coverage every dab from
+`tip::stack_depth(step_at(..), reach_at(..), ..)`, so laying the dabs closer
+lowers each one's contribution by exactly as much. The cap changes how smooth a
+stroke is. It cannot change how dark it is.
 
 ## What is in it today
 
