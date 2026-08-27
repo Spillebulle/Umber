@@ -31,7 +31,7 @@ use egui::{
 };
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::time::Duration;
-use umber_core::{BlendMode, Color, Edit, EditKind, EditTarget, LayerStack, Timestamp};
+use umber_core::{BlendMode, Color, EditKind, EditTarget, LayerStack, Timestamp};
 
 /// Grab area of a splitter. Wider than the 1 px rule it draws, because a 1 px
 /// target is not something anyone can hit.
@@ -2075,22 +2075,21 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         // Without it, reopening the module with the pointer over the list would
         // resolve a drop nobody was making.
         if released && let Some(to) = carried.destination() {
-            // Snapshotted before the move and recorded only where one happened,
-            // exactly as `App::record_move` does it for the chevrons — here
-            // rather than there because this holds the `Editor` and not the
-            // `App`. The entry costs nothing to hold: no slot changes hands, so
-            // it is a shape and no pixels at all.
+            // **Handed to the caller rather than carried out here**, which is
+            // the one thing about this drag that is not obvious. A reorder needs
+            // nothing from the GPU, so this used to snapshot the shape, move the
+            // entry and record — all of it from a panel. What a panel cannot do
+            // is put a floating transform down first: committing one needs the
+            // renderer. So a `MoveLayer` could be recorded in the middle of a
+            // text placement, and the placement's own entry then had to be
+            // recorded at the *add* to stay underneath it, which made Escape
+            // drain the redo stack for a gesture that changed nothing. See
+            // `crate::editor::MadeLayer::before`.
             //
-            // **It does not settle a float first, and cannot from here**: this
-            // has the `Editor` and committing needs the renderer. So a
-            // `MoveLayer` can land in the middle of a gesture, which is what a
-            // text placement's undo entry is timed against — see
-            // `crate::editor::MadeLayer::entry_at`.
-            let before = ed.layers.shape(ed.doc.layer_bytes());
-            if ed.layers.reorder_to(carried.from, to.index, to.depth) {
-                ed.history.record(Edit::new(EditKind::MoveLayer, before));
-                changed = true;
-            }
+            // `App::record_move` is now the single route, so the settling, the
+            // snapshot and the "record only where something moved" rule are each
+            // stated once. The chevrons have always gone that way.
+            actions.reorder_layer = Some((carried.from, to.index, to.depth));
         }
     }
     ui.ctx().data_mut(|d| match drag {

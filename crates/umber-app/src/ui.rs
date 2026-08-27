@@ -144,6 +144,21 @@ pub struct UiActions {
     pub delete_picked: bool,
     pub move_layer_up: Option<usize>,
     pub move_layer_down: Option<usize>,
+    /// A row dragged to a new place in the Layers panel: which entry, where it
+    /// lands, and at what nesting.
+    ///
+    /// **The panel used to carry this out itself**, because it holds the
+    /// `Editor` and a reorder needs nothing from the GPU. What it cannot do from
+    /// there is put a floating transform down first, and until it did, a
+    /// `MoveLayer` could be recorded in the middle of a text placement — see
+    /// `crate::editor::MadeLayer::before` for what that cost. Handed over
+    /// instead, so `App::record_move` is the one place a reorder is settled,
+    /// snapshotted and recorded, whichever control asked for it.
+    ///
+    /// A `Copy` triple rather than `layerdrag::Drop`, because [`UiActions`] is
+    /// `Copy`; the panel has already asked `LayerStack::can_reorder`, and
+    /// `reorder_to` asks again, so a stale index is refused rather than obeyed.
+    pub reorder_layer: Option<(usize, usize, u8)>,
     /// Give the selected layer a mask, or take its mask off. The caller's,
     /// because a new mask has to be filled white on the GPU and both have to be
     /// recorded in the history.
@@ -673,7 +688,7 @@ fn strip_width(n: usize) -> f32 {
 /// land, and this is a picture that has not been put down yet.
 fn transform_box(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
     ed.transform_buttons = [None, None];
-    let Some(float) = ed.float else {
+    let Some(float) = ed.float.as_ref() else {
         return;
     };
 

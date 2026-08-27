@@ -1408,7 +1408,7 @@ impl UmberApp {
         // Whatever route got here — Enter, a tab switch, a save — there is no
         // box left for a pending put-down to be outside of.
         self.put_down_at = None;
-        let Some(float) = self.editor.float.take() else {
+        let Some(mut float) = self.editor.float.take() else {
             return;
         };
         let set_from = self.editor.float_text.take();
@@ -1439,7 +1439,7 @@ impl UmberApp {
                 .as_ref()
                 .is_some_and(|gfx| gfx.canvases.contains_key(&id));
         if nowhere {
-            self.editor.unmake_layer(float.made);
+            self.editor.unmake_layer(float.made.take());
             if let Some(gfx) = self.gfx.as_mut()
                 && let Some(canvas) = gfx.canvases.get_mut(&id)
             {
@@ -1466,14 +1466,13 @@ impl UmberApp {
         // absence of one — a full-canvas caption on a 10000² document would be
         // 400 MB of patch and a blocking read at the moment the artist lets go.
         //
-        // **The entry itself was recorded at the add**, by `add_text_layer`, and
-        // this is only the reading that says so. It has to be that way round:
-        // the layer stands in the stack for the whole gesture, so an entry
-        // recorded here would sit on the undo stack above a reorder made in
-        // between — and undoing top-down would take the layer out before that
-        // reorder's shape, which names it, was ever reached. See
-        // `crate::editor::MadeLayer::entry_at`.
-        let own_layer = float.made.is_some();
+        // **Taken here and recorded below, once the commit is certain.** Every
+        // return above this point goes through `Editor::unmake_layer` instead,
+        // and there is deliberately no route that records and then gives up:
+        // that is what lets Escape cost the history nothing at all. See
+        // `crate::editor::MadeLayer::before`.
+        let made = float.made.take();
+        let own_layer = made.is_some();
 
         // Blocks on the GPU, and is submitted on its own encoder so it observes
         // the layer before the commit below touches it. Once per gesture, at
@@ -1566,19 +1565,24 @@ impl UmberApp {
             .flatten()
             .and_then(|at| self.editor.layers.take_text(at));
         let took_a_record = lifted_text.is_some();
-        // **Nothing at all is recorded for a placement onto its own layer**, and
-        // that is the whole of its undo rather than a gap in it: `add_text_layer`
-        // recorded the entry when the layer appeared, and taking that layer back
-        // out takes the pixels this commit is about to write with it, because a
-        // `ShapeEntry::Gone` carries the whole `Layer` and its `SlotClaim`. So
-        // one Ctrl+Z takes back the layer, the words and the record together.
-        //
-        // The kind is `EditKind::AddLayer` rather than a variant of its own,
-        // because that row undoes exactly as an add does and two rows that undo
-        // identically must not have two names — the rule that already files a
-        // paste under Transform and a cut under Erase. It also means no
-        // `history::VERSION` bump and nothing new in the file, since
-        // `SaveHistory::new` skips every structural entry already.
+        // **Nothing else may have recorded since the add**, or this entry sits
+        // above a shape that names the layer it takes out and that shape is then
+        // one `LayerStack::restore_shape` refuses. Every structural edit settles
+        // the float before it records, the two reorder routes included — see
+        // `Self::record_move`. Recorded before the pixels are written for no
+        // reason but reading order; there is no early return left between here
+        // and the end of the function.
+        if let Some(made) = made {
+            self.editor.commit_made_layer(made);
+        }
+        // **No patch at all is recorded for a placement onto its own layer**,
+        // and that is the whole of its undo rather than a gap in it: the entry
+        // recorded just above holds the stack as it stood before the layer
+        // appeared, and taking that layer back out takes the pixels this commit
+        // is about to write with it, because a `ShapeEntry::Gone` carries the
+        // whole `Layer` and its `SlotClaim`. So one Ctrl+Z takes back the layer,
+        // the words and the record together. `Editor::commit_made_layer` is
+        // where the kind is argued.
         //
         // A lift can never be in this case: `made` is set by `place_text` alone
         // and a placement is a paste, so `lifted` is false. Stated rather than
@@ -1731,27 +1735,18 @@ impl UmberApp {
     /// only giving the storage back — and, for a text placement that made a
     /// layer to land on, giving that back too.
     ///
-    /// **Escape is free for a lift and a paste, and for a text placement it
-    /// costs the redo stack.** That distinction is worth stating rather than
-    /// glossing, because an earlier draft of this comment claimed the stronger
-    /// thing and it is not true. A lift and a paste record nothing until the
-    /// commit, so abandoning one really does put the document exactly where it
-    /// was. A placement records its entry when it *makes its layer* — it has to,
-    /// or a reorder in the middle of the gesture ends up above it on the undo
-    /// stack; see [`crate::editor::MadeLayer::entry_at`] — and
-    /// `History::record` drains the redo stack. [`Editor::unmake_layer`] pops
-    /// the entry again but cannot put redo back.
-    ///
-    /// So: undo a stroke, place a caption, press Escape, and the stroke can no
-    /// longer be redone. That is what *every* edit in Umber does to the redo
-    /// stack and a placement is an edit from the moment a layer appears; what
-    /// makes it worth a paragraph is only that this path looks like it changed
-    /// nothing. The way to give it back is to stop the reorder recording inside
-    /// the gesture at all — `App::record_move` could settle the float and the
-    /// Layers panel's drag could be collected into `UiActions` and settled here
-    /// — after which the entry can go back to the commit and Escape costs
-    /// nothing again. That is a change to two working call sites and it is not
-    /// made here.
+    /// **Escape is free, and a text placement is no exception to that** — which
+    /// is worth stating because for a day it was one. A lift, a paste and a
+    /// placement all record nothing until the commit, so abandoning any of them
+    /// puts the document exactly where it was found: no entry to take off, and
+    /// no redo stack drained by a `History::record` that
+    /// [`Editor::unmake_layer`] could never undo. The placement's entry did
+    /// briefly live at the *add*, for a reason and at that price — undo a
+    /// stroke, place a caption, press Escape, and the stroke could no longer be
+    /// redone. What bought it back was stopping a reorder from landing inside
+    /// the gesture, which is `App::record_move`'s settling and the Layers
+    /// panel's drag going through [`UiActions::reorder_layer`]. The whole
+    /// argument is at [`crate::editor::MadeLayer::before`].
     ///
     /// The layer itself is empty until the commit writes into it, which is why
     /// [`Editor::unmake_layer`] drops its slice rather than parking it.
@@ -2200,32 +2195,24 @@ impl UmberApp {
     /// entry the whole placement gets.
     ///
     /// [`Self::add_layer`], with the name taken from the text and with what it
-    /// hands back. **The entry is the placement's whole undo**, and that is the
+    /// hands back. **One entry is the placement's whole undo**, and that is the
     /// design rather than a coincidence: the layer is new, so taking it back out
     /// takes its pixels with it — a `ShapeEntry::Gone` carries the whole `Layer`
-    /// with its `SlotClaim` — and `finish_transform` therefore records nothing at
-    /// all for this case, captures no patch, and does not block on a readback.
-    /// One Ctrl+Z takes back the layer, the words on it and its record together,
-    /// which is one entry for one thing the artist did.
+    /// with its `SlotClaim` — so `finish_transform` captures no patch for this
+    /// case and does not block on a readback. One Ctrl+Z takes back the layer,
+    /// the words on it and its record together, which is one entry for one thing
+    /// the artist did.
     ///
-    /// **Recorded here rather than at the commit**, which is the part that was
-    /// wrong first and is worth stating at the code: the layer stands in the
-    /// stack for the whole gesture, so an entry recorded at the *end* of it sits
-    /// on the undo stack above anything recorded in between — and a reorder in
-    /// that window records a shape naming this layer. Undoing top-down would
-    /// then take the layer out before the reorder's shape was reached, and
-    /// `LayerStack::restore_shape` refuses a shape naming an entry that is gone.
-    /// See [`crate::editor::MadeLayer::entry_at`].
+    /// **Nothing is recorded here.** The shape the entry will be made of is
+    /// snapshotted onto the [`crate::editor::MadeLayer`] and recorded at the
+    /// commit, by `Editor::commit_made_layer`; that field's docs have the
+    /// argument, including why the entry spent a day at this end instead.
     ///
-    /// Escape is still free: the layer is empty until the commit writes into it,
-    /// and [`Editor::unmake_layer`] takes the layer and the entry back off
-    /// together.
-    ///
-    /// It deliberately does **not** `mark_modified`. The window between Place
-    /// and the commit ends either in a commit, which marks it, or in a cancel,
-    /// which leaves the document exactly as it was found — and a dot claiming
-    /// unsaved work after an Escape that changed nothing is a claim about the
-    /// document that is not true.
+    /// It therefore does **not** `mark_modified` either. The window between
+    /// Place and the commit ends either in a commit, which marks it, or in a
+    /// cancel, which leaves the document exactly as it was found — and a dot
+    /// claiming unsaved work after an Escape that changed nothing is a claim
+    /// about the document that is not true.
     ///
     /// `Err` carries the sentence to show. Both refusals are ones the Place
     /// button is already disabled for, so this catches a route that goes round
@@ -2859,21 +2846,48 @@ impl UmberApp {
 
     /// Run a reorder and record it, if it moved anything.
     ///
-    /// The two chevrons share it so the shape is snapshotted before the move
-    /// and the entry only recorded where one happened — a `MoveLayer` row for a
-    /// drop that changed nothing would be a step the artist could click and see
-    /// nothing undo. The drag in the layers panel does the same thing at its
-    /// own call site, because it holds the `Editor` and not the `App`.
+    /// **Every route a reorder can take comes through here**: the two chevrons,
+    /// and the Layers panel's drag by way of [`UiActions::reorder_layer`]. That
+    /// is what makes the settling below one rule rather than two call sites that
+    /// have to agree.
+    ///
+    /// The shape is snapshotted before the move and the entry recorded only
+    /// where one happened — a `MoveLayer` row for a drop that changed nothing
+    /// would be a step the artist could click and see nothing undo.
     fn record_move(&mut self, moved: impl FnOnce(&mut umber_core::LayerStack) -> bool) {
-        // **This does not put a float down first, unlike every other structural
-        // edit here**, and that is deliberate rather than forgotten: a reorder
-        // moves an entry in a `Vec` and a float is bound to a *slot*, so the
-        // preview goes on naming the right slice whatever row it now sits in.
-        // What it costs is that a `MoveLayer` really can land in the middle of a
-        // gesture, which is why a text placement records its own entry when the
-        // layer appears rather than when the float is put down. See
-        // `crate::editor::MadeLayer::entry_at`; the layer-list drag in
-        // `panels.rs` is the same shape and the same argument.
+        // **The float goes down first, as it does for every other structural
+        // edit here**, and this one needed an argument the others did not. A
+        // reorder moves an entry in a `Vec` while a float is bound to a *slot*,
+        // so the preview goes on naming the right slice whatever row it lands
+        // in — which is why this used to settle nothing at all. What that cost
+        // was the history: a `MoveLayer` recorded in the middle of a text
+        // placement carries a shape naming the layer the placement made, so the
+        // placement's own entry could not be recorded at its commit without
+        // sitting above that shape and taking the layer out from under it. The
+        // repair was to record the placement's entry at the *add* instead, which
+        // works and makes Escape drain the redo stack for a gesture that changed
+        // nothing. Settling here is what buys that back. See
+        // `crate::editor::MadeLayer::before`.
+        //
+        // The cost is one frame's worth of surprise: a click on a chevron with a
+        // box in the air puts the picture down. Adding a layer, deleting one,
+        // grouping and both mask commands have always done exactly that.
+        //
+        // **And the settle can itself move the rows this move names**, which is
+        // the one thing it costs. Both callers hand over *positions* read while
+        // the panel was drawn, and `finish_transform`'s `nowhere` gate takes a
+        // placement's own layer back out — a block dragged entirely off the
+        // canvas — so every row below it shifts by one and the reorder would act
+        // on the layer next door. A stale reorder is refused rather than obeyed,
+        // which is the rule `can_reorder` already keeps: a refusal changes
+        // nothing at all, and the artist drags the row again. Comparing the
+        // count is enough because removing a layer is the only way settling
+        // touches the stack.
+        let rows = self.editor.layers.len();
+        self.finish_transform();
+        if self.editor.layers.len() != rows {
+            return;
+        }
         let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         if !moved(&mut self.editor.layers) {
             return;
@@ -4298,7 +4312,7 @@ impl UmberApp {
         // hold this frame's position of the picture by the time the stack is
         // drawn. It restores only what the previous frame wrote plus what this
         // one will, and allocates nothing.
-        if let Some(float) = self.editor.float {
+        if let Some(float) = self.editor.float.as_ref() {
             canvas.draw_float(
                 &gfx.gpu.queue,
                 &mut encoder,
@@ -4520,7 +4534,7 @@ impl UmberApp {
         // invariant enforced at five call sites is one that will be forgotten
         // at the sixth. The preview would otherwise go on standing in front of
         // a layer nobody is editing.
-        if let Some(float) = self.editor.float
+        if let Some(float) = self.editor.float.as_ref()
             && (self.editor.ui.tool != Tool::Transform
                 || self.editor.layers.active_slot() != Some(float.slot))
         {
@@ -4644,6 +4658,14 @@ impl UmberApp {
         }
         if let Some(index) = actions.move_layer_down {
             self.record_move(|layers| layers.move_down(index).is_some());
+        }
+        // The Layers panel's drag, through the same gate the chevrons use so a
+        // float is put down first whichever control asked. `reorder_to` judges
+        // the move again, so a drop the panel accepted a frame ago against a
+        // stack the settling has since changed is refused rather than obeyed —
+        // and a refusal records nothing at all.
+        if let Some((from, to, depth)) = actions.reorder_layer {
+            self.record_move(|layers| layers.reorder_to(from, to, depth));
         }
         if actions.fit_view {
             self.editor.fit_view();
@@ -6793,6 +6815,116 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 
 #[cfg(test)]
 mod tests {
+
+    /// **Every structural edit puts a floating transform down before it
+    /// records.**
+    ///
+    /// A source scan, and it says so rather than pretending to be more. What it
+    /// guards is a *call site* on `UmberApp`, which needs an `EventLoopProxy` and
+    /// therefore an event loop, so there is no way to drive it here — the same
+    /// limit `every_path_that_abandons_a_float_gives_its_layer_back` lives with.
+    ///
+    /// The rule is `crate::editor::MadeLayer::before`'s. A structural entry
+    /// carries a `StackShape` naming every layer in the stack, so one recorded
+    /// while a text placement is in the air names the layer that placement made —
+    /// and the placement's own entry, recorded at its commit, then sits above it
+    /// and takes that layer out first. `LayerStack::restore_shape` refuses the
+    /// shape that is left, silently. Settling first is what makes the case
+    /// unreachable, and it is what lets the placement record at the commit at all,
+    /// which is what makes Escape free.
+    ///
+    /// The two that were missing were the Layers panel's chevrons and its drag.
+    /// The drag reaches `record_move` through `UiActions::reorder_layer` because
+    /// settling needs the renderer, so the second half of this guard is that
+    /// `panels.rs` records nothing at all.
+    ///
+    /// Sentinels are built with `concat!` so the scan cannot match its own
+    /// source — "a source-text guard must not match its own source", the rule
+    /// `try_reserve`'s scan already lives by. Lines are trimmed rather than
+    /// sliced on `"\n}\n"`, because `include_str!` hands the file back as it sits
+    /// on disk and this repository is checked out with CRLF.
+    #[test]
+    fn every_structural_edit_settles_a_float_before_it_records() {
+        let source = include_str!("app.rs");
+        let settle = concat!("self.finish_", "transform();");
+        // The whole of what `EditBody::Structure` is recorded for. A seventh
+        // structural kind means a seventh entry here, which is the point: the
+        // failure this guards against is a new one being written without the
+        // settling, not the six that exist drifting.
+        let kinds = [
+            concat!("EditKind::", "AddLayer,"),
+            concat!("EditKind::", "MoveLayer,"),
+            concat!("EditKind::", "DeleteLayer,"),
+            concat!("EditKind::", "Group,"),
+            concat!("EditKind::", "AddMask,"),
+            concat!("EditKind::", "RemoveMask,"),
+        ];
+        // Only the shipped half of the file: the tests below build histories by
+        // hand and are not edits anybody makes.
+        let body = source
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .expect("a first half");
+
+        let mut seen = 0;
+        let mut open: Option<(&str, bool)> = None;
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            // A method of `impl UmberApp`, which this file indents by four.
+            if indent == 4 && (trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")) {
+                open = Some((trimmed, false));
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if let Some((_, settled)) = open.as_mut()
+                && trimmed.contains(settle)
+            {
+                *settled = true;
+            }
+            if !kinds.iter().any(|k| trimmed.contains(k)) {
+                continue;
+            }
+            let Some((name, settled)) = open else {
+                panic!("a structural record outside any method: {trimmed}");
+            };
+            seen += 1;
+            assert!(
+                settled,
+                "`{name}` records a structural entry without putting a float down \
+                 first. A shape recorded while a text placement is in the air names \
+                 the layer that placement made, and the placement's own entry then \
+                 undoes above it and takes that layer out - leaving a shape \
+                 `restore_shape` refuses. See `crate::editor::MadeLayer::before`."
+            );
+        }
+        assert_eq!(
+            seen, 6,
+            "the number of structural records in this file moved. They are \
+             `add_layer`, `record_move`, `delete_entries`, `group_layers`, \
+             `add_mask` and `remove_mask`; a seventh has to settle a float too, \
+             and a missing one means this scan is no longer looking at them."
+        );
+
+        // The other half: a panel holds the `Editor` and not the `App`, so it
+        // cannot settle a float and therefore may not record. The Layers panel's
+        // drag used to; it hands the move to `UiActions::reorder_layer` now.
+        let panels = include_str!("panels.rs");
+        let record = concat!("history", ".record(");
+        for line in panels.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(record),
+                "`panels.rs` records a history entry: {trimmed}. A panel cannot put \
+                 a float down first, so what it wants recorded goes through \
+                 `UiActions` and `App` does it."
+            );
+        }
+    }
 
     /// **Every path that takes a float gives back the layer a placement made.**
     ///
