@@ -14,22 +14,55 @@ release cannot be cut without notes.
 
 ## 0.1.5
 
-A new set of icons, and Linux packages that can actually upgrade themselves.
+New icons throughout, a Flow control for brushes, smoother lasso selections, and
+text that stays editable.
 
 ### New
 
+- **Flow, on every brush.** Opacity caps how dark a stroke can get; flow decides
+  how much each dab lays down. Below 100% a stroke builds as it goes, so crossing
+  your own line inside a single stroke darkens it, the way it does in Photoshop
+  and Krita. At 100% every brush paints exactly as it did before.
+- **Text is placed on a layer of its own.** That is what keeps it editable: text
+  put down over existing paint used to become paint itself, because setting it
+  again would have meant clearing pixels that were never yours to clear. On its
+  own layer there is nothing underneath, so you can always come back and change
+  the words. There is a switch beside Place if you want the old behaviour.
+- **Select has an Ellipse mode**, a Roundness rail for the rectangle, and a
+  Stabiliser for the lasso.
 - **The icons are Lucide's.** Umber drew its own, and they are now taken from
-  [Lucide](https://lucide.dev), the set used across this family of
-  applications. Every mark is the same size and weight it was, and means the
-  same thing; five of them stay hand-drawn because Lucide has no mark for a
-  layer mask, a deselect, a resize corner or a colour harmony. The transform
-  tool's mark changed the most: it is a box with a handle at each corner now,
-  which is what the tool draws on the canvas.
+  [Lucide](https://lucide.dev), the set used across this family of applications.
+  Every mark means the same thing it did; four are still drawn here, because
+  Lucide has no mark for a mask being taken off, a deselect, a resize corner or a
+  colour harmony.
 - **The `.deb` and `.rpm` enrol your machine in Umber's package archive.** The
-  updater used to tell you to run an upgrade command that could not work,
-  because there was no archive to upgrade from. Install either package now and
-  your package manager keeps Umber current the way it keeps everything else
-  current. There is an opt-out, and nothing else on your system is touched.
+  updater used to tell you to run an upgrade command that could not work, because
+  there was no archive to upgrade from. Install either package now and your
+  package manager keeps Umber current the way it keeps everything else current.
+  There is an opt-out, and nothing else on your system is touched.
+
+### Fixed
+
+- **Brushes no longer step so far that a stroke scallops.** The packs Umber
+  converts composite every dab, where Umber saturates coverage, so an author's own
+  spacing reads as a continuous mark in the application it was written for and as
+  a row of scallops here. 101 of the 252 shipped brushes were stepping too far and
+  are capped at a tenth of their own width. Brushes whose dabs are meant to be
+  separate are left exactly as they were.
+- **A lasso drawn while zoomed out is smooth when you zoom back in.** It used to
+  come back as a staircase, because at low zoom a single screen pixel is many
+  document pixels and the outline could only ever be as fine as the screen. The
+  outline is now recorded against the screen and smoothed to the document.
+- **Six icons were quietly deformed** by a bug in how Umber read the path data it
+  ships: the eyedropper worst of all, and the chain, pencil, document, copy and
+  lasso marks subtly.
+- **The eyedropper's magnifier is a lens** rather than a hard-edged grid of
+  pixels, and it no longer has a black outline.
+- **The selection marquee is crisp on high-resolution displays.** At 150% and
+  175% scaling its line landed across two device pixels and came out washed
+  out, which showed up most over a white canvas.
+- **The buttons in module headers were too big** and are the size of the marks
+  beside them now.
 
 ## 0.1.4 — 2026-08-13
 

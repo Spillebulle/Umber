@@ -79,6 +79,52 @@ Invariants that are easy to break:
   levels to the canvas. `R16Unorm` is not even a legal render target on the
   feature set Umber requests. The measurements are under "Pressure" in Platform
   support — read them before proposing this again.
+- **`Brush::flow` is what a dab lays down; `Brush::opacity` is what the stroke
+  comes out at, and they are different numbers.** Flow scales the *converted
+  per-dab* coverage, so a stroke arrives at its mark over several dabs and goes
+  past it where it crosses itself — Photoshop's Flow, Krita's build-up painting
+  mode. Opacity is still applied exactly once at commit, over coverage the `max`
+  has already saturated. Folding flow into the mark instead would be a second
+  opacity arriving through the door the anti-compounding rule keeps shut, and it
+  is distinguishable rather than a matter of taste: on the dab a single pass
+  reaches `1 − (1 − flow)^depth` and follows the spacing, on the mark it reaches
+  `flow` whatever the spacing.
+  - **This is what "turning on build-up does nothing" was.** `coverage_at`
+    answers 1.0 for every dab unless the brush sets `pressure_opacity`, and
+    build-up's `a = cov + a(1 − cov)` at `cov == 1` is `a = 1`, byte for byte
+    the `max` it replaces. Build-up can only build where a dab lays down less
+    than full coverage, so before flow there was nothing for it to accumulate;
+    `mypaint.rs`'s `build_up: false` comment had said so all along.
+  - **1.0 is the exact identity and every shipped preset depends on it**, which
+    is checked against a build that has no flow field rather than against this
+    one. `stroke.rs`'s `COVERAGE_BEFORE_FLOW` is 120 figures produced at
+    d0efaa3 and compared bit for bit. The first version of that guard compared
+    the default against a literal 1.0 — the same brush — and every mutation of
+    the flow-1.0 path walked through it; mutation is what said so.
+  - **Below 1.0 it selects the accumulating blend, through `Brush::builds`.**
+    Under the `max` a uniform per-dab scale is not flow at all: `max` is
+    idempotent, so every dab writing `flow` caps the stroke at `flow` and the
+    mark comes out uniformly fainter and just as flat. `builds()` is
+    `build_up || flow < 1.0` and is the **one** statement of the question —
+    `StrokeBuilder` asks it twice over the *same* snapshotted brush, once as
+    `builds_up` for the pipeline and once in `emit` for what a dab carries, so
+    the two cannot disagree for any frame of a stroke.
+  - **The scratch floor is re-applied after flow multiplies**, because flow can
+    take a dab `per_dab_for_stroke` had already lifted over one level of the
+    `R8Unorm` scratch back under it, where a constant increment never moves the
+    accumulator and the stroke is absent rather than faint.
+  - **There is an eight-bit ceiling on flow and it is not new.** Where the
+    conversion has already floored a dab, flow multiplies a pinned value and the
+    floor puts it back, so the whole rail produces one mark: measured, 39 levels
+    at every flow for a mark of 0.05 at 2% spacing. Those brushes were already
+    painting 39 where their curve asked for 12.8. The remedy is the wider
+    scratch, not a finer floor.
+  - **There is no `DabTarget::Flow`**, deliberately. That enum derives serde and
+    a `brushes.ron` parses with `?`, so a new variant is a hard error in every
+    older build — the painter's whole collection. And `builds()` would have to
+    read the modulation *table* rather than the value, as `colours_dabs` does,
+    so any brush merely naming Flow would pay the accumulating path for the
+    whole stroke whether the mapping fired or not.
 - **`Brush::build_up` is the one exception to the `max`, and it is a *blend
   state*, not a shader branch.** A sparse texture stamp's mark is the overlap of
   many faint stamps — GIMP and Krita composite every dab — so a `max` caps a
@@ -230,6 +276,23 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
   recomposites a second of a fifty-four-layer 20000×5000 stack, for as long as
   anything is selected. The animation is not what to reconsider there; the
   missing composite cache is. See `docs/perf/composite-throughput.md` R6.
+- **A mark over artwork must be a whole number of device pixels wide, and egui
+  will not do that half for you.** It snaps an axis-aligned line's *position* —
+  `tessellate_line_segment`, and `dashes_from_line` emits `Shape::LineSegment`s
+  so dashes get it too — but a width given in points is drawn as it stands. One
+  point at 150% scaling is 1.5 device pixels, whose opaque core is half a pixel
+  straddling a pixel boundary, so nothing is fully covered: measured on white
+  paper the marquee's dark half reads 64 rather than 0. It bites at 150% and 175%
+  only, the interval where the nearest whole pixel count is even while the scale
+  is not, which is why nobody working at 100% or 200% would ever see it.
+  `ui::ant_width` rounds the width to whole device pixels; it changes nothing at
+  100% or 200% and does nothing at all for a diagonal, because there is nothing
+  there to snap. **`transform_box` still draws the unfixed one-point stroke** —
+  the same defect on a mark over the same artwork. **And in Paper over white
+  paper the pair's light half is white on white**, so what shows is a single dark
+  line rather than two-tone ants; the contrast guarantee still holds at 5.5:1, so
+  that is a look rather than a defect, and changing it means giving up the accent
+  as one half of the pair.
 - **A live selection carries three real buttons over the canvas** — Deselect,
   Copy, Cut — so their rectangles go in `Editor::selection_buttons` and through
   `canvas_overlay_owns_pointer`, exactly as the transform tool's flip pair and
@@ -305,6 +368,102 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
   layer flat rather than painting through the selection it lifts through: paint
   made through the mask has `a == m`, so the share is identically one and the
   test would pass under any rule.
+- **A lasso's samples are the screen's, not the document's, and that is what
+  "the outline is a staircase" was.** A gesture made at zoom 0.1 has a vertex
+  every ten document pixels because one screen pixel *is* ten of them, and no
+  amount of sampling more often can put anything between two of them — so
+  "record the pointer more often" is not the repair. Two things are: the step
+  is a **screen** distance divided by the zoom, exactly as `press`'s
+  `close_within` already was, which stops seven of every eight screen pixels
+  being thrown away at 8:1 and never fires below 1:1; and the samples are
+  subdivided by Chaikin corner-cutting until the segments reach a document
+  pixel, which is the only thing that can put a curve where the lattice left a
+  step. Measured on a circle traced at a tenth scale: the sharpest corner falls
+  from 90 degrees to 14 and the longest facet from 10 pixels to 1.8, and the
+  smoothed ring is *closer* to the circle than the samples were — corner
+  cutting moves the outline towards what the hand was tracing rather than
+  merely somewhere flatter. Catmull-Rom is the tempting alternative and
+  reproduces the lattice as a wave instead of removing it; a symmetric (1,2,1)
+  average removes the noise and adds no vertices, so it leaves the facets
+  exactly where they were.
+- **The number of passes is adaptive, and zero is the common case.** The two
+  ends of the zoom range want opposite things: a gesture at 0.1 has ten-pixel
+  edges and needs four passes, one at 8:1 already has eighth-of-a-pixel edges
+  and needs none — where a fixed count would multiply the busiest ring anybody
+  can produce by eight for a difference no mask and no camera can show. It
+  reads the **mean** spacing rather than the largest, because one long edge is
+  a jump the pointer made rather than a staircase, and it is re-derived as the
+  gesture grows rather than snapshotted at the press, so the preview and the
+  finished shape share one function. `MAX_LASSO_SMOOTHING` is 3 and it is a
+  bound on a **per-frame** cost: `ui::selection_outline` draws one line segment
+  per vertex for as long as the selection stands.
+- **`SelectionDraft::lasso_ring` is called by the preview and by the finish,
+  and that is structural rather than disciplined.** Two statements of a curve
+  drift, and the symptom is the outline jumping the instant the pen comes off
+  the glass — the failure `composite.wgsl` and `commit.wgsl` share a file to
+  avoid. The corner-cutting is the **open** form with the ends pinned, which is
+  a decision about the gesture: a lasso's closing edge runs from where the hand
+  stopped back to where it started and is not something anybody drew, so
+  rounding the corners either side of it would move the outline away from the
+  pixels the artist was looking at.
+- **The lasso has a stabiliser and it defaults to zero, where the brush's
+  defaults to 0.35.** A brush stroke is a mark somebody wants smooth; a
+  selection outline is a boundary they are aiming at, and one that trails the
+  pointer lands somewhere they did not point. The filter is
+  `StrokeBuilder::extend`'s, so a hand that has learnt what the brush's rail
+  does knows what this one does — and **zero is a branch, not an alpha of
+  one**: `s + (a - s) * 1.0` is not `a` in floating point wherever the two are
+  far apart, so an alpha of one would make "the default records what the
+  pointer reported" a claim about rounding. An exponential filter following a
+  moving target settles at a constant lag rather than catching up, so a
+  stabilised lasso ends where the hand was four reports ago; that is not a
+  defect to pull out at the release, and for a closed outline it costs nothing
+  anybody can see.
+- **Two of the four modes have a setting of their own, and
+  `SelectionMode::extra` is where that is said.** The rectangle's corner
+  roundness and the lasso's stabiliser; the ellipse and the polygon have none.
+  A strip that drew both whatever the mode would be two controls doing nothing
+  for half of what the picker offers. It is in `umber-core` because *which*
+  modes have one is a property of the gesture rather than of the drawing, and
+  it is exhaustive so a fifth mode has to answer it. **The draft records both
+  settings whatever the mode**, so nothing in `ui.rs` has to be kept in step
+  with what the strip happened to draw — the mode is what ignores the one it
+  has no use for.
+- **An ellipse is its own mode and not a rectangle at full roundness.** A fully
+  rounded *rectangle* is a stadium, two straight flanks joined by half-discs,
+  and only a square one is a circle; an ellipse is the curve through all four
+  midpoints. Folding the two together would leave the picker with no way to ask
+  for the shape every other application calls an elliptical marquee.
+  **Roundness zero is hard-wired to the four-corner ring** rather than reached
+  by an arc of zero radius: a degenerate arc still emits its endpoints, so the
+  ring would carry eight vertices in coincident pairs where the plain rectangle
+  carries four — and the plain rectangle is the one shape the fill rule is
+  exact on *both* axes for.
+- **A curved ring's junctions are pushed analytically and its arcs contribute
+  only their interiors.** `cos(π/2)` in `f32` is `-4.4e-8`, so an arc's own last
+  point misses the corner it lands on by a millionth of a pixel — invisible in
+  the mask and still a second vertex a hair from the one the straight run
+  beside it contributes. Pushing every junction by hand is what lets a
+  duplicate be dropped by *exact* equality, which is needed because at full
+  roundness the straight runs on the short axis have no length at all. A
+  zero-length edge is one the rasteriser walks on every sub-scanline that spans
+  it and one more term in `winding`'s sum, for a segment that encloses nothing.
+- **`ARC_TOLERANCE` is a twentieth of a pixel and the segment count is derived
+  from it**, `⌈(π/2) / 2 acos(1 − t/r)⌉`, so a small corner is cheap and a large
+  circle is not faceted — a fixed sixteen-per-quarter is wrong at both ends, and
+  a rounded rectangle draws four arcs whose radius the artist sets with a rail.
+- **The feather works and the marquee is why nobody can see it.** Reported as
+  doing nothing and asked to be removed; it is not removed.
+  `a_stroke_through_a_feathered_selection_comes_out_soft` puts one solid dab
+  through a selection softened by six pixels on a real device and reads the ramp
+  off the layer. What is true is that a feather deliberately leaves the *rings*
+  exactly where they were, so the marching ants are identical whether the rail
+  is at 0 or at 250 and the only feedback is the next stroke — and the rail
+  applies to the next gesture rather than the one standing. Both are the design
+  behaving as designed; if that is not good enough the answer is a second mark
+  on the marquee, never taking the rail off.
+
+# Draft prose for CLAUDE.md, Interface section
 - **The four operations are on the tool options strip as well as on the
   modifiers**, and `App::combined_selection_op` is the one place the two meet —
   Shift adds, Ctrl (Cmd) subtracts, both intersect, nothing held takes the
@@ -578,11 +737,47 @@ all** — the straight-alpha sRGB RGBA8 it already held is exactly
 `umber-core::text` sets it, `umber-core::fonts` finds the faces, `textpanel.rs`
 draws the module and `cputext.rs` is the splash's own use of the same `Pen`.
 
-- **Placing text is literally a paste, and that is the whole design.** The set
-  lines go through `Clip::place` and `begin_float` — the same two Ctrl+V uses —
-  so the transform tool's handles move, scale, turn and flip it, Escape abandons
-  it, and one undo takes it back off as an ordinary `EditKind::Transform`. No
-  new float kind, no new undo variant, no second placer.
+- **Placing text is a paste onto a layer the placement makes for itself**, and
+  the two halves were built at different times. The pixels are still a paste:
+  the set lines go through `Clip::place` and `begin_float` — the same two Ctrl+V
+  uses — so the transform tool's handles move, scale, turn and flip it, Escape
+  abandons it, and there is no new float kind and no second placer. What changed
+  is where they land. This bullet used to end "and one undo takes it back off as
+  an ordinary `EditKind::Transform`", which is now true only of a placement onto
+  the selected layer.
+- **A placement keeps its record only where it lands on nothing, and its own
+  layer is what makes that true rather than lucky.** `finish_transform` keeps the
+  `TextObject` only where every pixel it is about to write over is transparent,
+  because setting text again means clearing what the old text drew — and alpha
+  compositing is not invertible, so over a picture the record would be a promise
+  Update could only keep by destroying paint. That rule is right and it was the
+  whole of the artist's complaint: text put down over anything was paint from the
+  moment it touched the canvas, silently, and the only sign was an Update button
+  that was not offered. A layer of its own makes the condition hold by
+  construction. `Editor::ui.text_own_layer` is the switch, it defaults to **on**,
+  and its control is on the Text panel beside Place — `Prefs::wheel_rotates`'
+  arrangement and its argument.
+- **One placement is one undo entry, and it needed no new `EditBody` arm.**
+  Removing the layer removes its pixels: a `ShapeEntry::Gone` carries the whole
+  `Layer` with its `SlotClaim`, so a structural entry is the whole undo. **There
+  is no patch and no readback** — a full-canvas caption on a 10000² document
+  would have been 400 MB of patch and a blocking read at the moment the artist
+  let go. The kind is `EditKind::AddLayer` rather than a variant of its own,
+  because the row undoes exactly as an add does, and `SaveHistory::new` skips
+  every structural entry so nothing new reaches the file.
+- **`LayerStack::add_named` is not a rename**, which is what keeps
+  `docs/layer-rename.md` unbuilt: a name given at *creation* is not a value
+  anybody changed. `textobj::layer_name` is the rule — first line with anything
+  on it, whitespace collapsed, cut at a word boundary — in `umber-core` because
+  rules are testable without a window. **Nothing marks a name that was cut**:
+  Archivo has no ellipsis, and three full stops would be a mark inside a name
+  that travels into the `.ora`.
+- **A new layer is not locked by the layer it is put beside.**
+  `LayerStack::new_layer_would_be_locked` asks about the *insertion point*; the
+  two readings disagree on exactly the stack that matters, a locked layer inside
+  an unlocked folder. `LayerStack::add_refusal` is the one statement of "is there
+  room", read by `add_layer`, `add_text_layer` and the Place button, and it
+  answers **which** refusal because the two remedies differ.
 - **Text *is* kept now, and `umber-core::textobj` is the record.** This bullet
   used to say the opposite — "the string, the face and the size are recorded
   nowhere" — and that was true and deliberate for as long as placing text was
@@ -1309,17 +1504,53 @@ are the contiguous run immediately below it whose `depth` is greater.
   unreachable there, while "some of the stack" is the ordinary case here and an
   empty box would say none was ticked.
 - **A module's header lays its controls out before its title, and the title takes
-  what is left.** Four marks and a close mark want 114 points; the header's
-  control strip is 120 at `metrics::PANEL`, 83 at `limits::SIDEBAR_MIN_WIDTH` and
-  38 at `metrics::TOOL_RAIL`. So at the design's width it fits and at every
-  narrower one the strip overruns leftwards into the title — which is the
-  "3 ticked" label and the six bulk buttons drawn over each other, one storey up.
-  Truncating the title is the fix and it costs a word: in edit mode at 190 points
-  "Palette" reads "Palet…". That is better than the full word with a button
-  through it, and it only happens while somebody is dragging the panel. The guard
-  sweeps **each kind's own `min_width`** rather than one constant — missing
-  `PanelKind::Tools`' 100-point floor is the "domain the code sees" failure again
-  — and carries the galley's **row count** as well as the two rectangles.
+  what is left.** Four marks and a close mark want 104 points — `ui::ICON_BUTTON`
+  is 16 and `metrics::BUTTON_GAP` is 6 — against a strip that is 120 at
+  `metrics::PANEL`, 83 at `limits::SIDEBAR_MIN_WIDTH` and 38 at
+  `metrics::TOOL_RAIL`. So at the design's width it fits with sixteen points
+  spare and at every narrower one the strip overruns leftwards into the title —
+  which is the "3 ticked" label and the six bulk buttons drawn over each other,
+  one storey up. Truncating the title is the fix and it still costs a word at the
+  narrow end. **The module to watch is Brushes, not Palette**: Palette's room
+  grows as `width - 131`, so it would need a column under 166 points to clip and
+  is unclippable at every width the dock permits, where Brushes had 31 points for
+  a 41-point word and was genuinely cut. It has 41 now, and 0.375 points in hand.
+  The guard sweeps **each kind's own `min_width`** rather than one constant —
+  missing `PanelKind::Tools`' 100-point floor is the "domain the code sees"
+  failure again — and carries the galley's **row count**, epaint's own
+  `Galley::elided`, the rect the strip was *offered*, and the widest strip any
+  module draws, which it pins as the literal **104**. Not as
+  `5 * ICON_BUTTON + 4 * BUTTON_GAP`: that is the arithmetic the header itself
+  does, so it would agree with itself at any mark size. A fit assertion alone
+  pins almost nothing — 104 against 120 tolerates every size up to 19, so the
+  old 18 passed it — and is inert for the six kinds whose strip is 0 or 16.
+  **It must install the fonts as well as apply the theme.** A bare
+  `egui::Context` spaces items 8 points apart where the interface sets 6 and
+  lays text out in egui's fallback face, which is *narrower* than Archivo. The
+  first assertion is entirely about how wide a word is, so without both the
+  guard measures a header Umber does not draw.
+- **A mark's hit target is not its size, and `ui::icon_button` was the one
+  control where it was.** Every other icon control here insets its mark:
+  `widgets::tool_button` is `metrics::TOOL_BUTTON`'s 32 with an 18-point mark,
+  `widgets::icon_toggle` is 20 with 16, `panels::remove_button` was 18 with 12.
+  `icon_button` allocated 18 and drew at 18, so a module header put four marks
+  at 18 beside a close mark at 12 — which is what "the header buttons are too
+  big" turned out to mean, and that pair is the reading that carries it rather
+  than any appeal to the design's padding. It is `ui::ICON_BUTTON` (16) and
+  `ui::ICON_BUTTON_MARK` (12, what the close mark always was), and
+  `remove_button` takes both rather than restating them: a size typed at that
+  call site is how the two drifted. **The tool rail is not an inconsistency with
+  this** — its mark is 18 inside a 32-point button, so it has a button's worth
+  of air, where a header mark has none. Two things to know before moving it
+  again: the argument is header-shaped while the constant governs some
+  twenty-seven call sites, most nowhere near a header, so at 16 it is the
+  *smallest interactive target in the interface*, under `PICK_HIT`'s 18 and
+  `ICON_TOGGLE`'s 20; and **12 is exactly where `icons::draw`'s stroke stops
+  thinning** — `(2 * size / 24).max(1.0)` is 1.5 at 18 and precisely 1.0 at 12,
+  on the floor rather than clamped by it, so anything smaller blots. Read that
+  beside `Palette::active_ink`'s note that this widget is 1.43:1 on
+  `control_active` in MediaBog: the mark is a third thinner than it was on a
+  control already recorded as marginal there.
 - **The Layers module's stack commands are in its header**, for the reason the
   Brushes module's Edit mark is: a panel body is a scroll area, and with a stack
   of any size the list fills it immediately, so the four commands that act on the
@@ -2396,6 +2627,32 @@ reporter's own window.
   `ImportWarning` and the UI shows them; the rule is that subtly wrong pixels
   are worse than a refusal, because a refusal sends the artist to export an ORA
   while a wrong import wastes an afternoon.
+- **The shipped library's spacing is capped at 10%, and it is the one setting the
+  generator changes rather than refuses.** `spacing` does not mean the same thing
+  in the engines these presets were written for: MyPaint, Krita and Clip Studio
+  composite every dab, so a step of a quarter of the mark reads as continuous
+  because the neighbours pile up in the dips, where Umber saturates coverage with
+  a `max` and nothing piles up. Transcribing the author's figure faithfully
+  therefore produces a brush that paints *unlike* their brush — the thing
+  `build-brush-library.rs` exists to prevent — and it is what was reported as
+  choppy strokes. 103 of 252 converted presets were above it and 101 moved. **It
+  costs almost no ink**, because under a `max` a stroke's mark is the union of
+  its dabs' footprints: mean 1.10x, 83 of 101 within 5%. **And no frame budget
+  cares** — the dab pass is one draw call for N instances, and the heaviest brush
+  hands it five dabs a frame covering 0.36 of a window. **The exemption is
+  geometric, not a list of names**: `step_at` is `reach x 2 x spacing`, so at 1.0
+  the step is the dab's whole width and the dabs stop touching — below it the
+  spacing decides only smoothness, at or above it the gaps *are* the mark. **It
+  reads the author's figure and not the dab actually stamped**, which is decided
+  rather than overlooked: `reach_at` takes the nominal `dab_ratio` and a `Ratio`
+  modulation can narrow the real dab, so `ramon/rs-blendop` was already gapping
+  by 0.90 px — reading the real aspect would have *exempted* the one brush that
+  was gapping by accident, which is the complaint rather than an exception to it.
+  **A scatter clause was measured and refused**: 1.38x against 1.04x,
+  overlapping, and the two worst non-exempt cases have no scatter at all. **The
+  importers do not cap and must not.** `examples/measure-spacing.rs` is the
+  evidence and takes two libraries the way `diff-brush-library` does, because
+  once the generator has run the author's figure is not in the shipped file.
 - **The shipped brush library and a user's own import hold to different
   standards, deliberately.** `examples/build-brush-library.rs` *refuses* a
   MyPaint brush that needs anything Umber cannot render — nothing shipped under
@@ -3008,6 +3265,34 @@ with any other tool in hand is the same gesture.
   read as sRGB.** Umber has no colour management anywhere, so there is nothing to
   convert against. Hardware overlays are not in it either — video planes read as
   black.
+- **The loupe is a lens, and the boundary is the rim's inner edge rather than the
+  cells'.** A grid of squares cannot tile a disc, so clipping the cells to their
+  own circle leaves a staircase *inside* it — six-point steps, which is what the
+  first draft drew. The clip is generous by exactly one cell and `loupe::RIM`
+  hides the overhang, so what the eye follows is a `circle_stroke`'s feathered
+  inner edge. **egui strokes a circle on the *outside* of its radius** —
+  `tessellate_circle` calls `PathStroke::outside()` — so the radius asked for is
+  the boundary itself; handing it a mid-radius put the band four points out and
+  left the picture spilling past the lens.
+- **The rim is a surface, not a border, and there is no outline at all.**
+  `ui::loupe_glass` draws the lens thickness, a catch-light at the boundary with
+  a second tighter lobe on the side *away* from the light (which is what tells
+  glass from a moulded button), and the rim's own shading turning from one end of
+  the lightness axis to the other. Every band is a `Shape::Mesh`, because a
+  gradient across a band is the one shape a `Painter` has no method for and
+  because two meshes abut with no seam where two feathered fills leave a
+  hairline. A mesh has no feathering of its own, so the silhouette is handed back
+  to a `circle_filled` underneath and the outermost stop fades to nothing.
+- **`contrast::LIT` and `contrast::SHADE` name the two ends of the axis for a
+  *shading* pass.** `ink_on` answers with one; a curved surface needs both at
+  once, and that holds even on a named token — Paper's `popover` is pure white,
+  so there is no lighter half to derive and only the shadow does any work there.
+  A *mark* still asks `ink_on`.
+- **The magnification stays uniform to the very edge, and that is a refusal.** A
+  real lens compresses its perimeter; copying that would make the outer cells
+  narrower while the block behind them is still read on a uniform grid, so a cell
+  would stop standing for one screen pixel — which is what the control is aimed
+  by.
 - **No loupe**, and Umber's own title bar is outside the client area and does
   read off the desktop. Both stated rather than denied.
 - **`Tool::paints` was a `matches!` and is a `match`** — the standing rule paying
@@ -3434,11 +3719,45 @@ design shows a whole row of them.
   `lucide.rs` flattens them into polylines at the interface's own stroke
   weight — no rasteriser, no icon font, and an icon updated by pasting one
   line over another. **The exception is a mark Lucide does not carry**, which
-  is `Drawn`'s five and no more: a layer mask, its off twin, deselect, the
+  is `Drawn`'s four and no more: the layer mask's off twin, deselect, the
   resize corner and the colour harmony. Each variant records what was searched
-  for and not found, `the_marks_umber_draws_itself_are_these_five` pins the
+  for and not found, `the_marks_umber_draws_itself_are_these_four` pins the
   list, and what the exception does **not** cover is redrawing a mark Lucide
   already has.
+- **A search that comes back empty is evidence about the search.** `Drawn::Mask`
+  was a hand-drawn layer mask on the recorded ground that the only thing in the
+  set carrying the word is `venetian-mask`. Lucide has **`view`** — a frame with
+  an eye inside it, which is a layer and how much of it shows through — so the
+  argument was a search of the *word* rather than of the picture, and the mark
+  Umber was drawing by hand was in the set the whole time. It also puts the mask
+  in `Icon::Eye`'s family, which is what a layer's eye and its mask are. The
+  list that test blesses is only ever as good as the searches written beside it.
+- **A retracted argument has to be answered, not deleted.** The hand-drawn mask
+  carried "a frame plus a *solid* shape rather than two outlines, because at
+  16 px two nested rings read as a target" — and `view` is two nested outlines,
+  drawn at 14 in a brush chip and at `ui::ICON_BUTTON_MARK`'s 12 in a header,
+  which is exactly what that sentence warned against. Looked at on the sheet it
+  holds: the outlines are a rounded **rectangle** and a **lens**, so they never
+  concentre, and the pupil is the solid mark the disc used to be. Rings were the
+  hazard, not outlines. Deleting the sentence with the function would have
+  thrown away the one argument the change had to clear.
+- **A coordinate that fails to parse becomes 0.0, which is a plausible
+  coordinate, so a scanning bug deforms an icon rather than breaking it.** SVG's
+  number grammar lets a second point end the number before it, so `.4.4` is two
+  numbers; `lucide::Lexer::number` took `.` unconditionally, and
+  `parse().unwrap_or(0.0)` did the rest. Six marks were wrong on the canvas —
+  `pipette` twice in one subpath and visibly a blot, and `link`, `pencil`,
+  `file`, `copy` and `lasso-select` once each and still recognisably themselves,
+  which is worse, because nobody reports those. **Neither existing guard could
+  see it**: `every_icon_fills_its_box` passes because a zero lands inside the
+  box, and any round trip through the same lexer agrees with itself.
+  `every_number_in_every_icon_parses` asks the one question the `unwrap_or`
+  answers away — it takes the tokens the *scan* produced, unparsed, and requires
+  Rust to parse each. **It was found by an artist looking at a published
+  picture**, which is the argument for `icon_sheet` existing at all. The bug came
+  in with the parser from `crates/muster-app/src/lucide.rs`, which
+  `STYLE-GUIDE.md` §11 names as the reference implementation for the family, so
+  it is there too.
 - **Two marks can be correct and still collide, and only looking finds it.**
   Lucide's `scaling` and `external-link` are both a rounded box with a diagonal
   arrow leaving the top right corner; at 18 px they are one mark, and the
@@ -3450,9 +3769,40 @@ design shows a whole row of them.
   handles the tool actually draws on the canvas.
 - **A negated mark is drawn from the mark it negates.** `Drawn::Deselect`
   strokes `Icon::Select`'s *own* flattened outlines and puts Lucide's own
-  `m2 2 20 20` across them, and `Drawn::MaskOff` is `mask()` plus the same
-  stroke. Drawing the box again is what the first version did, and it left the
-  pair at two sizes with two dash spans that had to be kept in step by hand.
+  `m2 2 20 20` across them, and `Drawn::MaskOff` does the same with
+  `Icon::Mask`'s. Drawing the box again is what the first version did, and it
+  left the pair at two sizes with two dash spans that had to be kept in step by
+  hand. The mask's pair kept that guarantee through the move to Lucide's `view`
+  without being touched: it used to share a `mask()` function with the mark it
+  negates, and it now reaches for that mark's geometry, which is the same
+  promise with nothing left to maintain. **`eye-off` is the near miss and is the
+  wrong answer** — Lucide ships no `view-off`, and `eye-off` negates the eye
+  where this negates the frame with the eye in it, so the pair would read as two
+  objects rather than one with something done to it.
+- **A fixed-width dropdown is checked with `widgets::dropdown_label_room`, which
+  is the arithmetic `dropdown` itself elides by.** `DropdownWidth::Exact` does
+  not grow, so a width a few points short clips the word — the defect that made
+  the layer row's blend picker draw "Luminosit". A guard subtracting its own
+  guess at the furniture would be a second statement of the rule, agreeing with
+  something the widget need not follow. `SELECT_MODE_WIDTH` is the second
+  control held to this.
+- **`widgets::menu_choice` is the menu row with a mark before its label**, for a
+  picker whose choices *are* shapes. It takes the whole width the menu offers so
+  every entry's highlight is the same, which only works where the trigger is
+  `Exact` and wide enough for the longest label — a menu is as wide as its
+  trigger. Its chosen row's ink is `Palette::active_ink` and never the accent,
+  for the reason `history_row`'s is.
+- **`lucide.rs` reads the smooth cubic now.** `S` is not a curve of its own: it
+  is a `C` whose first control point is the previous one's second reflected
+  about the current point, so it adds no geometry and no second flattening. The
+  reflection state has to be **cleared by everything that is not a cubic**, or a
+  control point from three commands ago bends a curve nothing asked to bend —
+  and a guard for that has to start from a path with a cubic *somewhere* in it,
+  or the stale value is `None` either way and the test passes with the clearing
+  removed. `every_command_is_one_the_parser_knows` is what caught the gap in the
+  first place, which is that test doing exactly what it was written for.
+
+# Draft prose for CLAUDE.md, Testing section
 - **Shortcuts live in `shortcuts.rs`, not in a `match`.** The settings dialog
   enumerates them, which a match arm cannot do. `resolve` compares ctrl/shift/alt
   exactly — that is what stops plain `Z` (zoom tool) also firing on `Ctrl+Z`.
@@ -4292,6 +4642,59 @@ method rather than as an anecdote:
   `an_effect_switched_off_gives_its_page_back` passed a mutation of `retain_only`
   because the case it drove went through `forget_all`; it drives both now. That
   is the same failure as a guard agreeing for the wrong reason, one level along.
+- **A test of an exactness whose inexact twin happens to agree is a test of
+  nothing.** `a_lasso_with_no_stabiliser_records_the_points_it_was_given` pins
+  the recorded samples *and then* asserts that the filter it skipped would
+  really have moved them. Without the second half it would pass at any
+  coordinates where `s + (a - s)` happens to round back to `a`, which is most of
+  them.
+
+# README
+
+`README.md` line 237 says "rectangle, freehand lasso, or polygon
+point-to-point". Suggested replacement:
+
+> **Select** marks out where edits may land: rectangle, ellipse, freehand lasso,
+> or polygon point-to-point. Everything the brush and eraser do is clipped to
+> it, antialiased edges included, so a diagonal is a diagonal rather than a
+> staircase.
+
+And after the feather sentence (line 242), optionally:
+
+> A rectangle's corners can be rounded all the way to a stadium, and the lasso
+> has a stabiliser for a shaky hand.
+- **An appearance change is a claim about a device pixel, so read one back.**
+  `ui::tests::frame_pixel` runs egui's own tessellation and point-samples every
+  triangle in order, which is what a rasteriser does at a pixel centre — so a
+  guard can ask what colour came out with no device and stay in the default
+  suite. It needs a **fill rule**: without one a point on a seam between two
+  triangles is covered by both and a translucent wash composites twice, which
+  read eight levels out. A top-left rule with a tolerance is what works, and the
+  tolerance is load-bearing — two triangles sharing an edge evaluate their edge
+  functions from different vertices, so a plain equality against zero fires for
+  neither or both. `the_cpu_frame_sampler_agrees_with_the_gpu` is what makes it
+  an instrument rather than a second opinion: 156,763 of 160,000 pixels exact,
+  worst 3 levels on the silhouette. **`prerasterized_discs` is on by default**,
+  so `circle_filled` is a textured quad out of the font atlas rather than
+  geometry, and a CPU sampler that reads vertex colours cannot see it.
+- **A guard that samples one radius covers one band.** The loupe's rim guard
+  sampled at `RIM * 0.37` and reached only the rim's shading; the thickness and
+  the catch-light could both have been deleted with every guard green, and the
+  counter-lobe the comments call the whole difference between glass and plastic
+  had no measurement at all. A critic found it by reading the radii against the
+  bands, not by anything failing. **Enumerate what a sample point actually
+  touches**, the same way call sites of a rule get enumerated.
+- **A guard on a generated asset that shares the generator's own predicate can
+  only agree with it.** The spacing cap's first guard asserted "spacing >=
+  `DABS_COME_APART_AT` implies exempt", which is a spelling of the generator's
+  `if` and is true of *any* boundary: lower the constant to 0.4, regenerate, and
+  a library of half-spaced brushes passes. The fix is to check the exempt set
+  against the thing the constant is *about* — every exempt preset is driven
+  through `StrokeBuilder` and its dabs must be measurably disjoint — and to pin
+  the figure as a literal beside it. **The converse was false and saying so is
+  part of the fix**: five presets gap at 0.1 anyway, for reasons of their own, so
+  asserting "a capped brush lays a continuous mark" would have needed a list of
+  five names.
 - **A guard that a sparse path did not move a pixel cannot live inside one
   build.** `examples/hash-layers` is the shape: fingerprint every layer and every
   warning, build the other side in a scratch tree **with its own target
