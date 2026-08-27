@@ -5639,32 +5639,49 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
         let mut written = 0;
-        for tool in [Tool::Brush, Tool::Pan, Tool::Zoom] {
+        for tool in [Tool::Brush, Tool::Pan, Tool::Zoom, Tool::Select] {
             // The three rail widths, plus the pair either side of where Zoom's
             // second sentence has to come off: 740 is the narrowest strip that
             // holds it whole and 720 is the widest that drops it, so a budget
             // edited to a number that overruns shows up as text running off the
             // right of one of these two rather than as nothing at all.
-            for (n, width) in [900.0_f32, 740.0, 720.0, 560.0, 380.0]
+            for (n, width) in [1600.0_f32, 900.0, 740.0, 720.0, 560.0, 380.0]
                 .into_iter()
                 .enumerate()
             {
-                let mut ed = Editor::default();
-                ed.layout = crate::dock::Layout::default();
-                ed.ui.tool = tool;
-                let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
-                let field = vec2(width, metrics::OPTIONS_STRIP);
-                let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
-                        .show(root, |ui| {
-                            ui.set_height(metrics::OPTIONS_STRIP);
-                            super::options_strip(ui, &palette, &mut ed);
-                        });
-                });
-                let name = format!("strip-{tool:?}-{}-{width:.0}.png", n + 1).to_lowercase();
-                docshot::write_png(&dir.join(name), &image).expect("write the png");
-                written += 1;
+                // Select draws a different strip per mode — the lasso carries a
+                // stabiliser the rectangle does not, the rectangle a roundness
+                // the lasso does not — so one shot of it would say nothing
+                // about the other three. Every other tool has one strip.
+                let modes: &[umber_core::SelectionMode] = if tool == Tool::Select {
+                    &umber_core::SelectionMode::ALL
+                } else {
+                    &[umber_core::SelectionMode::Rectangle]
+                };
+                for mode in modes {
+                    let mut ed = Editor::default();
+                    ed.layout = crate::dock::Layout::default();
+                    ed.ui.tool = tool;
+                    ed.ui.selection_mode = *mode;
+                    let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+                    let field = vec2(width, metrics::OPTIONS_STRIP);
+                    let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                            .show(root, |ui| {
+                                ui.set_height(metrics::OPTIONS_STRIP);
+                                super::options_strip(ui, &palette, &mut ed);
+                            });
+                    });
+                    let name = if tool == Tool::Select {
+                        format!("strip-{tool:?}-{mode:?}-{}-{width:.0}.png", n + 1)
+                    } else {
+                        format!("strip-{tool:?}-{}-{width:.0}.png", n + 1)
+                    };
+                    docshot::write_png(&dir.join(name.to_lowercase()), &image)
+                        .expect("write the png");
+                    written += 1;
+                }
             }
         }
         println!("wrote {written} strips to {}", dir.display());
