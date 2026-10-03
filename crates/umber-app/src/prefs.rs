@@ -183,6 +183,13 @@ pub struct Prefs {
     /// preferences file is not a record of what a previous build drew; it is a
     /// record of what its owner chose, and nobody chose this.
     pub text_own_layer: bool,
+    /// The Alt brush-size drag waits for the pointer to go down. See
+    /// [`crate::editor::UiState::resize_needs_press`]. Absent reads as off,
+    /// which is the drag every build before it made.
+    pub resize_needs_press: bool,
+    /// The Alt brush-size drag anchors the circle's edge under the pointer.
+    /// See [`crate::editor::UiState::resize_from_edge`]. Absent reads as off.
+    pub resize_from_edge: bool,
     /// A directory of the user's own fonts, scanned beside the machine's own.
     ///
     /// The third of `umber_core::fonts`' three sources, and the one somebody
@@ -244,6 +251,8 @@ impl Default for Prefs {
             wheel_angles: WheelAngles::default(),
             save_history: true,
             text_own_layer: true,
+            resize_needs_press: false,
+            resize_from_edge: false,
             font_folder: None,
             // Exactly what every build before the setting existed held, so a
             // missing or older preferences file changes nobody's behaviour.
@@ -446,6 +455,11 @@ pub fn to_text(prefs: &Prefs) -> String {
     }
     out.push_str(&format!("save_history = {}\n", prefs.save_history));
     out.push_str(&format!("text_own_layer = {}\n", prefs.text_own_layer));
+    out.push_str(&format!(
+        "resize_needs_press = {}\n",
+        prefs.resize_needs_press
+    ));
+    out.push_str(&format!("resize_from_edge = {}\n", prefs.resize_from_edge));
     // Written only when there is one, so a preferences file from a session that
     // never set it is byte for byte what it was before this key existed.
     if let Some(folder) = &prefs.font_folder {
@@ -589,6 +603,16 @@ pub fn from_text(text: &str) -> Prefs {
             "text_own_layer" => {
                 if let Some(v) = parse_bool(value) {
                     prefs.text_own_layer = v;
+                }
+            }
+            "resize_needs_press" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.resize_needs_press = v;
+                }
+            }
+            "resize_from_edge" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.resize_from_edge = v;
                 }
             }
             // Taken verbatim, and deliberately not checked for existence here:
@@ -851,6 +875,8 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         wheel_angles: ed.ui.wheel_angles,
         save_history: ed.ui.save_history,
         text_own_layer: ed.ui.text_own_layer,
+        resize_needs_press: ed.ui.resize_needs_press,
+        resize_from_edge: ed.ui.resize_from_edge,
         font_folder: ed.font_folder.clone(),
         // Read off the live history, like every other value here is read off
         // the thing that uses it, so the file cannot come to disagree with what
@@ -933,6 +959,8 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.wheel_angles = prefs.wheel_angles;
     ed.ui.save_history = prefs.save_history;
     ed.ui.text_own_layer = prefs.text_own_layer;
+    ed.ui.resize_needs_press = prefs.resize_needs_press;
+    ed.ui.resize_from_edge = prefs.resize_from_edge;
     set_font_folder(ed, prefs.font_folder.clone());
     set_undo_budget(ed, prefs.undo_budget_mb);
     ed.autosave.enabled = prefs.autosave;
@@ -1057,6 +1085,8 @@ mod tests {
         assert_eq!(prefs.wheel_shape, editor.ui.wheel_shape);
         assert_eq!(prefs.wheel_angles, editor.ui.wheel_angles);
         assert_eq!(prefs.save_history, editor.ui.save_history);
+        assert_eq!(prefs.resize_needs_press, editor.ui.resize_needs_press);
+        assert_eq!(prefs.resize_from_edge, editor.ui.resize_from_edge);
         // Against the constant rather than against `editor.history`, which
         // reads a published value another test in this process may have moved.
         // What has to hold is that the shipped default is the figure every
@@ -1100,6 +1130,33 @@ mod tests {
             "reading the file must reach the picker, not just the Prefs struct"
         );
         assert!(!capture(&ctx, &editor).wheel_rotates, "and back out again");
+    }
+
+    /// The two brush-size-drag preferences, carried through the file and into
+    /// the editor and back. Both ship **off**, so each is switched on here —
+    /// a file that never wrote the key reads back as `false`, and asserting
+    /// the default would pass having tested nothing.
+    #[test]
+    fn the_brush_resize_preferences_survive_a_restart() {
+        let _serial = prefs_lock();
+        let prefs = Prefs {
+            resize_needs_press: true,
+            resize_from_edge: true,
+            ..Prefs::default()
+        };
+        let back = from_text(&to_text(&prefs));
+        assert!(back.resize_needs_press, "the file must not lose the choice");
+        assert!(back.resize_from_edge, "the file must not lose the choice");
+
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        assert!(!editor.ui.resize_needs_press, "the default is off");
+        assert!(!editor.ui.resize_from_edge, "the default is off");
+        apply(&back, &ctx, &mut editor);
+        assert!(editor.ui.resize_needs_press, "reading the file must reach the gesture");
+        assert!(editor.ui.resize_from_edge, "reading the file must reach the gesture");
+        let out = capture(&ctx, &editor);
+        assert!(out.resize_needs_press && out.resize_from_edge, "and back out again");
     }
 
     /// The picker's own names, which the file is written in, must not be the
@@ -1494,6 +1551,10 @@ mod tests {
             // ships as, so a file that never wrote the key would read back
             // as `true` and this assertion would pass having tested nothing.
             text_own_layer: false,
+            // On, which is not the default, for the reason the line above is
+            // off.
+            resize_needs_press: true,
+            resize_from_edge: true,
             font_folder: Some(PathBuf::from("/home/painter/type/My Foundry")),
             undo_budget_mb: 1024,
             autosave: false,
@@ -1526,6 +1587,8 @@ mod tests {
         assert_eq!(back.wheel_angles, prefs.wheel_angles);
         assert_eq!(back.save_history, prefs.save_history);
         assert_eq!(back.text_own_layer, prefs.text_own_layer);
+        assert_eq!(back.resize_needs_press, prefs.resize_needs_press);
+        assert_eq!(back.resize_from_edge, prefs.resize_from_edge);
         // A path with a space in it, because the file is `key = value` split on
         // the first `=` and a folder somebody actually has is not one word.
         assert_eq!(back.font_folder, prefs.font_folder);
