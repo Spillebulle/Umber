@@ -775,6 +775,36 @@ impl Brush {
         let along = crate::geom::drag_towards_more(delta);
         (from * (along / Self::RESIZE_DOUBLE_PX).exp2()).clamp(Self::MIN_SIZE, Self::MAX_SIZE)
     }
+
+    /// Where the preview circle's centre goes when a resize drag is anchored
+    /// at the circle's **edge** rather than its centre.
+    ///
+    /// The other way of spelling this gesture. [`Brush::size_after_drag`]
+    /// measures a *displacement* and spends it on a doubling, which is fast and
+    /// keeps a brush's character; this one is direct manipulation — the
+    /// pointer is on the rim, and the rim goes where the pointer goes. So the
+    /// circle is placed with the pointer on its right-hand edge: the centre is
+    /// one radius to the left, in screen pixels, which is `size × zoom / 2`,
+    /// and [`Brush::size_from_rim`] then reads the size back off the distance.
+    /// The right-hand edge rather than any other, because right has always
+    /// been the "bigger" direction of this gesture, so the first instinct a
+    /// hand brings from the other mode still grows the brush.
+    pub fn rim_centre(origin: Vec2, size: f32, zoom: f32) -> Vec2 {
+        origin - Vec2::new(size * 0.5 * zoom, 0.0)
+    }
+
+    /// The size whose rim passes through `pos`, for a circle centred on
+    /// `centre` — both in screen pixels — on a canvas at `zoom`.
+    ///
+    /// Linear and in every direction: the diameter is twice the distance
+    /// between the two, so a pointer dragged through the centre and out the
+    /// far side grows the brush again, which is what a rim one is holding
+    /// does. Clamped to the brush's own limits, like the other drag, so a
+    /// pointer put exactly on the centre asks for the smallest brush rather
+    /// than for nothing.
+    pub fn size_from_rim(centre: Vec2, pos: Vec2, zoom: f32) -> f32 {
+        (centre.distance(pos) * 2.0 / zoom.max(1e-6)).clamp(Self::MIN_SIZE, Self::MAX_SIZE)
+    }
 }
 
 #[cfg(test)]
@@ -800,6 +830,33 @@ mod tests {
         assert!((Brush::size_after_drag(40.0, vec2(d, 0.0)) - 80.0).abs() < 1e-3);
         assert!((Brush::size_after_drag(40.0, vec2(-d, 0.0)) - 20.0).abs() < 1e-3);
         assert_eq!(Brush::size_after_drag(40.0, Vec2::ZERO), 40.0);
+    }
+
+    /// The edge-anchored drag is direct manipulation: the pointer sits on the
+    /// circle's rim, so the centre is one radius to the left of where the
+    /// gesture began, and the size is whatever distance the rim is then taken
+    /// to — linear, through the zoom, and the brush's own limits.
+    #[test]
+    fn an_edge_anchored_resize_starts_on_the_rim_and_follows_it() {
+        // A 40 px brush at zoom 2 is 80 screen pixels across, so its centre is
+        // 40 to the left of the pointer that started on its right-hand edge.
+        let origin = vec2(500.0, 300.0);
+        let centre = Brush::rim_centre(origin, 40.0, 2.0);
+        assert_eq!(centre, vec2(460.0, 300.0));
+        // Not having moved, the size is exactly what it was.
+        assert_eq!(Brush::size_from_rim(centre, origin, 2.0), 40.0);
+        // Twice the distance from the centre is twice the size…
+        assert!((Brush::size_from_rim(centre, vec2(540.0, 300.0), 2.0) - 80.0).abs() < 1e-3);
+        // …in any direction, including straight through the centre and out
+        // the other side, where the rim is simply on the left now.
+        assert!((Brush::size_from_rim(centre, vec2(460.0, 380.0), 2.0) - 80.0).abs() < 1e-3);
+        assert!((Brush::size_from_rim(centre, vec2(380.0, 300.0), 2.0) - 80.0).abs() < 1e-3);
+        // And the limits still hold at both ends.
+        assert_eq!(Brush::size_from_rim(centre, centre, 2.0), Brush::MIN_SIZE);
+        assert_eq!(
+            Brush::size_from_rim(centre, vec2(460.0 + 1e6, 300.0), 2.0),
+            Brush::MAX_SIZE
+        );
     }
 
     /// The vertical axis is worth exactly what the horizontal one is, and up is
