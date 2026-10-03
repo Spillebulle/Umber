@@ -1249,13 +1249,16 @@ fn brush_size_preview(ui: &egui::Ui, p: &Palette, ed: &Editor) {
     let Some(resize) = ed.brush_resize else {
         return;
     };
-    let at = ed.to_points(resize.origin);
+    // The model's centre, not its origin: for the edge-anchored drag the two
+    // differ by a radius, and drawing anywhere but where the size is measured
+    // from would put the rim somewhere other than under the pointer.
+    let at = ed.to_points(resize.centre);
     // Document pixels → physical pixels is the zoom; physical → points is
     // egui's, and the same conversion every other canvas boundary makes.
     let radius = ed.brush.size * 0.5 * ed.camera.zoom / ed.pixels_per_point.max(1e-3);
     let painter = ui.painter();
     painter.circle_stroke(at, radius, Stroke::new(1.0, p.accent));
-    // The anchor the drag is measured from — and the only thing on screen at
+    // The centre the drag is measured from — and the only thing on screen at
     // all when a one-pixel brush is being sized at a low zoom.
     painter.circle_filled(at, 1.0, p.accent);
 }

@@ -84,14 +84,93 @@ impl Interaction {
 /// nothing is held, the canvas is not being drawn on or moved, and letting go
 /// of Alt over a panel has to end it wherever the pointer happens to be. It is
 /// a modifier's state, and it lives and dies with `ModifiersChanged`.
-#[derive(Clone, Copy, Debug)]
+///
+/// It is also the **model** of the gesture, with no pointer in it: what a move
+/// does and what a press does are its methods, so the two preferences that
+/// change the gesture — [`UiState::resize_needs_press`] and
+/// [`UiState::resize_from_edge`] — are decided here, where a test can drive
+/// them, and `app.rs` only supplies the events. `from_edge` is **snapshotted**
+/// when the gesture is armed rather than read off the preference per move,
+/// for the reason a `StrokeStyle` is: the preview draws at `centre` and the
+/// size is measured from it, and the two must mean the same thing for every
+/// frame of one gesture.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrushResize {
-    /// Where the pointer was when Alt went down, in physical window pixels.
-    /// The drag is measured from here, and the preview circle is centred here.
+    /// Where the pointer was when the drag was anchored, in physical window
+    /// pixels. The centre-anchored drag is measured from here.
     pub origin: Vec2,
     /// The size the brush had at that moment. The drag is absolute against
     /// this, so coming back to the origin comes back to exactly this size.
     pub from: f32,
+    /// Where the preview circle is centred, in physical window pixels: on
+    /// `origin` for the centre-anchored drag, one radius to its left for the
+    /// edge-anchored one, so the pointer starts on the rim. The edge-anchored
+    /// size is measured from here.
+    pub centre: Vec2,
+    /// The edge-anchored rule rather than the centre-anchored one, for the
+    /// whole of this gesture.
+    pub from_edge: bool,
+    /// Whether moving the pointer rescales the brush yet. False only while
+    /// "press to resize" is on and nothing is down: the circle then follows
+    /// the pointer at the current size and the press is what anchors it.
+    pub anchored: bool,
+    /// A button or a contact is down carrying the drag. Set by the press that
+    /// resolved to `Press::ResizeBrush`, and what the release reads to settle
+    /// tap-or-drag — for both pointers, since a mouse button carries it too
+    /// under "press to resize".
+    pub pressed: bool,
+}
+
+impl BrushResize {
+    /// Arm the gesture at `at`, with the brush at `size` on a canvas at `zoom`.
+    /// `anchored` is false where the press has to come first.
+    pub fn new(at: Vec2, size: f32, zoom: f32, from_edge: bool, anchored: bool) -> Self {
+        Self {
+            origin: at,
+            from: size,
+            centre: Self::centre_for(at, size, zoom, from_edge),
+            from_edge,
+            anchored,
+            pressed: false,
+        }
+    }
+
+    fn centre_for(at: Vec2, size: f32, zoom: f32, from_edge: bool) -> Vec2 {
+        if from_edge {
+            Brush::rim_centre(at, size, zoom)
+        } else {
+            at
+        }
+    }
+
+    /// The pointer moved to `pos`. Answers the size the brush should now be,
+    /// or `None` while the drag is waiting for a press — in which case the
+    /// preview circle has been moved along under the pointer instead, at
+    /// `size_now`, which is the brush's current size.
+    pub fn moved(&mut self, pos: Vec2, size_now: f32, zoom: f32) -> Option<f32> {
+        if !self.anchored {
+            self.origin = pos;
+            self.from = size_now;
+            self.centre = Self::centre_for(pos, size_now, zoom, self.from_edge);
+            return None;
+        }
+        Some(if self.from_edge {
+            Brush::size_from_rim(self.centre, pos, zoom)
+        } else {
+            Brush::size_after_drag(self.from, pos - self.origin)
+        })
+    }
+
+    /// The pointer went down at `pos` carrying the drag, with the brush at
+    /// `size`. A drag that was waiting for this is anchored here; one that was
+    /// already anchored — a pen contact in the ordinary mode — keeps the
+    /// circle Alt put down, exactly as it always has.
+    pub fn press(&mut self, pos: Vec2, size: f32, zoom: f32) {
+        if !self.anchored {
+            *self = Self::new(pos, size, zoom, self.from_edge, true);
+        }
+        self.pressed = true;
+    }
 }
 
 /// The selected tool. Brush and eraser paint, select marks out where they may,
@@ -2530,6 +2609,67 @@ pub fn over_egui_area(editor: &Editor, ctx: &egui::Context, screen: Vec2) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With "press to resize" on, Alt arms the gesture and nothing moves: the
+    /// circle follows the pointer at the brush's current size, and a move
+    /// rescales nothing until the pointer is down.
+    #[test]
+    fn an_unanchored_brush_resize_follows_the_pointer_and_resizes_nothing() {
+        let mut r = BrushResize::new(Vec2::new(100.0, 100.0), 40.0, 1.0, false, false);
+        assert!(!r.anchored);
+        assert_eq!(r.moved(Vec2::new(300.0, 50.0), 40.0, 1.0), None);
+        // The preview is wherever the pointer went.
+        assert_eq!(r.centre, Vec2::new(300.0, 50.0));
+        // And in edge mode it is placed with the pointer on its right rim.
+        let mut e = BrushResize::new(Vec2::new(100.0, 100.0), 40.0, 2.0, true, false);
+        assert_eq!(e.moved(Vec2::new(300.0, 50.0), 40.0, 2.0), None);
+        assert_eq!(e.centre, Vec2::new(260.0, 50.0));
+    }
+
+    /// The press is what anchors it, where it landed and at the size the
+    /// brush had then — not where Alt went down, which may be a long way off.
+    #[test]
+    fn a_press_anchors_the_brush_resize_where_it_landed() {
+        let mut r = BrushResize::new(Vec2::new(0.0, 0.0), 10.0, 1.0, false, false);
+        r.moved(Vec2::new(500.0, 500.0), 40.0, 1.0);
+        r.press(Vec2::new(500.0, 500.0), 40.0, 1.0);
+        assert!(r.anchored && r.pressed);
+        assert_eq!(r.origin, Vec2::new(500.0, 500.0));
+        assert_eq!(r.from, 40.0);
+        // A drag of one doubling to the right is now measured from there.
+        let d = umber_core::Brush::RESIZE_DOUBLE_PX;
+        let size = r.moved(Vec2::new(500.0 + d, 500.0), 40.0, 1.0).unwrap();
+        assert!((size - 80.0).abs() < 1e-3);
+        // Pressing an already anchored drag — a pen contact in the ordinary
+        // mode — marks it pressed and re-anchors nothing, so the circle Alt
+        // put down stays where it was.
+        let mut plain = BrushResize::new(Vec2::new(0.0, 0.0), 10.0, 1.0, false, true);
+        plain.press(Vec2::new(500.0, 500.0), 10.0, 1.0);
+        assert!(plain.pressed);
+        assert_eq!(plain.origin, Vec2::ZERO);
+    }
+
+    /// An edge-anchored drag sizes the brush to the circle you leave on the
+    /// screen: the rim is under the pointer, and the size is the distance to
+    /// the centre, through the zoom.
+    #[test]
+    fn an_edge_anchored_brush_resize_sizes_the_brush_to_the_rim() {
+        let mut r = BrushResize::new(Vec2::new(500.0, 300.0), 40.0, 2.0, true, true);
+        assert_eq!(r.centre, Vec2::new(460.0, 300.0));
+        assert_eq!(r.moved(Vec2::new(500.0, 300.0), 40.0, 2.0), Some(40.0));
+        let size = r.moved(Vec2::new(540.0, 300.0), 40.0, 2.0).unwrap();
+        assert!((size - 80.0).abs() < 1e-3);
+        // Where the centre-anchored drag would have read that same move as a
+        // displacement of 40 px, which is not a doubling — the two modes are
+        // different rules and this test must be able to tell them apart.
+        let mut c = BrushResize::new(Vec2::new(500.0, 300.0), 40.0, 2.0, false, true);
+        let by_centre = c.moved(Vec2::new(540.0, 300.0), 40.0, 2.0).unwrap();
+        assert!(
+            (by_centre - umber_core::Brush::size_after_drag(40.0, Vec2::new(40.0, 0.0))).abs()
+                < 1e-5
+        );
+        assert!((by_centre - size).abs() > 1.0);
+    }
 
     /// The one place a paper name becomes a tile, and every state it can be in.
     ///

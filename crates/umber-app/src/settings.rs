@@ -538,6 +538,9 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
         );
     });
 
+    ui.add_space(16.0);
+    resize_section(ui, p, ed);
+
     ui.add_space(8.0);
     // The one control in Umber that governs a request leaving the machine, so
     // it is a live switch rather than a note — and it sits in General beside
@@ -595,6 +598,50 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
 
     ui.add_space(16.0);
     autosave_section(ui, p, ed, actions);
+}
+
+/// The two ways the Alt brush-size drag can be spelled differently.
+///
+/// Both are preferences rather than fixed policy because both are a matter of
+/// which hand is holding the pointer: a pen hovering in range with Alt held
+/// resizing the brush is the complaint one of them answers, and whether a
+/// drag "pushes the rim" or "spends distance on a doubling" is a habit
+/// brought from another application. Both ship off, so the drag every build
+/// before them made is what a fresh install gets. The decisions live on
+/// `BrushResize`; these are only its switches.
+fn resize_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    controls::section(ui, p, "Brush size drag");
+    let mut needs_press = ed.ui.resize_needs_press;
+    controls::row(ui, p, "Resize only while pressed", |ui| {
+        if widgets::toggle(ui, p, &mut needs_press).clicked() {
+            ed.ui.resize_needs_press = needs_press;
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        "Holding Alt shows the circle under the pointer but changes nothing \
+         until the pen or the mouse button is down. A tap without moving still \
+         picks a colour. With this on, Alt-dragging the mouse resizes rather \
+         than picking.",
+    );
+    ui.add_space(4.0);
+    let mut from_edge = ed.ui.resize_from_edge;
+    controls::row(ui, p, "Start at the circle's edge", |ui| {
+        if widgets::toggle(ui, p, &mut from_edge).clicked() {
+            ed.ui.resize_from_edge = from_edge;
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        "The pointer begins on the circle's edge and drags it. The brush ends \
+         up exactly as big as the circle you leave on the screen. Off, the \
+         pointer begins at the centre and the size doubles every hundred \
+         pixels to the right or up.",
+    );
 }
 
 /// Where the Text module looks for faces.
@@ -4016,6 +4063,116 @@ mod tests {
             between > 5.5 && between < 6.0,
             "a budget between two rungs landed at {between}",
         );
+    }
+
+    /// Every string a shape tree paints, with where it painted it, and every
+    /// toggle-sized rectangle. A `Shape::Vec` is what a widget's own painting
+    /// comes back as, so this recurses rather than reading the top level.
+    fn drawn(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>, toggles: &mut Vec<Rect>) {
+        match shape {
+            egui::Shape::Text(text) => texts.push((
+                text.galley.text().to_owned(),
+                Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            // `widgets::toggle` is the one control drawn as a 28×16 rounded
+            // fill; nothing else on the pane has that shape.
+            egui::Shape::Rect(r) if (r.rect.size() - vec2(28.0, 16.0)).length() < 0.01 => {
+                toggles.push(r.rect)
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    drawn(shape, texts, toggles);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The two brush-size-drag preferences are on the General pane and a press
+    /// on each one's toggle flips the flag the gesture reads.
+    ///
+    /// A guard on the model is not a guard on the panel: `BrushResize` is
+    /// tested in `editor`, and nothing there can see whether the pane offers
+    /// the switch at all or wires it to the right field. So this presses the
+    /// toggle egui actually drew — found by its row's label — and reads the
+    /// flag off the editor afterwards.
+    #[test]
+    fn the_brush_resize_toggles_flip_the_flags_the_gesture_reads() {
+        let _serial = prefs::prefs_lock();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::apply(&ctx, &palette);
+        // Tall enough that nothing on the pane is below the fold: the pane is
+        // drawn bare, without `pane`'s scroll area, so every row is reachable.
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(WIDTH - RAIL_WIDTH, 3000.0));
+        let mut ed = Editor::default();
+        let mut now = 0.0f64;
+        let mut run = |ed: &mut Editor, events: Vec<egui::Event>| {
+            now += 0.05;
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(now),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut actions = crate::ui::UiActions::default();
+                    general_pane(ui, &palette, ed, &mut actions);
+                },
+            );
+            let mut texts = Vec::new();
+            let mut toggles = Vec::new();
+            for clipped in &out.shapes {
+                drawn(&clipped.shape, &mut texts, &mut toggles);
+            }
+            (texts, toggles)
+        };
+        // Three passes build the font atlas, so the rows are where they will
+        // settle before anything is aimed at them.
+        for _ in 0..3 {
+            run(&mut ed, vec![]);
+        }
+
+        for (label, read) in [
+            (
+                "Resize only while pressed",
+                (|ed: &Editor| ed.ui.resize_needs_press) as fn(&Editor) -> bool,
+            ),
+            ("Start at the circle's edge", |ed: &Editor| {
+                ed.ui.resize_from_edge
+            }),
+        ] {
+            let (texts, toggles) = run(&mut ed, vec![]);
+            let (_, row) = texts
+                .iter()
+                .find(|(t, _)| t == label)
+                .unwrap_or_else(|| panic!("the General pane draws no row called {label:?}"));
+            // The toggle on that row is the one whose vertical centre is the
+            // label's: `controls::row` puts the control at the right end of
+            // the label's own line.
+            let toggle = toggles
+                .iter()
+                .find(|r| (r.center().y - row.center().y).abs() < row.height())
+                .copied()
+                .unwrap_or_else(|| panic!("no toggle on the {label:?} row"));
+            assert!(!read(&ed), "{label} starts off");
+            let at = toggle.center();
+            let button = |pressed: bool| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            run(&mut ed, vec![egui::Event::PointerMoved(at)]);
+            run(&mut ed, vec![button(true)]);
+            run(&mut ed, vec![button(false)]);
+            assert!(
+                read(&ed),
+                "pressing the toggle on the {label:?} row did not switch it on"
+            );
+        }
     }
 
     /// Drawing the pane does not change the budget, and a figure between two

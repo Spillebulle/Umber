@@ -1153,10 +1153,19 @@ mod tests {
         assert!(!editor.ui.resize_needs_press, "the default is off");
         assert!(!editor.ui.resize_from_edge, "the default is off");
         apply(&back, &ctx, &mut editor);
-        assert!(editor.ui.resize_needs_press, "reading the file must reach the gesture");
-        assert!(editor.ui.resize_from_edge, "reading the file must reach the gesture");
+        assert!(
+            editor.ui.resize_needs_press,
+            "reading the file must reach the gesture"
+        );
+        assert!(
+            editor.ui.resize_from_edge,
+            "reading the file must reach the gesture"
+        );
         let out = capture(&ctx, &editor);
-        assert!(out.resize_needs_press && out.resize_from_edge, "and back out again");
+        assert!(
+            out.resize_needs_press && out.resize_from_edge,
+            "and back out again"
+        );
     }
 
     /// The picker's own names, which the file is written in, must not be the

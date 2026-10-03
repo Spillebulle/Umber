@@ -32,7 +32,7 @@ use umber_core::docformat::{self, Canvas, SaveDocument, SaveLayer};
 use umber_core::export;
 use umber_core::history::PatchPiece;
 use umber_core::{
-    Brush, Clip, Color, Dab, Document, Edit, EditBody, EditKind, EditRefusal, InputPoint, Jump,
+    Clip, Color, Dab, Document, Edit, EditBody, EditKind, EditRefusal, InputPoint, Jump,
     PixelPatch, PixelRect, SelectionOp, Transform,
 };
 use umber_render::{
@@ -3255,9 +3255,16 @@ impl UmberApp {
         if start == self.editor.brush_resize.is_some() {
             return;
         }
-        self.editor.brush_resize = start.then_some(crate::editor::BrushResize {
-            origin: self.editor.cursor,
-            from: self.editor.brush.size,
+        // Anchored at once unless the artist has asked for the press to do it
+        // — see `BrushResize`, which is where both preferences are decided.
+        self.editor.brush_resize = start.then(|| {
+            crate::editor::BrushResize::new(
+                self.editor.cursor,
+                self.editor.brush.size,
+                self.editor.camera.zoom,
+                self.editor.ui.resize_from_edge,
+                !self.editor.ui.resize_needs_press,
+            )
         });
         // The circle appearing and — more importantly — disappearing is a frame
         // nothing else would ask for.
@@ -5423,7 +5430,17 @@ impl UmberApp {
         self.editor.last_cursor = pos;
 
         match decision {
-            gesture::Press::Ignored | gesture::Press::ResizeBrush => {}
+            gesture::Press::Ignored => {}
+            // The model decides whether this press anchors the drag or merely
+            // carries on the one Alt put down; either way the release reads
+            // `pressed` to settle tap-or-drag.
+            gesture::Press::ResizeBrush => {
+                let size = self.editor.brush.size;
+                let zoom = self.editor.camera.zoom;
+                if let Some(resize) = &mut self.editor.brush_resize {
+                    resize.press(pos, size, zoom);
+                }
+            }
             gesture::Press::Pan => self.editor.interaction = Interaction::Panning,
             gesture::Press::Zoom => {
                 self.editor.zoom_anchor = pos;
@@ -5514,9 +5531,14 @@ impl UmberApp {
             // pointer, or the tool looks dead until the next click lands a
             // vertex somewhere unexpected.
             Interaction::Idle => {
-                if let Some(resize) = self.editor.brush_resize {
-                    self.editor.brush.size =
-                        Brush::size_after_drag(resize.from, pos - resize.origin);
+                if let Some(resize) = &mut self.editor.brush_resize {
+                    // `None` while the drag is waiting for a press: the circle
+                    // has followed the pointer and the brush is untouched.
+                    if let Some(size) =
+                        resize.moved(pos, self.editor.brush.size, self.editor.camera.zoom)
+                    {
+                        self.editor.brush.size = size;
+                    }
                 } else if self.editor.selection_draft.is_some() {
                     let doc = self.editor.screen_to_doc(pos);
                     self.editor.selection_moved(doc);
@@ -5541,17 +5563,25 @@ impl UmberApp {
             || self.editor.brush_resize.is_some()
     }
 
-    /// The press was let go of. `contact` is whether it was a pen or a finger
-    /// leaving the glass rather than a button coming up.
-    fn pointer_released(&mut self, pos: Vec2, contact: bool) {
+    /// The press was let go of, by a button coming up or a pen or a finger
+    /// leaving the glass. Which of the two it was is not read here: the one
+    /// release the two pointers used to settle differently, the brush-size
+    /// drag, is settled off what the *press* resolved to.
+    fn pointer_released(&mut self, pos: Vec2) {
         self.editor.cursor = pos;
 
         // A contact that was carrying the brush-size drag is the one gesture a
         // pen spells differently from a mouse, and this is where the difference
         // is settled: it travelled, so it was the resize; it did not, so it was
         // the tablet's Alt-click and therefore the eyedropper. See
-        // `gesture::press`.
-        if contact && let Some(resize) = self.editor.brush_resize {
+        // `gesture::press`. Read off `pressed` rather than off whether this
+        // was a contact, because under "press to resize" a mouse button
+        // carries the drag too and its release has to be settled the same way
+        // — and a mouse press that did *not* carry it has already ended the
+        // drag, so the two readings agree wherever the old one applied.
+        if let Some(resize) = self.editor.brush_resize
+            && resize.pressed
+        {
             if gesture::is_tap(resize.origin.distance(pos)) {
                 // Put back the wobble the tap made of the size before reading
                 // the colour: a click is not allowed to have resized anything.
@@ -6167,7 +6197,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                             self.editor.interaction = Interaction::Idle;
                         }
                     }
-                    (false, MouseButton::Left) => self.pointer_released(pos, false),
+                    (false, MouseButton::Left) => self.pointer_released(pos),
                     (false, _) => {}
                 }
                 if let Some(g) = self.gfx.as_ref() {
@@ -6389,7 +6419,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                         // button comes up: the box is still there to be dragged
                         // again — unless the tap was a click outside it, which
                         // puts it down.
-                        self.pointer_released(pos, true);
+                        self.pointer_released(pos);
                         self.editor.drawing_touch = None;
                         self.editor.pinch = None;
                     }
