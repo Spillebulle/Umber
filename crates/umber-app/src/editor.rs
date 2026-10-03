@@ -398,6 +398,25 @@ pub struct UiState {
     /// changed does not decide whether it should still be true tomorrow, and the
     /// only place this one means anything is the button it governs.
     pub text_own_layer: bool,
+    /// The Alt brush-size drag waits for the pointer to go down.
+    ///
+    /// Off, Alt alone starts the drag and every movement rescales — a pen
+    /// hovering in range with Alt held is resizing, which is the complaint.
+    /// On, Alt arms it and the preview circle follows the pointer at the
+    /// current size until a button or the nib is down; only then is the circle
+    /// anchored and the drag measured. A mouse button then counts as a
+    /// contact, so the mouse takes the pen's rule whole and a tap is the
+    /// eyedropper — see `gesture::press`.
+    pub resize_needs_press: bool,
+    /// The Alt brush-size drag anchors the circle's **edge** under the pointer
+    /// rather than its centre.
+    ///
+    /// Off, the drag is a displacement spent on a doubling,
+    /// `Brush::size_after_drag`. On, the circle is placed with the pointer on
+    /// its right-hand rim and the rim follows the pointer: the size is the
+    /// distance to the centre, `Brush::size_from_rim`, so the brush is exactly
+    /// as big as the circle you left on the screen.
+    pub resize_from_edge: bool,
 }
 
 /// Tabs of the brush editor dialog.
@@ -536,6 +555,10 @@ impl Default for UiState {
             modulation: 0,
             save_history: true,
             text_own_layer: true,
+            // Both off: the drag every build before them made, so a
+            // preferences file that names neither changes nothing.
+            resize_needs_press: false,
+            resize_from_edge: false,
         }
     }
 }

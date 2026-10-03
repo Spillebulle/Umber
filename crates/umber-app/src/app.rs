@@ -6142,6 +6142,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                                 // of how Alt keeps meaning the eyedropper here.
                                 contact: false,
                                 resizing: self.editor.brush_resize.is_some(),
+                                press_resizes: self.editor.ui.resize_needs_press,
                             },
                         );
                     }
@@ -6288,6 +6289,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                                 pan_button: false,
                                 contact: true,
                                 resizing: self.editor.brush_resize.is_some(),
+                                press_resizes: self.editor.ui.resize_needs_press,
                             },
                         );
                         // A press the interface took is not this contact's to

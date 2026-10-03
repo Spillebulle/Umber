@@ -63,6 +63,10 @@ pub struct Pointer {
     /// A brush-size drag is armed, because Alt went down over the canvas with
     /// nothing else happening.
     pub resizing: bool,
+    /// The "press to resize" preference is on: the armed drag waits for the
+    /// pointer to go down and a button counts as a contact for that purpose.
+    /// See `UiState::resize_needs_press`.
+    pub press_resizes: bool,
 }
 
 /// What a press turned out to mean.
@@ -137,7 +141,13 @@ impl Press {
 ///    Krita and Photoshop spell it on a tablet: Alt with the nib down and
 ///    moving is the resize, and Alt with the nib down and *still* is the
 ///    eyedropper, settled at the release by [`is_tap`]. A mouse press is never
-///    a contact, so nothing about the mouse changes.
+///    a contact, so nothing about the mouse changes — **unless the artist has
+///    asked for it to**. `press_resizes` is the "press to resize" preference,
+///    under which Alt arms the drag and nothing moves until the pointer is
+///    down; a button is then a contact for this purpose and the mouse takes
+///    the pen's rule whole, tap-for-the-eyedropper included. That costs the
+///    mouse its Alt-*drag* eyedropper while the preference is on, which is
+///    the trade the preference states.
 /// 4. **Then Alt**, which is the eyedropper in every paint application.
 /// 5. **Then the tool.**
 pub fn press(p: Pointer) -> Press {
@@ -147,7 +157,7 @@ pub fn press(p: Pointer) -> Press {
     if p.ui_owns {
         return Press::Ignored;
     }
-    if p.contact && p.resizing {
+    if p.resizing && (p.contact || p.press_resizes) {
         return Press::ResizeBrush;
     }
     if p.alt {
@@ -322,6 +332,7 @@ mod tests {
             pan_button: false,
             contact: false,
             resizing: false,
+            press_resizes: false,
         }
     }
 
@@ -506,6 +517,35 @@ mod tests {
             ..armed
         };
         assert_eq!(press(same_by_mouse), Press::Eyedropper);
+    }
+
+    /// The "press to resize" preference makes a button a contact for this one
+    /// purpose: with it on, Alt arms the drag and nothing moves until the
+    /// pointer is down, mouse and pen alike. The eyedropper is then the tap,
+    /// settled at the release exactly as it already is for a pen.
+    #[test]
+    fn with_press_to_resize_on_a_mouse_button_carries_the_resize_too() {
+        let armed_by_mouse = Pointer {
+            alt: true,
+            resizing: true,
+            press_resizes: true,
+            ..mouse(Tool::Brush)
+        };
+        assert_eq!(press(armed_by_mouse), Press::ResizeBrush);
+        // The pen's answer is unchanged by the preference: it was already a
+        // contact.
+        let armed_by_pen = Pointer {
+            contact: true,
+            ..armed_by_mouse
+        };
+        assert_eq!(press(armed_by_pen), Press::ResizeBrush);
+        // And with nothing armed the preference is inert: Alt with a button is
+        // still the eyedropper, because there is no resize to carry on.
+        let unarmed = Pointer {
+            resizing: false,
+            ..armed_by_mouse
+        };
+        assert_eq!(press(unarmed), Press::Eyedropper);
     }
 
     #[test]
