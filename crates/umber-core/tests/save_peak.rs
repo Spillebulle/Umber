@@ -58,9 +58,21 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-            Some(live.saturating_sub(layout.size()))
-        });
+        // A compare-exchange loop by hand, because the two library spellings
+        // of it are each refused by one side of the gate: `fetch_update` is
+        // deprecated from Rust 1.99, which CI's newest-stable turns into a
+        // build failure under `-D warnings`, and its replacement `try_update`
+        // is stable only since 1.95, above the declared `rust-version`, which
+        // clippy's MSRV lint refuses. This is what either one does inside.
+        let mut live = LIVE.load(Ordering::Relaxed);
+        while let Err(now) = LIVE.compare_exchange_weak(
+            live,
+            live.saturating_sub(layout.size()),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            live = now;
+        }
         unsafe { System.dealloc(ptr, layout) }
     }
 }
