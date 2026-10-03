@@ -4855,7 +4855,15 @@ Three things follow, and all three were bugs:
     eyedropper is Alt with the nib down and still, settled at the release by
     `gesture::is_tap`. `a_pen_press_resolves_to_what_a_mouse_press_would` pins
     every other cell of the matrix, and `alt_with_a_contact_carries_the_brush_
-    resize_on` pins that this asymmetry does not leak back onto the mouse.
+    resize_on` pins that this asymmetry does not leak back onto the mouse —
+    **unless asked to**: `UiState::resize_needs_press` ("Resize only while
+    pressed", Settings → General) makes a button a contact for this one
+    purpose, so the mouse takes the pen's rule whole and loses its Alt-*drag*
+    eyedropper while it is on. A second preference, `resize_from_edge`,
+    anchors the circle's rim under the pointer and sizes the brush to the
+    circle left on screen. **Both are decided on `BrushResize`, a model with
+    no pointer in it**; `app.rs` supplies events and `ui.rs` draws at the
+    model's `centre`, which is the one field the two modes disagree about.
   - **One contact drives the Pan and Zoom tools; two fingers are still a
     pinch.** "One finger navigates nothing" is right for a hand that has landed
     on the glass with a brush in hand and wrong for somebody who went to the

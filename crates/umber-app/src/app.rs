@@ -3454,7 +3454,9 @@ impl UmberApp {
     /// way to resize a brush — so the pick is only decided at the release, by
     /// which time there is no gesture left to follow the pointer with. A pen
     /// user reaches the desktop half through the *tool* instead, where the
-    /// press is an ordinary `Press::Eyedropper` and the drag is the drag.
+    /// press is an ordinary `Press::Eyedropper` and the drag is the drag. A
+    /// mouse under "press to resize" (`UiState::resize_needs_press`) takes
+    /// the pen's rule and the same click-not-drag with it.
     ///
     /// Where the pointer has left the window it reads the desktop; see
     /// [`syspick`], and note that this is a second source of *pixels* and not
@@ -5413,10 +5415,12 @@ impl UmberApp {
         }
 
         // Every press ends the brush-size drag except the one that is carrying
-        // it on. A mouse press is never a contact, so `press` can never answer
-        // `ResizeBrush` for one and this stays exactly the rule it always was:
-        // Alt with a button is the eyedropper, Alt without one is the resize,
-        // and a press is what tells them apart.
+        // it on. A mouse press is never a contact, so without "press to
+        // resize" `press` can never answer `ResizeBrush` for one and this
+        // stays exactly the rule it always was: Alt with a button is the
+        // eyedropper, Alt without one is the resize, and a press is what tells
+        // them apart. With that preference on a button carries the drag as a
+        // contact does, and the release settles tap-or-drag for both.
         if decision != gesture::Press::ResizeBrush {
             self.set_brush_resize(false);
         }

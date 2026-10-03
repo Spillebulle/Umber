@@ -5850,6 +5850,57 @@ mod tests {
         }
     }
 
+    /// The brush-size preview is drawn at the model's **centre**, which is the
+    /// one field the two anchoring modes disagree about: for the edge-anchored
+    /// drag it is a radius to the left of where the pointer is. Drawn at the
+    /// origin instead, the rim would sit a radius away from the pointer that
+    /// is supposed to be holding it — and no test of the model can see where
+    /// the painter put the circle.
+    #[test]
+    fn the_brush_size_preview_is_drawn_where_the_size_is_measured_from() {
+        use crate::editor::BrushResize;
+        use glam::Vec2;
+        fn circles(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, f32)>) {
+            match shape {
+                egui::Shape::Circle(c) => out.push((c.center, c.radius)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| circles(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        for (from_edge, expected) in [
+            (true, egui::pos2(460.0, 300.0)),
+            (false, egui::pos2(500.0, 300.0)),
+        ] {
+            let mut ed = Editor::default();
+            ed.pixels_per_point = 1.0;
+            ed.camera.zoom = 2.0;
+            ed.brush.size = 40.0;
+            ed.brush_resize = Some(BrushResize::new(
+                Vec2::new(500.0, 300.0),
+                40.0,
+                2.0,
+                from_edge,
+                true,
+            ));
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                super::brush_size_preview(ui, &palette, &ed);
+            });
+            let mut found = Vec::new();
+            for clipped in &out.shapes {
+                circles(&clipped.shape, &mut found);
+            }
+            // The rim: 40 document px at zoom 2 is 80 screen px across, so a
+            // radius of 40 points at one pixel per point.
+            let (centre, _) = found
+                .iter()
+                .find(|(_, r)| (r - 40.0).abs() < 0.01)
+                .unwrap_or_else(|| panic!("no rim drawn (from_edge = {from_edge}): {found:?}"));
+            assert_eq!(*centre, expected, "from_edge = {from_edge}");
+        }
+    }
+
     /// Draw one loupe into a fresh context and hand back what it painted and
     /// the context it painted into.
     fn draw_loupe(seen: crate::loupe::Loupe) -> (egui::Context, Vec<(egui::Rect, egui::Color32)>) {
