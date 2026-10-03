@@ -12,6 +12,20 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.6
+
+Two new ways to resize a brush with Alt.
+
+### New
+
+- **Two ways to resize a brush with Alt**, both switches in Settings → General
+  and both off until you turn them on. "Resize only while pressed" leaves the
+  brush alone until the pen or the mouse button is down: holding Alt shows the
+  circle under the pointer, and the drag starts where you press. A tap without
+  moving still picks a colour. "Start at the circle's edge" puts the pointer on
+  the circle's rim and lets you drag the rim, so the brush ends up exactly as
+  big as the circle you leave on the screen.
+
 ## 0.1.5
 
 New icons throughout, a Flow control for brushes, smoother lasso selections, and
