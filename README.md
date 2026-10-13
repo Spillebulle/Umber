@@ -45,7 +45,7 @@ notes and the checksums.
 
 The `.deb`, the `.rpm` and the Arch package add the
 [Spillebulle archive](https://spillebulle.github.io/packages/) as they install,
-so `sudo apt upgrade`, `sudo dnf upgrade` or `sudo pacman -Syu` carries Umber
+so `apt upgrade`, `pacman -Syu` or your usual system update carries Umber
 along with everything else, on CachyOS and the other Arch distributions too.
 Nothing to configure.
 

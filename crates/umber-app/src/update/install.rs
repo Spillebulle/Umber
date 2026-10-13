@@ -134,13 +134,11 @@ impl Manager {
     /// was true of `pacman -Syu umber`, for a package in no repository, and of
     /// `flatpak update`, for a bundle with no remote.
     ///
-    /// **The arms with the archive print the commands `../Packages/
-    /// ENROLMENT.md` names**, the same three in every application from the
-    /// archive. `sudo dnf upgrade` is safe to name for rpm, although Fedora,
-    /// RHEL and openSUSE drive that format with different front ends, because
-    /// the archive is only *detected* through `/etc/yum.repos.d/`, which is
-    /// dnf's (and yum's) directory and not zypper's: a machine that has the
-    /// file is a machine where dnf reads it.
+    /// The rpm arms still print no command even with the archive configured,
+    /// and for the original reason: Fedora, RHEL and openSUSE drive the same
+    /// package format with three different front ends, so naming one would be
+    /// wrong on two distributions out of three. "Your usual system update" is
+    /// the sentence that is true on all three.
     fn remedy(self, version: &Version, arch: Option<Arch>) -> String {
         // Where the architecture is unknown there is no file name to write, and
         // inventing one would send somebody looking for a file that is not
@@ -151,7 +149,7 @@ impl Manager {
         match (self, arch) {
             (Self::Dpkg { archive: true }, _) => "This machine has the Spillebulle archive, \
                  so apt already has the new version. Update it with:\n\n    \
-                 sudo apt update && sudo apt upgrade"
+                 sudo apt update && sudo apt install --only-upgrade umber"
                 .to_string(),
 
             (Self::Dpkg { archive: false }, Some(arch)) => {
@@ -166,8 +164,7 @@ impl Manager {
             }
 
             (Self::Rpm { archive: true }, _) => "This machine has the Spillebulle archive, \
-                 so dnf already has the new version. Update it with:\n\n    \
-                 sudo dnf upgrade"
+                 so your usual system update now includes Umber."
                 .to_string(),
 
             (Self::Rpm { archive: false }, Some(arch)) => {
@@ -679,15 +676,9 @@ mod tests {
     fn pacmans_archive_is_the_section_the_package_appends() {
         // What `packaging/linux/umber.install` writes, after the
         // distribution's own repositories.
-        const ENROLLED: &str = "[options]
-HoldPkg = pacman glibc
-
-[core]
-            Include = /etc/pacman.d/mirrorlist
-
-[spillebulle]
-            Include = /etc/pacman.d/spillebulle
-";
+        const ENROLLED: &str = "[options]\nHoldPkg = pacman glibc\n\n\
+            [core]\nInclude = /etc/pacman.d/mirrorlist\n\n\
+            [spillebulle]\nInclude = /etc/pacman.d/spillebulle\n";
         let env = no_env();
         let arch = || {
             probe(
@@ -708,13 +699,8 @@ HoldPkg = pacman glibc
         // that cannot be read says nothing either way, so neither is the
         // archive: printing `pacman -Syu` to them is the defect itself.
         for conf in [
-            "[core]
-Include = /etc/pacman.d/mirrorlist
-#[spillebulle]
-",
-            "[core]
-Include = /etc/pacman.d/mirrorlist
-",
+            "[core]\nInclude = /etc/pacman.d/mirrorlist\n#[spillebulle]\n",
+            "[core]\nInclude = /etc/pacman.d/mirrorlist\n",
             "",
         ] {
             let p = with_pacman_conf(arch(), conf);
@@ -989,36 +975,30 @@ Include = /etc/pacman.d/mirrorlist
         }
     }
 
-    /// With the archive, each manager is told the command
-    /// `../Packages/ENROLMENT.md` names, the same in every application from
-    /// the archive, and no file name, because there is nothing to fetch.
     #[test]
-    fn with_the_archive_each_manager_is_told_to_do_the_upgrade() {
-        for (manager, command) in [
-            (
-                Manager::Dpkg { archive: true },
-                "sudo apt update && sudo apt upgrade",
-            ),
-            (Manager::Rpm { archive: true }, "sudo dnf upgrade"),
-            (Manager::Pacman { archive: true }, "sudo pacman -Syu"),
-        ] {
-            for arch in [Some(Arch::X86_64), Some(Arch::Aarch64), None] {
-                let message = InstallKind::Managed(manager)
-                    .cannot_update(&offered(), arch)
-                    .expect("a managed copy says why");
-                assert!(
-                    message.contains(command),
-                    "{manager:?}:
-{message}"
-                );
-                for extension in [".deb", ".rpm", ".flatpak", ".pkg.tar.zst"] {
-                    assert!(
-                        !message.contains(extension),
-                        "{manager:?}:
-{message}"
-                    );
-                }
-            }
+    fn with_the_archive_apt_is_told_to_do_the_upgrade() {
+        let message = InstallKind::Managed(Manager::Dpkg { archive: true })
+            .cannot_update(&offered(), Some(Arch::X86_64))
+            .expect("a managed copy says why");
+        assert!(
+            message.contains("sudo apt update && sudo apt install --only-upgrade umber"),
+            "{message}",
+        );
+        // And no file name, because there is nothing to go and fetch.
+        assert!(!message.contains(".deb"), "{message}");
+    }
+
+    #[test]
+    fn with_the_archive_pacman_is_told_to_do_the_upgrade() {
+        // The section `umber.install` appends is what makes `pacman -Syu` find
+        // a new Umber, so with it that is the whole answer, on any
+        // architecture, and there is no file to name.
+        for arch in [Some(Arch::X86_64), Some(Arch::Aarch64), None] {
+            let message = InstallKind::Managed(Manager::Pacman { archive: true })
+                .cannot_update(&offered(), arch)
+                .expect("a managed copy says why");
+            assert!(message.contains("sudo pacman -Syu"), "{arch:?}\n{message}");
+            assert!(!message.contains(".pkg.tar.zst"), "{arch:?}\n{message}");
         }
     }
 

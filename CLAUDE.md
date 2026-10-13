@@ -5459,8 +5459,9 @@ must not learn about HTTP, the same boundary that keeps them testable.
     ever disagree nothing breaks visibly, and every user of the archive is
     simply told to download a file by hand for ever.
   - **The updater says which of the two situations a machine is in.** With the
-    archive it prints the command ENROLMENT.md names (`sudo apt update && sudo
-    apt upgrade`, `sudo dnf upgrade`, `sudo pacman -Syu`); without it, it names
+    archive it prints the upgrade command (`sudo apt update && sudo apt install
+    --only-upgrade umber`, `sudo pacman -Syu`, and for rpm "your usual system
+    update", since three front ends share the format); without it, it names
     the exact package file to fetch. pacman's archive is a section of
     `/etc/pacman.conf` rather than a file, so the `Probe` carries a `read` as
     well as an `exists`. It never prints an upgrade command to a machine that

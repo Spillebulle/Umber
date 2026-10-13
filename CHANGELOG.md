@@ -24,9 +24,6 @@ archive can be installed beside it.
   upgrades Umber with everything else, on Arch, CachyOS and the other Arch
   distributions. When an update is out, Umber says that command; on an Arch
   machine without the archive it names the exact file to fetch instead.
-- **Umber names your system's usual upgrade command** when the archive is set
-  up: `sudo apt update && sudo apt upgrade`, `sudo dnf upgrade` or
-  `sudo pacman -Syu`.
 
 ### Fixed
 
