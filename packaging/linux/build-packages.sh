@@ -172,14 +172,17 @@ echo "==> building umber_${version}_${arch}.deb"
 deb="$work/deb"
 stage_tree "$deb/usr"
 mkdir -p "$deb/DEBIAN"
-# `/usr/share/keyrings` rather than `/etc/apt/keyrings`: the first is where a
-# package puts a keyring it owns and dpkg can track, the second is where a
-# human puts one by hand. `Signed-By` in the source below names this file, so
-# the key is never fetched over the network and the archive is trusted for
-# these packages and for nothing else on the system.
+# The key ships under **Umber's own name**, `/usr/share/umber/`, and the
+# `postinst` below copies it to the shared keyring the source names. Up to
+# 0.1.6 it shipped at `/usr/share/keyrings/spillebulle-archive.gpg`, which was
+# right for one application and wrong for two: dpkg refuses to install a package
+# that ships a path another package already owns, even byte for byte the same
+# file, so the second application from the archive would not install at all.
+# `../Packages/ENROLMENT.md` is the contract every application follows, and
+# these paths are copied from it rather than derived.
 if [ -n "$archive_key" ]; then
     install -Dm644 "$work/$ARCHIVE_KEYRING.gpg" \
-        "$deb/usr/share/keyrings/$ARCHIVE_KEYRING.gpg"
+        "$deb/usr/share/umber/$ARCHIVE_KEYRING.gpg"
 fi
 # Installed-Size is in kibibytes and Debian's own tools warn without it.
 size=$(du -ks "$deb/usr" | cut -f1)
@@ -234,17 +237,38 @@ EOF
 # against it or pointed it somewhere else keeps their version. Deleting it and
 # leaving `.disabled` beside it is the documented way off the archive, and is
 # honoured here so that the next upgrade does not quietly put it back.
+#
+# The keyring follows the same rule. `/etc/apt/keyrings/` belongs to no
+# package, so every application's `postinst` puts the key there if it is
+# missing and none of them owns it; removing one leaves the others verifying.
+# A machine enrolled by 0.1.6 or earlier has a source whose `Signed-By` names
+# `/usr/share/keyrings/`, a file this upgrade removes, so that one line is
+# pointed at the shared copy; any other `Signed-By` is somebody's own and is
+# left alone. Every step ends `|| true`: a painting application that installs
+# without enrolling is better than one that does not install.
+#
+# Byte for byte `../Packages/ENROLMENT.md`'s apt scriptlet, which is why it is
+# a quoted heredoc with the URL spelt out rather than built from variables.
 if [ -n "$archive_key" ]; then
-    cat >> "$deb/DEBIAN/postinst" <<EOF
+    cat >> "$deb/DEBIAN/postinst" <<'EOF'
 
 sources=/etc/apt/sources.list.d/spillebulle.sources
-if [ ! -e "\$sources" ] && [ ! -e "\$sources.disabled" ]; then
-    cat > "\$sources" <<'SOURCES'
-Types: deb
-URIs: $ARCHIVE_BASE/deb/
-Suites: ./
-Signed-By: /usr/share/keyrings/$ARCHIVE_KEYRING.gpg
-SOURCES
+keyring=/etc/apt/keyrings/spillebulle-archive.gpg
+if [ ! -e "$sources.disabled" ]; then
+    mkdir -p /etc/apt/keyrings || true
+    [ -e "$keyring" ] || install -m644 /usr/share/umber/spillebulle-archive.gpg "$keyring" || true
+    # Packages from before this contract shipped the keyring at
+    # /usr/share/keyrings/, which an upgrade removes; point at the shared copy.
+    if [ -e "$sources" ] && grep -q '^Signed-By: /usr/share/keyrings/spillebulle-archive.gpg$' "$sources"; then
+        sed -i "s|^Signed-By: /usr/share/keyrings/spillebulle-archive.gpg\$|Signed-By: $keyring|" "$sources" || true
+    fi
+    if [ ! -e "$sources" ]; then
+        printf '%s\n' \
+            'Types: deb' \
+            'URIs: https://spillebulle.github.io/packages/deb/' \
+            'Suites: ./' \
+            "Signed-By: $keyring" > "$sources" || true
+    fi
 fi
 EOF
 fi
@@ -332,7 +356,10 @@ fi
     if [ -n "$archive_key" ]; then
         echo "repo=/etc/yum.repos.d/spillebulle.repo"
         echo "if [ ! -e \"\$repo\" ] && [ ! -e \"\$repo.disabled\" ]; then"
-        echo "    cat > \"\$repo\" <<'REPO'"
+        # `|| :` because a distribution with no `/etc/yum.repos.d` (openSUSE
+        # keeps its own elsewhere) must still install Umber; the contract's
+        # rule that every step may fail without failing the install.
+        echo "    cat > \"\$repo\" <<'REPO' || :"
         echo "[spillebulle]"
         echo "name=Spillebulle"
         echo "baseurl=$ARCHIVE_BASE/rpm/"

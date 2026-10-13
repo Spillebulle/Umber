@@ -300,6 +300,10 @@ jobs:
           work=/home/builder/build
           install -d -o builder "$work"
           cp packaging/linux/PKGBUILD "$work/"
+          # Named by the PKGBUILD's `install=`, and makepkg only looks for it
+          # beside the PKGBUILD. Without it the build fails, which is the good
+          # outcome: the alternative is a package that never enrols the machine.
+          cp packaging/linux/umber.install "$work/"
           cp "dist/umber-${version}-x86_64-unknown-linux-gnu.tar.gz" "$work/"
           sed -i "s/^pkgver=.*/pkgver=${version}/" "$work/PKGBUILD"
           chown -R builder "$work"

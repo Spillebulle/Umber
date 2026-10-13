@@ -1,0 +1,47 @@
+# What the Arch package does on install: enrol the machine in the Spillebulle
+# package archive, so `sudo pacman -Syu` keeps Umber current from then on, the
+# way it keeps everything else current. Without this the package is in no
+# repository and pacman has nothing to upgrade it from, for ever.
+#
+# Copied from `../Packages/ENROLMENT.md`, which is the one contract every
+# application from the archive follows; change it there first. The rules it
+# keeps: every file is created only if it is missing, nothing is ever removed
+# (so there is no pre_remove or post_remove here, and removing Umber does not
+# cut the others off), `/etc/pacman.d/spillebulle.disabled` opts out, and every
+# step ends `|| true` because an application that installs without enrolling
+# is better than one that does not install.
+#
+# The key is trusted with a local signature, which is what `pacman-key` does
+# for every third-party repository. The section goes at the end of
+# `pacman.conf`, after the distribution's own repositories, so theirs win any
+# name they share. `packaging/check.sh` holds these paths against the updater's
+# (`crates/umber-app/src/update/install.rs`).
+
+_spillebulle_archive() {
+    local conf=/etc/pacman.d/spillebulle
+    local fpr=7A9EA69E033F3C3EF4F53EB4A72BC0FD5E061ADA
+    [ -e "$conf.disabled" ] && return 0
+    # Every time, not only when the key is missing: both are idempotent, and
+    # a key present but never signed (an earlier attempt that failed) would
+    # otherwise stay "unknown trust" for ever and stop `pacman -Syu`.
+    if command -v pacman-key >/dev/null 2>&1; then
+        pacman-key --add /usr/share/umber/spillebulle-archive.asc >/dev/null 2>&1 || true
+        pacman-key --lsign-key "$fpr" >/dev/null 2>&1 || true
+    fi
+    if [ ! -e "$conf" ]; then
+        printf '%s\n' \
+            'SigLevel = Required DatabaseRequired' \
+            'Server = https://spillebulle.github.io/packages/arch/$arch' > "$conf" || true
+    fi
+    if ! grep -q '^\[spillebulle\]' /etc/pacman.conf 2>/dev/null; then
+        printf '\n[spillebulle]\nInclude = %s\n' "$conf" >> /etc/pacman.conf || true
+    fi
+}
+
+post_install() {
+    _spillebulle_archive
+}
+
+post_upgrade() {
+    _spillebulle_archive
+}

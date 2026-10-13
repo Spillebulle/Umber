@@ -23,6 +23,13 @@ provides=('umber')
 conflicts=('umber')
 options=('!strip' '!debug')
 
+# The scriptlet that enrols the machine in the Spillebulle archive, so that
+# `pacman -Syu` upgrades Umber afterwards. makepkg wants the file beside this
+# one, which is why `release.yml` copies it into the build directory; and
+# `packaging/check.sh` fails if either half goes missing, because a package
+# built without it installs perfectly and simply never upgrades.
+install=umber.install
+
 # Opened at runtime by winit and wgpu rather than recorded in the ELF, so
 # namcap's automatic scan will not find them.
 #
@@ -65,6 +72,11 @@ package() {
         install -Dm644 "${stage}/icons/umber-${size}.png" \
             "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/io.github.spillebulle.umber.png"
     done
+    # The archive's public key, armoured, under Umber's own name: no two
+    # packages may ship one path, so `umber.install` hands it to `pacman-key`
+    # from here rather than every application shipping a shared copy.
+    install -Dm644 "${stage}/packaging/linux/spillebulle-archive.asc" \
+        "${pkgdir}/usr/share/umber/spillebulle-archive.asc"
     install -Dm644 "${stage}/LICENSE" \
         "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
     install -Dm644 "${stage}/README.md" \

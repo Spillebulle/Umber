@@ -82,14 +82,73 @@ ok "every packaging script names $APP_ID"
 # the updater still runs, and it simply tells every user of the archive to go
 # and download a file by hand for ever. That is the shape of defect this whole
 # script exists for.
+#
+# The paths are `../Packages/ENROLMENT.md`'s, the contract every application
+# from the archive follows, and are spelt out here rather than read from it
+# because that file is in another repository CI does not check out.
+updater=crates/umber-app/src/update/install.rs
 for path in /etc/apt/sources.list.d/spillebulle.sources \
             /etc/yum.repos.d/spillebulle.repo; do
     grep -q "$path" packaging/linux/build-packages.sh || \
         fail "packaging/linux/build-packages.sh never writes $path"
-    grep -q "$path" crates/umber-app/src/update/install.rs || \
+    grep -qF "$path" "$updater" || \
         fail "the updater never looks for $path"
 done
+
+# pacman's half. The scriptlet appends a `[spillebulle]` section to
+# /etc/pacman.conf, and that section is what the updater reads to decide
+# whether `pacman -Syu` can find a new Umber.
+arch_install=packaging/linux/umber.install
+[ -f "$arch_install" ] || fail "$arch_install is missing"
+for text in /etc/pacman.conf '[spillebulle]'; do
+    grep -qF "$text" "$arch_install" || fail "$arch_install never writes $text"
+    grep -qF "$text" "$updater" || fail "the updater never looks for $text"
+done
+grep -qF 'conf=/etc/pacman.d/spillebulle' "$arch_install" || \
+    fail "$arch_install does not write /etc/pacman.d/spillebulle"
+grep -qF 'Server = https://spillebulle.github.io/packages/arch/$arch' "$arch_install" || \
+    fail "$arch_install does not point pacman at the archive's arch/\$arch"
+grep -q '^post_install()' "$arch_install" && grep -q '^post_upgrade()' "$arch_install" || \
+    fail "$arch_install must enrol on both post_install and post_upgrade"
+if grep -qE '^(pre|post)_remove\(\)' "$arch_install"; then
+    fail "$arch_install has a remove hook; nothing the archive needs is ever removed"
+fi
 ok "the packages and the updater agree on where the archive is configured"
+
+# The key each package ships, and the path its scriptlet reads it from, must be
+# the same file. Under Umber's own name in both formats, never a shared path:
+# dpkg refuses a second package that ships a path the first already owns, so
+# a shared keyring in the `.deb` stops the next application installing at all.
+grep -q '"\$deb/usr/share/umber/\$ARCHIVE_KEYRING.gpg"' packaging/linux/build-packages.sh || \
+    fail "the .deb does not ship the key at /usr/share/umber/spillebulle-archive.gpg"
+grep -qF 'install -m644 /usr/share/umber/spillebulle-archive.gpg "$keyring"' \
+    packaging/linux/build-packages.sh || \
+    fail "the .deb's postinst does not copy /usr/share/umber/spillebulle-archive.gpg to the shared keyring"
+grep -qF 'keyring=/etc/apt/keyrings/spillebulle-archive.gpg' packaging/linux/build-packages.sh || \
+    fail "the .deb's postinst does not use the shared keyring /etc/apt/keyrings/spillebulle-archive.gpg"
+if grep -q '\$deb/usr/share/keyrings' packaging/linux/build-packages.sh; then
+    fail "the .deb ships a file under /usr/share/keyrings, which a second application cannot also ship"
+fi
+grep -qF '"${pkgdir}/usr/share/umber/spillebulle-archive.asc"' packaging/linux/PKGBUILD || \
+    fail "the Arch package does not ship the key at /usr/share/umber/spillebulle-archive.asc"
+grep -qF 'pacman-key --add /usr/share/umber/spillebulle-archive.asc' "$arch_install" || \
+    fail "$arch_install does not add the key from /usr/share/umber/spillebulle-archive.asc"
+grep -qF 7A9EA69E033F3C3EF4F53EB4A72BC0FD5E061ADA "$arch_install" || \
+    fail "$arch_install does not trust the archive key's fingerprint"
+# Signed on every install, never only when the key is missing: a key added once
+# but never signed stays "unknown trust" and stops `pacman -Syu` for good.
+if grep -q 'list-keys' "$arch_install"; then
+    fail "$arch_install guards the key on --list-keys; it must add and lsign it every time"
+fi
+ok "every package ships the key under its own name, where its scriptlet reads it"
+
+# The Arch scriptlet only runs if the PKGBUILD names it, and makepkg only finds
+# it if the workflow copies it next to the PKGBUILD.
+grep -q '^install=umber.install$' packaging/linux/PKGBUILD || \
+    fail "the PKGBUILD does not name umber.install, so the scriptlet never runs"
+grep -qF 'cp packaging/linux/umber.install' .github/workflows/release.yml || \
+    fail "release.yml does not copy umber.install beside the PKGBUILD, so makepkg will fail"
+ok "the Arch scriptlet is named by the PKGBUILD and shipped by the workflow"
 
 # Not a failure: the public key is checked in when the archive has one, and
 # until then the packages build exactly as they did before it existed. Said out
