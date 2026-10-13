@@ -54,7 +54,8 @@ jobs:
 
       - name: Shell syntax
         run: |
-          for f in packaging/linux/build-packages.sh tools/*.sh; do
+          for f in packaging/linux/build-packages.sh packaging/linux/umber.install \
+                   packaging/check.sh tools/*.sh; do
             bash -n "$f"
           done
 
@@ -69,6 +70,241 @@ jobs:
       # to find out — see the header of the script.
       - name: Metadata consistency
         run: sh packaging/check.sh
+
+  # --- the packages enrol the machine -----------------------------------------
+  #
+  # `../Packages/ENROLMENT.md` says what every `.deb`, `.rpm` and Arch package
+  # does on install, and "Checking it" there is these jobs: install each in a
+  # clean container and assert the keyring, the source, the section and the
+  # trusted key. The scriptlets otherwise run for the first time on somebody's
+  # machine, after the release.
+  #
+  # **The binary inside is `/usr/bin/true`, deliberately.** What is under test is
+  # the packaging and its scriptlets, which do not care what the executable
+  # does, and a real release build is ten minutes of wgpu for no extra
+  # information; `release.yml` packages the real one. Everything else is what
+  # ships: the same `build-packages.sh`, the same PKGBUILD and `umber.install`.
+  enrol-build:
+    name: enrolment / build packages
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the .deb and .rpm around a stub binary
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          cp /usr/bin/true umber
+          bash packaging/linux/build-packages.sh "$version" ./umber amd64 dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enrol-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+
+  # The defect the contract exists for only shows with **two** applications
+  # installed: dpkg refuses a package that ships a path another package already
+  # owns, even byte for byte the same file. So a second package is made from
+  # Umber's by renaming every path and word that says `umber` to `twin`.
+  # Whatever path is then still shared between the two is one that is not
+  # Umber's own, which is exactly the kind of file that stops the second
+  # application installing.
+  enrol-debian:
+    name: enrolment / debian
+    needs: enrol-build
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: enrol-packages
+          path: dist
+
+      - name: Install, then install a second enrolling package
+        run: |
+          set -eu
+          apt-get update
+          deb=$(ls dist/*.deb)
+          apt-get install -y "./$deb"
+
+          sources=/etc/apt/sources.list.d/spillebulle.sources
+          keyring=/etc/apt/keyrings/spillebulle-archive.gpg
+          test -f "$keyring" || { echo "no keyring at $keyring"; exit 1; }
+          cmp "$keyring" /usr/share/umber/spillebulle-archive.gpg
+          test ! -e /usr/share/keyrings/spillebulle-archive.gpg
+          printf '%s\n' 'Types: deb' \
+            'URIs: https://spillebulle.github.io/packages/deb/' \
+            'Suites: ./' "Signed-By: $keyring" > expected.sources
+          diff -u expected.sources "$sources"
+          # The archive's key, dearmoured, which is what apt reads.
+          apt-get install -y gpg
+          gpg --show-keys --with-colons "$keyring" \
+            | grep -qx 'fpr:::::::::7A9EA69E033F3C3EF4F53EB4A72BC0FD5E061ADA:'
+          # And the live archive verifies against it, which is the only proof
+          # that the key and the paths together work.
+          apt-get -o APT::Update::Error-Mode=any update
+
+          # The second application.
+          mkdir twin
+          dpkg-deb -R "$deb" twin
+          # Listed before renaming, deepest first, so no rename moves a path
+          # that is still to be visited.
+          find twin -depth -name '*umber*' > renames
+          while read -r path; do
+            dir=$(dirname "$path"); base=$(basename "$path")
+            mv "$path" "$dir/$(printf '%s' "$base" | sed 's/umber/twin/g')"
+          done < renames
+          sed -i 's/umber/twin/g' twin/DEBIAN/control twin/DEBIAN/postinst twin/DEBIAN/postrm
+          dpkg-deb --build --root-owner-group twin twin.deb
+          dpkg -c twin.deb
+          rm "$sources"   # so the twin's postinst is seen writing it too
+          apt-get install -y ./twin.deb
+          diff -u expected.sources "$sources"
+          cmp "$keyring" /usr/share/twin/spillebulle-archive.gpg
+
+          # Removing one leaves the other enrolled.
+          apt-get remove -y umber
+          diff -u expected.sources "$sources"
+          test -f "$keyring"
+
+      - name: A machine enrolled before the contract is moved to the shared keyring
+        run: |
+          set -eu
+          sources=/etc/apt/sources.list.d/spillebulle.sources
+          printf '%s\n' 'Types: deb' \
+            'URIs: https://spillebulle.github.io/packages/deb/' \
+            'Suites: ./' 'Signed-By: /usr/share/keyrings/spillebulle-archive.gpg' > "$sources"
+          rm /etc/apt/keyrings/spillebulle-archive.gpg
+          /var/lib/dpkg/info/twin.postinst configure
+          grep -qx 'Signed-By: /etc/apt/keyrings/spillebulle-archive.gpg' "$sources"
+          test -f /etc/apt/keyrings/spillebulle-archive.gpg
+
+          # Somebody's own Signed-By is theirs.
+          sed -i 's|^Signed-By: .*|Signed-By: /root/mine.gpg|' "$sources"
+          /var/lib/dpkg/info/twin.postinst configure
+          grep -qx 'Signed-By: /root/mine.gpg' "$sources"
+
+      - name: The .disabled marker is honoured
+        run: |
+          set -eu
+          sources=/etc/apt/sources.list.d/spillebulle.sources
+          rm -f "$sources" /etc/apt/keyrings/spillebulle-archive.gpg
+          touch "$sources.disabled"
+          /var/lib/dpkg/info/twin.postinst configure
+          test ! -e "$sources"
+          test ! -e /etc/apt/keyrings/spillebulle-archive.gpg
+
+  enrol-fedora:
+    name: enrolment / fedora
+    needs: enrol-build
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: enrol-packages
+          path: dist
+
+      - name: Install
+        run: |
+          set -eu
+          dnf install -y dist/*.rpm
+          repo=/etc/yum.repos.d/spillebulle.repo
+          test -f /etc/pki/rpm-gpg/RPM-GPG-KEY-spillebulle
+          cat "$repo"
+          grep -qx 'baseurl=https://spillebulle.github.io/packages/rpm/' "$repo"
+          grep -qx 'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-spillebulle' "$repo"
+          grep -qx 'gpgcheck=1' "$repo"
+          grep -qx 'repo_gpgcheck=1' "$repo"
+          # The live archive's signed metadata verifies with the key the
+          # package installed.
+          dnf -y makecache --repo spillebulle
+
+  # The Arch package is built here the way `release.yml` builds it: the
+  # release tarball's layout, the PKGBUILD with `pkgver` filled in, and
+  # `umber.install` beside it. Then installed **with** its scriptlets, which is
+  # pacman's default and the whole point.
+  enrol-arch:
+    name: enrolment / archlinux
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the package around a stub binary
+        run: |
+          set -eu
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          stage="umber-${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "staging/$stage"
+          cp /usr/bin/true "staging/$stage/umber"
+          cp README.md CHANGELOG.md LICENSE "staging/$stage/"
+          cp -r packaging "staging/$stage/"
+          cp -r assets/icons "staging/$stage/icons"
+
+          useradd -m builder
+          work=/home/builder/build
+          install -d -o builder "$work"
+          tar czf "$work/${stage}.tar.gz" -C staging "$stage"
+          cp packaging/linux/PKGBUILD packaging/linux/umber.install "$work/"
+          sed -i "s/^pkgver=.*/pkgver=${version}/" "$work/PKGBUILD"
+          chown -R builder "$work"
+          su builder -c "cd $work && makepkg --noconfirm --nodeps"
+          mkdir -p out
+          cp "$work"/*.pkg.tar.zst out/
+          ls -l out
+
+      - name: Install with its scriptlets
+        run: |
+          set -eu
+          # A real Arch machine has a local master key from installation; the
+          # container's keyring has none until this, and `--lsign-key` needs it.
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Sy --noconfirm
+          pacman -U --noconfirm out/*.pkg.tar.zst
+
+          fpr=7A9EA69E033F3C3EF4F53EB4A72BC0FD5E061ADA
+          grep -qx '\[spillebulle\]' /etc/pacman.conf
+          grep -qx 'Include = /etc/pacman.d/spillebulle' /etc/pacman.conf
+          tail -n 4 /etc/pacman.conf
+          test -f /etc/pacman.d/spillebulle
+          grep -qx 'SigLevel = Required DatabaseRequired' /etc/pacman.d/spillebulle
+          grep -qxF 'Server = https://spillebulle.github.io/packages/arch/$arch' /etc/pacman.d/spillebulle
+          test -f /usr/share/umber/spillebulle-archive.asc
+          pacman-key --list-keys "$fpr"
+
+          # Installing again adds no second section.
+          pacman -U --noconfirm out/*.pkg.tar.zst
+          test "$(grep -c '^\[spillebulle\]' /etc/pacman.conf)" = 1
+
+          # Trusted, not merely present: the live archive's database is signed
+          # and `DatabaseRequired`, so this refuses unless the key the package
+          # added carries the local signature. A key present but never signed
+          # is "unknown trust", which is exactly what stopped `pacman -Syu`.
+          pacman -Sy --noconfirm
+          pacman -Sl spillebulle
+
+      - name: The .disabled marker is honoured
+        run: |
+          set -eu
+          # Off the archive: section and settings gone, marker left.
+          sed -i '/^\[spillebulle\]$/,/^Include = \/etc\/pacman.d\/spillebulle$/d' /etc/pacman.conf
+          rm /etc/pacman.d/spillebulle
+          touch /etc/pacman.d/spillebulle.disabled
+          pacman -U --noconfirm out/*.pkg.tar.zst
+          # Not `! grep`: a negated command never trips `set -e`.
+          if grep -q '^\[spillebulle\]' /etc/pacman.conf; then
+            echo "the section came back despite the marker"; exit 1
+          fi
+          test ! -e /etc/pacman.d/spillebulle
 
   # **Every runner the release builds on.** `release.ps1` will not push a tag
   # until this workflow is green on that commit, which only means anything if
