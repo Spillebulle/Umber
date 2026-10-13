@@ -87,7 +87,7 @@ impl Arch {
 
 /// The package manager that owns an installation.
 ///
-/// The two formats the house archive publishes carry a second fact with them:
+/// The three formats the house archive publishes carry a second fact with them:
 /// whether *this machine* has that archive configured. It is the difference
 /// between a package manager that can fetch a new Umber and one that cannot,
 /// and it changes the whole of what there is to say, so it is part of the
@@ -101,7 +101,9 @@ pub enum Manager {
     Rpm {
         archive: bool,
     },
-    Pacman,
+    Pacman {
+        archive: bool,
+    },
     /// A system path with no recognisable manager behind it. Named separately
     /// from "unknown installation" because the answer to the user is different:
     /// this one is certainly not ours to overwrite.
@@ -115,7 +117,7 @@ impl Manager {
             Self::Flatpak => "Flatpak",
             Self::Dpkg { .. } => "apt / dpkg",
             Self::Rpm { .. } => "dnf / zypper / rpm",
-            Self::Pacman => "pacman",
+            Self::Pacman { .. } => "pacman",
             Self::Unknown => "a package manager",
         }
     }
@@ -132,11 +134,13 @@ impl Manager {
     /// was true of `pacman -Syu umber`, for a package in no repository, and of
     /// `flatpak update`, for a bundle with no remote.
     ///
-    /// The rpm arms still print no command even with the archive configured,
-    /// and for the original reason: Fedora, RHEL and openSUSE drive the same
-    /// package format with three different front ends, so naming one would be
-    /// wrong on two distributions out of three. "Your usual system update" is
-    /// the sentence that is true on all three.
+    /// **The arms with the archive print the commands `../Packages/
+    /// ENROLMENT.md` names**, the same three in every application from the
+    /// archive. `sudo dnf upgrade` is safe to name for rpm, although Fedora,
+    /// RHEL and openSUSE drive that format with different front ends, because
+    /// the archive is only *detected* through `/etc/yum.repos.d/`, which is
+    /// dnf's (and yum's) directory and not zypper's: a machine that has the
+    /// file is a machine where dnf reads it.
     fn remedy(self, version: &Version, arch: Option<Arch>) -> String {
         // Where the architecture is unknown there is no file name to write, and
         // inventing one would send somebody looking for a file that is not
@@ -147,7 +151,7 @@ impl Manager {
         match (self, arch) {
             (Self::Dpkg { archive: true }, _) => "This machine has the Spillebulle archive, \
                  so apt already has the new version. Update it with:\n\n    \
-                 sudo apt update && sudo apt install --only-upgrade umber"
+                 sudo apt update && sudo apt upgrade"
                 .to_string(),
 
             (Self::Dpkg { archive: false }, Some(arch)) => {
@@ -162,7 +166,8 @@ impl Manager {
             }
 
             (Self::Rpm { archive: true }, _) => "This machine has the Spillebulle archive, \
-                 so your usual system update now includes Umber."
+                 so dnf already has the new version. Update it with:\n\n    \
+                 sudo dnf upgrade"
                 .to_string(),
 
             (Self::Rpm { archive: false }, Some(arch)) => {
@@ -176,15 +181,26 @@ impl Manager {
                 )
             }
 
-            // The Arch package is built for x86-64 only, and is in no
-            // repository: neither the official ones nor the AUR. So there is
-            // nothing for `pacman -Syu` to find, and the file is the answer.
-            (Self::Pacman, Some(Arch::X86_64)) => {
+            // The archive's pacman repository is `[spillebulle]`, and the
+            // package's `umber.install` adds it on install. With it, the system
+            // upgrade carries Umber like everything else.
+            (Self::Pacman { archive: true }, _) => "This machine has the Spillebulle archive, \
+                 so pacman already has the new version. Update it with:\n\n    \
+                 sudo pacman -Syu"
+                .to_string(),
+
+            // Without the section the package is in no repository pacman
+            // reads: not the official ones, not the AUR. So there is nothing
+            // for `pacman -Syu` to find, and the file is the answer. x86-64
+            // only, because the Arch package is.
+            (Self::Pacman { archive: false }, Some(Arch::X86_64)) => {
                 let file = format!("umber-bin-{version}-1-x86_64.pkg.tar.zst");
                 format!(
-                    "The Arch package is in no repository, so pacman has nothing to \
-                     upgrade from. Take {file} from the releases page and install it \
-                     over this one:\n\n    sudo pacman -U {file}"
+                    "This machine does not have the Spillebulle archive, so pacman has \
+                     nothing newer to offer whatever it says. Take {file} from the \
+                     releases page and install it over this one:\n\n    \
+                     sudo pacman -U {file}\n\nThat package adds the archive, and \
+                     pacman keeps Umber up to date from then on."
                 )
             }
 
@@ -284,6 +300,11 @@ pub struct Probe<'a> {
     pub exe: Option<PathBuf>,
     pub env: &'a dyn Fn(&str) -> Option<String>,
     pub exists: &'a dyn Fn(&Path) -> bool,
+    /// A text file's contents, or `None` if it cannot be read. Needed for one
+    /// question only: pacman's archive is a *section* of `/etc/pacman.conf`
+    /// rather than a file of its own, so its presence is not a path that
+    /// exists.
+    pub read: &'a dyn Fn(&Path) -> Option<String>,
 }
 
 impl Probe<'_> {
@@ -294,8 +315,18 @@ impl Probe<'_> {
             exe: std::env::current_exe().ok(),
             env: &|key| std::env::var(key).ok(),
             exists: &|path| path.exists(),
+            read: &|path| std::fs::read_to_string(path).ok(),
         }
     }
+}
+
+/// Whether a `pacman.conf` has the archive's `[spillebulle]` section.
+///
+/// A whole line, so a commented-out `#[spillebulle]` is somebody having left
+/// the archive rather than somebody on it; that is also how `umber.install`
+/// decides whether to append the section, so the two cannot disagree.
+fn has_pacman_archive(conf: &str) -> bool {
+    conf.lines().any(|line| line.trim() == "[spillebulle]")
 }
 
 /// Work out how this copy was installed.
@@ -404,7 +435,12 @@ fn linux_manager(probe: &Probe<'_>) -> Manager {
     if exists("/var/lib/dpkg/info/umber.list") {
         apt
     } else if exists("/var/lib/pacman/local") {
-        Manager::Pacman
+        // Read only here, where it can matter: pacman.conf is the section
+        // `packaging/linux/umber.install` appends, not a file of its own.
+        Manager::Pacman {
+            archive: (probe.read)(Path::new("/etc/pacman.conf"))
+                .is_some_and(|conf| has_pacman_archive(&conf)),
+        }
     } else if exists("/var/lib/rpm") || exists("/usr/lib/sysimage/rpm") {
         rpm
     } else if exists("/var/lib/dpkg/status") {
@@ -507,7 +543,16 @@ mod tests {
             exists: Box::leak(Box::new(move |path: &Path| {
                 present.iter().any(|p| Path::new(p) == path)
             })),
+            read: &|_| None,
         }
+    }
+
+    /// The same probe, with `/etc/pacman.conf` reading as `conf`.
+    fn with_pacman_conf<'a>(mut probe: Probe<'a>, conf: &'static str) -> Probe<'a> {
+        probe.read = Box::leak(Box::new(move |path: &Path| {
+            (path == Path::new("/etc/pacman.conf")).then(|| conf.to_string())
+        }));
+        probe
     }
 
     fn no_env() -> HashMap<&'static str, &'static str> {
@@ -624,7 +669,81 @@ mod tests {
             &env,
             &["/var/lib/pacman/local"],
         );
-        assert_eq!(detect(&p), InstallKind::Managed(Manager::Pacman));
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Pacman { archive: false })
+        );
+    }
+
+    #[test]
+    fn pacmans_archive_is_the_section_the_package_appends() {
+        // What `packaging/linux/umber.install` writes, after the
+        // distribution's own repositories.
+        const ENROLLED: &str = "[options]
+HoldPkg = pacman glibc
+
+[core]
+            Include = /etc/pacman.d/mirrorlist
+
+[spillebulle]
+            Include = /etc/pacman.d/spillebulle
+";
+        let env = no_env();
+        let arch = || {
+            probe(
+                Os::Linux,
+                Some("/usr/bin/umber"),
+                &env,
+                &["/var/lib/pacman/local"],
+            )
+        };
+
+        let p = with_pacman_conf(arch(), ENROLLED);
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Pacman { archive: true })
+        );
+
+        // A section somebody commented out is somebody who left, and a file
+        // that cannot be read says nothing either way, so neither is the
+        // archive: printing `pacman -Syu` to them is the defect itself.
+        for conf in [
+            "[core]
+Include = /etc/pacman.d/mirrorlist
+#[spillebulle]
+",
+            "[core]
+Include = /etc/pacman.d/mirrorlist
+",
+            "",
+        ] {
+            let p = with_pacman_conf(arch(), conf);
+            assert_eq!(
+                detect(&p),
+                InstallKind::Managed(Manager::Pacman { archive: false }),
+                "{conf:?}",
+            );
+        }
+        assert_eq!(
+            detect(&arch()),
+            InstallKind::Managed(Manager::Pacman { archive: false })
+        );
+
+        // And the section on a Debian machine has not got apt pointed
+        // anywhere.
+        let p = with_pacman_conf(
+            probe(
+                Os::Linux,
+                Some("/usr/bin/umber"),
+                &env,
+                &["/var/lib/dpkg/info/umber.list"],
+            ),
+            ENROLLED,
+        );
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Dpkg { archive: false })
+        );
     }
 
     #[test]
@@ -751,7 +870,8 @@ mod tests {
             Manager::Dpkg { archive: false },
             Manager::Rpm { archive: true },
             Manager::Rpm { archive: false },
-            Manager::Pacman,
+            Manager::Pacman { archive: true },
+            Manager::Pacman { archive: false },
             Manager::Unknown,
         ]
     }
@@ -803,6 +923,7 @@ mod tests {
     fn no_upgrade_command_is_printed_to_a_machine_with_no_archive() {
         let never = [
             "apt install --only-upgrade",
+            "apt upgrade",
             "pacman -Syu",
             "flatpak update",
             "dnf upgrade",
@@ -811,7 +932,9 @@ mod tests {
         for manager in every_manager() {
             let archived = matches!(
                 manager,
-                Manager::Dpkg { archive: true } | Manager::Rpm { archive: true },
+                Manager::Dpkg { archive: true }
+                    | Manager::Rpm { archive: true }
+                    | Manager::Pacman { archive: true },
             );
             if archived {
                 continue;
@@ -852,7 +975,7 @@ mod tests {
                 "umber-0.1.2-1.x86_64.rpm",
             ),
             (
-                Manager::Pacman,
+                Manager::Pacman { archive: false },
                 Arch::X86_64,
                 "umber-bin-0.1.2-1-x86_64.pkg.tar.zst",
             ),
@@ -866,17 +989,37 @@ mod tests {
         }
     }
 
+    /// With the archive, each manager is told the command
+    /// `../Packages/ENROLMENT.md` names, the same in every application from
+    /// the archive, and no file name, because there is nothing to fetch.
     #[test]
-    fn with_the_archive_apt_is_told_to_do_the_upgrade() {
-        let message = InstallKind::Managed(Manager::Dpkg { archive: true })
-            .cannot_update(&offered(), Some(Arch::X86_64))
-            .expect("a managed copy says why");
-        assert!(
-            message.contains("sudo apt update && sudo apt install --only-upgrade umber"),
-            "{message}",
-        );
-        // And no file name, because there is nothing to go and fetch.
-        assert!(!message.contains(".deb"), "{message}");
+    fn with_the_archive_each_manager_is_told_to_do_the_upgrade() {
+        for (manager, command) in [
+            (
+                Manager::Dpkg { archive: true },
+                "sudo apt update && sudo apt upgrade",
+            ),
+            (Manager::Rpm { archive: true }, "sudo dnf upgrade"),
+            (Manager::Pacman { archive: true }, "sudo pacman -Syu"),
+        ] {
+            for arch in [Some(Arch::X86_64), Some(Arch::Aarch64), None] {
+                let message = InstallKind::Managed(manager)
+                    .cannot_update(&offered(), arch)
+                    .expect("a managed copy says why");
+                assert!(
+                    message.contains(command),
+                    "{manager:?}:
+{message}"
+                );
+                for extension in [".deb", ".rpm", ".flatpak", ".pkg.tar.zst"] {
+                    assert!(
+                        !message.contains(extension),
+                        "{manager:?}:
+{message}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -886,7 +1029,7 @@ mod tests {
         // that has never existed.
         for (manager, arch) in [
             (Manager::Dpkg { archive: false }, None),
-            (Manager::Pacman, Some(Arch::Aarch64)),
+            (Manager::Pacman { archive: false }, Some(Arch::Aarch64)),
             (Manager::Flatpak, Some(Arch::Aarch64)),
         ] {
             let message = InstallKind::Managed(manager)

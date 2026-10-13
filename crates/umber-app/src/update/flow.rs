@@ -812,7 +812,8 @@ mod tests {
             Manager::Dpkg { archive: false },
             Manager::Rpm { archive: true },
             Manager::Rpm { archive: false },
-            Manager::Pacman,
+            Manager::Pacman { archive: true },
+            Manager::Pacman { archive: false },
             Manager::Unknown,
         ] {
             let a = actions(

@@ -435,7 +435,7 @@ mod tests {
         for kind in [
             InstallKind::Managed(super::super::install::Manager::Dpkg { archive: false }),
             InstallKind::Managed(super::super::install::Manager::Rpm { archive: false }),
-            InstallKind::Managed(super::super::install::Manager::Pacman),
+            InstallKind::Managed(super::super::install::Manager::Pacman { archive: false }),
             InstallKind::Managed(super::super::install::Manager::Flatpak),
             InstallKind::Unknown,
         ] {
