@@ -5430,11 +5430,23 @@ must not learn about HTTP, the same boundary that keeps them testable.
   command cannot ever have worked: the packages come from a release page, apt
   only consults archives it has been given, and a machine with none answers
   "already the newest version" in the voice of something that had checked. So
-  the `.deb` carries the archive's public key in `/usr/share/keyrings` and
-  writes `/etc/apt/sources.list.d/spillebulle.sources` from its `postinst`, the
-  `.rpm` does the same with `/etc/yum.repos.d/spillebulle.repo`, and from then
-  on the package manager keeps Umber current the way it keeps everything else
-  current. Three rules come with it:
+  every package does what `../Packages/ENROLMENT.md` says, which is the one
+  contract for every application from the archive and is copied rather than
+  re-derived: the `.deb` ships the key as `/usr/share/umber/spillebulle-
+  archive.gpg` and its `postinst` puts the shared copy in
+  `/etc/apt/keyrings/` and writes `/etc/apt/sources.list.d/spillebulle.sources`;
+  the `.rpm` writes `/etc/yum.repos.d/spillebulle.repo`; and the Arch package's
+  `packaging/linux/umber.install` adds and locally signs the key, writes
+  `/etc/pacman.d/spillebulle` and appends a `[spillebulle]` section to
+  `/etc/pacman.conf`. From then on the package manager keeps Umber current the
+  way it keeps everything else current. Four rules come with it:
+  - **No package ships a path another could also ship.** dpkg refuses a
+    package that ships a file another package already owns, even byte for byte
+    the same, so the key used to live at `/usr/share/keyrings/` and that
+    stopped the second application from the archive installing at all. Each
+    ships its key under its own name and the scriptlet writes the shared copy.
+    CI's `enrol-debian` job installs a renamed twin of the `.deb` beside it to
+    prove it.
   - **The source file is written by the scriptlet, never shipped in the
     package.** A file under `/etc` that dpkg owns is a conffile, and dpkg
     removes a conffile on purge, so a source shared by four applications would
@@ -5447,10 +5459,13 @@ must not learn about HTTP, the same boundary that keeps them testable.
     ever disagree nothing breaks visibly, and every user of the archive is
     simply told to download a file by hand for ever.
   - **The updater says which of the two situations a machine is in.** With the
-    archive it prints the upgrade command; without it, it names the exact
-    package file to fetch. It never prints an upgrade command to a machine that
+    archive it prints the command ENROLMENT.md names (`sudo apt update && sudo
+    apt upgrade`, `sudo dnf upgrade`, `sudo pacman -Syu`); without it, it names
+    the exact package file to fetch. pacman's archive is a section of
+    `/etc/pacman.conf` rather than a file, so the `Probe` carries a `read` as
+    well as an `exists`. It never prints an upgrade command to a machine that
     has nowhere to upgrade from, and `install.rs` has a test that fails on any
-    of the four commands that used to be printed.
+    of them reaching one.
 - **An installation a package manager owns is never written to.** `.deb`,
   `.rpm`, Arch and Flatpak copies are detected and told which manager owns them
   and what to run. Overwriting them is usually not permitted, makes the

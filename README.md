@@ -26,40 +26,57 @@ Layers and History modules](docs/images/window.png)
 
 ## Install
 
-**Umber 0.1.6.** Take the file for your system, or browse the
+**Umber 0.1.7.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/umber/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-setup-0.1.6-x64.exe) | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-setup-0.1.6-arm64.exe) |
-| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber_0.1.6_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber_0.1.6_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-bin-0.1.6-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.6/Umber-0.1.6-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.6/Umber-0.1.6-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-x64.msi) | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.6/umber-0.1.6-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-setup-0.1.7-x64.exe) | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-setup-0.1.7-arm64.exe) |
+| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber_0.1.7_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber_0.1.7_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-1.aarch64.rpm) |
+| Arch, CachyOS | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-bin-0.1.7-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.7/Umber-0.1.7-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.7/Umber-0.1.7-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x64.msi) | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-aarch64-unknown-linux-gnu.tar.gz) |
 
-The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
-as they install, so `apt upgrade` or your usual system update carries Umber along
-with everything else. Nothing to configure.
+The `.deb`, the `.rpm` and the Arch package add the
+[Spillebulle archive](https://spillebulle.github.io/packages/) as they install,
+so `sudo apt upgrade`, `sudo dnf upgrade` or `sudo pacman -Syu` carries Umber
+along with everything else, on CachyOS and the other Arch distributions too.
+Nothing to configure.
 
 To add the archive first and install from it, or on a machine that installed
-Umber before 0.1.5, on Debian, Ubuntu, Mint and Pop!_OS:
+Umber before it enrolled the machine, on Debian, Ubuntu, Mint and Pop!_OS:
 
 ```sh
-curl -fsSL https://spillebulle.github.io/packages/spillebulle-archive.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/spillebulle-archive.gpg
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://spillebulle.github.io/packages/spillebulle-archive.asc   | sudo gpg --dearmor -o /etc/apt/keyrings/spillebulle-archive.gpg
 sudo tee /etc/apt/sources.list.d/spillebulle.sources >/dev/null <<'EOF'
 Types: deb
 URIs: https://spillebulle.github.io/packages/deb/
 Suites: ./
-Signed-By: /usr/share/keyrings/spillebulle-archive.gpg
+Signed-By: /etc/apt/keyrings/spillebulle-archive.gpg
 EOF
 sudo apt update && sudo apt install umber
+```
+
+On Arch, CachyOS, EndeavourOS and Manjaro:
+
+```sh
+curl -fsSL https://spillebulle.github.io/packages/spillebulle-archive.asc -o /tmp/spillebulle-archive.asc
+sudo pacman-key --add /tmp/spillebulle-archive.asc
+sudo pacman-key --lsign-key 7A9EA69E033F3C3EF4F53EB4A72BC0FD5E061ADA
+printf '%s
+' 'SigLevel = Required DatabaseRequired'   'Server = https://spillebulle.github.io/packages/arch/$arch'   | sudo tee /etc/pacman.d/spillebulle >/dev/null
+printf '
+[spillebulle]
+Include = /etc/pacman.d/spillebulle
+' | sudo tee -a /etc/pacman.conf >/dev/null
+sudo pacman -Syu umber-bin
 ```
 
 On Fedora, RHEL and openSUSE:

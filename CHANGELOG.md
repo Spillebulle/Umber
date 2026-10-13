@@ -12,6 +12,30 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.7
+
+Arch and CachyOS keep Umber up to date, and a second application from the same
+archive can be installed beside it.
+
+### New
+
+- **The Arch package enrols your machine in Umber's package archive**, the way
+  the `.deb` and `.rpm` already do. After installing it once, `sudo pacman -Syu`
+  upgrades Umber with everything else, on Arch, CachyOS and the other Arch
+  distributions. When an update is out, Umber says that command; on an Arch
+  machine without the archive it names the exact file to fetch instead.
+- **Umber names your system's usual upgrade command** when the archive is set
+  up: `sudo apt update && sudo apt upgrade`, `sudo dnf upgrade` or
+  `sudo pacman -Syu`.
+
+### Fixed
+
+- **A second application from the archive installs beside Umber.** The `.deb`
+  shipped the archive's key at a path every application would have needed, and
+  apt refuses a package that ships a file another package already owns. The key
+  is now Umber's own copy, and a machine enrolled by an earlier version is moved
+  to the shared one on upgrade.
+
 ## 0.1.6
 
 Two new ways to resize a brush with Alt.
