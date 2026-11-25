@@ -64,6 +64,7 @@ pub mod time;
 pub mod tip;
 mod tip_table;
 pub mod transform;
+pub mod vector;
 
 pub use brush::{Brush, BrushMode, GrainPattern};
 pub use camera::{Camera, ScrollSpan};
@@ -109,3 +110,4 @@ pub use textobj::{Placement, TextFace, TextObject};
 pub use time::Timestamp;
 pub use tip::{StrokeCoverage, TipMask, TipReading, TipTarget, stroke_coverage};
 pub use transform::{Affine, Handle, Transform};
+pub use vector::{Node, Path, PathRole, VectorObject};
