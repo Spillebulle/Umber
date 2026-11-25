@@ -4837,6 +4837,27 @@ mod tests {
         assert_eq!(s.vector_at(at), Some(&some_paths()));
     }
 
+    /// The record is charged **on its own**, which the delete test above cannot
+    /// say: its `>=` is met by the slice and the layer's own bytes whether or not
+    /// the record is counted. Two parked layers differing only in their records
+    /// must differ in cost by exactly the difference between the records.
+    #[test]
+    fn a_parked_vector_layer_is_charged_for_its_paths() {
+        let park = |record: VectorObject| {
+            let mut s = LayerStack::new();
+            let at = s.add_vector_layer("Paths", record).expect("room");
+            let before = s.shape(64 * 64 * 4);
+            let removed = s.remove_many(&[at]).expect("removable");
+            before.with_removed(removed).byte_len()
+        };
+        let (small, large) = (VectorObject::empty(), with_ink());
+        assert!(large.byte_len() > small.byte_len());
+        assert_eq!(
+            park(large.clone()) - park(small.clone()),
+            large.byte_len() - small.byte_len()
+        );
+    }
+
     #[test]
     fn a_folder_deleted_with_a_vector_layer_in_it_comes_back_whole() {
         let mut s = grouped();
