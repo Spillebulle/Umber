@@ -1767,7 +1767,17 @@ them.
   would make the layer paintable, and the next save would delete the paths a
   newer Umber put there, which is the failure the version bump exists to prevent
   arriving by the side door. The version is probed as a `u64`, so a figure past
-  `u32` is `Opaque` rather than unreadable.
+  `u32` is `Opaque` rather than unreadable. **A canvas flip and a canvas resize
+  are refused while any layer holds one**, with a sentence, because this build
+  cannot mirror or move paths it cannot read, and carrying every pixel while
+  leaving those paths where they were is a document the newer build would open
+  wrong. `LayerStack::has_opaque_vector` is the one predicate;
+  `Editor::flip_refusal` (lock first, because that one the artist can take off)
+  feeds the flip rows, the flip command, the undo and redo of a flip through
+  `StepGate::FlipRefused` and `mirror_document`, and `Editor::resize_refused`
+  gates `App::apply_canvas` and disables the Canvas settings dialog's Apply.
+  A change to the resolution or the background alone moves nothing and is
+  never refused.
 - **`print` is written only beside Ink, and a mismatch drops Ink and keeps Cut
   and Plot.** It is the text record's fingerprint of the layer image, and it
   means something only for paths that describe pixels. Cut and Plot describe
@@ -1836,9 +1846,10 @@ them.
   check that N is all of them.
 - **A flip is bounded, not exact.** The design said "exact" and that is false in
   `f32`: mirroring a non-dyadic figure about a canvas edge rounds. What holds, and
-  is tested, is that one round trip costs at most one rounding
-  (`canvas * EPSILON`) and that a thousand of them equal the first — no
-  accumulating drift. This is *not* the layer array's `flip.wgsl`, which is an
+  is tested, is that one round trip costs at most one rounding at the larger of
+  the canvas and the figure, and that a thousand of them equal the first — no
+  accumulating drift. The test's figures are all within about 5000, so it does
+  not exercise a figure far larger than the canvas. This is *not* the layer array's `flip.wgsl`, which is an
   exact texel permutation; a path is a float. Undoing a flip is another flip, so
   nothing is dropped: Ink is mirrored with the rest, because the pixels it
   describes are mirrored by the same flip.
@@ -1850,13 +1861,37 @@ them.
   pixels by — so the two cannot disagree about where the picture went. **Ink is
   the exception**, stripped with a notice appended to any already up (text's
   stays), because Ink describes pixels the resize cropped or moved.
+- **A flip or a resize drops a path it pushed out of bounds, and says so.**
+  Neither transform clamps, because clamping deforms a shape, so a path lying
+  far off the canvas can be carried past `MAX_COORD` by a mirror or by enough
+  anchored resizes. Left there, `to_json` would refuse the whole record at the
+  next save and every other path on the layer would go with it.
+  `VectorObject::bounded` takes out each path that fails the per-path half of
+  `check` (`path_in_bounds`, one statement shared by both), so the rest
+  survive; `translate_vectors` returns a `VectorCarry` (Ink stripped, paths
+  lost) and `flip_vectors` the lost count, and `Editor::apply_canvas` and
+  `flip_canvas` append a line to the notice. The undo of the flip does not
+  bring the path back, which is why the line is said.
+- **A record `to_json` refuses is saved as an empty record, never as no
+  record.** Writing nothing reopened the layer as an ordinary paintable one,
+  changing its kind under the artist, while `required_version` still declared 5
+  for a record the archive did not hold. The writer writes
+  `VectorObject::empty()` in its place, the attribute still points at it, and
+  `SaveWarning::VectorNotRecorded` says the layer was saved as an empty vector
+  layer.
 - **The paint gate is `EditRefusal::Vector`, at `refusal_at`, and a mask is not
   refused.** A stroke on a vector layer's *mask* changes no layer pixel and
   cannot put the record out of step, for the reason it is allowed on text. Cut
   and paste say a sentence through the existing refusal tables; **a lift raises
   one too** (`float_refusal_notice`) where every other lift refusal stays silent,
   and a canvas press with a brush raises none, or the pen going down would be a
-  dialog. "Clear layer" is *disabled* with a tooltip rather than meaning
+  dialog. **The lift's sentence is said once, not once a press**: `LiftNotice`
+  latches on the document, the active layer's id and the tool it was raised for,
+  `render` observes that key every frame and re-arms when any of the three
+  changes, so another layer and back says it again. A paste is not latched.
+  With "On its own layer" off, the Text panel's Place is disabled over a vector
+  layer with its own sentence, read from the same `active_refusal` the paste
+  gate uses, rather than lit and then refused in a paste's words. "Clear layer" is *disabled* with a tooltip rather than meaning
   "convert to paint" as it does on text: there may be no paint to keep, and
   throwing away paths silently is the wrong reading. The one reading is
   `editor::clear_layer_refusal`, shared by the menu item and the command so the
@@ -1889,20 +1924,34 @@ them.
   set, and the header's strip is pinned at 104.
 - **The overlay is cached, and a still frame allocates nothing.**
   `vectorview::VectorView::lines` keys on the document, `vector_revision`, the
-  visibility bitmask, the camera, the canvas region and the scale, flattens at a
-  quarter of a screen pixel, culls whatever misses the view and clamps each point
-  to 4096 points beyond it. The tessellated line is an `Arc<Mesh>` rebuilt only
-  when the lines, the scale or the three colours change, because egui takes a
-  path's points by value and `Shape::line` would copy every point every frame.
-  Past `MAX_POINTS` (262,144) it simply stops drawing, with a `debug` log and
-  nothing on screen — the cap is a bound on a per-frame cost, as the lasso's is.
+  visibility bitmask, the camera, the canvas region and the scale. **There is no
+  clamp.** A whole path whose bounds miss the view is culled; each cubic whose
+  control-point hull misses the view grown by `CULL_MARGIN` (8 points) is culled
+  before it is flattened; what is left is flattened per cubic by
+  `umber_core::vector::flatten_cubic`, the one flattener, which `Path::flatten`
+  also uses through `Path::segments`, at `0.25 / zoom / ppp` document pixels;
+  and each segment is clipped to the same rectangle by an `f64` Liang-Barsky
+  clip, so a path that leaves the view and comes back splits into separate runs
+  rather than drawing a chord. A clamp was the first draft and was wrong: it
+  slides each axis separately, bending a diagonal where it is seen. `MAX_POINTS`
+  (262,144) is spent on visible segments only, and past it the overlay stops
+  drawing, with a `debug` log and nothing on screen; the scratch holds one cubic
+  and is shrunk back to `SCRATCH_KEEP`. **The residual work bound is the number
+  of cubics whose hull meets the view times 256**, the flattener's segment cap,
+  and a hull can meet the view while its curve does not. The tessellated line is
+  an `Arc<Mesh>` rebuilt only when the lines, the scale or the three colours
+  change, because egui takes a path's points by value and `Shape::line` would
+  copy every point every frame.
 - **The machine lines snap themselves, and both passes are an *odd* number of
   device pixels wide.** egui snaps a `LineSegment` (the marquee) and never a
   path, so an axis-aligned run is rounded to the pixel grid here with egui's own
   `Stroke::round_center_to_pixel`; diagonals are not moved. Odd widths centre on
-  a pixel centre, which is where the marquee's single pixel is centred, and the
-  underlay is exactly two device pixels wider so one underlay pixel shows on each
-  side. The overlay's screen points equal the marquee's for the same selection,
+  a pixel centre, and the underlay is exactly two device pixels wider so one
+  underlay pixel shows on each side. **That shares the marquee's centre only at
+  100% and 125%**, where the marquee is one device pixel and so is the top pass:
+  there the two are the same width and only the colour and solid against dashed
+  tell them apart. At 150% to 200% the marquee is two device pixels centred on a
+  pixel boundary, and the three-pixel top pass sits half a device pixel off it. The overlay's screen points equal the marquee's for the same selection,
   and `the_lines_land_where_the_marquee_does` compares them against
   `selection_screen` itself at 150% with an off-grid camera.
 - **The palette's two derived colours, and the hue that had to move.**
@@ -3571,10 +3620,12 @@ once per stroke but must never move into the drawing loop.
   turns out to have been.
 - **`EditKind` has a variant only for something the engine can restore**, and
   the rule is the bound rather than the count. It is Paint, Erase, Transform,
-  the two canvas flips, and the six structural edits — an entry exists where a
-  patch was captured, where the edit is its own inverse (the flips), or where
-  the *shape* of the stack can be put back (a delete, an add, a reorder,
-  entries gathered into a folder, a mask added or removed). **A layer cannot be
+  the two canvas flips, the six structural edits and Paths — an entry exists
+  where a patch was captured, where the edit is its own inverse (the flips),
+  where the *shape* of the stack can be put back (a delete, an add, a reorder,
+  entries gathered into a folder, a mask added or removed), or where a layer's
+  paths record can be swapped back by slot (`EditKind::Paths`, whose body is
+  `EditBody::Vector`). **A layer cannot be
   renamed at all**, and this line said it could until two agents went looking
   for `EditKind::Rename` on the strength of it: `Layer::name` is written only
   where a layer is created or imported, `LayerStack` has no rename method, and

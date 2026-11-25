@@ -29,9 +29,10 @@ archive can be installed beside it.
   Make one with the spline button beside Add on the Layers panel, or let the
   commands below make one for you. It keeps its lines when you save and reopen,
   follows a canvas flip, moves with the picture when you resize the canvas, and
-  every change to it is one undo step. Paint, paste and cut are refused on it
-  with a sentence, and Clear layer is greyed out, because there is no paint to
-  clear.
+  every change to it is one undo step. Paste and cut are refused on it with a
+  sentence, and the brush does not paint on it. Clear layer is greyed out,
+  because there is no paint to clear. The transform tool says once that there
+  is nothing on it to move, not every time you press.
 - **Cut path from selection and Plot path from selection**, on the Edit menu.
   Each turns the outline of the current selection into a closed line, on the
   active vector layer or on a new one made for it. They are the way to get a
@@ -46,6 +47,13 @@ archive can be installed beside it.
 - **A document with a vector layer needs this version or newer.** An older
   Umber refuses it rather than opening it with the lines missing and saving
   over them.
+- **A line pushed too far off the canvas is removed, and Umber says so.** A
+  flip or a resize can carry a line that already lay far outside the picture
+  past the furthest a document can hold. That one line goes and the others on
+  the layer stay.
+- **A document with lines from a newer Umber cannot be flipped or resized.**
+  This version cannot read those lines, so it cannot move them with the
+  picture. Flip canvas and the resize in Canvas settings say so instead.
 
 ### Fixed
 
