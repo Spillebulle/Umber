@@ -651,7 +651,8 @@ pub enum BrushTab {
 /// refuse every flip or quiet the document for a refusal it is about to make.
 ///
 /// **Every reader today matches exhaustively, and a test is what keeps it that
-/// way.** The two menu rows read `gate == StepGate::FlipLocked`, which is
+/// way.** The two menu rows read `gate == StepGate::FlipLocked` (as the
+/// refusing arm was then called), which is
 /// `matches!` wearing an operator: a fourth answer would have been a compile
 /// error in `App::settle_step` and a silent `false` in both rows — the menu
 /// going on offering a command the model had just learned to decline, in a
@@ -677,24 +678,45 @@ pub enum StepGate {
     /// first — `flip_canvas` does both before it mirrors and stepping over one
     /// has to do the same.
     SettleForFlip,
-    /// A canvas flip a locked layer refuses. The entry stays where it is, and
-    /// the artist is told: a flip that half happened cannot be undone by
-    /// flipping again.
-    FlipLocked,
+    /// A canvas flip the document refuses, for the reason carried. The entry
+    /// stays where it is, and the artist is told: a flip that half happened
+    /// cannot be undone by flipping again.
+    FlipRefused(FlipRefusal),
 }
+
+/// Why a canvas flip is refused. [`Editor::flip_refusal`] is the one reading.
+///
+/// Two reasons with two remedies, so the sentence has to say which: a lock is
+/// something the artist can take off, a record from a newer Umber is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlipRefusal {
+    /// Some layer is locked, and a flip cannot skip one.
+    Locked,
+    /// Some vector layer holds paths from a newer Umber, which this build
+    /// cannot mirror. See `LayerStack::has_opaque_vector`.
+    NewerPaths,
+}
+
+/// What a flip refused for paths from a newer Umber says, wherever it is said.
+pub const FLIP_NEWER_PATHS: &str = "This document has vector paths from a newer Umber. \
+     Flipping the canvas would leave them behind, so it is not done.";
+
+/// The resize's twin of [`FLIP_NEWER_PATHS`].
+pub const RESIZE_NEWER_PATHS: &str = "This document has vector paths from a newer Umber. \
+     Resizing the canvas would leave them behind, so it is not done.";
 
 impl StepGate {
     /// Does this answer refuse the step outright?
     ///
     /// **Exhaustive, and that is the whole reason it exists** rather than the
-    /// two call sites comparing against [`StepGate::FlipLocked`]. A control asks
+    /// two call sites comparing against one refusing variant. A control asks
     /// "may I offer this", which is a question about the *set* of refusing
     /// answers, and an equality test answers it only for as long as that set has
     /// one member. See the type's own docs.
     pub fn refuses(self) -> bool {
         match self {
             Self::Clear | Self::SettleForFlip => false,
-            Self::FlipLocked => true,
+            Self::FlipRefused(_) => true,
         }
     }
 }
@@ -704,7 +726,7 @@ impl StepGate {
 /// **Three controls have to say this**: the Image menu's two flip rows, the Edit
 /// menu's Undo and Redo rows, and the notice a refused keystroke raises. They
 /// were three hand-written near-copies, which is the drift
-/// [`Editor::flip_refused_by_lock`] was introduced two commits earlier to stop
+/// [`Editor::flip_refusal`] (then a lock-only `bool`) was introduced to stop
 /// for the *reading* — the sentence deserves the same treatment and a critic
 /// pointed out that it had not had it.
 ///
@@ -2049,8 +2071,28 @@ impl Editor {
     /// Redo rows, and the keystroke behind each. One statement here rather than
     /// three `layers.any_locked()` calls that happen to be spelled the same, so
     /// a change to what refuses a flip cannot leave one control offering it.
-    pub fn flip_refused_by_lock(&self) -> bool {
-        self.layers.any_locked()
+    ///
+    /// **A record from a newer Umber refuses it too**, and for the same shape of
+    /// reason: this build cannot read those paths, so it cannot mirror them,
+    /// and a flip that moved every pixel and left them where they were is a
+    /// document the newer build would open wrong. The lock is asked first,
+    /// because it is the one the artist can do something about.
+    pub fn flip_refusal(&self) -> Option<FlipRefusal> {
+        if self.layers.any_locked() {
+            Some(FlipRefusal::Locked)
+        } else if self.layers.has_opaque_vector() {
+            Some(FlipRefusal::NewerPaths)
+        } else {
+            None
+        }
+    }
+
+    /// Would a change of canvas *size* be refused? A record from a newer Umber
+    /// is the one reason, for [`Editor::flip_refusal`]'s: its paths cannot be
+    /// moved with the picture. A change to the resolution or the background
+    /// alone moves nothing and is never refused.
+    pub fn resize_refused(&self, size: glam::UVec2) -> bool {
+        size != self.doc.size && self.layers.has_opaque_vector()
     }
 
     /// What carrying the entry at the top of the undo stack backwards needs of
@@ -2099,8 +2141,10 @@ impl Editor {
         // be a second copy of a number that has exactly one source.
         match next.and_then(umber_core::EditKind::flip_axis) {
             None => StepGate::Clear,
-            Some(_) if self.flip_refused_by_lock() => StepGate::FlipLocked,
-            Some(_) => StepGate::SettleForFlip,
+            Some(_) => match self.flip_refusal() {
+                Some(why) => StepGate::FlipRefused(why),
+                None => StepGate::SettleForFlip,
+            },
         }
     }
 
@@ -3463,7 +3507,7 @@ mod tests {
             assert_eq!(
                 ed.undo_gate(),
                 if flip {
-                    StepGate::FlipLocked
+                    StepGate::FlipRefused(FlipRefusal::Locked)
                 } else {
                     StepGate::Clear
                 },
@@ -3488,7 +3532,7 @@ mod tests {
             assert_eq!(
                 ed.redo_gate(),
                 if flip {
-                    StepGate::FlipLocked
+                    StepGate::FlipRefused(FlipRefusal::Locked)
                 } else {
                     StepGate::Clear
                 },
@@ -3545,7 +3589,7 @@ mod tests {
         assert_eq!(ed.history.len(), 4, "the redo stack was drained");
         assert_eq!(
             ed.undo_gate(),
-            StepGate::FlipLocked,
+            StepGate::FlipRefused(FlipRefusal::Locked),
             "the gate read past the flip on top of the undo stack"
         );
         assert_eq!(

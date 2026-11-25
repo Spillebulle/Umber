@@ -2,7 +2,7 @@
 
 use crate::canvasdlg;
 use crate::crash;
-use crate::editor::{self, Editor, Floating, Interaction, StepGate, Tool};
+use crate::editor::{self, Editor, FlipRefusal, Floating, Interaction, StepGate, Tool};
 use crate::gesture;
 use crate::keylayout;
 use crate::loading;
@@ -848,7 +848,7 @@ impl UmberApp {
     fn settle_step(&mut self, gate: StepGate, step: &'static str) -> bool {
         match gate {
             StepGate::Clear => true,
-            StepGate::FlipLocked => {
+            StepGate::FlipRefused(why) => {
                 // A notice rather than silence, and it is the *paste's*
                 // precedent rather than the canvas press's: an undo is an
                 // explicit command with one obvious outcome, where a press on
@@ -858,7 +858,7 @@ impl UmberApp {
                 // rows are disabled to match, so this catches a keystroke
                 // rather than being the only thing between a live control and a
                 // dialog. See `ui::draw`.
-                self.editor.notice = Some(flip_step_refusal(step));
+                self.editor.notice = Some(flip_step_refusal(step, why));
                 false
             }
             StepGate::SettleForFlip => {
@@ -1040,7 +1040,7 @@ impl UmberApp {
         // and a flip that half happened cannot be undone by flipping again,
         // which is the entire reason it stores no pixels.
         //
-        // Read through `Editor::flip_refused_by_lock`, which is also what
+        // Read through `Editor::flip_refusal`, which is also what
         // disables the Image menu's two flip rows and the Edit menu's Undo and
         // Redo, so no control can offer a flip this will then decline. This
         // stays as the gate rather than becoming an assertion about the
@@ -1050,7 +1050,12 @@ impl UmberApp {
         // rather than an omission: the undo path reaches this through a gate
         // that has already said "undone" or "put back", and a second box here
         // would be two dialogs for one keystroke.
-        if self.editor.flip_refused_by_lock() {
+        //
+        // A record from a newer Umber refuses it here too, through the same
+        // reading (`Editor::flip_refusal`): those paths cannot be mirrored, and
+        // a flip that carried every pixel and left them behind is a document
+        // the build that wrote them would open wrong.
+        if self.editor.flip_refusal().is_some() {
             return false;
         }
         // Masks are slices too, and a mask that stayed put while its layer
@@ -1111,6 +1116,15 @@ impl UmberApp {
         // flight would commit unmirrored over a flipped picture.
         self.finish_stroke();
 
+        // An explicit command with one outcome, so a refusal says so, which
+        // is the paste's precedent rather than the canvas press's. The menu
+        // rows are disabled to match, so this catches a keystroke.
+        // `mirror_document` stays silent itself because the undo path has
+        // already said "undone" or "put back" by the time it gets there.
+        if let Some(why) = self.editor.flip_refusal() {
+            self.editor.notice = Some(flip_refusal_notice(why));
+            return;
+        }
         if !self.mirror_document(axis) {
             return;
         }
@@ -5060,9 +5074,13 @@ impl UmberApp {
         // is the scheduler's.
         self.stop_autosave_of(id);
         let doc = change.doc;
+        // Refused before anything moves, and the dialog's Apply is disabled
+        // to match, so this catches only what the dialog could not see.
+        if self.editor.resize_refused(doc.size) {
+            self.editor.notice = Some(resize_refusal_notice());
+            return;
+        }
         let resized = self.editor.apply_canvas(doc, change.anchor);
-        // The paths moved by the same plan the pixels are about to, in the
-        // model; what is left is the repaint, which is below.
         // What the new array has to hold. Read *after* `apply_canvas`, which is
         // what drops the selection and clears the history — neither of which
         // moves a claim, but the number has to be the one the stack ends the
@@ -6929,13 +6947,51 @@ fn blit_into(dest: &mut [u8], to: PixelRect, src: &[u8], from: PixelRect) {
 /// menu rows that say the same thing. The wording has no em-dash in it, which is
 /// the rule for everything the interface draws rather than a preference about
 /// this box.
-fn flip_step_refusal(step: &'static str) -> Notice {
+fn flip_step_refusal(step: &'static str, why: FlipRefusal) -> Notice {
+    match why {
+        FlipRefusal::Locked => Notice {
+            title: "A layer is locked".into(),
+            lines: vec![format!(
+                "That step was not {step}. It is a canvas flip. {} and try again.",
+                editor::FLIP_LOCKED_REASON
+            )],
+        },
+        FlipRefusal::NewerPaths => Notice {
+            title: NEWER_PATHS_TITLE.into(),
+            lines: vec![format!(
+                "That step was not {step}. It is a canvas flip. {}",
+                editor::FLIP_NEWER_PATHS
+            )],
+        },
+    }
+}
+
+/// The title of every notice a record from a newer Umber raises.
+const NEWER_PATHS_TITLE: &str = "Paths from a newer Umber";
+
+/// What a refused flip command says. Exhaustive, so a third reason has to be
+/// worded before it can be raised.
+fn flip_refusal_notice(why: FlipRefusal) -> Notice {
+    match why {
+        FlipRefusal::Locked => Notice {
+            title: "A layer is locked".into(),
+            lines: vec![format!(
+                "The canvas was not flipped. {} and try again.",
+                editor::FLIP_LOCKED_REASON
+            )],
+        },
+        FlipRefusal::NewerPaths => Notice {
+            title: NEWER_PATHS_TITLE.into(),
+            lines: vec![editor::FLIP_NEWER_PATHS.to_string()],
+        },
+    }
+}
+
+/// What a refused resize says. One reason, `Editor::resize_refused`'s.
+fn resize_refusal_notice() -> Notice {
     Notice {
-        title: "A layer is locked".into(),
-        lines: vec![format!(
-            "That step was not {step}. It is a canvas flip. {} and try again.",
-            editor::FLIP_LOCKED_REASON
-        )],
+        title: NEWER_PATHS_TITLE.into(),
+        lines: vec![editor::RESIZE_NEWER_PATHS.to_string()],
     }
 }
 
@@ -7538,7 +7594,7 @@ mod tests {
         ed.layers.active_mut().locked = true;
         assert_eq!(
             ed.undo_gate(),
-            crate::editor::StepGate::FlipLocked,
+            crate::editor::StepGate::FlipRefused(FlipRefusal::Locked),
             "a locked layer must refuse the step over the flip"
         );
         ed.layers.active_mut().locked = false;
@@ -8170,9 +8226,26 @@ mod tests {
             "Unlock the layer to clear it.",
             crate::editor::VECTOR_LOST_ON_RESIZE_LINE,
             crate::editor::VECTOR_LOST_ON_FLIP_LINE,
+            crate::editor::FLIP_NEWER_PATHS,
+            crate::editor::RESIZE_NEWER_PATHS,
         ] {
             sentences.push(("clear".to_string(), tip.to_string()));
         }
+        for why in [FlipRefusal::Locked, FlipRefusal::NewerPaths] {
+            for notice in [
+                flip_refusal_notice(why),
+                flip_step_refusal("undone", why),
+                flip_step_refusal("put back", why),
+            ] {
+                sentences.push((format!("flip {why:?}"), notice.title));
+                for line in notice.lines {
+                    sentences.push((format!("flip {why:?}"), line));
+                }
+            }
+        }
+        let resize = resize_refusal_notice();
+        sentences.push(("resize".to_string(), resize.title));
+        sentences.extend(resize.lines.into_iter().map(|l| ("resize".to_string(), l)));
         // And the one the real stack produces, so the list above cannot drift
         // from what the function answers.
         let mut stack = umber_core::LayerStack::new();
@@ -8184,6 +8257,49 @@ mod tests {
             assert_eq!(text.trim(), text, "{who}: edge space in {text:?}");
             assert!(!text.is_empty(), "{who}: empty");
         }
+    }
+
+    /// **A record from a newer Umber refuses a flip and a resize, and the
+    /// sentences say so.** The editor's readings are driven over a real stack,
+    /// so a stack that holds such a record and one that does not disagree; the
+    /// notices are the ones the commands raise.
+    #[test]
+    fn paths_from_a_newer_umber_refuse_a_flip_and_a_resize_with_a_sentence() {
+        let mut ed = crate::editor::Editor::default();
+        let bigger = glam::UVec2::new(ed.doc.size.x + 1, ed.doc.size.y);
+        assert_eq!(ed.flip_refusal(), None);
+        assert!(!ed.resize_refused(bigger));
+        ed.layers
+            .add_vector_layer("Newer", umber_core::VectorObject::Opaque(b"{}".to_vec()))
+            .expect("room");
+        assert_eq!(ed.flip_refusal(), Some(FlipRefusal::NewerPaths));
+        assert!(ed.resize_refused(bigger));
+        assert!(
+            !ed.resize_refused(ed.doc.size),
+            "a change that keeps the size moves nothing and is not refused"
+        );
+        ed.history.record(umber_core::Edit::new(
+            umber_core::EditKind::FlipHorizontal,
+            umber_core::EditBody::Flip,
+        ));
+        assert_eq!(
+            ed.undo_gate(),
+            StepGate::FlipRefused(FlipRefusal::NewerPaths),
+            "the undo of a flip is a flip"
+        );
+        // A lock is named first, because it is the one the artist can take off.
+        ed.layers.active_mut().locked = true;
+        assert_eq!(ed.flip_refusal(), Some(FlipRefusal::Locked));
+
+        let flip = flip_refusal_notice(FlipRefusal::NewerPaths);
+        assert_eq!(flip.lines, vec![editor::FLIP_NEWER_PATHS.to_string()]);
+        assert!(flip.lines[0].contains("Flipping the canvas"));
+        let resize = resize_refusal_notice();
+        assert_eq!(resize.lines, vec![editor::RESIZE_NEWER_PATHS.to_string()]);
+        assert!(resize.lines[0].contains("Resizing the canvas"));
+        let step = flip_step_refusal("undone", FlipRefusal::NewerPaths);
+        assert!(step.lines[0].starts_with("That step was not undone."));
+        assert!(step.lines[0].ends_with(editor::FLIP_NEWER_PATHS));
     }
 
     /// **A lift's notice is said once**, and re-armed by a change of layer, of
@@ -8260,8 +8376,8 @@ mod tests {
     /// on the keyboard path alone and have two sentences to keep in step.
     #[test]
     fn a_refused_history_step_says_what_did_not_happen_and_how_to_let_it() {
-        let undone = flip_step_refusal("undone");
-        let put_back = flip_step_refusal("put back");
+        let undone = flip_step_refusal("undone", FlipRefusal::Locked);
+        let put_back = flip_step_refusal("put back", FlipRefusal::Locked);
         for (at, notice) in [("undo", &undone), ("redo", &put_back)] {
             assert_eq!(notice.lines.len(), 1, "{at}");
             let line = &notice.lines[0];

@@ -1862,6 +1862,21 @@ impl LayerStack {
         self.layers.iter().any(Layer::is_vector)
     }
 
+    /// Does any layer hold a record from a newer Umber
+    /// ([`VectorObject::Opaque`])?
+    ///
+    /// **What refuses a canvas flip and a canvas resize.** Such a record is held
+    /// as bytes this build cannot read, so it cannot be mirrored or moved; doing
+    /// either to the picture would carry every pixel and leave those paths where
+    /// they were, which is a document the newer build that wrote them would open
+    /// wrong. The one reading, so the menu rows, the commands and the undo of a
+    /// flip cannot disagree about it.
+    pub fn has_opaque_vector(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.vector().is_some_and(VectorObject::is_opaque))
+    }
+
     /// Would [`LayerStack::set_vector`] install `record` at `index`?
     ///
     /// The one statement of the rule, which `set_vector` reads, so a control
@@ -5133,6 +5148,23 @@ mod tests {
             VectorCarry::default(),
             "and it is one-off"
         );
+    }
+
+    /// Only a record this build cannot read answers yes; an empty record, an
+    /// ordinary one and a stack with no vector layer all answer no.
+    #[test]
+    fn only_a_newer_builds_record_refuses_a_flip_or_a_resize() {
+        let mut s = LayerStack::new();
+        assert!(!s.has_opaque_vector(), "no vector layer");
+        s.add_vector_layer("Empty", VectorObject::empty())
+            .expect("room");
+        s.add_vector_layer("Paths", some_paths()).expect("room");
+        assert!(!s.has_opaque_vector(), "records this build can read");
+        s.add_vector_layer("Newer", VectorObject::Opaque(b"{}".to_vec()))
+            .expect("room");
+        assert!(s.has_opaque_vector());
+        assert!(s.remove(3).is_some());
+        assert!(!s.has_opaque_vector(), "and the answer follows the stack");
     }
 
     /// **A move that takes a path out of bounds takes that path out, and only

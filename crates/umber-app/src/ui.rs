@@ -2111,8 +2111,8 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // here rather than only refused in `mirror_document`, so the
     // menu does not offer what it will not do.
     // The same reading the Edit menu's Undo and Redo rows take, and the same
-    // one `App::mirror_document` gates on. See `Editor::flip_refused_by_lock`.
-    let flip_locked = ed.flip_refused_by_lock();
+    // one `App::mirror_document` gates on. See `Editor::flip_refusal`.
+    let flip_refused = ed.flip_refusal();
     for (axis, hint) in [
         (
             umber_core::FlipAxis::Horizontal,
@@ -2127,17 +2127,15 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
             umber_core::FlipAxis::Horizontal => Action::FlipCanvasHorizontal,
             umber_core::FlipAxis::Vertical => Action::FlipCanvasVertical,
         };
-        if menu_item(ui, action, !flip_locked)
+        if menu_item(ui, action, flip_refused.is_none())
             .on_hover_text(hint)
-            // The reason is `editor::FLIP_LOCKED_REASON`, shared with the Edit
-            // menu's two history rows and with the notice a refused keystroke
-            // raises. Three hand-written near-copies of one sentence is the
-            // drift `flip_refused_by_lock` was introduced to stop for the
-            // *reading*, left standing for the wording.
-            .on_disabled_hover_text(format!(
-                "A layer is locked. {} first.",
-                editor::FLIP_LOCKED_REASON
-            ))
+            // The reason is `editor::FLIP_LOCKED_REASON` or
+            // `editor::FLIP_NEWER_PATHS`, shared with the Edit menu's two
+            // history rows and with the notice a refused keystroke raises.
+            // Three hand-written near-copies of one sentence is the drift
+            // `flip_refusal` was introduced to stop for the *reading*, left
+            // standing for the wording.
+            .on_disabled_hover_text(flip_refused.map_or_else(String::new, flip_refused_tip))
             .clicked()
         {
             actions.flip_canvas = Some(axis);
@@ -2226,7 +2224,7 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // `App::settle_step` raises is left catching the keystroke alone. Each
     // reason gets its own sentence, because "nothing to undo" over a document
     // twenty strokes deep sends somebody looking for the wrong problem.
-    // `StepGate::refuses` and never `== StepGate::FlipLocked`: a control asks
+    // `StepGate::refuses` and never an equality on one variant: a control asks
     // whether it may offer the command, which is a question about the *set* of
     // refusing answers, and an equality test answers it only while that set has
     // one member. An equality test is what stood here first, and it is
@@ -2242,30 +2240,28 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // which is the direction that costs a document nothing — and drawing the
     // menu from a speculative `finish_transform` would mean predicting an edit
     // in order to describe it.
-    let undo_locked = ed.undo_gate().refuses();
+    let undo_gate = ed.undo_gate();
+    let undo_locked = undo_gate.refuses();
     if menu_item(ui, Action::Undo, ed.history.can_undo() && !undo_locked)
-        .on_disabled_hover_text(if undo_locked {
-            format!(
-                "The next step back is a canvas flip, and a layer is locked. {} first.",
-                editor::FLIP_LOCKED_REASON
-            )
-        } else {
-            "Nothing in the history to undo.".to_owned()
+        .on_disabled_hover_text(match undo_gate {
+            editor::StepGate::FlipRefused(why) => step_refused_tip("back", why),
+            editor::StepGate::Clear | editor::StepGate::SettleForFlip => {
+                "Nothing in the history to undo.".to_owned()
+            }
         })
         .clicked()
     {
         actions.undo = true;
         ui.close();
     }
-    let redo_locked = ed.redo_gate().refuses();
+    let redo_gate = ed.redo_gate();
+    let redo_locked = redo_gate.refuses();
     if menu_item(ui, Action::Redo, ed.history.can_redo() && !redo_locked)
-        .on_disabled_hover_text(if redo_locked {
-            format!(
-                "The next step forward is a canvas flip, and a layer is locked. {} first.",
-                editor::FLIP_LOCKED_REASON
-            )
-        } else {
-            "Nothing undone to put back.".to_owned()
+        .on_disabled_hover_text(match redo_gate {
+            editor::StepGate::FlipRefused(why) => step_refused_tip("forward", why),
+            editor::StepGate::Clear | editor::StepGate::SettleForFlip => {
+                "Nothing undone to put back.".to_owned()
+            }
         })
         .clicked()
     {
@@ -2462,6 +2458,32 @@ fn update_rehearsal(ui: &mut egui::Ui, ed: &mut Editor) {
 /// Nothing in a release build.
 #[cfg(not(debug_assertions))]
 fn update_rehearsal(_ui: &mut egui::Ui, _ed: &mut Editor) {}
+
+/// The tooltip on a disabled flip row, for the reason the flip is refused.
+/// Exhaustive, so a third reason has to be worded before a row can carry it.
+fn flip_refused_tip(why: editor::FlipRefusal) -> String {
+    match why {
+        editor::FlipRefusal::Locked => {
+            format!("A layer is locked. {} first.", editor::FLIP_LOCKED_REASON)
+        }
+        editor::FlipRefusal::NewerPaths => editor::FLIP_NEWER_PATHS.to_owned(),
+    }
+}
+
+/// The tooltip on a disabled Undo or Redo row whose next step is a refused flip.
+/// `way` is "back" or "forward".
+fn step_refused_tip(way: &str, why: editor::FlipRefusal) -> String {
+    match why {
+        editor::FlipRefusal::Locked => format!(
+            "The next step {way} is a canvas flip, and a layer is locked. {} first.",
+            editor::FLIP_LOCKED_REASON
+        ),
+        editor::FlipRefusal::NewerPaths => format!(
+            "The next step {way} is a canvas flip. {}",
+            editor::FLIP_NEWER_PATHS
+        ),
+    }
+}
 
 /// A menu entry standing for one bindable command: its own name, and the chord
 /// currently bound to it.
