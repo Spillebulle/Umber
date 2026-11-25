@@ -404,6 +404,10 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .frame(Frame::NONE)
         .show(root, |ui| {
             let rect = ui.max_rect();
+            // First, so the marquee and the transform box are drawn over the
+            // machine lines: a selection made on top of a cut line is the thing
+            // being worked on, and the cut line is the thing it was made from.
+            vector_paths(ui.painter(), &p, ed, rect);
             selection_outline(ui, &p, ed, rect);
             // Beside the outline it belongs to rather than beside the
             // transform box, which is the other thing drawn here and is what
@@ -538,6 +542,165 @@ fn ant_width(pixels_per_point: f32) -> f32 {
 /// Asked for only where a selection or a gesture actually exists, so a document
 /// with nothing selected is exactly as idle as it was before.
 const ANT_FRAME_MS: u64 = 60;
+
+/// How wide a machine line's top pass is asked to be, in points.
+///
+/// Wider than the marquee's one device pixel so a cut line is not read as a
+/// selection that stopped marching, and narrow enough to sit on the edge of a
+/// shape without covering it. What is drawn is [`odd_device_width`] of it.
+const MACHINE_LINE: f32 = 1.5;
+
+/// `points` rounded to an **odd** whole number of device pixels, in points.
+///
+/// Odd for the reason [`ant_width`] is whole and one step further: an odd
+/// width centres on a pixel centre, which is where egui puts the marquee's one
+/// device pixel, so a cut line made from a selection lands on the very pixels
+/// its marquee did rather than straddling them. And the underlay is the top
+/// plus two device pixels, so the two passes share a parity, centre on the
+/// same pixel and leave exactly one pixel of underlay on each side; a three
+/// point underlay rounded on its own would have disagreed with the top by half
+/// a pixel at half the scales Windows offers.
+fn odd_device_width(points: f32, pixels_per_point: f32) -> f32 {
+    let ppp = pixels_per_point.max(1e-3);
+    let pixels = ((points * ppp - 1.0) * 0.5).round().max(0.0) * 2.0 + 1.0;
+    pixels / ppp
+}
+
+/// Every visible vector layer's cut and plot paths, as solid two-tone lines.
+///
+/// The pair is [`Palette::accent_underlay`] under the role's own colour, the
+/// marquee's arrangement, and solid where the marquee is dashed so the two are
+/// never read as one another. Both colours are derived so that one of the
+/// passes reads at 3:1 on any painting at all; see [`Palette::cut_line`].
+///
+/// **Nothing here allocates on a frame where nothing moved.** The lines are
+/// flattened and mapped by [`crate::vectorview::VectorView`] only when its key
+/// moves, and tessellated into one mesh only when those lines or the scale or
+/// the colours do. A still frame hands egui an `Arc` of last frame's mesh.
+///
+/// Axis-aligned runs are snapped to the pixel grid before tessellating, which
+/// is what `tessellate_line_segment` does for the marquee and a path never gets
+/// from egui: without it a cut line along a rectangle's edge would be the soft
+/// two-pixel ridge [`ant_width`] describes, beside a marquee that is crisp.
+fn vector_paths(painter: &egui::Painter, p: &Palette, ed: &mut Editor, view: Rect) {
+    // The marquee's scale for the *mapping*, which is what lands the lines on
+    // its pixels; the context's for the widths and the snap, which is what
+    // makes them whole device pixels on this frame. See `ant_width`.
+    let ppp = ed.pixels_per_point.max(1e-3);
+    let doc = ed.session.active_id();
+    let Editor {
+        vector_view,
+        vector_mesh,
+        layers,
+        camera,
+        ..
+    } = ed;
+    let drawn = vector_view.lines(doc, layers, camera, view, ppp);
+    if drawn.lines.is_empty() {
+        return;
+    }
+    let ctx = painter.ctx();
+    let device = ctx.pixels_per_point();
+    let key = crate::vectorview::MeshKey {
+        generation: drawn.generation,
+        ppp: device.to_bits(),
+        colours: [p.accent_underlay(), p.cut_line(), p.plot_line()],
+    };
+    if vector_mesh.key != Some(key) {
+        vector_mesh.mesh = std::sync::Arc::new(machine_line_mesh(ctx, drawn, device, key.colours));
+        vector_mesh.key = Some(key);
+    }
+    painter
+        .with_clip_rect(view)
+        .add(egui::Shape::Mesh(std::sync::Arc::clone(&vector_mesh.mesh)));
+}
+
+/// The lines tessellated: every underlay first, then every top pass, so where
+/// two lines cross both tops show rather than one line's underlay cutting the
+/// other.
+fn machine_line_mesh(
+    ctx: &egui::Context,
+    drawn: crate::vectorview::Lines<'_>,
+    ppp: f32,
+    [under, cut, plot]: [egui::Color32; 3],
+) -> egui::epaint::Mesh {
+    use egui::epaint::{PathShape, tessellator::Tessellator};
+    let top_width = odd_device_width(MACHINE_LINE, ppp);
+    let under_width = top_width + 2.0 / ppp;
+    let snap_stroke = Stroke::new(top_width, under);
+    let mut tessellator = Tessellator::new(
+        ppp,
+        ctx.tessellation_options(|o| *o),
+        ctx.fonts(|f| f.font_image_size()),
+        Vec::new(),
+    );
+    let mut mesh = egui::epaint::Mesh::default();
+    for underlay in [true, false] {
+        for line in drawn.lines {
+            let colour = match line.role {
+                umber_core::PathRole::Cut => cut,
+                umber_core::PathRole::Plot => plot,
+                // `VectorView` never emits one; Ink is the layer's pixels.
+                umber_core::PathRole::Ink => continue,
+            };
+            let stroke = if underlay {
+                Stroke::new(under_width, under)
+            } else {
+                Stroke::new(top_width, colour)
+            };
+            let run = &drawn.points[line.points.clone()];
+            // A closed path ends on its first point; drawn as a closed line it
+            // gets a join there instead of two butt ends and a notch.
+            let closed = run.len() > 3 && run.first() == run.last();
+            let shape = if closed {
+                PathShape::closed_line(
+                    snapped(&run[..run.len() - 1], true, snap_stroke, ppp),
+                    stroke,
+                )
+            } else {
+                PathShape::line(snapped(run, false, snap_stroke, ppp), stroke)
+            };
+            tessellator.tessellate_path(&shape, &mut mesh);
+        }
+    }
+    mesh
+}
+
+/// `points` with every coordinate an axis-aligned neighbour shares rounded to
+/// where egui would centre a line `stroke` wide — the rule
+/// `tessellate_line_segment` applies to the marquee, applied per run. A
+/// diagonal is left exactly where it was, because there is no grid to put it
+/// on and moving it would only make a curve wobble. Neighbours wrap where the
+/// line is `closed`, or a rectangle's first corner would see only one of its
+/// two edges.
+fn snapped(points: &[egui::Pos2], closed: bool, stroke: Stroke, ppp: f32) -> Vec<egui::Pos2> {
+    let n = points.len();
+    let mut out = points.to_vec();
+    for i in 0..n {
+        let prev = if i > 0 {
+            Some(points[i - 1])
+        } else if closed {
+            points.last().copied()
+        } else {
+            None
+        };
+        let next = if i + 1 < n {
+            Some(points[i + 1])
+        } else if closed {
+            points.first().copied()
+        } else {
+            None
+        };
+        let here = points[i];
+        if prev.is_some_and(|q| q.x == here.x) || next.is_some_and(|q| q.x == here.x) {
+            stroke.round_center_to_pixel(ppp, &mut out[i].x);
+        }
+        if prev.is_some_and(|q| q.y == here.y) || next.is_some_and(|q| q.y == here.y) {
+            stroke.round_center_to_pixel(ppp, &mut out[i].y);
+        }
+    }
+    out
+}
 
 /// The selection, and the outline being drawn if one is.
 ///
@@ -6867,6 +7030,285 @@ mod tests {
                  {solid_under} of the underlay, {solid_accent} of the accent"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The machine lines
+    // -----------------------------------------------------------------------
+
+    /// An editor holding one vector layer with `record`, set up as
+    /// [`editor_with_selection`] sets its marquee up and with no selection.
+    fn editor_with_paths(record: umber_core::VectorObject, ppp: f32) -> Editor {
+        let mut ed = editor_with_selection(MARQUEE_DOC, vec![MARQUEE_RING.to_vec()], ppp);
+        ed.selection = None;
+        ed.layers
+            .add_vector_layer("Cut lines", record)
+            .expect("room for a layer");
+        ed
+    }
+
+    fn one_path(
+        role: umber_core::PathRole,
+        from: glam::Vec2,
+        to: glam::Vec2,
+    ) -> umber_core::VectorObject {
+        use umber_core::{Node, Path, VectorObject};
+        VectorObject::empty()
+            .appended(vec![Path {
+                role,
+                closed: false,
+                nodes: vec![Node::corner(from), Node::corner(to)],
+                ink: None,
+            }])
+            .expect("legal")
+    }
+
+    /// **A cut line is drawn, in the cut colour, on whole device pixels.**
+    ///
+    /// Read off the frame rather than off the colour `vector_paths` asks for,
+    /// which is the guard that would agree with itself: down one column across
+    /// a horizontal path, the device pixels that carry the cut colour *exactly*
+    /// are counted, and so are those that carry the underlay exactly. A soft
+    /// line has neither; a line on the wrong parity has the right total split
+    /// unevenly. At every scale Windows offers.
+    #[test]
+    fn the_overlay_draws_a_cut_line_in_the_cut_colour() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let field = vec2(320.0, 220.0);
+        let paper = egui::Color32::WHITE;
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            let mut ed = editor_with_paths(
+                one_path(
+                    umber_core::PathRole::Cut,
+                    glam::Vec2::new(40.0, 100.0),
+                    glam::Vec2::new(280.0, 100.0),
+                ),
+                ppp,
+            );
+            let prims = frame_at(&palette, field, ppp, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(rect, 0.0, paper);
+                super::vector_paths(ui.painter(), &palette, &mut ed, rect);
+            });
+
+            let x = (160.0 * ppp).floor() + 0.5;
+            let (mut cut, mut under, mut first_cut, mut last_cut) = (0, 0, None, 0);
+            for row in int_range(80.0, 120.0, ppp) {
+                let at = pos2(x / ppp, (row as f32 + 0.5) / ppp);
+                let c = frame_pixel(&prims, paper, at);
+                if c == palette.cut_line() {
+                    cut += 1;
+                    first_cut.get_or_insert(row);
+                    last_cut = row;
+                } else if c == palette.accent_underlay() {
+                    under += 1;
+                }
+            }
+            let want = (super::odd_device_width(super::MACHINE_LINE, ppp) * ppp).round() as u32;
+            assert_eq!(
+                cut, want,
+                "at {ppp}x the cut line covers {cut} device pixels"
+            );
+            assert_eq!(
+                under, 2,
+                "at {ppp}x the underlay covers {under} device pixels, not one each side"
+            );
+            let first = first_cut.expect("some cut pixels");
+            assert_eq!(
+                last_cut + 1 - first,
+                cut,
+                "at {ppp}x the cut line has a gap"
+            );
+        }
+    }
+
+    /// A plot line is drawn in the plot colour, not the cut one: the role
+    /// reaches the paint.
+    #[test]
+    fn a_plot_line_is_drawn_in_the_plot_colour() {
+        let palette = Palette::of(ThemeKind::Paper);
+        let paper = egui::Color32::WHITE;
+        let mut ed = editor_with_paths(
+            one_path(
+                umber_core::PathRole::Plot,
+                glam::Vec2::new(40.0, 100.0),
+                glam::Vec2::new(280.0, 100.0),
+            ),
+            1.0,
+        );
+        let prims = frame_at(&palette, vec2(320.0, 220.0), 1.0, |ui| {
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, 0.0, paper);
+            super::vector_paths(ui.painter(), &palette, &mut ed, rect);
+        });
+        let seen = int_range(80.0, 120.0, 1.0)
+            .map(|row| frame_pixel(&prims, paper, pos2(160.5, row as f32 + 0.5)))
+            .filter(|c| *c == palette.plot_line())
+            .count();
+        assert_eq!(seen, 1);
+    }
+
+    /// **A path made from a rectangle selection lands on the marquee it was
+    /// made from.** The path goes through the real command's plan, the marquee
+    /// is drawn by the real `selection_outline`, and the two sets of screen
+    /// points are compared — the outline's out of the buffer it leaves behind,
+    /// so nothing here restates how either maps a document point. At 150%,
+    /// with the camera centred off the pixel grid, which is where a mapping
+    /// that differed by a scale or a pivot would show.
+    #[test]
+    fn the_lines_land_where_the_marquee_does() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let ppp = 1.5;
+        let mut ed = editor_with_selection(MARQUEE_DOC, vec![MARQUEE_RING.to_vec()], ppp);
+        match ed
+            .plan_path_from_selection(umber_core::PathRole::Cut)
+            .expect("no refusal")
+            .expect("a selection")
+        {
+            crate::editor::PathPlan::NewLayer { name, record } => {
+                ed.layers
+                    .add_vector_layer(name, *record)
+                    .expect("room for a layer");
+            }
+            crate::editor::PathPlan::Append { .. } => {
+                panic!("the active layer is not a vector layer")
+            }
+        }
+        let mut seen = None;
+        frame_at(&palette, vec2(320.0, 220.0), ppp, |ui| {
+            let rect = ui.max_rect();
+            super::vector_paths(ui.painter(), &palette, &mut ed, rect);
+            super::selection_outline(ui, &palette, &mut ed, rect);
+            seen = Some(rect);
+        });
+        let rect = seen.expect("the frame ran");
+        let doc = ed.session.active_id();
+        let drawn = ed
+            .vector_view
+            .lines(doc, &ed.layers, &ed.camera, rect, ed.pixels_per_point);
+        assert_eq!(drawn.lines.len(), 1);
+        assert_eq!(
+            &drawn.points[drawn.lines[0].points.clone()],
+            ed.selection_screen.as_slice(),
+            "the cut line and its marquee disagree about where the rectangle is"
+        );
+    }
+
+    /// A frame where nothing moved hands egui the mesh it already has.
+    #[test]
+    fn a_still_frame_reuses_the_mesh() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let mut ed = editor_with_paths(
+            one_path(
+                umber_core::PathRole::Cut,
+                glam::Vec2::new(40.0, 100.0),
+                glam::Vec2::new(280.0, 100.0),
+            ),
+            1.0,
+        );
+        let ctx = fresh_context(&palette);
+        let frame = |ed: &mut Editor| {
+            frame_into(&ctx, vec2(320.0, 220.0), 1.0, |ui| {
+                let rect = ui.max_rect();
+                super::vector_paths(ui.painter(), &palette, ed, rect);
+            });
+            std::sync::Arc::clone(&ed.vector_mesh.mesh)
+        };
+        let first = frame(&mut ed);
+        let second = frame(&mut ed);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a still frame rebuilt the mesh"
+        );
+        assert!(!first.vertices.is_empty());
+        ed.camera.center.x += 3.0;
+        let third = frame(&mut ed);
+        assert!(
+            !std::sync::Arc::ptr_eq(&second, &third),
+            "a camera move kept the old mesh"
+        );
+    }
+
+    /// **A cut line never reaches the picture.** The export of a document with
+    /// a cut and a plot path laid right across its painting is byte for byte
+    /// the export of the same document without them. Through the real
+    /// `layer_draws` and the real `export_rgba`, because what this guards is
+    /// that the overlay stays an overlay: the day somebody rasterises a cut
+    /// path into its layer, the sticker printed from this file has the cutting
+    /// line printed round it.
+    ///
+    /// Skips rather than fails with no adapter, and holds `gputest::lock` for
+    /// its whole length — see `crate::gputest`.
+    #[test]
+    fn a_document_export_ignores_cut_paths() {
+        use umber_render::CanvasRenderer;
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        // Wide rather than square, for the reason every GPU fixture here is.
+        let size = glam::UVec2::new(40, 24);
+        let mut ed = Editor::default();
+        ed.doc = umber_core::Document::new(size.x, size.y);
+        let mut canvas = CanvasRenderer::new(
+            &gpu.device,
+            &gpu.queue,
+            size,
+            wgpu::TextureFormat::Rgba8Unorm,
+            umber_core::LayerStack::MAX_SLOTS,
+        );
+        canvas.clear_all_layers(&gpu.queue);
+        canvas.set_background(ed.doc.background);
+        let painted = ed.layers.layers()[0].slot().expect("a layer");
+        let whole = umber_core::PixelRect {
+            x: 0,
+            y: 0,
+            width: size.x,
+            height: size.y,
+        };
+        let picture: Vec<u8> = (0..whole.area())
+            .flat_map(|i| [(i * 7 % 251) as u8, 90, 200, 255])
+            .collect();
+        canvas.write_layer_rect(&gpu.device, &gpu.queue, painted, whole, &picture);
+        let without = canvas.export_rgba(&gpu.device, &gpu.queue, &ed.layer_draws(None));
+        // The painting reached the export, so the comparison below is between
+        // two pictures and not between two blanks.
+        assert!(
+            without
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] == 255 && px[2] > 150),
+            "the fixture's painting is not in the export"
+        );
+
+        let across = |role| umber_core::Path {
+            role,
+            closed: false,
+            nodes: vec![
+                umber_core::Node::corner(glam::Vec2::new(-5.0, 12.0)),
+                umber_core::Node::corner(glam::Vec2::new(45.0, 12.0)),
+            ],
+            ink: None,
+        };
+        let record = umber_core::VectorObject::empty()
+            .appended(vec![
+                across(umber_core::PathRole::Cut),
+                across(umber_core::PathRole::Plot),
+            ])
+            .expect("legal");
+        let at = ed
+            .layers
+            .add_vector_layer("Cut lines", record)
+            .expect("room for a layer");
+        let slot = ed.layers.layers()[at].slot().expect("a layer");
+        canvas.clear_layer(&gpu.queue, slot);
+        let with = canvas.export_rgba(&gpu.device, &gpu.queue, &ed.layer_draws(None));
+        assert_eq!(with.len(), without.len());
+        assert!(
+            with == without,
+            "a cut or plot path reached the exported picture"
+        );
     }
 
     /// Device pixel indices whose *centres* lie inside a span given in points.

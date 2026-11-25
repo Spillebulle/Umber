@@ -188,6 +188,28 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
+/// The hue a vector layer's cut path starts from, in degrees on the RGB wheel:
+/// a red leaning a little to magenta. Red is what a cut line is on a cutting
+/// machine's own screen.
+///
+/// **Only a little**, and that was measured rather than chosen: at 345 the
+/// light form a dark theme takes is a pink 64 from the link colours' rose
+/// (`#EE5AA8`), under the 68 `cut_and_plot_are_told_apart_in_every_theme`
+/// holds it to. A sweep of both hues in five-degree steps put 355 at 85, the
+/// closest it comes to anything over all twenty-four themes and accents, and
+/// pure red at 95; 355 keeps the lean away from the accents' oranges.
+const CUT_HUE: f32 = 355.0;
+
+/// The hue a plot path starts from: a cyan leaning to blue, the far side of
+/// the wheel from the cut, so the two roles differ in hue whatever lightness
+/// the contrast leaves them. 195 rather than 200 for the same sweep's reason.
+const PLOT_HUE: f32 = 195.0;
+
+/// How far a machine line's top pass stands off its underlay:
+/// [`contrast::READABLE`] squared. See [`Palette::machine_line`] for why the
+/// square is exactly what makes one of the two read on any painting.
+const MACHINE_LINE_CONTRAST: f64 = contrast::READABLE * contrast::READABLE;
+
 /// Whether a mark can be seen on the surface it is drawn on, and an ink for one
 /// that has to be.
 ///
@@ -1242,6 +1264,67 @@ impl Palette {
         contrast::ink_on(self.accent, contrast::Ink::Strong)
     }
 
+    /// The colour a vector layer's **cut** path is drawn in over the canvas: a
+    /// red towards magenta, taken to whichever end of the lightness axis the
+    /// [`Palette::accent_underlay`] beneath it is not.
+    ///
+    /// **Derived, not tabled**, for the reason the underlay is: the accent is a
+    /// preference on top of the theme and the theme editor can set it to
+    /// anything, so a table would be twenty-four authored answers that a theme
+    /// somebody wrote could still break. See [`Palette::machine_line`] for the
+    /// rule and `the_machine_lines_read_over_any_artwork` for what it buys.
+    pub fn cut_line(&self) -> Color32 {
+        self.machine_line(CUT_HUE)
+    }
+
+    /// The colour a vector layer's **plot** path is drawn in: a cyan towards
+    /// blue, by the rule [`Palette::cut_line`] follows.
+    pub fn plot_line(&self) -> Color32 {
+        self.machine_line(PLOT_HUE)
+    }
+
+    /// A fully saturated `hue`, taken towards the end of the lightness axis the
+    /// underlay is not until it stands [`MACHINE_LINE_CONTRAST`] off it.
+    ///
+    /// **Why that figure makes the pair read on any painting.** Contrast is a
+    /// ratio of luminances, so for any artwork lying between the two passes
+    /// `ratio(top, under) = ratio(top, art) × ratio(art, under)`. The underlay
+    /// alone reads at [`contrast::READABLE`] on everything up to the artwork
+    /// where it reaches exactly that; at that artwork the top pass needs
+    /// another [`contrast::READABLE`], so the two together need its square.
+    /// Past that artwork the top only gets further away. The marquee cannot do
+    /// this because its top pass *is* the accent, a mid tone it does not get
+    /// to move; here the hue is ours and only the lightness is spent.
+    ///
+    /// Mixed in sRGB bytes through [`mix`] and bisected rather than solved, as
+    /// [`contrast::ink_on`] is, so the guarantee holds for the bytes drawn: the
+    /// predicate is monotone in `t`, `hi` starts at the extreme, which reaches
+    /// 21:1, and `hi` is what comes back. Taking the hue *towards* an end
+    /// rather than choosing a grey keeps as much of the hue as the contrast
+    /// leaves, which is what tells the two roles apart.
+    fn machine_line(&self, hue: f32) -> Color32 {
+        let under = self.accent_underlay();
+        let far = if contrast::luminance(under) < 0.5 {
+            contrast::LIT
+        } else {
+            contrast::SHADE
+        };
+        let [r, g, b, _] = umber_core::Hsv::new(hue, 1.0, 1.0)
+            .to_color(1.0)
+            .to_srgb_u8();
+        let pure = Color32::from_rgb(r, g, b);
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..14 {
+            let mid = 0.5 * (lo + hi);
+            if contrast::ratio(mix(pure, far, mid), under) >= MACHINE_LINE_CONTRAST {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        mix(pure, far, hi)
+    }
+
     /// The theme in its authored accent.
     ///
     /// The one place a [`ThemeKind`] becomes colours, which is what lets
@@ -1705,6 +1788,112 @@ mod tests {
     use super::contrast::Ink;
     use super::*;
 
+    /// How far apart two marks' colours are: the sum of the per-channel
+    /// differences. Crude next to a perceptual metric and deliberately so: it
+    /// is `mix`'s own arithmetic, it is honest about what it measures, and the
+    /// bounds were settled by looking at the marks rather than derived from a
+    /// model. **One function for every separation guard here**, so a figure
+    /// one of them quotes is a figure another can be held to.
+    fn apart(a: Color32, b: Color32) -> u32 {
+        let d = |x: u8, y: u8| u32::from(x.abs_diff(y));
+        d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
+    }
+
+    /// The closest any two accents come in any one theme: the bar
+    /// `no_two_accents_look_alike_in_one_theme` documents as 68, computed
+    /// rather than quoted.
+    fn tightest_accent_pair() -> u32 {
+        let mut tightest = u32::MAX;
+        for kind in ThemeKind::ALL {
+            for (i, a) in Accent::ALL.into_iter().enumerate() {
+                for b in Accent::ALL.into_iter().skip(i + 1) {
+                    let d = apart(
+                        Palette::with_accent(kind, a).accent,
+                        Palette::with_accent(kind, b).accent,
+                    );
+                    tightest = tightest.min(d);
+                }
+            }
+        }
+        tightest
+    }
+
+    /// A vector layer's cut and plot lines lie over artwork, like the marquee,
+    /// and unlike the marquee they **can** reach 3:1 on every colour there is,
+    /// because the top pass is not tied to a mid-tone accent.
+    ///
+    /// The sweep is the marquee guard's own, and the claim it holds is stronger
+    /// than that guard's 2.2: one of the two passes reads at
+    /// [`contrast::READABLE`] against every painting.
+    #[test]
+    fn the_machine_lines_read_over_any_artwork() {
+        for kind in ThemeKind::ALL {
+            for accent in Accent::ALL {
+                let p = Palette::with_accent(kind, accent);
+                let under = p.accent_underlay();
+                for (role, top) in [("cut", p.cut_line()), ("plot", p.plot_line())] {
+                    let mut worst = (f64::MAX, Color32::BLACK);
+                    for r in 0..=255u8 {
+                        for g in (0..=255u8).step_by(15) {
+                            for b in (0..=255u8).step_by(15) {
+                                let art = Color32::from_rgb(r, g, b);
+                                let pair =
+                                    contrast::ratio(top, art).max(contrast::ratio(under, art));
+                                if pair < worst.0 {
+                                    worst = (pair, art);
+                                }
+                            }
+                        }
+                    }
+                    let (seen, art) = worst;
+                    assert!(
+                        seen >= contrast::READABLE,
+                        "{kind:?}/{accent:?}: the {role} line is {seen:.3}:1 on {art:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cut and plot are told apart from each other, from the accent and from
+    /// every link colour, by at least as much as the two closest accents are,
+    /// in every theme and accent. Measured with [`apart`], the function the
+    /// accent guard measures with, and against a bar it computes rather than
+    /// the figure in that guard's comment.
+    ///
+    /// The link colours are in it because a link mark and a cut line are both
+    /// coloured marks over the same window, and the accent because the marquee
+    /// is drawn in it and is often on screen beside a cut line made from it.
+    #[test]
+    fn cut_and_plot_are_told_apart_in_every_theme() {
+        let bar = tightest_accent_pair();
+        for kind in ThemeKind::ALL {
+            for accent in Accent::ALL {
+                let p = Palette::with_accent(kind, accent);
+                let (cut, plot) = (p.cut_line(), p.plot_line());
+                let d = apart(cut, plot);
+                assert!(
+                    d >= bar,
+                    "{kind:?}/{accent:?}: cut {cut:?} and plot {plot:?} are {d} apart"
+                );
+                for (role, line) in [("cut", cut), ("plot", plot)] {
+                    let d = apart(line, p.accent);
+                    assert!(
+                        d >= bar,
+                        "{kind:?}/{accent:?}: {role} is {d} from the accent"
+                    );
+                    for link in p.link_colours {
+                        let d = apart(line, link);
+                        assert!(
+                            d >= bar,
+                            "{kind:?}/{accent:?}: {role} {line:?} is {d} from link {link:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A link group is told apart from its neighbours by the colour of a 12-px
     /// mark and by nothing else, so "no two are equal" is far too weak a test:
     /// two colours a dozen units apart are the same mark at that size. This
@@ -1719,15 +1908,6 @@ mod tests {
     /// hair from Umber itself.
     #[test]
     fn link_colours_are_told_apart_from_each_other_and_from_every_accent() {
-        // Sum of the per-channel differences. Crude next to a perceptual metric
-        // and deliberately so: it is `mix`'s own arithmetic, it is honest about
-        // what it measures, and the bounds were settled by looking at the marks
-        // rather than derived from a model.
-        let apart = |a: Color32, b: Color32| {
-            let d = |x: u8, y: u8| u32::from(x.abs_diff(y));
-            d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
-        };
-
         for kind in ThemeKind::ALL {
             let p = Palette::of(kind);
             assert_eq!(
@@ -1777,10 +1957,6 @@ mod tests {
     /// one was, in `shit_studio`'s own doc block.
     #[test]
     fn no_two_accents_look_alike_in_one_theme() {
-        let apart = |a: Color32, b: Color32| {
-            let d = |x: u8, y: u8| u32::from(x.abs_diff(y));
-            d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
-        };
         for kind in ThemeKind::ALL {
             let inks: Vec<Color32> = Accent::ALL
                 .into_iter()

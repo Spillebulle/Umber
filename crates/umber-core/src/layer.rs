@@ -924,6 +924,13 @@ pub struct AddedLayer {
     pub id: u32,
 }
 
+/// The next [`LayerStack::vector_revision`], shared by every stack in the
+/// process. See there for why it is not per stack.
+fn next_vector_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bottom-to-top stack of layers. Index 0 is the bottom.
 #[derive(Debug)]
 pub struct LayerStack {
@@ -935,6 +942,8 @@ pub struct LayerStack {
     /// Next [`Layer::id`]. Never recycled, so an entry that has left the stack
     /// and comes back is still the same entry.
     next_id: u32,
+    /// What [`LayerStack::vector_revision`] answers.
+    vector_revision: u64,
 }
 
 impl Default for LayerStack {
@@ -1046,6 +1055,7 @@ impl LayerStack {
             active: 0,
             pool: Arc::new(Mutex::new(SlotPool::default())),
             next_id: 0,
+            vector_revision: next_vector_revision(),
         }
     }
 
@@ -1375,6 +1385,7 @@ impl LayerStack {
         // the layer that *was* selected is still in the stack — inside the
         // folder, which is where the painter just put it.
         self.active = at + n;
+        self.touch_vectors();
         Some(at + n)
     }
 
@@ -1532,6 +1543,7 @@ impl LayerStack {
             "add left a malformed stack"
         );
         self.active = at;
+        self.touch_vectors();
         Some(AddedLayer { slot: number, id })
     }
 
@@ -1783,6 +1795,7 @@ impl LayerStack {
         match self.layers.get_mut(index) {
             Some(layer) if !layer.folder && layer.text.is_none() && layer.vector.is_none() => {
                 layer.vector = Some(Box::new(record));
+                self.touch_vectors();
                 true
             }
             _ => false,
@@ -1803,12 +1816,32 @@ impl LayerStack {
         self.add_named(name)?;
         let at = self.active;
         self.layers[at].vector = Some(Box::new(record));
+        self.touch_vectors();
         Some(at)
     }
 
     /// The record for the layer at `index`.
     pub fn vector_at(&self, index: usize) -> Option<&VectorObject> {
         self.layers.get(index)?.vector()
+    }
+
+    /// A number that changes whenever what the vector overlay draws could have.
+    ///
+    /// Moved inside every method that writes a layer's record — the field is
+    /// private to this module, so those are all of them — and inside every
+    /// structural edit, so the overlay's cache of flattened lines needs no call
+    /// site to remember to throw it away. Drawn from one process-wide counter
+    /// rather than counted per stack, so a stack built to replace another (an
+    /// open, a recovered copy) can never answer a number the old one did.
+    /// **Visibility is not in it**: the eye is a public field written from the
+    /// interface, so the overlay reads it afresh every frame instead.
+    pub fn vector_revision(&self) -> u64 {
+        self.vector_revision
+    }
+
+    /// Say that what the overlay draws may have changed.
+    fn touch_vectors(&mut self) {
+        self.vector_revision = next_vector_revision();
     }
 
     /// Is any layer a vector layer?
@@ -1849,6 +1882,7 @@ impl LayerStack {
         record: VectorObject,
     ) -> Result<Option<Box<VectorObject>>, VectorSetRefusal> {
         self.can_set_vector(index, &record)?;
+        self.touch_vectors();
         Ok(self.layers[index].vector.replace(Box::new(record)))
     }
 
@@ -1870,7 +1904,9 @@ impl LayerStack {
                     record.is_none() || layer.text.is_none(),
                     "a layer is never both text and vector"
                 );
-                Ok(std::mem::replace(&mut layer.vector, record))
+                let was = std::mem::replace(&mut layer.vector, record);
+                self.touch_vectors();
+                Ok(was)
             }
             None => Err(record),
         }
@@ -1887,6 +1923,7 @@ impl LayerStack {
                 **record = record.flipped(axis, canvas);
             }
         }
+        self.touch_vectors();
     }
 
     /// Move every vector layer's paths by `by`, as a resize moves the picture.
@@ -1908,6 +1945,7 @@ impl LayerStack {
                 **record = moved;
             }
         }
+        self.touch_vectors();
         stripped
     }
 
@@ -2231,6 +2269,7 @@ impl LayerStack {
         // Deleting one of a pair would otherwise leave the survivor in a group
         // of one — see `dissolve_lone_groups`.
         self.dissolve_lone_groups();
+        self.touch_vectors();
         Some(taken)
     }
 
@@ -2641,6 +2680,7 @@ impl LayerStack {
             .iter()
             .position(|(i, _)| *i == was)
             .unwrap_or_else(|| self.active.min(self.layers.len() - 1));
+        self.touch_vectors();
         true
     }
 
@@ -2869,6 +2909,9 @@ impl LayerStack {
         let was: Vec<(u32, u8)> = self.layers.iter().map(|l| (l.id, l.depth)).collect();
         let was_active = self.layers.get(self.active).map_or(0, |l| l.id);
 
+        // Here rather than at the end, which has more than one way out: from
+        // this line on the stack is being rebuilt whatever happens next.
+        self.touch_vectors();
         let mut held: Vec<Option<Layer>> = self.layers.drain(..).map(Some).collect();
         let mut find = |id: u32| -> Option<Layer> {
             held.iter_mut()
@@ -4710,6 +4753,90 @@ mod tests {
     /// `LayerStack` has no `PartialEq`, and the records are the part under test.
     fn records_of(s: &LayerStack) -> Vec<Option<VectorObject>> {
         s.layers().iter().map(|l| l.vector().cloned()).collect()
+    }
+
+    /// **Every door a record comes through moves the revision**, and the list
+    /// was taken by searching for writes to the field rather than from memory:
+    /// `slot_revision` was once called exhaustive by construction and was false
+    /// for exactly one method. The overlay keeps its flattened lines until this
+    /// number moves, so a writer missing here is a cut line left drawn where the
+    /// path no longer is.
+    ///
+    /// The structural edits are here too, though the overlay also reads which
+    /// layers exist and which are visible afresh every frame: a layer leaving
+    /// and coming back is the case where that reading alone could match a
+    /// cache built before it went.
+    #[test]
+    fn every_writer_of_a_vector_record_moves_the_revision() {
+        fn bumps(s: &mut LayerStack, what: &str, f: impl FnOnce(&mut LayerStack)) {
+            let before = s.vector_revision();
+            f(s);
+            assert_ne!(
+                before,
+                s.vector_revision(),
+                "{what} left the revision alone"
+            );
+        }
+        fn still(s: &mut LayerStack, what: &str, f: impl FnOnce(&mut LayerStack)) {
+            let before = s.vector_revision();
+            f(s);
+            assert_eq!(before, s.vector_revision(), "{what} moved the revision");
+        }
+
+        let mut s = LayerStack::new();
+        bumps(&mut s, "install_vector", |s| {
+            assert!(s.install_vector(0, some_paths()));
+        });
+        let mut at = 0;
+        bumps(&mut s, "add_vector_layer", |s| {
+            at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        });
+        bumps(&mut s, "set_vector", |s| {
+            s.set_vector(at, with_ink()).expect("legal");
+        });
+        still(&mut s, "a refused set_vector", |s| {
+            assert!(s.set_vector(99, some_paths()).is_err());
+        });
+        let slot = s.get(at).and_then(Layer::slot).expect("a layer");
+        bumps(&mut s, "restore_vector", |s| {
+            s.restore_vector(slot, Some(Box::new(some_paths())))
+                .expect("held");
+        });
+        bumps(&mut s, "flip_vectors", |s| {
+            s.flip_vectors(FlipAxis::Horizontal, UVec2::new(100, 100));
+        });
+        bumps(&mut s, "translate_vectors", |s| {
+            s.translate_vectors(Vec2::new(3.0, 4.0));
+        });
+        bumps(&mut s, "add", |s| {
+            s.add().expect("room");
+        });
+        bumps(&mut s, "reorder", |s| {
+            assert!(s.reorder(0, 2));
+        });
+        bumps(&mut s, "group", |s| {
+            s.group(&[1]).expect("grouped");
+        });
+        let shape = s.shape(0);
+        let mut removed = Vec::new();
+        bumps(&mut s, "remove", |s| {
+            removed = s.remove(0).expect("removed");
+        });
+        bumps(&mut s, "restore_shape", |s| {
+            s.restore_shape(shape.with_removed(removed));
+        });
+        bumps(&mut s, "remove_many", |s| {
+            s.remove_many(&[0]).expect("removed");
+        });
+    }
+
+    /// Two stacks never answer the same revision, so a document opened into a
+    /// tab cannot be drawn from the lines of the one it replaced.
+    #[test]
+    fn two_stacks_never_share_a_vector_revision() {
+        let a = LayerStack::new();
+        let b = LayerStack::new();
+        assert_ne!(a.vector_revision(), b.vector_revision());
     }
 
     /// **The paint gate refuses a vector layer and not its mask**, for the text

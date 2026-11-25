@@ -794,6 +794,18 @@ pub struct Editor {
     /// is a cache of GPU state rather than part of the document. See
     /// [`crate::thumbs`].
     pub thumbs: crate::thumbs::Thumbs,
+    /// Where the vector layers' cut and plot paths land on screen, and the
+    /// mesh they were tessellated into.
+    ///
+    /// Above the `--- documents ---` line for the reason [`Editor::thumbs`]
+    /// is: it is a cache of what is drawn rather than part of the document,
+    /// and it is keyed by document id, so a tab switch is a key that moved
+    /// rather than a field that leaked. See [`crate::vectorview`].
+    pub vector_view: crate::vectorview::VectorView,
+    /// Those lines tessellated, so a still frame hands egui an `Arc` rather
+    /// than a copy of every point. A field of its own beside `vector_view`
+    /// because it is built *from* that one's borrowed lines.
+    pub vector_mesh: crate::vectorview::Tessellated,
     /// Where the live document lets an edit land, or `None` for all of it.
     ///
     /// An `Arc` because the renderer compares it by identity to decide whether
@@ -1133,6 +1145,8 @@ impl Default for Editor {
             papers: BTreeMap::new(),
             layers: LayerStack::new(),
             thumbs: crate::thumbs::Thumbs::default(),
+            vector_view: crate::vectorview::VectorView::default(),
+            vector_mesh: crate::vectorview::Tessellated::default(),
             session: Session::default(),
             notice: None,
             loading: None,
