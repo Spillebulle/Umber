@@ -305,6 +305,15 @@ impl PathPlan {
     }
 }
 
+/// The one statement of what a full stack says, written as a literal so it can
+/// sit inside `concat!`. A test pins the figure to `LayerStack::MAX`.
+macro_rules! stack_full_line {
+    () => {
+        "This document already has 64 entries, which is all Umber holds."
+    };
+}
+pub(crate) use stack_full_line;
+
 /// Why the active layer's paths cannot be edited, in the order the tests are
 /// made. One enum so the tool's hint, its refusals and `plan_paths` read one
 /// answer rather than restating it.
@@ -1774,7 +1783,7 @@ impl Editor {
             Some(umber_core::AddRefusal::StackFull) => {
                 return Some((
                     "There is no room for another layer",
-                    "This document is full. Delete a layer to make room.",
+                    concat!(stack_full_line!(), " Delete a layer to make room."),
                 ));
             }
             Some(umber_core::AddRefusal::TooDeep) => {
@@ -5324,13 +5333,57 @@ mod tests {
     #[test]
     fn a_replacement_is_refused_rather_than_made_a_layer() {
         let mut ed = with_vector_paths(1);
-        assert!(ed.plan_paths(vec![triangle_at(0.0)], Some(5)).is_err());
+        let ids = stack_ids(&ed);
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        assert_eq!(
+            ed.plan_paths(vec![triangle_at(0.0)], Some(5)).unwrap_err(),
+            umber_core::vector::VectorRefusal::Impossible.sentence()
+        );
         let active = ed.layers.active_index();
         ed.layers.get_mut(active).unwrap().locked = true;
         assert_eq!(
             ed.plan_paths(vec![triangle_at(0.0)], Some(0)).unwrap_err(),
             PathEditRefusal::Locked.sentence()
         );
+        assert_eq!(stack_ids(&ed), ids, "no layer was made");
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(ed.layers.vector_revision(), revision);
+    }
+
+    /// The full-stack sentence states the figure the stack really holds.
+    #[test]
+    fn the_full_stack_sentence_names_the_real_maximum() {
+        assert!(stack_full_line!().contains(&LayerStack::MAX.to_string()));
+        let mut ed = with_a_selection();
+        while ed.layers.len() < LayerStack::MAX {
+            ed.layers.add().expect("room");
+        }
+        let said = ed
+            .plan_paths(vec![triangle_at(0.0)], None)
+            .expect_err("full");
+        assert!(said.contains(&LayerStack::MAX.to_string()), "{said}");
+    }
+
+    /// An edit one ulp from the record there is still an edit: equality is
+    /// exact, so a nudge too small to see is not thrown away.
+    #[test]
+    fn a_one_ulp_edit_still_records() {
+        let mut ed = with_vector_paths(1);
+        let before = record_of(&ed);
+        let mut after = before.clone();
+        let umber_core::VectorObject::Paths(paths) = &mut after else {
+            panic!("paths");
+        };
+        let x = &mut paths[0].nodes[0].at.x;
+        *x = f32::from_bits(x.to_bits() + 1);
+        assert_ne!(after, before);
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        ed.apply_path_edit(after.clone()).expect("an edit");
+        assert_eq!(ed.history.position(), position + 1);
+        assert_ne!(ed.layers.vector_revision(), revision, "the overlay is told");
+        assert_eq!(record_of(&ed), after);
     }
 
     /// One entry, of the kind the History panel draws a spline for, and undo

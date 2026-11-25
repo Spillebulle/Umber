@@ -2263,13 +2263,15 @@ impl UmberApp {
             Some(umber_core::AddRefusal::StackFull) => {
                 return Err(Notice {
                     title: "There is no room for another layer".to_string(),
-                    lines: vec![format!(
-                        "This document already has {} entries, which is all Umber holds. \
-                         Delete a layer to make room, or switch off \"On its own layer\" \
+                    lines: vec![
+                        concat!(
+                            crate::editor::stack_full_line!(),
+                            " Delete a layer to make room, or switch off \"On its own layer\" \
                          under the Text panel to set the words on the layer that is \
-                         selected.",
-                        umber_core::LayerStack::MAX
-                    )],
+                         selected."
+                        )
+                        .to_string(),
+                    ],
                 });
             }
             Some(umber_core::AddRefusal::TooDeep) => {
