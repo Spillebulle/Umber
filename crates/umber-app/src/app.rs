@@ -1280,10 +1280,10 @@ impl UmberApp {
             // A paste always says so. A lift says so once per layer, tool and
             // document (`LiftNotice`), or every press of the pen on a vector
             // layer would raise the same dialog over the canvas again.
-            if let Some(notice) = float_refusal_notice(why, pixels.is_some()) {
-                if pixels.is_some() || self.lift_notice.due(self.lift_key()) {
-                    self.editor.notice = Some(notice);
-                }
+            if let Some(notice) = float_refusal_notice(why, pixels.is_some())
+                && (pixels.is_some() || self.lift_notice.due(self.lift_key()))
+            {
+                self.editor.notice = Some(notice);
             }
             return false;
         }
