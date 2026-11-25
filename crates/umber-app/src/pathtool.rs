@@ -156,7 +156,7 @@ pub struct PathTool {
     said: Option<&'static str>,
     pick: Option<Pick>,
     /// The pick before the last `Set` was asked for, which a refusal restores.
-    before: Option<Pick>,
+    before: Option<Option<Pick>>,
     /// The path being dragged as it would be if released now.
     dragged: Option<Path>,
     /// Shift on the last move, so the release shapes the path as the drag did.
@@ -178,6 +178,19 @@ impl Default for PathTool {
             before: None,
             dragged: None,
             alone: false,
+        }
+    }
+}
+
+/// What is said of a figure past the bound. The record's own sentence is about
+/// turning a shape into a path, which is not what a drag did.
+const OUT_OF_BOUNDS: &str = "That would put the path too far from the canvas.";
+
+fn refusal_sentence(why: VectorRefusal) -> &'static str {
+    match why {
+        VectorRefusal::Impossible => OUT_OF_BOUNDS,
+        VectorRefusal::TooManyNodes | VectorRefusal::TooManyPaths | VectorRefusal::Opaque => {
+            why.sentence()
         }
     }
 }
@@ -226,6 +239,23 @@ impl PathTool {
         }
     }
 
+    /// The active layer changed under a draft that continues one of its
+    /// paths. The draft now lands as a new path and the old one is untouched.
+    pub fn detach(&mut self) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.continues = None;
+            self.base_len = 0;
+        }
+    }
+
+    /// Whatever press is held ends without committing. The tool's own edits
+    /// call this first, or the release that follows would commit a drag that
+    /// began against a record that is no longer there.
+    fn cancel_hold(&mut self) {
+        self.held = Held::Nothing;
+        self.dragged = None;
+    }
+
     /// Drop the pick (active layer changed, foreign revision, tab switch).
     pub fn let_go(&mut self) {
         self.pick = None;
@@ -241,6 +271,8 @@ impl PathTool {
 
     /// A press. `edit` is `mode == Edit || ctrl`.
     pub fn press(&mut self, at: Vec2, edit: bool, ground: Ground<'_>) {
+        // A press while one is held replaces it, leaving no stale drag behind.
+        self.cancel_hold();
         if edit {
             self.press_edit(at, ground);
             return;
@@ -248,6 +280,7 @@ impl PathTool {
         self.said = None;
         // A plain press is a drawing press, and drawing lets go of the pick.
         self.pick = None;
+        self.before = None;
         self.dragged = None;
         let hit = ground.reach.hit;
 
@@ -277,6 +310,8 @@ impl PathTool {
             self.held = Held::Closing;
             return;
         }
+        // A node after a refused close means the artist went on drawing.
+        draft.closed = false;
         draft.nodes.push(Node::corner(at));
         self.held = Held::Placing { press: at };
     }
@@ -288,6 +323,7 @@ impl PathTool {
             return;
         };
         self.said = None;
+        self.before = None;
         self.dragged = None;
         self.sanitize(ground);
         let reach = ground.reach;
@@ -373,6 +409,7 @@ impl PathTool {
     }
 
     pub fn release(&mut self, at: Vec2, ground: Ground<'_>) -> Commit {
+        self.sanitize(ground);
         let held = std::mem::replace(&mut self.held, Held::Nothing);
         self.dragged = None;
         match held {
@@ -387,7 +424,7 @@ impl PathTool {
                 }
                 Commit::Nothing
             }
-            Held::Closing => self.land(),
+            Held::Closing => self.land(true),
             Held::Handle {
                 path, ref start, ..
             }
@@ -441,11 +478,14 @@ impl PathTool {
 
     /// Enter.
     pub fn finish(&mut self) -> Commit {
-        self.land()
+        self.cancel_hold();
+        // Enter ends an open path; only the closing press lands one closed.
+        self.land(false)
     }
 
     /// Backspace, Delete or Undo with a draft up. True when it took something.
     pub fn pop(&mut self) -> bool {
+        self.cancel_hold();
         let Some(draft) = self.draft.as_mut() else {
             return false;
         };
@@ -469,8 +509,12 @@ impl PathTool {
     pub fn abandon(&mut self) -> bool {
         self.said = None;
         match self.held {
-            Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing => {}
-            Held::Picked | Held::Handle { .. } | Held::Node { .. } | Held::Segment { .. } => {
+            Held::Nothing
+            | Held::Placing { .. }
+            | Held::Closing
+            | Held::Continuing
+            | Held::Picked => {}
+            Held::Handle { .. } | Held::Node { .. } | Held::Segment { .. } => {
                 // Escape in the middle of a drag cancels the drag and no more.
                 self.held = Held::Nothing;
                 self.dragged = None;
@@ -495,7 +539,7 @@ impl PathTool {
     pub fn settle(&mut self) -> Commit {
         self.held = Held::Nothing;
         self.dragged = None;
-        let commit = self.land();
+        let commit = self.land(false);
         if commit == Commit::Nothing {
             self.draft = None;
         }
@@ -521,13 +565,17 @@ impl PathTool {
             Ok(()) => self.before = None,
             Err(why) => {
                 self.said = Some(why);
-                self.pick = self.before.take();
+                // Only a `Set` that is outstanding has a pick to put back.
+                if let Some(previous) = self.before.take() {
+                    self.pick = previous;
+                }
             }
         }
     }
 
     /// Delete or Backspace with no draft: the node picked, or else the path.
     pub fn remove(&mut self, ground: Ground<'_>) -> Commit {
+        self.cancel_hold();
         self.sanitize(ground);
         let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
             return Commit::Nothing;
@@ -549,9 +597,15 @@ impl PathTool {
     /// The Cut / Plot switch. With a pick it changes that path alone and never
     /// the role for new paths; without one it sets the role for new paths.
     pub fn set_role(&mut self, role: PathRole, ground: Ground<'_>) -> Commit {
+        self.cancel_hold();
         self.sanitize(ground);
-        let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
+        let Some(pick) = self.pick else {
             self.role = role;
+            return Commit::Nothing;
+        };
+        // A pick on a layer that cannot be read is still a pick: the default
+        // is not what the artist pressed the switch for.
+        let Some(record) = ground.paths else {
             return Commit::Nothing;
         };
         let mut next = record.paths()[pick.path].clone();
@@ -572,6 +626,7 @@ impl PathTool {
     /// to close, and with fewer nothing happens and nothing is said: the
     /// button is not the place to teach geometry.
     pub fn toggle_closed(&mut self, ground: Ground<'_>) -> Commit {
+        self.cancel_hold();
         self.sanitize(ground);
         let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
             return Commit::Nothing;
@@ -606,6 +661,7 @@ impl PathTool {
         ground: Ground<'_>,
         make: impl Fn(&Path, usize) -> Option<Node>,
     ) -> Commit {
+        self.cancel_hold();
         self.sanitize(ground);
         let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
             return Commit::Nothing;
@@ -658,12 +714,12 @@ impl PathTool {
     fn set(&mut self, result: Result<VectorObject, VectorRefusal>, pick: Option<Pick>) -> Commit {
         match result {
             Ok(record) => {
-                self.before = self.pick;
+                self.before = Some(self.pick);
                 self.pick = pick;
                 Commit::Set(record)
             }
             Err(why) => {
-                self.said = Some(why.sentence());
+                self.said = Some(refusal_sentence(why));
                 Commit::Nothing
             }
         }
@@ -671,7 +727,7 @@ impl PathTool {
 
     /// The draft as a landing, where it is long enough to be a path. The draft
     /// itself stays put until `landed`.
-    fn land(&self) -> Commit {
+    fn land(&self, closed: bool) -> Commit {
         let Some(draft) = self.draft.as_ref() else {
             return Commit::Nothing;
         };
@@ -681,7 +737,7 @@ impl PathTool {
         Commit::Land {
             paths: vec![Path {
                 role: self.draft_role.unwrap_or(self.role),
-                closed: draft.closed,
+                closed,
                 nodes: draft.nodes.clone(),
                 ink: None,
             }],
@@ -727,7 +783,8 @@ fn shaped(held: &Held, at: Vec2, alone: bool) -> Option<Path> {
 fn continuation(ground: Ground<'_>, at: Vec2, hit: f32) -> Option<(Draft, PathRole)> {
     let record = ground.paths?;
     for (index, path) in record.paths().iter().enumerate() {
-        if path.closed {
+        // An open Ink path is not a line, and landing it would strip its ink.
+        if path.closed || !is_line(path) {
             continue;
         }
         let (Some(first), Some(last)) = (path.nodes.first(), path.nodes.last()) else {
@@ -1334,6 +1391,23 @@ mod tests {
         let got = set_of(t.set_role(PathRole::Plot, on(&rec)));
         assert_eq!(got.paths()[0].role, PathRole::Plot);
         assert_eq!(t.role, PathRole::Plot);
+
+        // Tool Cut, pick a Cut path: the pick turns Plot, the default stays.
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let got = set_of(t.set_role(PathRole::Plot, on(&rec)));
+        assert_eq!(got.paths()[0].role, PathRole::Plot);
+        assert_eq!(t.role, PathRole::Cut);
+    }
+
+    #[test]
+    fn a_pick_on_unreadable_ground_leaves_the_default_alone() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        assert_eq!(t.set_role(PathRole::Plot, bare()), Commit::Nothing);
+        assert_eq!(t.role, PathRole::Cut);
+        assert!(t.pick().is_some());
     }
 
     #[test]
@@ -1394,7 +1468,7 @@ mod tests {
         t.moved(v(1.0e6, 0.0), false);
         let c = t.release(v(2.0e6, 0.0), on(&rec));
         assert_eq!(c, Commit::Nothing);
-        assert_eq!(t.said(), Some(VectorRefusal::Impossible.sentence()));
+        assert_eq!(t.said(), Some(OUT_OF_BOUNDS));
         assert_eq!(t.pick().unwrap().node, Some(1));
     }
 
@@ -1468,5 +1542,138 @@ mod tests {
         t.press(v(500.0, 500.0), false, on(&rec));
         assert_eq!(t.pick(), None);
         assert_eq!(t.draft().unwrap().nodes.len(), 1);
+    }
+
+    #[test]
+    fn an_open_ink_path_is_not_continued() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        t.press(v(100.0, 200.0), false, on(&rec));
+        t.release(v(100.0, 200.0), on(&rec));
+        assert_eq!(t.draft().unwrap().continues, None);
+        assert_eq!(t.draft().unwrap().nodes.len(), 1);
+    }
+
+    #[test]
+    fn a_refused_close_is_forgotten_once_drawing_goes_on() {
+        let mut t = PathTool::default();
+        for p in [v(0.0, 0.0), v(50.0, 0.0), v(50.0, 50.0)] {
+            tap(&mut t, p, bare());
+        }
+        tap(&mut t, v(0.0, 0.0), bare());
+        t.landed(Err("full"));
+        tap(&mut t, v(0.0, 50.0), bare());
+        let (paths, _) = land_of(t.finish());
+        assert_eq!(paths[0].nodes.len(), 4);
+        assert!(!paths[0].closed);
+    }
+
+    #[test]
+    fn enter_after_a_refused_close_lands_open() {
+        let mut t = PathTool::default();
+        for p in [v(0.0, 0.0), v(50.0, 0.0), v(50.0, 50.0)] {
+            tap(&mut t, p, bare());
+        }
+        let (closed, _) = land_of(tap(&mut t, v(0.0, 0.0), bare()));
+        assert!(closed[0].closed);
+        t.landed(Err("full"));
+        let (paths, _) = land_of(t.finish());
+        assert!(!paths[0].closed);
+        let (paths, _) = land_of(t.settle());
+        assert!(!paths[0].closed);
+    }
+
+    #[test]
+    fn an_edit_of_the_tools_own_ends_the_press_it_was_made_during() {
+        let rec = edit_record();
+        let mut t = with_node_picked(&rec);
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(130.0, 0.0), false);
+        let r1 = set_of(t.remove(on(&rec)));
+        assert!(!t.is_held());
+        assert!(t.dragged().is_none());
+        assert_eq!(t.release(v(130.0, 0.0), on(&r1)), Commit::Nothing);
+    }
+
+    #[test]
+    fn a_second_press_leaves_no_stale_drag() {
+        let rec = edit_record();
+        let mut t = with_node_picked(&rec);
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(130.0, 0.0), false);
+        assert!(t.dragged().is_some());
+        t.press(v(500.0, 500.0), true, on(&rec));
+        assert!(t.dragged().is_none());
+        assert_eq!(t.release(v(500.0, 500.0), on(&rec)), Commit::Nothing);
+    }
+
+    #[test]
+    fn a_stale_pick_is_dropped_by_every_call_that_takes_ground() {
+        let rec = edit_record();
+        let short = VectorObject::Paths(vec![rec.paths()[0].clone()]);
+        let pick_square = || {
+            let mut t = PathTool::default();
+            edit_tap(&mut t, v(250.0, 0.0), on(&rec));
+            assert_eq!(t.pick().unwrap().path, 1);
+            t
+        };
+        let mut t = pick_square();
+        t.press(v(50.0, 0.0), true, on(&short));
+        assert_eq!(t.pick().map(|p| p.path), Some(0));
+
+        let mut t = pick_square();
+        assert_eq!(t.set_role(PathRole::Plot, on(&short)), Commit::Nothing);
+        assert_eq!(t.pick(), None);
+        assert_eq!(t.role, PathRole::Plot, "no pick left, so it is the default");
+
+        let mut t = pick_square();
+        assert_eq!(t.toggle_closed(on(&short)), Commit::Nothing);
+        assert_eq!(t.pick(), None);
+
+        let mut t = pick_square();
+        assert_eq!(t.role_shown(on(&short)), PathRole::Cut);
+        assert!(!t.can_smooth(on(&short)));
+        t.release(v(0.0, 0.0), on(&short));
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn a_refusal_with_nothing_outstanding_keeps_the_pick() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        t.applied(Err("no"));
+        assert_eq!(t.pick().unwrap().path, 0);
+        // And a Set answered before the next press is not undone by a later Err.
+        let _ = set_of(t.set_role(PathRole::Plot, on(&rec)));
+        t.press(v(500.0, 500.0), true, on(&rec));
+        t.applied(Err("late"));
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn detaching_makes_a_continued_draft_a_new_path() {
+        let rec = record();
+        let mut t = PathTool::default();
+        t.press(v(51.0, 0.0), false, on(&rec));
+        t.release(v(51.0, 0.0), on(&rec));
+        tap(&mut t, v(50.0, 40.0), on(&rec));
+        t.detach();
+        let (paths, replaces) = land_of(t.finish());
+        assert_eq!(replaces, None);
+        assert_eq!(paths[0].nodes.len(), 3);
+    }
+
+    #[test]
+    fn every_refusal_has_a_sentence_and_only_the_bound_has_its_own_wording() {
+        for why in VectorRefusal::ALL {
+            let said = refusal_sentence(why);
+            match why {
+                VectorRefusal::Impossible => assert_eq!(said, OUT_OF_BOUNDS),
+                VectorRefusal::TooManyNodes
+                | VectorRefusal::TooManyPaths
+                | VectorRefusal::Opaque => assert_eq!(said, why.sentence()),
+            }
+        }
     }
 }
