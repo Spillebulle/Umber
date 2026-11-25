@@ -924,8 +924,10 @@ pub enum SaveWarning {
         layer: String,
         why: crate::textobj::NotRecorded,
     },
-    /// The layer's paths could not be written, so the layer is an empty one in
-    /// the file. Nothing was painted on a vector layer, so nothing else is lost.
+    /// The layer's paths could not be written, so it was saved as an empty
+    /// vector layer: it reopens as a vector layer with no paths, never as an
+    /// ordinary one. Nothing was painted on a vector layer, so nothing else is
+    /// lost.
     ///
     /// `why` is the record's own refusal, which is what the artist can act on:
     /// too many points and a figure that is not a figure are different remedies.
@@ -981,7 +983,8 @@ impl std::fmt::Display for SaveWarning {
             ),
             Self::VectorNotRecorded { layer, why } => write!(
                 f,
-                "Layer “{layer}”: its paths could not be saved. {} The layer was saved empty.",
+                "Layer “{layer}”: its paths could not be saved. {} It was saved as an empty \
+                 vector layer.",
                 why.sentence()
             ),
             Self::EffectsNotPortable { layers } => write!(
@@ -1715,25 +1718,34 @@ fn write_archive<W: Write + std::io::Seek>(
         //
         // An empty record is written: a vector layer with no path yet is still
         // a vector layer, and an attribute-less layer would reopen as paint.
-        // A refusal writes nothing and is named, so no attribute points at a
-        // gap.
+        //
+        // **A refusal writes an empty record too, never no record.** Writing
+        // nothing would reopen the layer as an ordinary paintable one, which
+        // changes its kind under the artist, and would make the file's declared
+        // revision (`required_version` reads presence, so 5) claim a record the
+        // archive does not hold. The paths are lost either way and the warning
+        // says so; what is kept is that the layer is still a vector layer.
         let vector_entry = match layer.vector {
             Some(vector) => {
                 let print = placed.fingerprint();
-                match vector.to_json(Some(&print)) {
-                    Ok(json) => {
-                        let src = vector_src(i);
-                        zip.start_file(&src, deflated())?;
-                        zip.write_all(&json)?;
-                        Some(src)
-                    }
+                let json = match vector.to_json(Some(&print)) {
+                    Ok(json) => Some(json),
                     Err(why) => {
                         warnings.push(SaveWarning::VectorNotRecorded {
                             layer: layer.name.to_string(),
                             why,
                         });
-                        None
+                        crate::vector::VectorObject::empty().to_json(None).ok()
                     }
+                };
+                match json {
+                    Some(json) => {
+                        let src = vector_src(i);
+                        zip.start_file(&src, deflated())?;
+                        zip.write_all(&json)?;
+                        Some(src)
+                    }
+                    None => None,
                 }
             }
             None => None,
@@ -3310,10 +3322,11 @@ mod tests {
         );
     }
 
-    /// A record the writer refuses is not written, and no attribute points at
-    /// the gap. The pixels are the layer's ordinary PNG either way.
+    /// A record the writer refuses is named, and an empty record is written in
+    /// its place, so the layer reopens as a vector layer rather than as paint.
+    /// The pixels are the layer's ordinary PNG either way.
     #[test]
-    fn a_record_that_cannot_be_written_is_named_and_leaves_no_attribute() {
+    fn a_record_that_cannot_be_written_is_named_and_saved_empty() {
         use crate::vector::{Node, Path, PathRole, VectorObject};
         let size = UVec2::new(4, 4);
         let px = empty(size);
@@ -3334,7 +3347,22 @@ mod tests {
                 why: crate::vector::VectorRefusal::Impossible,
             }]
         );
-        assert!(!read_stack_xml(&bytes).contains(VECTOR_ATTR));
+        let xml = read_stack_xml(&bytes);
+        assert!(xml.contains(VECTOR_ATTR), "{xml}");
+        assert!(
+            xml.contains(&format!("{VERSION_ATTR}=\"5\"")),
+            "the revision the file declares is still true of it:\n{xml}"
+        );
+        let doc = docimport::read_openraster(&bytes).expect("opens");
+        assert_eq!(
+            doc.layers[0].vector.as_deref(),
+            Some(&VectorObject::empty())
+        );
+        let opened = doc.open();
+        assert!(
+            opened.stack.get(0).unwrap().is_vector(),
+            "it reopens as a vector layer, not as paint"
+        );
     }
 
     // --- folders ------------------------------------------------------------
