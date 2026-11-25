@@ -7319,9 +7319,16 @@ mod tests {
         // commands that put the float down and finish the stroke before they
         // plan anything, so a shape recorded there never names a layer a
         // placement is holding in the air.
+        //
+        // `apply_path_edit` is the third and its safety is a promise about
+        // callers that nothing here can check yet: the Path tool is the only
+        // one, a float exists only with the transform tool in hand, and the
+        // tool must therefore put nothing in the air before it swaps a record.
+        // Where that tool is wired in, this is the line to re-read.
         let allowed = [
             concat!("fn commit_made_", "layer"),
             concat!("fn apply_path_", "plan"),
+            concat!("fn apply_path_", "edit"),
         ];
         for (what, text) in [
             ("panels.rs", shipped(include_str!("panels.rs"))),

@@ -305,6 +305,43 @@ impl PathPlan {
     }
 }
 
+/// Why the active layer's paths cannot be edited, in the order the tests are
+/// made. One enum so the tool's hint, its refusals and `plan_paths` read one
+/// answer rather than restating it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathEditRefusal {
+    /// The active entry is not a vector layer.
+    NotVector,
+    /// Its record is from a newer Umber and is held as bytes.
+    Newer,
+    /// It, or a folder around it, is locked.
+    Locked,
+    /// It, or a folder around it, is hidden.
+    Hidden,
+}
+
+impl PathEditRefusal {
+    /// Every refusal, in the order they are tested.
+    pub const ALL: [PathEditRefusal; 4] = [
+        PathEditRefusal::NotVector,
+        PathEditRefusal::Newer,
+        PathEditRefusal::Locked,
+        PathEditRefusal::Hidden,
+    ];
+
+    /// What the interface says. Exhaustive, so a fifth reason is worded.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            PathEditRefusal::NotVector => "Select a vector layer to edit its paths.",
+            PathEditRefusal::Newer => {
+                "These paths are from a newer Umber and cannot be changed here."
+            }
+            PathEditRefusal::Locked => "This layer is locked.",
+            PathEditRefusal::Hidden => "This layer is hidden. Show it to edit its paths.",
+        }
+    }
+}
+
 fn path_refusal(sentence: &str) -> Notice {
     Notice {
         title: "No path was made".to_string(),
@@ -1595,37 +1632,168 @@ impl Editor {
         role: umber_core::PathRole,
     ) -> Result<PathPlan, Notice> {
         let paths = umber_core::VectorObject::from_rings(rings, role);
-        if paths.is_empty() {
-            return Err(path_refusal(
-                umber_core::vector::VectorRefusal::Impossible.sentence(),
+        self.plan_paths(paths, None).map_err(path_refusal)
+    }
+
+    /// Why the active layer's paths cannot be edited, or `None` when they can.
+    ///
+    /// **Visibility is the stack's effective reading**, the one
+    /// `vectorview::shown` draws by, so a layer inside a hidden folder is
+    /// hidden here too. An edit to a layer nobody can see would land blind.
+    pub fn path_edit_refusal(&self) -> Option<PathEditRefusal> {
+        let active = self.layers.active_index();
+        let Some(record) = self.layers.vector_at(active) else {
+            return Some(PathEditRefusal::NotVector);
+        };
+        if record.is_opaque() {
+            return Some(PathEditRefusal::Newer);
+        }
+        if self.layers.effective_locked(active) {
+            return Some(PathEditRefusal::Locked);
+        }
+        if !self.layers.effective_visible(active) {
+            return Some(PathEditRefusal::Hidden);
+        }
+        None
+    }
+
+    /// The active layer's record, where it may be edited.
+    pub fn editable_paths(&self) -> Option<&umber_core::VectorObject> {
+        match self.path_edit_refusal() {
+            Some(_) => None,
+            None => self.layers.vector_at(self.layers.active_index()),
+        }
+    }
+
+    /// Where finished paths go: onto the active layer where it may be edited,
+    /// otherwise a layer of their own. `replaces` names a path of the active
+    /// layer the first of `paths` takes the place of, and is refused outright
+    /// where the layer cannot be edited, because a new layer has nothing to
+    /// replace.
+    ///
+    /// The one door every way of making paths goes through, so the selection
+    /// commands and the Path tool cannot come to judge a layer differently.
+    /// Nothing here takes `&mut self`: a refusal changes nothing.
+    pub fn plan_paths(
+        &self,
+        mut paths: Vec<umber_core::vector::Path>,
+        replaces: Option<usize>,
+    ) -> Result<PathPlan, &'static str> {
+        let impossible = umber_core::vector::VectorRefusal::sentence;
+        let Some(first_role) = paths.first().map(|p| p.role) else {
+            return Err(impossible(umber_core::vector::VectorRefusal::Impossible));
+        };
+        let active = self.layers.active_index();
+        match (self.path_edit_refusal(), replaces) {
+            (Some(why), Some(_)) => Err(why.sentence()),
+            (Some(_), None) => {
+                let record = umber_core::VectorObject::empty()
+                    .appended(paths)
+                    .map_err(impossible)?;
+                if let Some((_, sentence)) = self.new_layer_refusal() {
+                    return Err(sentence);
+                }
+                let name = match first_role {
+                    umber_core::PathRole::Cut => CUT_LAYER_NAME,
+                    umber_core::PathRole::Plot => PLOT_LAYER_NAME,
+                    umber_core::PathRole::Ink => INK_LAYER_NAME,
+                };
+                Ok(PathPlan::NewLayer {
+                    name,
+                    record: Box::new(record),
+                })
+            }
+            (None, replaces) => {
+                let (Some(existing), Some(slot)) =
+                    (self.layers.vector_at(active), self.layers.active_slot())
+                else {
+                    return Err(PathEditRefusal::NotVector.sentence());
+                };
+                let after = match replaces {
+                    Some(index) => {
+                        // `paths` is not empty, so the first is there to take.
+                        let first = paths.remove(0);
+                        existing
+                            .with_path(index, first)
+                            .and_then(|swapped| swapped.appended(paths))
+                            .map_err(impossible)?
+                    }
+                    None => existing.appended(paths).map_err(impossible)?,
+                };
+                match self.layers.can_set_vector(active, &after) {
+                    Ok(()) => Ok(PathPlan::Append {
+                        slot,
+                        after: Box::new(after),
+                    }),
+                    Err(why) => Err(set_refusal_sentence(why)),
+                }
+            }
+        }
+    }
+
+    /// Swap the active layer's record for `after` as one "Edit paths" entry.
+    ///
+    /// A record equal to the one there records nothing and answers `Ok`: an
+    /// entry that undoes to itself is a row in the history that does nothing.
+    /// A refusal, from the layer's state or from the record, changes nothing.
+    pub fn apply_path_edit(&mut self, after: umber_core::VectorObject) -> Result<(), &'static str> {
+        if let Some(why) = self.path_edit_refusal() {
+            return Err(why.sentence());
+        }
+        let index = self.layers.active_index();
+        if self.layers.vector_at(index) == Some(&after) {
+            return Ok(());
+        }
+        let Some(slot) = self.layers.active_slot() else {
+            return Err(PathEditRefusal::NotVector.sentence());
+        };
+        match self.layers.set_vector(index, after) {
+            Ok(was) => {
+                self.history.record(umber_core::Edit::vector(
+                    slot,
+                    was,
+                    Some(umber_core::Timestamp::now()),
+                ));
+                self.mark_modified();
+                Ok(())
+            }
+            Err(why) => Err(set_refusal_sentence(why)),
+        }
+    }
+
+    /// The refusals a new layer has, in the order the stack states them, as a
+    /// title and one sentence. **Static text**, so `plan_paths` can answer with
+    /// the sentence alone while the notice is built from the same pair: the two
+    /// ways in cannot come to word one refusal differently.
+    ///
+    /// The stack's limits come first, one sentence per reason because the
+    /// remedies differ. A layer born inside a locked folder would be locked at
+    /// once, holding paths nobody could then change.
+    fn new_layer_refusal(&self) -> Option<(&'static str, &'static str)> {
+        match self.layers.add_refusal() {
+            Some(umber_core::AddRefusal::StackFull) => {
+                return Some((
+                    "There is no room for another layer",
+                    "This document is full. Delete a layer to make room.",
+                ));
+            }
+            Some(umber_core::AddRefusal::TooDeep) => {
+                return Some((
+                    "That folder is nested as deep as it goes",
+                    "A layer inside it would be one level too deep. Select a layer \
+                     outside it.",
+                ));
+            }
+            None => {}
+        }
+        if self.layers.new_layer_would_be_locked() {
+            return Some((
+                "That folder is locked",
+                "A new layer inside it would be locked too. Unlock the folder, or \
+                 select a layer outside it.",
             ));
         }
-        let active = self.layers.active_index();
-        if let Some(existing) = self.layers.vector_at(active)
-            && !existing.is_opaque()
-            && !self.layers.effective_locked(active)
-            && let Some(slot) = self.layers.active_slot()
-        {
-            let after = existing
-                .appended(paths)
-                .map_err(|why| path_refusal(why.sentence()))?;
-            return match self.layers.can_set_vector(active, &after) {
-                Ok(()) => Ok(PathPlan::Append {
-                    slot,
-                    after: Box::new(after),
-                }),
-                Err(why) => Err(path_refusal(set_refusal_sentence(why))),
-            };
-        }
-        let record = umber_core::VectorObject::empty()
-            .appended(paths)
-            .map_err(|why| path_refusal(why.sentence()))?;
-        let name = match role {
-            umber_core::PathRole::Cut => CUT_LAYER_NAME,
-            umber_core::PathRole::Plot => PLOT_LAYER_NAME,
-            umber_core::PathRole::Ink => INK_LAYER_NAME,
-        };
-        self.plan_new_layer(name, record)
+        None
     }
 
     /// An empty vector layer above the active entry, for the Layers panel's
@@ -1642,41 +1810,10 @@ impl Editor {
         name: &'static str,
         record: umber_core::VectorObject,
     ) -> Result<PathPlan, Notice> {
-        // The stack's limits before anything else, one sentence per reason,
-        // because the remedies differ.
-        match self.layers.add_refusal() {
-            Some(umber_core::AddRefusal::StackFull) => {
-                return Err(Notice {
-                    title: "There is no room for another layer".to_string(),
-                    lines: vec![format!(
-                        "This document already has {} entries, which is all Umber holds. \
-                         Delete a layer to make room.",
-                        LayerStack::MAX
-                    )],
-                });
-            }
-            Some(umber_core::AddRefusal::TooDeep) => {
-                return Err(Notice {
-                    title: "That folder is nested as deep as it goes".to_string(),
-                    lines: vec![
-                        "A layer inside it would be one level too deep. Select a layer \
-                         outside it."
-                            .to_string(),
-                    ],
-                });
-            }
-            None => {}
-        }
-        // A layer born inside a locked folder would be locked at once, holding
-        // paths nobody could then change.
-        if self.layers.new_layer_would_be_locked() {
+        if let Some((title, sentence)) = self.new_layer_refusal() {
             return Err(Notice {
-                title: "That folder is locked".to_string(),
-                lines: vec![
-                    "A new layer inside it would be locked too. Unlock the folder, or \
-                     select a layer outside it."
-                        .to_string(),
-                ],
+                title: title.to_string(),
+                lines: vec![sentence.to_string()],
             });
         }
         Ok(PathPlan::NewLayer {
@@ -5096,5 +5233,241 @@ mod tests {
         ed.unmake_layer(None);
         let after: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
         assert_eq!(before, after);
+    }
+
+    // --- landing and editing paths ------------------------------------------
+
+    /// An editor whose active layer is a vector layer holding `n` closed
+    /// rectangles, made the way the commands make them.
+    fn with_vector_paths(n: usize) -> Editor {
+        let mut ed = with_a_selection();
+        for _ in 0..n {
+            run_path_command(&mut ed, umber_core::PathRole::Cut).expect("room");
+        }
+        ed
+    }
+
+    /// A closed triangle at `x`, which no rectangle the selection makes is.
+    fn triangle_at(x: f32) -> umber_core::Path {
+        umber_core::Path {
+            role: umber_core::PathRole::Cut,
+            closed: true,
+            nodes: vec![
+                umber_core::Node::corner(Vec2::new(x, 0.0)),
+                umber_core::Node::corner(Vec2::new(x + 10.0, 0.0)),
+                umber_core::Node::corner(Vec2::new(x + 5.0, 8.0)),
+            ],
+            ink: None,
+        }
+    }
+
+    fn record_of(ed: &Editor) -> umber_core::VectorObject {
+        ed.layers
+            .vector_at(ed.layers.active_index())
+            .expect("a vector layer")
+            .clone()
+    }
+
+    /// **A hidden layer is not one to draw onto blind.** The two readings
+    /// disagree here: the layer is a vector layer, unlocked and not opaque, so
+    /// only its eye can tell the plans apart.
+    #[test]
+    fn paths_drawn_over_a_hidden_vector_layer_go_to_a_new_layer() {
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        let plan = ed.plan_paths(vec![triangle_at(0.0)], None).expect("a plan");
+        let PathPlan::Append { .. } = plan else {
+            panic!("visible appends");
+        };
+
+        ed.layers.get_mut(active).unwrap().visible = false;
+        let plan = ed.plan_paths(vec![triangle_at(0.0)], None).expect("a plan");
+        let PathPlan::NewLayer { .. } = plan else {
+            panic!("hidden goes beside");
+        };
+    }
+
+    /// A layer inside a hidden folder is hidden, which is the stack's reading
+    /// and not the layer's own flag.
+    #[test]
+    fn a_layer_inside_a_hidden_folder_is_hidden_to_the_path_tool() {
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        let folder = ed.layers.group(&[active]).expect("a folder");
+        ed.layers.get_mut(folder).unwrap().visible = false;
+        let inner = (0..ed.layers.len())
+            .find(|&i| ed.layers.vector_at(i).is_some())
+            .expect("the vector layer");
+        ed.layers.set_active(inner);
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Hidden));
+    }
+
+    #[test]
+    fn a_replacement_swaps_one_path_and_keeps_the_count() {
+        let mut ed = with_vector_paths(2);
+        let before = record_of(&ed);
+        let plan = ed
+            .plan_paths(vec![triangle_at(100.0)], Some(0))
+            .expect("a plan");
+        let PathPlan::Append { after, .. } = plan.clone() else {
+            panic!("a replacement lands on the layer");
+        };
+        assert_eq!(after.paths().len(), before.paths().len());
+        assert_eq!(after.paths()[0], triangle_at(100.0));
+        assert_eq!(after.paths()[1], before.paths()[1]);
+        ed.apply_path_plan(plan).expect("carried out");
+        assert_eq!(active_paths(&ed).len(), 2);
+    }
+
+    /// A replacement of a path that is not there, or on a layer that cannot be
+    /// edited, is a sentence and not a new layer.
+    #[test]
+    fn a_replacement_is_refused_rather_than_made_a_layer() {
+        let mut ed = with_vector_paths(1);
+        assert!(ed.plan_paths(vec![triangle_at(0.0)], Some(5)).is_err());
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        assert_eq!(
+            ed.plan_paths(vec![triangle_at(0.0)], Some(0)).unwrap_err(),
+            PathEditRefusal::Locked.sentence()
+        );
+    }
+
+    /// One entry, of the kind the History panel draws a spline for, and undo
+    /// through the same door `App::reverse` uses restores the record exactly.
+    ///
+    /// `App` cannot be built without a device, so the undo is
+    /// [`LayerStack::restore_vector`] with the entry's own `was`, which is the
+    /// whole of what `reverse_vector` does.
+    #[test]
+    fn a_path_edit_is_one_undo_entry_and_undo_restores_it() {
+        let mut ed = with_vector_paths(2);
+        let before = record_of(&ed);
+        let position = ed.history.position();
+        let after = before.with_path(1, triangle_at(30.0)).expect("a record");
+
+        ed.apply_path_edit(after.clone()).expect("an edit");
+
+        assert_eq!(record_of(&ed), after);
+        assert_eq!(ed.history.position(), position + 1, "exactly one entry");
+        let entry = ed.history.take_undo().expect("the edit");
+        assert_eq!(entry.kind, umber_core::EditKind::Paths);
+        let umber_core::EditBody::Vector { slot, was } = entry.body else {
+            panic!("an edit records a record");
+        };
+        ed.layers.restore_vector(slot, was).expect("the layer");
+        assert_eq!(record_of(&ed), before, "back as it was");
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_records_nothing() {
+        let mut ed = with_vector_paths(1);
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        ed.apply_path_edit(record_of(&ed)).expect("nothing to do");
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(ed.layers.vector_revision(), revision);
+    }
+
+    /// A coordinate past the bound never becomes a record, and a record the
+    /// layer would refuse is an `Err` with the layer left alone.
+    #[test]
+    fn an_edit_past_the_coordinate_bound_changes_nothing() {
+        let mut ed = with_vector_paths(1);
+        let before = record_of(&ed);
+        let too_far = triangle_at(umber_core::vector::MAX_COORD * 2.0);
+        assert!(
+            before.with_path(0, too_far.clone()).is_err(),
+            "the record refuses it before the editor is asked"
+        );
+
+        // Past the bound by the other door: a record built without the check.
+        let bad = umber_core::VectorObject::Paths(vec![too_far]);
+        let revision = ed.layers.vector_revision();
+        let position = ed.history.position();
+        assert!(ed.apply_path_edit(bad).is_err());
+        assert_eq!(ed.layers.vector_revision(), revision);
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(record_of(&ed), before);
+    }
+
+    /// A locked layer refuses an edit with its sentence and changes nothing.
+    #[test]
+    fn a_locked_layer_refuses_a_path_edit() {
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        let revision = ed.layers.vector_revision();
+        assert_eq!(
+            ed.apply_path_edit(umber_core::VectorObject::empty()),
+            Err(PathEditRefusal::Locked.sentence())
+        );
+        assert_eq!(ed.layers.vector_revision(), revision);
+    }
+
+    #[test]
+    fn every_refusal_has_its_sentence_and_all_lists_them() {
+        for (i, why) in PathEditRefusal::ALL.iter().enumerate() {
+            let (position, sentence) = match why {
+                PathEditRefusal::NotVector => (0, "Select a vector layer to edit its paths."),
+                PathEditRefusal::Newer => (
+                    1,
+                    "These paths are from a newer Umber and cannot be changed here.",
+                ),
+                PathEditRefusal::Locked => (2, "This layer is locked."),
+                PathEditRefusal::Hidden => (3, "This layer is hidden. Show it to edit its paths."),
+            };
+            assert_eq!(i, position, "{why:?} is where ALL says");
+            assert_eq!(why.sentence(), sentence);
+        }
+    }
+
+    #[test]
+    fn the_refusals_are_tested_in_their_order() {
+        // A locked, hidden layer that is not a vector layer says so first.
+        let mut ed = Editor::default();
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        ed.layers.get_mut(active).unwrap().visible = false;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::NotVector));
+        assert!(ed.editable_paths().is_none());
+
+        // A locked, hidden vector layer says locked.
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        ed.layers.get_mut(active).unwrap().visible = false;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Locked));
+
+        // Unlocked and hidden says hidden; shown and unlocked says nothing.
+        ed.layers.get_mut(active).unwrap().locked = false;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Hidden));
+        ed.layers.get_mut(active).unwrap().visible = true;
+        assert_eq!(ed.path_edit_refusal(), None);
+        assert!(ed.editable_paths().is_some());
+    }
+
+    /// A record from a newer Umber is held as bytes and said to be.
+    #[test]
+    fn a_newer_record_is_refused_before_a_lock() {
+        let mut ed = Editor::default();
+        ed.layers
+            .add_vector_layer("newer", umber_core::VectorObject::Opaque(vec![1, 2, 3]))
+            .expect("room");
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Newer));
+    }
+
+    /// None of the four sentences has a run of spaces, a stray edge space or an
+    /// em-dash.
+    #[test]
+    fn no_path_edit_sentence_has_a_run_of_spaces() {
+        for why in PathEditRefusal::ALL {
+            let text = why.sentence();
+            assert!(!text.contains("  "), "a run of spaces in {text:?}");
+            assert_eq!(text.trim(), text);
+            assert!(!text.contains('\u{2014}'), "an em-dash in {text:?}");
+        }
     }
 }
