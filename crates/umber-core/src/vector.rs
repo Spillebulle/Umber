@@ -289,6 +289,25 @@ pub enum RecordError {
     Unreadable(String),
 }
 
+/// The per-path half of [`VectorObject::check`]: at least two nodes, and every
+/// figure finite and within [`MAX_COORD`]. One statement, so `check` and
+/// [`VectorObject::bounded`] cannot disagree about which path is legal.
+fn path_in_bounds(path: &Path) -> bool {
+    let ok = |v: f32| v.is_finite() && v.abs() <= MAX_COORD;
+    let ok2 = |v: Vec2| ok(v.x) && ok(v.y);
+    if path.nodes.len() < 2 {
+        return false;
+    }
+    let nodes = path
+        .nodes
+        .iter()
+        .all(|n| ok2(n.at) && ok2(n.handle_in) && ok2(n.handle_out) && ok(n.pressure));
+    let ink = path.ink.as_ref().is_none_or(|ink| {
+        ok(ink.size) && ink.colour.iter().all(|c| ok(*c)) && ink.brush.len() <= MAX_BRUSH_ID
+    });
+    nodes && ink
+}
+
 /// What a vector layer holds.
 #[derive(Clone, Debug, PartialEq)]
 pub enum VectorObject {
@@ -355,27 +374,33 @@ impl VectorObject {
         if self.node_count() > MAX_NODES {
             return Err(VectorRefusal::TooManyNodes);
         }
-        let ok = |v: f32| v.is_finite() && v.abs() <= MAX_COORD;
-        let ok2 = |v: Vec2| ok(v.x) && ok(v.y);
-        for path in paths {
-            if path.nodes.len() < 2 {
-                return Err(VectorRefusal::Impossible);
-            }
-            for n in &path.nodes {
-                if !(ok2(n.at) && ok2(n.handle_in) && ok2(n.handle_out) && ok(n.pressure)) {
-                    return Err(VectorRefusal::Impossible);
-                }
-            }
-            if let Some(ink) = &path.ink {
-                if !ok(ink.size) || !ink.colour.iter().all(|c| ok(*c)) {
-                    return Err(VectorRefusal::Impossible);
-                }
-                if ink.brush.len() > MAX_BRUSH_ID {
-                    return Err(VectorRefusal::Impossible);
-                }
-            }
+        if paths.iter().all(path_in_bounds) {
+            Ok(())
+        } else {
+            Err(VectorRefusal::Impossible)
         }
-        Ok(())
+    }
+
+    /// This record with every path that fails [`VectorObject::check`]'s
+    /// per-path rule taken out, and whether any was.
+    ///
+    /// **What a transform runs after it has moved the nodes.** `flipped` and
+    /// `translated` do not clamp, because clamping deforms a shape, so a path
+    /// far off the canvas can be pushed past [`MAX_COORD`] by a mirror, or by
+    /// enough anchored resizes. Left there, the record would fail `check` at the
+    /// next save and `to_json` would refuse the *whole* record, taking every
+    /// other path on the layer with it. Judged per path so the rest survive; the
+    /// counts cannot have grown, since a transform adds no path and no node.
+    pub fn bounded(self) -> (Self, bool) {
+        match self {
+            VectorObject::Paths(paths) => {
+                let before = paths.len();
+                let kept: Vec<Path> = paths.into_iter().filter(path_in_bounds).collect();
+                let lost = kept.len() != before;
+                (VectorObject::Paths(kept), lost)
+            }
+            VectorObject::Opaque(bytes) => (VectorObject::Opaque(bytes), false),
+        }
     }
 
     /// This record with `more` after its paths, or why not. Changes nothing on a
@@ -436,8 +461,10 @@ impl VectorObject {
     /// Every node moved by `by`; handles are offsets and stay put.
     ///
     /// Not clamped: clamping would deform the shape. A figure pushed past
-    /// [`MAX_COORD`] is left as it is, and [`VectorObject::check`], which
-    /// [`VectorObject::to_json`] runs, is the backstop that refuses to write it.
+    /// [`MAX_COORD`] is left as it is here, and the caller runs
+    /// [`VectorObject::bounded`] afterwards to take that path out, as
+    /// `LayerStack::translate_vectors` does; [`VectorObject::check`], which
+    /// [`VectorObject::to_json`] runs, is the backstop behind that.
     pub fn translated(&self, by: Vec2) -> Self {
         let paths = match self {
             VectorObject::Paths(p) => p,

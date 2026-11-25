@@ -440,6 +440,19 @@ impl EditRefusal {
     }
 }
 
+/// What [`LayerStack::translate_vectors`] cost the vector layers, counted in
+/// records, so the caller can say so.
+///
+/// Named fields rather than a pair, because both are counts of records and a
+/// tuple would read the same the wrong way round.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VectorCarry {
+    /// Records that held Ink and lost it.
+    pub stripped_ink: usize,
+    /// Records that lost at least one path the move took out of bounds.
+    pub lost_paths: usize,
+}
+
 /// Why [`LayerStack::set_vector`] declined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorSetRefusal {
@@ -1912,41 +1925,56 @@ impl LayerStack {
         }
     }
 
-    /// Mirror every vector layer's paths with the canvas.
+    /// Mirror every vector layer's paths with the canvas, and say how many
+    /// records lost a path doing it.
     ///
     /// Beside [`LayerStack::flip_text`] and for its reason: undoing a flip is
-    /// another flip, so nothing may be dropped here. Ink is mirrored with the
-    /// rest, because the pixels it describes are mirrored by the same flip.
-    pub fn flip_vectors(&mut self, axis: FlipAxis, canvas: UVec2) {
+    /// another flip, so nothing that *can* be mirrored is dropped. Ink is
+    /// mirrored with the rest, because the pixels it describes are mirrored by
+    /// the same flip. **What cannot be is a path the mirror pushes past
+    /// [`crate::vector::MAX_COORD`]** — one lying far off the canvas, on the side
+    /// away from the edge it is mirrored about — and that path is taken out by
+    /// [`VectorObject::bounded`] rather than left to make the next save refuse
+    /// the whole record. The undo of the flip does not bring it back, which is
+    /// why the count comes back for the caller to say so.
+    pub fn flip_vectors(&mut self, axis: FlipAxis, canvas: UVec2) -> usize {
+        let mut lost = 0;
         for layer in &mut self.layers {
             if let Some(record) = layer.vector.as_mut() {
-                **record = record.flipped(axis, canvas);
+                let (kept, dropped) = record.flipped(axis, canvas).bounded();
+                lost += usize::from(dropped);
+                **record = kept;
             }
         }
         self.touch_vectors();
+        lost
     }
 
     /// Move every vector layer's paths by `by`, as a resize moves the picture.
     ///
     /// Cut and Plot are geometry and simply move. A record with Ink loses it,
     /// because the pixels Ink described have been cropped or shifted by the same
-    /// resize and what is left would describe a picture that is gone. Returns how
-    /// many records lost Ink, so the caller can say so.
-    pub fn translate_vectors(&mut self, by: Vec2) -> usize {
-        let mut stripped = 0;
+    /// resize and what is left would describe a picture that is gone. A path
+    /// the move takes past [`crate::vector::MAX_COORD`] is taken out, as
+    /// [`LayerStack::flip_vectors`] does and for its reason. Both counts come
+    /// back, so the caller can say what happened.
+    pub fn translate_vectors(&mut self, by: Vec2) -> VectorCarry {
+        let mut carry = VectorCarry::default();
         for layer in &mut self.layers {
             if let Some(record) = layer.vector.as_mut() {
                 let moved = if record.has_ink() {
-                    stripped += 1;
+                    carry.stripped_ink += 1;
                     record.without_ink().translated(by)
                 } else {
                     record.translated(by)
                 };
-                **record = moved;
+                let (kept, dropped) = moved.bounded();
+                carry.lost_paths += usize::from(dropped);
+                **record = kept;
             }
         }
         self.touch_vectors();
-        stripped
+        carry
     }
 
     // --- effects ------------------------------------------------------------
@@ -5087,13 +5115,81 @@ mod tests {
         s.add_vector_layer("Plain", some_paths()).expect("room");
         s.add_vector_layer("Inked", with_ink()).expect("room");
         let by = Vec2::new(7.0, -3.0);
-        assert_eq!(s.translate_vectors(by), 1, "one record lost its Ink");
+        assert_eq!(
+            s.translate_vectors(by),
+            VectorCarry {
+                stripped_ink: 1,
+                lost_paths: 0
+            },
+            "one record lost its Ink"
+        );
         assert_eq!(s.vector_at(1), Some(&some_paths().translated(by)));
         let inked = s.vector_at(2).unwrap();
         assert!(!inked.has_ink());
         assert_eq!(inked, &with_ink().without_ink().translated(by));
         assert_eq!(inked.paths().len(), 2, "Cut and Plot survived");
-        assert_eq!(s.translate_vectors(Vec2::ZERO), 0, "and it is one-off");
+        assert_eq!(
+            s.translate_vectors(Vec2::ZERO),
+            VectorCarry::default(),
+            "and it is one-off"
+        );
+    }
+
+    /// **A move that takes a path out of bounds takes that path out, and only
+    /// that one.** Left in, the record fails `check` at the next save and
+    /// `to_json` refuses the whole of it, so every other path on the layer went
+    /// with the one that strayed. The far path starts legal and is pushed past
+    /// `MAX_COORD` by the move; the near one is moved and kept.
+    #[test]
+    fn a_move_past_the_bound_drops_that_path_and_keeps_the_rest() {
+        use crate::vector::{MAX_COORD, PathRole};
+        let far = a_path(PathRole::Cut, MAX_COORD - 30.0);
+        let near = a_path(PathRole::Plot, 5.0);
+        let record = VectorObject::empty()
+            .appended(vec![far, near.clone()])
+            .expect("both start in bounds");
+        let mut s = LayerStack::new();
+        s.add_vector_layer("Far", record).expect("room");
+        s.add_vector_layer("Plain", some_paths()).expect("room");
+        let by = Vec2::new(100.0, 0.0);
+        assert_eq!(
+            s.translate_vectors(by),
+            VectorCarry {
+                stripped_ink: 0,
+                lost_paths: 1
+            },
+            "one record lost a path, the other lost nothing"
+        );
+        let kept = s.vector_at(1).unwrap();
+        assert_eq!(kept.paths().len(), 1, "the far path is gone");
+        assert_eq!(kept.paths()[0].nodes[0].at, near.nodes[0].at + by);
+        assert!(kept.to_json(None).is_ok(), "and what is left can be saved");
+        assert_eq!(s.vector_at(2), Some(&some_paths().translated(by)));
+    }
+
+    /// The flip's twin: a path far off the canvas on the side away from the
+    /// edge it is mirrored about lands past the bound, and goes.
+    #[test]
+    fn a_flip_past_the_bound_drops_that_path_and_keeps_the_rest() {
+        use crate::vector::{MAX_COORD, PathRole};
+        let canvas = UVec2::new(100, 80);
+        let far = a_path(PathRole::Cut, -MAX_COORD + 10.0);
+        let near = a_path(PathRole::Plot, 5.0);
+        let record = VectorObject::empty()
+            .appended(vec![far, near])
+            .expect("both start in bounds");
+        let mut s = LayerStack::new();
+        s.add_vector_layer("Far", record).expect("room");
+        assert_eq!(s.flip_vectors(FlipAxis::Horizontal, canvas), 1);
+        let kept = s.vector_at(1).unwrap();
+        assert_eq!(kept.paths().len(), 1);
+        assert_eq!(kept.paths()[0].nodes[0].at.x, 100.0 - 5.0);
+        assert!(kept.to_json(None).is_ok());
+        assert_eq!(
+            s.flip_vectors(FlipAxis::Horizontal, canvas),
+            0,
+            "and what is left mirrors back without loss"
+        );
     }
 
     /// **Review focus 3**: undo finds the layer by slot, which a position is not

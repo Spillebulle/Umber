@@ -363,6 +363,36 @@ pub struct MadeLayer {
 pub const VECTOR_INK_LINE: &str =
     "Strokes on vector layers became ordinary paint, because the canvas changed size.";
 
+/// The line a resize adds when it took a vector path out of bounds.
+///
+/// A path is not clamped when the picture moves, because clamping deforms it,
+/// so one lying far off the canvas can be carried past the furthest a record
+/// may reach. It is taken out rather than left to make the next save refuse
+/// every path on that layer.
+pub const VECTOR_LOST_ON_RESIZE_LINE: &str = "A vector path was moved too far off the \
+     canvas when it changed size, so it was removed. The other paths are kept.";
+
+/// The flip's twin of [`VECTOR_LOST_ON_RESIZE_LINE`]. Undoing the flip does not
+/// bring the path back, which is why it says so.
+pub const VECTOR_LOST_ON_FLIP_LINE: &str = "A vector path was mirrored too far off the \
+     canvas, so it was removed. The other paths are kept.";
+
+/// Add `line` to the notice already up, or raise one with `title`.
+///
+/// Appended rather than replacing, so a document holding several kinds of
+/// layer hears about each of them.
+fn add_notice_line(notice: &mut Option<Notice>, title: &str, line: &str) {
+    match notice.as_mut() {
+        Some(up) => up.lines.push(line.to_string()),
+        None => {
+            *notice = Some(Notice {
+                title: title.to_string(),
+                lines: vec![line.to_string()],
+            })
+        }
+    }
+}
+
 /// The sentence on a disabled "Clear layer" over a vector layer.
 pub const CLEAR_VECTOR_TIP: &str =
     "A vector layer has no paint to clear. Delete the layer to remove its paths.";
@@ -1990,20 +2020,18 @@ impl Editor {
             // a path off the canvas, which is legal: a path is geometry, and
             // the part that is gone was never going to be drawn.
             let by = moved.to.as_vec2() - moved.from.as_vec2();
-            let inked = self.layers.translate_vectors(by);
-            if inked > 0 {
+            let carried = self.layers.translate_vectors(by);
+            if carried.stripped_ink > 0 {
                 // Appended to a notice already up rather than replacing it, so
                 // a document holding both kinds of layer hears about both.
-                let line = VECTOR_INK_LINE.to_string();
-                match self.notice.as_mut() {
-                    Some(up) => up.lines.push(line),
-                    None => {
-                        self.notice = Some(Notice {
-                            title: "Strokes are paint now".to_string(),
-                            lines: vec![line],
-                        })
-                    }
-                }
+                add_notice_line(&mut self.notice, "Strokes are paint now", VECTOR_INK_LINE);
+            }
+            if carried.lost_paths > 0 {
+                add_notice_line(
+                    &mut self.notice,
+                    "A vector path was removed",
+                    VECTOR_LOST_ON_RESIZE_LINE,
+                );
             }
             // Keep the zoom, but not the ability to be looking at a part of the
             // canvas that no longer exists.
@@ -2120,11 +2148,13 @@ impl Editor {
         // `Placement::flipped` — which is why a flip does not cost a text layer
         // its record the way a resize does, and it has to be, because undoing a
         // flip is another flip.
-        // And a vector layer's paths, which are exact under a mirror (Ink
-        // included, since the pixels it describes are mirrored by this same
-        // flip), so a flip takes nothing from a vector layer and its undo,
-        // which is another flip, puts every node back where it was.
-        self.layers.flip_vectors(axis, doc);
+        // And a vector layer's paths, which a mirror carries within one
+        // rounding (Ink included, since the pixels it describes are mirrored by
+        // this same flip), so its undo, which is another flip, puts every node
+        // back. The one exception is a path the mirror pushes past the bound a
+        // record may reach, which is taken out and said, after the text notice
+        // below so that one cannot replace it.
+        let lost_paths = self.layers.flip_vectors(axis, doc);
         let dropped = self.layers.flip_text(axis, doc);
         if dropped > 0 {
             // Rare rather than unreachable, and the difference is worth stating.
@@ -2145,6 +2175,13 @@ impl Editor {
                     text_layers(dropped)
                 )],
             });
+        }
+        if lost_paths > 0 {
+            add_notice_line(
+                &mut self.notice,
+                "A vector path was removed",
+                VECTOR_LOST_ON_FLIP_LINE,
+            );
         }
         // The gesture belongs to the pointer and was drawn on the picture as it
         // was. Abandoned rather than mirrored, exactly as a tab switch does —
@@ -3802,6 +3839,49 @@ mod tests {
         let notice = ed.notice.as_ref().expect("the loss was silent");
         assert_eq!(notice.lines, vec![VECTOR_INK_LINE.to_string()]);
         assert!(!VECTOR_INK_LINE.contains('\u{2014}'));
+    }
+
+    /// A resize or a flip that carries a path out of bounds takes that path out
+    /// and says so, with the line the notice really drew; and a move that keeps
+    /// every path in bounds says nothing.
+    #[test]
+    fn a_path_carried_out_of_bounds_is_removed_and_named() {
+        use umber_core::vector::MAX_COORD;
+        let far = |x: f32| {
+            a_record_of(vec![
+                a_path_at(Vec2::new(x, 5.0), false),
+                a_path_at(Vec2::new(5.0, 5.0), false),
+            ])
+        };
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer("Far", far(MAX_COORD - 30.0))
+            .expect("room");
+        let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
+        assert!(ed.apply_canvas(bigger, umber_core::Anchor::TopRight));
+        assert_eq!(ed.layers.vector_at(at).unwrap().paths().len(), 1);
+        let notice = ed.notice.take().expect("the loss was silent");
+        assert_eq!(notice.lines, vec![VECTOR_LOST_ON_RESIZE_LINE.to_string()]);
+
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer("Far", far(-MAX_COORD + 1.0))
+            .expect("room");
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+        assert_eq!(ed.layers.vector_at(at).unwrap().paths().len(), 1);
+        let notice = ed.notice.take().expect("the loss was silent");
+        assert_eq!(notice.lines, vec![VECTOR_LOST_ON_FLIP_LINE.to_string()]);
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+        assert!(
+            ed.notice.is_none(),
+            "a flip that lost nothing said something"
+        );
+        for line in [VECTOR_LOST_ON_RESIZE_LINE, VECTOR_LOST_ON_FLIP_LINE] {
+            assert!(!line.contains('\u{2014}'));
+            assert!(!line.contains("  "), "a run of spaces: {line}");
+        }
     }
 
     /// With text and inked paths both in the document the resize says both,

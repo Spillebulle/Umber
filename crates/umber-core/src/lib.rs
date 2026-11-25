@@ -93,7 +93,7 @@ pub use history::{Edit, EditBody, EditKind, History, Jump, PixelPatch};
 pub use input::InputPoint;
 pub use layer::{
     AddRefusal, AddedLayer, BlendMode, EditRefusal, EditTarget, Layer, LayerStack, SlotRoom,
-    StackShape, VectorSetRefusal,
+    StackShape, VectorCarry, VectorSetRefusal,
 };
 pub use overlay::{Side, Strip};
 // `palette::Palette` is deliberately **not** re-exported at the root. The app

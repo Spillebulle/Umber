@@ -8095,6 +8095,8 @@ mod tests {
         for tip in [
             crate::editor::CLEAR_VECTOR_TIP,
             "Unlock the layer to clear it.",
+            crate::editor::VECTOR_LOST_ON_RESIZE_LINE,
+            crate::editor::VECTOR_LOST_ON_FLIP_LINE,
         ] {
             sentences.push(("clear".to_string(), tip.to_string()));
         }
