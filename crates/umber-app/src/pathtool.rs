@@ -1,4 +1,5 @@
-//! The Path tool's state: drawing a path point by point.
+//! The Path tool's state: drawing a path point by point, and reshaping the
+//! paths already on the layer.
 //!
 //! The model only. Nothing here reads a pointer event type or paints, which is
 //! what lets every rule below be tested without a window, the same division
@@ -20,19 +21,23 @@
 //!   path on the layer is not touched until the landing replaces it, which is
 //!   what makes Escape free.
 //! - **A press is a held thing.** `Held` says what, so a release knows whether
-//!   it ends a drag of handles, a closing press or a continuation. It is an
-//!   enum because Edit mode's holds are more of the same kind.
-//! - **An Edit press does nothing here yet.** Edit mode arrives in the next
-//!   change, and until then a press that asks for it leaves the draft exactly
-//!   as it was.
+//!   it ends a drag of handles, a closing press, a continuation or an edit.
+//! - **An edit drag is absolute and works on a copy.** The path is cloned at
+//!   the press and every move recomputes from that clone and the pointer, never
+//!   from the last move, so a drag that returns to where it began is exactly
+//!   the path it began as and commits nothing. The layer's record is not
+//!   written until the release, which is what makes one gesture one `Set`.
+//! - **Smooth is decided at the press.** `pathedit::with_handle` is handed the
+//!   node as it was then, so a handle dragged through zero cannot change which
+//!   rule applies half way.
 
 // Nothing calls the tool until the pointer is wired to it, and clippy runs
 // with `-D warnings`. The wiring removes this line.
 #![allow(dead_code)]
 
 use glam::Vec2;
-use umber_core::pathedit;
-use umber_core::vector::{Node, Path, PathRole, VectorObject};
+use umber_core::pathedit::{self, Side};
+use umber_core::vector::{Node, Path, PathRole, VectorObject, VectorRefusal};
 
 /// Which half of the tool is in hand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,8 +95,15 @@ pub struct Draft {
     pub continues: Option<usize>,
 }
 
+/// What is picked on the layer: a path, and perhaps one node of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pick {
+    pub path: usize,
+    pub node: Option<usize>,
+}
+
 /// What a held press is doing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Held {
     Nothing,
     /// A node was placed at `press`; moving pulls its handles out.
@@ -102,6 +114,31 @@ enum Held {
     Closing,
     /// The press took an existing path up. It added no node and has no drag.
     Continuing,
+    /// The press picked another path. Nothing follows the pointer.
+    Picked,
+    /// Dragging a handle of `start`'s node.
+    Handle {
+        path: usize,
+        node: usize,
+        side: Side,
+        start: Path,
+    },
+    /// Dragging a node, from where the press was.
+    Node {
+        path: usize,
+        node: usize,
+        press: Vec2,
+        start: Path,
+    },
+    /// On the picked path's line: a tap splits it, a drag carries all of it.
+    Segment {
+        path: usize,
+        segment: usize,
+        t: f32,
+        press: Vec2,
+        tap: f32,
+        start: Path,
+    },
 }
 
 pub struct PathTool {
@@ -117,6 +154,13 @@ pub struct PathTool {
     held: Held,
     hover: Option<Vec2>,
     said: Option<&'static str>,
+    pick: Option<Pick>,
+    /// The pick before the last `Set` was asked for, which a refusal restores.
+    before: Option<Pick>,
+    /// The path being dragged as it would be if released now.
+    dragged: Option<Path>,
+    /// Shift on the last move, so the release shapes the path as the drag did.
+    alone: bool,
 }
 
 impl Default for PathTool {
@@ -130,7 +174,19 @@ impl Default for PathTool {
             held: Held::Nothing,
             hover: None,
             said: None,
+            pick: None,
+            before: None,
+            dragged: None,
+            alone: false,
         }
+    }
+}
+
+/// Paths the tool may pick and change. Ink describes pixels, not a line.
+fn is_line(path: &Path) -> bool {
+    match path.role {
+        PathRole::Cut | PathRole::Plot => path.ink.is_none(),
+        PathRole::Ink => false,
     }
 }
 
@@ -148,21 +204,51 @@ impl PathTool {
         self.said
     }
 
+    pub fn pick(&self) -> Option<Pick> {
+        self.pick
+    }
+
+    /// The path being dragged, as it would be if released now.
+    pub fn dragged(&self) -> Option<&Path> {
+        self.dragged.as_ref()
+    }
+
     pub fn is_held(&self) -> bool {
         match self.held {
             Held::Nothing => false,
-            Held::Placing { .. } | Held::Closing | Held::Continuing => true,
+            Held::Placing { .. }
+            | Held::Closing
+            | Held::Continuing
+            | Held::Picked
+            | Held::Handle { .. }
+            | Held::Node { .. }
+            | Held::Segment { .. } => true,
+        }
+    }
+
+    /// Drop the pick (active layer changed, foreign revision, tab switch).
+    pub fn let_go(&mut self) {
+        self.pick = None;
+        self.before = None;
+        self.dragged = None;
+        match self.held {
+            Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing => {}
+            Held::Picked | Held::Handle { .. } | Held::Node { .. } | Held::Segment { .. } => {
+                self.held = Held::Nothing;
+            }
         }
     }
 
     /// A press. `edit` is `mode == Edit || ctrl`.
     pub fn press(&mut self, at: Vec2, edit: bool, ground: Ground<'_>) {
         if edit {
-            // Edit gestures on committed paths arrive in the next change. Until
-            // then the press is not ours to act on, so the draft is untouched.
+            self.press_edit(at, ground);
             return;
         }
         self.said = None;
+        // A plain press is a drawing press, and drawing lets go of the pick.
+        self.pick = None;
+        self.dragged = None;
         let hit = ground.reach.hit;
 
         let Some(draft) = self.draft.as_mut() else {
@@ -195,24 +281,102 @@ impl PathTool {
         self.held = Held::Placing { press: at };
     }
 
+    /// An edit press, in the spec's order, first match winning.
+    fn press_edit(&mut self, at: Vec2, ground: Ground<'_>) {
+        let Some(record) = ground.paths else {
+            // Not an editable layer: the press is nobody's.
+            return;
+        };
+        self.said = None;
+        self.dragged = None;
+        self.sanitize(ground);
+        let reach = ground.reach;
+
+        if let Some(pick) = self.pick {
+            let path = &record.paths()[pick.path];
+            if ground.nodes_shown {
+                if let Some(n) = pick.node
+                    && let Some(side) = pathedit::handle_at(&path.nodes[n], at, reach.hit)
+                {
+                    self.held = Held::Handle {
+                        path: pick.path,
+                        node: n,
+                        side,
+                        start: path.clone(),
+                    };
+                    return;
+                }
+                if let Some(n) = pathedit::node_at(path, at, reach.hit) {
+                    self.pick = Some(Pick {
+                        path: pick.path,
+                        node: Some(n),
+                    });
+                    self.held = Held::Node {
+                        path: pick.path,
+                        node: n,
+                        press: at,
+                        start: path.clone(),
+                    };
+                    return;
+                }
+            }
+            if let Some(hit) = pathedit::segment_at(path, at, reach.hit) {
+                self.held = Held::Segment {
+                    path: pick.path,
+                    segment: hit.segment,
+                    t: hit.t,
+                    press: at,
+                    tap: reach.tap,
+                    start: path.clone(),
+                };
+                return;
+            }
+        }
+
+        // The nearest line of any other path in reach.
+        let mut best: Option<(usize, f32)> = None;
+        for (i, path) in record.paths().iter().enumerate() {
+            if !is_line(path) || self.pick.is_some_and(|p| p.path == i) {
+                continue;
+            }
+            if let Some(hit) = pathedit::segment_at(path, at, reach.hit)
+                && best.is_none_or(|(_, d)| hit.distance < d)
+            {
+                best = Some((i, hit.distance));
+            }
+        }
+        if let Some((path, _)) = best {
+            self.pick = Some(Pick { path, node: None });
+            self.held = Held::Picked;
+            return;
+        }
+        self.pick = None;
+    }
+
     /// The pointer moved, held or not. `alone` is Shift.
-    pub fn moved(&mut self, at: Vec2, _alone: bool) {
-        // Shift has no meaning in Draw mode; Edit mode's moves are where it
-        // will matter.
+    pub fn moved(&mut self, at: Vec2, alone: bool) {
         self.hover = Some(at);
-        if let (Held::Placing { .. }, Some(draft)) = (self.held, self.draft.as_mut())
-            && let Some(node) = draft.nodes.last_mut()
-        {
-            let out = at - node.at;
-            node.handle_out = out;
-            node.handle_in = -out;
+        self.alone = alone;
+        match &self.held {
+            Held::Placing { .. } => {
+                if let Some(node) = self.draft.as_mut().and_then(|d| d.nodes.last_mut()) {
+                    let out = at - node.at;
+                    node.handle_out = out;
+                    node.handle_in = -out;
+                }
+            }
+            Held::Handle { .. } | Held::Node { .. } | Held::Segment { .. } => {
+                self.dragged = shaped(&self.held, at, alone);
+            }
+            Held::Nothing | Held::Closing | Held::Continuing | Held::Picked => {}
         }
     }
 
     pub fn release(&mut self, at: Vec2, ground: Ground<'_>) -> Commit {
         let held = std::mem::replace(&mut self.held, Held::Nothing);
+        self.dragged = None;
         match held {
-            Held::Nothing | Held::Continuing => Commit::Nothing,
+            Held::Nothing | Held::Continuing | Held::Picked => Commit::Nothing,
             Held::Placing { press } => {
                 // A wobble inside the slop is a corner, not a tiny curve.
                 if at.distance(press) <= ground.reach.tap
@@ -224,6 +388,54 @@ impl PathTool {
                 Commit::Nothing
             }
             Held::Closing => self.land(),
+            Held::Handle {
+                path, ref start, ..
+            }
+            | Held::Node {
+                path, ref start, ..
+            } => {
+                let Some(record) = ground.paths else {
+                    return Commit::Nothing;
+                };
+                let Some(next) = shaped(&held, at, self.alone) else {
+                    return Commit::Nothing;
+                };
+                if next == *start {
+                    return Commit::Nothing;
+                }
+                let keep = self.pick;
+                self.set(record.with_path(path, next), keep)
+            }
+            Held::Segment {
+                path,
+                segment,
+                t,
+                press,
+                tap,
+                ref start,
+            } => {
+                let Some(record) = ground.paths else {
+                    return Commit::Nothing;
+                };
+                if at.distance(press) <= tap {
+                    let Some((next, node)) = pathedit::split(start, segment, t) else {
+                        return Commit::Nothing;
+                    };
+                    let pick = Some(Pick {
+                        path,
+                        node: Some(node),
+                    });
+                    return self.set(record.with_path(path, next), pick);
+                }
+                let Some(next) = shaped(&held, at, self.alone) else {
+                    return Commit::Nothing;
+                };
+                if next == *start {
+                    return Commit::Nothing;
+                }
+                let keep = self.pick;
+                self.set(record.with_path(path, next), keep)
+            }
         }
     }
 
@@ -252,16 +464,37 @@ impl PathTool {
         true
     }
 
-    /// Escape. True when it consumed the key.
+    /// Escape. True when it consumed the key. A draft goes first, then the
+    /// node picked, then the path, one for each press of the key.
     pub fn abandon(&mut self) -> bool {
-        self.held = Held::Nothing;
         self.said = None;
-        self.draft.take().is_some()
+        match self.held {
+            Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing => {}
+            Held::Picked | Held::Handle { .. } | Held::Node { .. } | Held::Segment { .. } => {
+                // Escape in the middle of a drag cancels the drag and no more.
+                self.held = Held::Nothing;
+                self.dragged = None;
+                return true;
+            }
+        }
+        self.held = Held::Nothing;
+        if self.draft.take().is_some() {
+            return true;
+        }
+        if let Some(pick) = self.pick.as_mut() {
+            if pick.node.take().is_some() {
+                return true;
+            }
+            self.pick = None;
+            return true;
+        }
+        false
     }
 
     /// Tool change, tab switch, close, resize, flip.
     pub fn settle(&mut self) -> Commit {
         self.held = Held::Nothing;
+        self.dragged = None;
         let commit = self.land();
         if commit == Commit::Nothing {
             self.draft = None;
@@ -278,6 +511,161 @@ impl PathTool {
                 self.said = None;
             }
             Err(why) => self.said = Some(why),
+        }
+    }
+
+    /// The outcome of the last `Commit::Set`. Err says why and puts the pick
+    /// back where it was before the edit asked to move it.
+    pub fn applied(&mut self, outcome: Result<(), &'static str>) {
+        match outcome {
+            Ok(()) => self.before = None,
+            Err(why) => {
+                self.said = Some(why);
+                self.pick = self.before.take();
+            }
+        }
+    }
+
+    /// Delete or Backspace with no draft: the node picked, or else the path.
+    pub fn remove(&mut self, ground: Ground<'_>) -> Commit {
+        self.sanitize(ground);
+        let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
+            return Commit::Nothing;
+        };
+        let path = &record.paths()[pick.path];
+        if let Some(n) = pick.node
+            && let Some(next) = pathedit::without_node(path, n)
+        {
+            let keep = Some(Pick {
+                path: pick.path,
+                node: None,
+            });
+            return self.set(record.with_path(pick.path, next), keep);
+        }
+        // No node, or a path too short to lose one: the path goes whole.
+        self.set(record.without_path(pick.path), None)
+    }
+
+    /// The Cut / Plot switch. With a pick it changes that path alone and never
+    /// the role for new paths; without one it sets the role for new paths.
+    pub fn set_role(&mut self, role: PathRole, ground: Ground<'_>) -> Commit {
+        self.sanitize(ground);
+        let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
+            self.role = role;
+            return Commit::Nothing;
+        };
+        let mut next = record.paths()[pick.path].clone();
+        if next.role == role {
+            return Commit::Nothing;
+        }
+        next.role = role;
+        let keep = self.pick;
+        self.set(record.with_path(pick.path, next), keep)
+    }
+
+    /// The pick's role while there is a pick, otherwise the one for new paths.
+    pub fn role_shown(&self, ground: Ground<'_>) -> PathRole {
+        self.picked(ground).map_or(self.role, |(_, path)| path.role)
+    }
+
+    /// Close an open path or open a closed one. An open path needs three nodes
+    /// to close, and with fewer nothing happens and nothing is said: the
+    /// button is not the place to teach geometry.
+    pub fn toggle_closed(&mut self, ground: Ground<'_>) -> Commit {
+        self.sanitize(ground);
+        let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
+            return Commit::Nothing;
+        };
+        let mut next = record.paths()[pick.path].clone();
+        if !next.closed && next.nodes.len() < 3 {
+            return Commit::Nothing;
+        }
+        next.closed = !next.closed;
+        let keep = self.pick;
+        self.set(record.with_path(pick.path, next), keep)
+    }
+
+    /// Both handles of the picked node to zero.
+    pub fn corner(&mut self, ground: Ground<'_>) -> Commit {
+        self.reshape_node(ground, |path, n| Some(pathedit::cornered(path.nodes[n])))
+    }
+
+    /// The picked node's handles along the line between its neighbours.
+    pub fn smooth(&mut self, ground: Ground<'_>) -> Commit {
+        self.reshape_node(ground, pathedit::smoothed)
+    }
+
+    pub fn can_smooth(&self, ground: Ground<'_>) -> bool {
+        self.picked(ground)
+            .zip(self.pick.and_then(|p| p.node))
+            .is_some_and(|((_, path), n)| pathedit::smoothed(path, n).is_some())
+    }
+
+    fn reshape_node(
+        &mut self,
+        ground: Ground<'_>,
+        make: impl Fn(&Path, usize) -> Option<Node>,
+    ) -> Commit {
+        self.sanitize(ground);
+        let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
+            return Commit::Nothing;
+        };
+        let Some(n) = pick.node else {
+            return Commit::Nothing;
+        };
+        let path = &record.paths()[pick.path];
+        let Some(node) = make(path, n) else {
+            return Commit::Nothing;
+        };
+        if node == path.nodes[n] {
+            return Commit::Nothing;
+        }
+        let mut next = path.clone();
+        next.nodes[n] = node;
+        let keep = self.pick;
+        self.set(record.with_path(pick.path, next), keep)
+    }
+
+    /// The pick and its path, where the ground still has both.
+    fn picked<'a>(&self, ground: Ground<'a>) -> Option<(Pick, &'a Path)> {
+        let pick = self.pick?;
+        let path = ground.paths?.paths().get(pick.path)?;
+        is_line(path).then_some((pick, path))
+    }
+
+    /// Drop a pick the ground no longer has: a path off the end, a node off
+    /// the end of its path, or a path that is not a line. Indexing a stale pick
+    /// would be a panic on the pointer path.
+    fn sanitize(&mut self, ground: Ground<'_>) {
+        let Some(record) = ground.paths else {
+            return;
+        };
+        let Some(pick) = self.pick else {
+            return;
+        };
+        match record.paths().get(pick.path).filter(|p| is_line(p)) {
+            None => self.pick = None,
+            Some(path) => {
+                if pick.node.is_some_and(|n| n >= path.nodes.len()) {
+                    self.pick = Some(Pick { node: None, ..pick });
+                }
+            }
+        }
+    }
+
+    /// Turn the record `with_path` produced into a commit, moving the pick as
+    /// the edit wants. A refusal says why and leaves the pick alone.
+    fn set(&mut self, result: Result<VectorObject, VectorRefusal>, pick: Option<Pick>) -> Commit {
+        match result {
+            Ok(record) => {
+                self.before = self.pick;
+                self.pick = pick;
+                Commit::Set(record)
+            }
+            Err(why) => {
+                self.said = Some(why.sentence());
+                Commit::Nothing
+            }
         }
     }
 
@@ -298,6 +686,37 @@ impl PathTool {
                 ink: None,
             }],
             replaces: draft.continues,
+        }
+    }
+}
+
+/// The dragged path for a hold with the pointer at `at`, recomputed from the
+/// press state. `None` for a hold that drags nothing, and for a drag on a line
+/// that has not yet left the tap slop.
+fn shaped(held: &Held, at: Vec2, alone: bool) -> Option<Path> {
+    match held {
+        Held::Handle {
+            node, side, start, ..
+        } => {
+            let from = start.nodes[*node];
+            let mut out = start.clone();
+            // Smoothness is judged on the node as it was at the press, and
+            // Shift is read now, so pressing it mid-drag takes effect.
+            out.nodes[*node] = pathedit::with_handle(from, *side, at - from.at, !alone);
+            Some(out)
+        }
+        Held::Node {
+            node, press, start, ..
+        } => {
+            let mut out = start.clone();
+            out.nodes[*node].at = start.nodes[*node].at + (at - *press);
+            Some(out)
+        }
+        Held::Segment {
+            press, tap, start, ..
+        } => (at.distance(*press) > *tap).then(|| pathedit::moved(start, at - *press)),
+        Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing | Held::Picked => {
+            None
         }
     }
 }
@@ -613,15 +1032,6 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_press_changes_nothing_yet() {
-        let mut t = PathTool::default();
-        tap(&mut t, v(0.0, 0.0), bare());
-        t.press(v(40.0, 0.0), true, bare());
-        assert!(!t.is_held());
-        assert_eq!(t.draft().unwrap().nodes.len(), 1);
-    }
-
-    #[test]
     fn no_mode_is_missing_from_all() {
         // Exhaustive on purpose: a third mode must say where it sits.
         for mode in PathMode::ALL {
@@ -633,5 +1043,411 @@ mod tests {
         }
         assert_eq!(PathMode::Draw.label(), "Draw");
         assert_eq!(PathMode::Edit.label(), "Edit");
+    }
+
+    // ---- Edit mode ----
+
+    fn corners(role: PathRole, closed: bool, points: &[(f32, f32)]) -> Path {
+        open(role, points, closed)
+    }
+
+    /// Path 0 open Cut, path 1 closed Plot square, path 2 Ink.
+    fn edit_record() -> VectorObject {
+        VectorObject::Paths(vec![
+            corners(PathRole::Cut, false, &[(0.0, 0.0), (100.0, 0.0)]),
+            corners(
+                PathRole::Plot,
+                true,
+                &[(200.0, 0.0), (300.0, 0.0), (300.0, 100.0), (200.0, 100.0)],
+            ),
+            corners(PathRole::Ink, false, &[(0.0, 200.0), (100.0, 200.0)]),
+        ])
+    }
+
+    fn edit_tap(t: &mut PathTool, at: Vec2, g: Ground<'_>) -> Commit {
+        t.press(at, true, g);
+        t.release(at, g)
+    }
+
+    fn set_of(c: Commit) -> VectorObject {
+        match c {
+            Commit::Set(r) => r,
+            Commit::Nothing | Commit::Land { .. } => panic!("expected a Set, got {c:?}"),
+        }
+    }
+
+    /// Pick path 0 by its line, then its node 1 by the node.
+    fn with_node_picked(rec: &VectorObject) -> PathTool {
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(rec));
+        edit_tap(&mut t, v(100.0, 0.0), on(rec));
+        assert_eq!(
+            t.pick(),
+            Some(Pick {
+                path: 0,
+                node: Some(1)
+            })
+        );
+        t
+    }
+
+    #[test]
+    fn a_press_on_a_line_picks_its_path_and_none_of_its_nodes() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 3.0), on(&rec));
+        assert_eq!(
+            t.pick(),
+            Some(Pick {
+                path: 0,
+                node: None
+            })
+        );
+    }
+
+    #[test]
+    fn the_nearest_of_two_paths_in_reach_is_picked() {
+        let rec = VectorObject::Paths(vec![
+            corners(PathRole::Cut, false, &[(0.0, 0.0), (100.0, 0.0)]),
+            corners(PathRole::Cut, false, &[(0.0, 6.0), (100.0, 6.0)]),
+        ]);
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 4.0), on(&rec));
+        assert_eq!(t.pick().map(|p| p.path), Some(1));
+    }
+
+    #[test]
+    fn an_ink_path_is_never_picked() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 200.0), on(&rec));
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn a_press_on_nothing_lets_go() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        edit_tap(&mut t, v(500.0, 500.0), on(&rec));
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn no_ground_means_a_press_does_nothing() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let before = t.pick();
+        t.press(v(250.0, 0.0), true, bare());
+        assert_eq!(t.pick(), before);
+        assert!(!t.is_held());
+        assert!(t.dragged().is_none());
+    }
+
+    #[test]
+    fn dragging_a_picked_node_moves_it_and_is_one_set() {
+        let rec = edit_record();
+        let mut t = with_node_picked(&rec);
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(110.0, 10.0), false);
+        assert_eq!(t.dragged().unwrap().nodes[1].at, v(110.0, 10.0));
+        let got = set_of(t.release(v(120.0, 30.0), on(&rec)));
+        assert_eq!(got.paths()[0].nodes[1].at, v(120.0, 30.0));
+        assert_eq!(got.paths()[0].nodes[0].at, v(0.0, 0.0));
+        assert_eq!(got.paths()[1], rec.paths()[1]);
+        assert_eq!(got.paths()[2], rec.paths()[2]);
+        assert!(t.dragged().is_none());
+    }
+
+    #[test]
+    fn a_drag_back_to_where_it_began_commits_nothing() {
+        let rec = edit_record();
+        let mut t = with_node_picked(&rec);
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(160.0, 40.0), false);
+        t.moved(v(100.0, 0.0), false);
+        assert_eq!(t.release(v(100.0, 0.0), on(&rec)), Commit::Nothing);
+    }
+
+    #[test]
+    fn a_tap_on_the_picked_segment_inserts_a_node_and_picks_it() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let got = set_of(edit_tap(&mut t, v(50.0, 0.0), on(&rec)));
+        assert_eq!(got.paths()[0].nodes.len(), 3);
+        assert_eq!(got.paths()[0].nodes[1].at, v(50.0, 0.0));
+        assert_eq!(t.pick().unwrap().node, Some(1));
+    }
+
+    #[test]
+    fn a_drag_on_the_picked_segment_moves_the_whole_path() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        t.press(v(50.0, 0.0), true, on(&rec));
+        t.moved(v(50.0, 30.0), false);
+        let got = set_of(t.release(v(50.0, 30.0), on(&rec)));
+        let at: Vec<Vec2> = got.paths()[0].nodes.iter().map(|n| n.at).collect();
+        assert_eq!(at, vec![v(0.0, 30.0), v(100.0, 30.0)]);
+        assert_eq!(t.pick().unwrap().path, 0);
+    }
+
+    /// Path 0 with a smooth middle node at (50, 0), handles of ten.
+    fn smooth_record() -> VectorObject {
+        let mut p = corners(
+            PathRole::Cut,
+            false,
+            &[(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)],
+        );
+        p.nodes[1].handle_in = v(-10.0, 0.0);
+        p.nodes[1].handle_out = v(10.0, 0.0);
+        VectorObject::Paths(vec![p])
+    }
+
+    /// Drag the middle node's out handle from (60, 0) to (60, 20) and return
+    /// the node that results.
+    fn drag_out_handle(shift: bool) -> Node {
+        let rec = smooth_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&rec));
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        t.press(v(60.0, 0.0), true, on(&rec));
+        t.moved(v(60.0, 20.0), shift);
+        let got = set_of(t.release(v(60.0, 20.0), on(&rec)));
+        got.paths()[0].nodes[1]
+    }
+
+    #[test]
+    fn dragging_a_smooth_handle_turns_its_twin_and_shift_does_not() {
+        let turned = drag_out_handle(false);
+        assert_eq!(turned.handle_out, v(10.0, 20.0));
+        let dir = v(10.0, 20.0).normalize();
+        assert!((turned.handle_in - (-dir * 10.0)).length() < 1e-4);
+        let cusp = drag_out_handle(true);
+        assert_eq!(cusp.handle_out, v(10.0, 20.0));
+        assert_eq!(cusp.handle_in, v(-10.0, 0.0));
+    }
+
+    #[test]
+    fn pressing_shift_mid_drag_takes_effect() {
+        let rec = smooth_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&rec));
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        t.press(v(60.0, 0.0), true, on(&rec));
+        t.moved(v(60.0, 20.0), false);
+        t.moved(v(60.0, 22.0), true);
+        assert_eq!(t.dragged().unwrap().nodes[1].handle_in, v(-10.0, 0.0));
+    }
+
+    #[test]
+    fn a_handle_is_only_hit_on_the_picked_node() {
+        let mut p = corners(PathRole::Cut, false, &[(0.0, 0.0), (100.0, 0.0)]);
+        p.nodes[0].handle_out = v(0.0, -40.0);
+        let rec = VectorObject::Paths(vec![p]);
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, -15.0), on(&rec));
+        edit_tap(&mut t, v(100.0, 0.0), on(&rec));
+        // Node 1 is picked; node 0's handle tip is not its to answer for.
+        t.press(v(0.0, -40.0), true, on(&rec));
+        t.moved(v(30.0, -40.0), false);
+        assert_eq!(t.release(v(30.0, -40.0), on(&rec)), Commit::Nothing);
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn with_nodes_hidden_a_press_on_a_node_reads_as_the_segment() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let hidden = Ground {
+            nodes_shown: false,
+            ..on(&rec)
+        };
+        let got = set_of(edit_tap(&mut t, v(100.0, 0.0), hidden));
+        assert_eq!(got.paths()[0].nodes.len(), 3);
+    }
+
+    #[test]
+    fn delete_removes_the_node_then_the_short_path_goes_whole() {
+        let rec = edit_record();
+        let mut t = with_node_picked(&rec);
+        let got = set_of(t.remove(on(&rec)));
+        assert_eq!(got.paths().len(), 2);
+        assert_eq!(got.paths()[0], rec.paths()[1]);
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn delete_takes_one_node_from_a_longer_path_and_keeps_the_path() {
+        let rec = smooth_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&rec));
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let got = set_of(t.remove(on(&rec)));
+        assert_eq!(got.paths()[0].nodes.len(), 2);
+        assert_eq!(
+            t.pick(),
+            Some(Pick {
+                path: 0,
+                node: None
+            })
+        );
+    }
+
+    #[test]
+    fn delete_with_no_node_removes_the_path() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let got = set_of(t.remove(on(&rec)));
+        assert_eq!(got.paths().len(), 2);
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn the_role_switch_changes_the_pick_and_not_the_default() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(250.0, 0.0), on(&rec));
+        assert_eq!(t.pick().unwrap().path, 1);
+        assert_eq!(t.role_shown(on(&rec)), PathRole::Plot);
+        let got = set_of(t.set_role(PathRole::Cut, on(&rec)));
+        assert_eq!(got.paths()[1].role, PathRole::Cut);
+        assert_eq!(t.role, PathRole::Cut);
+        // The path is already Plot: nothing to record.
+        assert_eq!(t.set_role(PathRole::Plot, on(&rec)), Commit::Nothing);
+        assert_eq!(
+            t.role,
+            PathRole::Cut,
+            "the default is not the pick's to set"
+        );
+
+        let mut t = PathTool {
+            role: PathRole::Plot,
+            ..PathTool::default()
+        };
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        assert_eq!(t.role_shown(on(&rec)), PathRole::Cut);
+        let got = set_of(t.set_role(PathRole::Plot, on(&rec)));
+        assert_eq!(got.paths()[0].role, PathRole::Plot);
+        assert_eq!(t.role, PathRole::Plot);
+    }
+
+    #[test]
+    fn with_no_pick_the_switch_sets_the_default() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        assert_eq!(t.set_role(PathRole::Plot, on(&rec)), Commit::Nothing);
+        assert_eq!(t.role, PathRole::Plot);
+        assert_eq!(t.role_shown(on(&rec)), PathRole::Plot);
+    }
+
+    #[test]
+    fn closing_an_open_path_of_two_is_refused_quietly() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        assert_eq!(t.toggle_closed(on(&rec)), Commit::Nothing);
+        assert_eq!(t.said(), None);
+    }
+
+    #[test]
+    fn opening_and_closing_the_square_round_trips() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(250.0, 0.0), on(&rec));
+        let opened = set_of(t.toggle_closed(on(&rec)));
+        assert!(!opened.paths()[1].closed);
+        let closed = set_of(t.toggle_closed(on(&opened)));
+        assert_eq!(closed, rec);
+    }
+
+    #[test]
+    fn corner_zeroes_both_handles_and_smooth_is_off_at_an_open_end() {
+        let rec = smooth_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&rec));
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let got = set_of(t.corner(on(&rec)));
+        let n = got.paths()[0].nodes[1];
+        assert_eq!((n.handle_in, n.handle_out), (Vec2::ZERO, Vec2::ZERO));
+        // Now a corner between two neighbours: smoothing it is a real change.
+        assert!(t.can_smooth(on(&got)));
+        let smoothed = set_of(t.smooth(on(&got)));
+        assert_ne!(smoothed.paths()[0].nodes[1].handle_out, Vec2::ZERO);
+
+        // An end node of an open path is left alone.
+        edit_tap(&mut t, v(0.0, 0.0), on(&rec));
+        assert_eq!(t.pick().unwrap().node, Some(0));
+        assert!(!t.can_smooth(on(&rec)));
+        assert_eq!(t.smooth(on(&rec)), Commit::Nothing);
+    }
+
+    #[test]
+    fn a_drag_past_the_bound_changes_nothing_and_says_so() {
+        let rec = edit_record();
+        let mut t = with_node_picked(&rec);
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(1.0e6, 0.0), false);
+        let c = t.release(v(2.0e6, 0.0), on(&rec));
+        assert_eq!(c, Commit::Nothing);
+        assert_eq!(t.said(), Some(VectorRefusal::Impossible.sentence()));
+        assert_eq!(t.pick().unwrap().node, Some(1));
+    }
+
+    #[test]
+    fn a_refused_set_puts_the_pick_back() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        let _ = set_of(edit_tap(&mut t, v(50.0, 0.0), on(&rec)));
+        assert_eq!(t.pick().unwrap().node, Some(1));
+        t.applied(Err("no"));
+        assert_eq!(t.said(), Some("no"));
+        assert_eq!(t.pick().unwrap().node, None);
+    }
+
+    #[test]
+    fn a_stale_pick_is_dropped_not_indexed() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(250.0, 0.0), on(&rec));
+        assert_eq!(t.pick().unwrap().path, 1);
+        let short = VectorObject::Paths(vec![rec.paths()[0].clone()]);
+        assert_eq!(t.remove(on(&short)), Commit::Nothing);
+        assert_eq!(t.pick(), None);
+    }
+
+    #[test]
+    fn escape_lets_go_of_the_node_then_the_path() {
+        let rec = edit_record();
+        let mut t = with_node_picked(&rec);
+        assert!(t.abandon());
+        assert_eq!(
+            t.pick(),
+            Some(Pick {
+                path: 0,
+                node: None
+            })
+        );
+        assert!(t.abandon());
+        assert_eq!(t.pick(), None);
+        assert!(!t.abandon());
+    }
+
+    #[test]
+    fn ctrl_in_draw_is_an_edit_press_and_a_plain_one_lets_go_and_draws() {
+        let rec = edit_record();
+        let mut t = PathTool::default();
+        assert_eq!(t.mode, PathMode::Draw);
+        t.press(v(50.0, 0.0), true, on(&rec));
+        t.release(v(50.0, 0.0), on(&rec));
+        assert!(t.pick().is_some());
+        t.press(v(500.0, 500.0), false, on(&rec));
+        assert_eq!(t.pick(), None);
+        assert_eq!(t.draft().unwrap().nodes.len(), 1);
     }
 }
