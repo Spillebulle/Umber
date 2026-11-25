@@ -1919,6 +1919,16 @@ impl UmberApp {
                 });
                 return;
             }
+            Some(EditRefusal::Vector) => {
+                self.editor.notice = Some(Notice {
+                    title: "This is a vector layer".to_string(),
+                    lines: vec![
+                        "Nothing was cut. This is a vector layer. Cut from an ordinary                          layer instead."
+                            .to_string(),
+                    ],
+                });
+                return;
+            }
             // Silent, for the reason the copy above is silent about a folder: a
             // folder is a perfectly ordinary thing to have selected, and the
             // `active_slot` read below already returns for both of these.
@@ -6834,6 +6844,10 @@ fn paste_refusal(why: EditRefusal) -> Notice {
             "Nothing was pasted. The text on this layer can still be set again, so \
              nothing may be pasted over it. Convert it to paint in the Text panel, \
              or select another layer.",
+        ),
+        EditRefusal::Vector => (
+            "This is a vector layer",
+            "Nothing was pasted. This is a vector layer. Paste onto an ordinary              layer instead.",
         ),
         EditRefusal::Missing => (
             "No layer is selected",
