@@ -373,8 +373,13 @@ impl VectorObject {
         Ok(next)
     }
 
-    /// The record on a mirrored canvas. Exact, so a flip undone by a flip is the
-    /// identity. The in and out handles are *not* swapped: each stays on the
+    /// The record on a mirrored canvas.
+    ///
+    /// A flip is **not** exactly its own inverse in `f32`: `c - (c - x)` rounds
+    /// for a figure that is not a dyadic fraction. A round trip moves a figure
+    /// by at most one rounding at the canvas's magnitude and repeating it does
+    /// not drift further; `a_double_flip_costs_one_rounding_and_never_drifts`
+    /// states and tests both. The in and out handles are *not* swapped: each stays on the
     /// side of its node it was on, and a handle is an offset, so only the
     /// mirrored component changes sign.
     pub fn flipped(&self, axis: FlipAxis, canvas: UVec2) -> Self {
@@ -411,6 +416,10 @@ impl VectorObject {
     }
 
     /// Every node moved by `by`; handles are offsets and stay put.
+    ///
+    /// Not clamped: clamping would deform the shape. A figure pushed past
+    /// [`MAX_COORD`] is left as it is, and [`VectorObject::check`], which
+    /// [`VectorObject::to_json`] runs, is the backstop that refuses to write it.
     pub fn translated(&self, by: Vec2) -> Self {
         let paths = match self {
             VectorObject::Paths(p) => p,
@@ -533,7 +542,7 @@ impl VectorObject {
         }
         let unreadable = |e: serde_json::Error| RecordError::Unreadable(e.to_string());
         let probe: Probe = serde_json::from_slice(bytes).map_err(unreadable)?;
-        if probe.version > VERSION {
+        if probe.version > u64::from(VERSION) {
             return Ok((VectorObject::Opaque(bytes.to_vec()), None));
         }
         let record: Record = serde_json::from_slice(bytes).map_err(unreadable)?;
@@ -558,7 +567,7 @@ impl VectorObject {
 /// Just enough of a record to learn whether this build can read the rest.
 #[derive(Deserialize)]
 struct Probe {
-    version: u32,
+    version: u64,
 }
 
 /// The record. **Field names and order are the file format.**
@@ -759,8 +768,17 @@ mod tests {
         for tol in [1.0, 0.25, 0.05] {
             let mut out = Vec::new();
             quarter().flatten(tol, &mut out);
-            for p in &out {
-                assert!((p.length() - 100.0).abs() <= 0.02 + tol, "{p} at {tol}");
+            // The vertices lie on the Bezier, which is within 0.02 of the
+            // circle however coarsely it is cut, so they say nothing about the
+            // tolerance. What the tolerance bounds is how far the *chords* sag.
+            for pair in out.windows(2) {
+                for k in 0..=20 {
+                    let p = pair[0].lerp(pair[1], k as f32 / 20.0);
+                    assert!(
+                        (p.length() - 100.0).abs() <= tol + 0.03,
+                        "chord point {p} at {tol}"
+                    );
+                }
             }
             assert!(out.len() >= last, "finer tolerance gave fewer points");
             last = out.len();
@@ -779,13 +797,54 @@ mod tests {
     }
 
     #[test]
-    fn flipping_twice_is_the_identity() {
+    fn flipping_twice_restores_figures_that_are_exact_in_f32() {
         let canvas = UVec2::new(700, 500);
         let a = fixture();
         for axis in [FlipAxis::Horizontal, FlipAxis::Vertical] {
             let once = a.flipped(axis, canvas);
             assert_ne!(once, a);
             assert_eq!(once.flipped(axis, canvas), a);
+        }
+    }
+
+    /// `c - (c - x)` rounds for a figure that is not a dyadic fraction, so a
+    /// flip is not exactly its own inverse. What is true, and is what is tested:
+    /// a round trip moves a figure by at most one rounding at the canvas's
+    /// magnitude, and it does not accumulate.
+    #[test]
+    fn a_double_flip_costs_one_rounding_and_never_drifts() {
+        for canvas in [UVec2::new(700, 500), UVec2::new(32768, 32768)] {
+            let xs = [0.1_f32, 33.37, 699.9, -12.34, -0.7, 700.3, 5000.123];
+            let nodes: Vec<Node> = xs
+                .iter()
+                .zip(xs.iter().rev())
+                .map(|(&x, &y)| Node {
+                    at: v(x, y),
+                    handle_in: v(0.3, -0.7),
+                    handle_out: v(-1.1, 2.3),
+                    pressure: 1.0,
+                })
+                .collect();
+            let a = VectorObject::Paths(vec![Path {
+                role: PathRole::Cut,
+                closed: false,
+                nodes,
+                ink: None,
+            }]);
+            let bound = canvas.x.max(canvas.y) as f32 * f32::EPSILON;
+            for axis in [FlipAxis::Horizontal, FlipAxis::Vertical] {
+                let twice = a.flipped(axis, canvas).flipped(axis, canvas);
+                for (n, m) in a.paths()[0].nodes.iter().zip(&twice.paths()[0].nodes) {
+                    assert!((n.at - m.at).abs().max_element() <= bound, "{n:?} {m:?}");
+                    assert_eq!(n.handle_in, m.handle_in);
+                    assert_eq!(n.handle_out, m.handle_out);
+                }
+                let mut state = twice.clone();
+                for round in 2..=1000 {
+                    state = state.flipped(axis, canvas).flipped(axis, canvas);
+                    assert_eq!(state, twice, "drifted at round {round}");
+                }
+            }
         }
     }
 
@@ -919,7 +978,7 @@ mod tests {
 
     #[test]
     fn a_nan_or_huge_figure_is_refused() {
-        for figure in ["1e30", "1e999"] {
+        for figure in ["1e30", "-1e30", "1e39", "1e999"] {
             let text = format!(
                 r#"{{"version":1,"paths":[{{"role":"Cut","nodes":[{{"at":[{figure},0]}},{{"at":[1,1]}}]}}]}}"#
             );
@@ -937,6 +996,29 @@ mod tests {
         assert!(obj.is_opaque());
         assert_eq!(print, None);
         assert_eq!(obj.to_json(None).unwrap(), bytes.to_vec());
+    }
+
+    #[test]
+    fn a_version_too_large_for_u32_is_still_a_newer_record() {
+        let bytes = br#"{"version":99999999999,"paths":[]}"#;
+        let (obj, _) = VectorObject::from_json(bytes).unwrap();
+        assert!(obj.is_opaque());
+        assert_eq!(obj.to_json(None).unwrap(), bytes.to_vec());
+    }
+
+    #[test]
+    fn a_path_with_one_node_is_dropped_and_the_rest_kept() {
+        let text = br#"{"version":1,"paths":[{"role":"Cut","nodes":[{"at":[0,0]}]},{"role":"Plot","nodes":[{"at":[0,0]},{"at":[4,4]}]}]}"#;
+        let (obj, _) = VectorObject::from_json(text).unwrap();
+        assert_eq!(obj.paths().len(), 1);
+        assert_eq!(obj.paths()[0].role, PathRole::Plot);
+    }
+
+    #[test]
+    fn a_record_translated_out_of_bounds_refuses_to_serialise() {
+        let moved = fixture().translated(v(MAX_COORD, 0.0));
+        assert_eq!(moved.check(), Err(VectorRefusal::Impossible));
+        assert_eq!(moved.to_json(None), Err(VectorRefusal::Impossible));
     }
 
     #[test]
