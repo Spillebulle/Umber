@@ -1775,7 +1775,10 @@ them.
   `Editor::flip_refusal` (lock first, because that one the artist can take off)
   feeds the flip rows, the flip command, the undo and redo of a flip through
   `StepGate::FlipRefused` and `mirror_document`, and `Editor::resize_refused`
-  gates `App::apply_canvas` and disables the Canvas settings dialog's Apply.
+  gates `App::apply_canvas`. **The Canvas settings dialog disables its Apply
+  from a second statement of that rule**, `has_opaque_vector() &&
+  form.resizes()`, which agrees only because the form's starting size is the
+  document's at open; it should call `resize_refused` and does not yet.
   A change to the resolution or the background alone moves nothing and is
   never refused.
 - **`print` is written only beside Ink, and a mismatch drops Ink and keeps Cut
@@ -1848,11 +1851,13 @@ them.
   `f32`: mirroring a non-dyadic figure about a canvas edge rounds. What holds, and
   is tested, is that one round trip costs at most one rounding at the larger of
   the canvas and the figure, and that a thousand of them equal the first — no
-  accumulating drift. The test's figures are all within about 5000, so it does
-  not exercise a figure far larger than the canvas. This is *not* the layer array's `flip.wgsl`, which is an
-  exact texel permutation; a path is a float. Undoing a flip is another flip, so
-  nothing is dropped: Ink is mirrored with the rest, because the pixels it
-  describes are mirrored by the same flip.
+  accumulating drift. The bound the test asserts is the canvas's
+  (`canvas * EPSILON`); its figures reach about 5000 on a 700-wide canvas and
+  nothing near `MAX_COORD`. This is *not* the layer array's `flip.wgsl`, which
+  is an exact texel permutation; a path is a float. Undoing a flip is another
+  flip, so nothing that can be mirrored is dropped: Ink is mirrored with the
+  rest, because the pixels it describes are mirrored by the same flip. A path
+  the flip pushes out of bounds is the exception, below.
 - **A resize translates paths where it drops text records.** The text record
   is a placement over pixels the resize may have cropped, so it goes. A path is
   geometry, exact under a translation, and may lie outside the canvas, so a
