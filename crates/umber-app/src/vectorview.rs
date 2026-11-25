@@ -44,7 +44,7 @@ use crate::session::DocId;
 const CULL_MARGIN: f32 = 8.0;
 
 /// The flattener's scratch is shrunk back to this many points when a build has
-/// left it larger. One cubic flattens to at most 257, so in practice it never
+/// left it larger. One cubic flattens to at most 256, so in practice it never
 /// grows past this; the bound is what a test can assert.
 pub const SCRATCH_KEEP: usize = 1024;
 
@@ -174,8 +174,12 @@ impl VectorView {
         self.points.clear();
         let ppp = ppp.max(1e-3);
         let zoom = camera.zoom.max(1e-6);
-        // A quarter of a *screen* pixel in document pixels: finer than that is
-        // a polyline nobody can tell from the curve, coarser shows facets.
+        // `0.25 / zoom / ppp` document pixels. The camera maps a document pixel
+        // to `zoom` device pixels, so `0.25 / zoom` alone would be a quarter of
+        // a device pixel; the second division makes it a quarter of a device
+        // pixel at 100% and finer than that at every larger scale (an eighth at
+        // 200%). Finer than anybody can tell from the curve, at the cost of a
+        // few more points on a high-density display; coarser shows facets.
         let tolerance = 0.25 / zoom / ppp;
         // The marquee's pivot: this frame's canvas rect, in physical pixels.
         let pivot = Vec2::new(view.center().x, view.center().y) * ppp;

@@ -545,9 +545,12 @@ const ANT_FRAME_MS: u64 = 60;
 
 /// How wide a machine line's top pass is asked to be, in points.
 ///
-/// Wider than the marquee's one device pixel so a cut line is not read as a
-/// selection that stopped marching, and narrow enough to sit on the edge of a
-/// shape without covering it. What is drawn is [`odd_device_width`] of it.
+/// What is drawn is [`odd_device_width`] of it, and that is **not** always wider
+/// than the marquee. At 100% and 125% it rounds to one device pixel, which is
+/// the marquee's own width, so there only the colour and solid against dashed
+/// tell a cut line from a selection that stopped marching. From 150% it is three
+/// device pixels against the marquee's two. Narrow enough everywhere to sit on
+/// the edge of a shape without covering it.
 const MACHINE_LINE: f32 = 1.5;
 
 /// `points` rounded to an **odd** whole number of device pixels, in points.

@@ -202,8 +202,11 @@ impl EditKind {
 
     /// Is this an edit to the *stack* rather than to pixels?
     ///
-    /// Read by the writer, which cannot yet put one in a file — see
-    /// `docformat::history::SaveHistory::new`.
+    /// **Nothing outside the tests reads this any more.** The writer and the
+    /// reader both ask [`EditKind::is_saved`] instead, because
+    /// [`EditKind::Paths`] is the first kind that is neither structural nor
+    /// writable. It is kept, exhaustive, because the question is still a real
+    /// one and the argument below is the reason `is_saved` exists.
     ///
     /// **An exhaustive `match` rather than the `matches!` this used to be**,
     /// and what it is guarding is the arms that answer `false`. Under
@@ -273,15 +276,17 @@ impl EditKind {
     /// Does undoing this put a layer's **pixels** back in the stack?
     ///
     /// The line the saved history is cut at, and it is a narrower question than
-    /// [`EditKind::is_structural`] on purpose. None of the six can be written
-    /// into a file yet, but only these two make the entries *older* than them
-    /// unwritable as well: a patch recorded before a delete names a slice no
+    /// [`EditKind::is_structural`] on purpose. None of the six structural kinds,
+    /// and not [`EditKind::Paths`] either, can be written into a file yet, but
+    /// only these two make the entries *older* than them unwritable as well: a patch recorded before a delete names a slice no
     /// layer in the saved stack holds, so it cannot be placed at all. An add, a
     /// move, a group or a new mask leaves every patch either side naming the
     /// layer it was captured from, so those entries are simply left out and
     /// everything around them is saved whole — which matters, because dragging
     /// a layer in the panel is one of the commonest things an artist does and
-    /// cutting the history there would silently discard the morning.
+    /// cutting the history there would silently discard the morning. A
+    /// [`EditKind::Paths`] entry is the same: it swaps a record back by slot and
+    /// moves no slice, so every patch either side still names its own pixels.
     ///
     /// Exhaustive for the reason [`EditKind::is_structural`] is, and the
     /// difference is only that today's silent answer happens to be the safe
@@ -335,8 +340,9 @@ impl EditKind {
 
 /// What an entry holds in order to be undone.
 ///
-/// Three shapes, because there are three ways an edit can be reversible and
-/// only one of them costs memory:
+/// Five shapes. Three are the three ways an edit can be reversible, and only
+/// the first of those costs pixel memory; the last two are pixels or nothing
+/// carried together with a record that has to travel with them:
 ///
 /// * [`EditBody::Pixels`] is everything that paints. The engine cannot work out
 ///   what was under a stroke, so it keeps it.
@@ -349,6 +355,9 @@ impl EditKind {
 /// * [`EditBody::Text`] is pixels **and** the [`crate::textobj::TextObject`]
 ///   that made them. See its own docs for why that is not the mixing the
 ///   paragraph below refuses.
+/// * [`EditBody::Vector`] is a vector layer's record and no pixels, put back by
+///   slot. Cut and Plot paths draw nothing into the layer, so the record is the
+///   whole of the edit.
 ///
 /// **No entry mixes pixels and *structure*.** A structural entry never carries
 /// a patch, for the reason the timeline is stepped rather than seeked: a delete
@@ -412,8 +421,9 @@ pub enum EditBody {
     },
     /// The vector record the layer in `slot` held before the edit.
     ///
-    /// No pixels: a vector layer's pixels are drawn from its record, so
-    /// restoring the record is the whole undo. By **slot** and not position,
+    /// No pixels: a path edit writes none (Cut and Plot are lines drawn over
+    /// the canvas, never into the layer), so restoring the record is the whole
+    /// undo. By **slot** and not position,
     /// for the reason [`crate::layer::LayerStack::restore_vector`] gives.
     /// In memory only; see [`EditKind::is_saved`].
     Vector {
