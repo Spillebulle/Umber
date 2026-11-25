@@ -114,6 +114,11 @@ pub struct VectorView {
     /// guards.
     #[cfg(test)]
     flattened: usize,
+    /// The most points the scratch has held at once, for the guard that a
+    /// build never holds more than a cubic: what it keeps *afterwards* is
+    /// shrunk, so only the high-water mark can see a whole path flattened.
+    #[cfg(test)]
+    scratch_peak: usize,
 }
 
 impl VectorView {
@@ -187,6 +192,8 @@ impl VectorView {
             capped,
             #[cfg(test)]
             flattened,
+            #[cfg(test)]
+            scratch_peak,
             ..
         } = self;
         let mut runs = Runs {
@@ -237,6 +244,7 @@ impl VectorView {
                     #[cfg(test)]
                     {
                         *flattened += 1;
+                        *scratch_peak = (*scratch_peak).max(scratch.len());
                     }
                     let mut from = hull[0];
                     for &doc in scratch.iter() {
@@ -900,10 +908,24 @@ mod tests {
             "the zigzag was meant to stay in view"
         );
         assert!(
+            view.scratch_peak <= 256, // one cubic flattens to at most 256 points
+            "the scratch held {} points at once",
+            view.scratch_peak
+        );
+        assert!(
             view.scratch_capacity() <= SCRATCH_KEEP,
-            "the scratch holds {} points",
+            "the scratch keeps {} points",
             view.scratch_capacity()
         );
+
+        // And a scratch something grew is given back after the next build.
+        view.scratch.reserve(100_000);
+        let moved = Camera {
+            center: Vec2::new(200.5, 150.0),
+            ..cam
+        };
+        view.lines(doc(), &s, &moved, VIEW, 1.0);
+        assert!(view.scratch_capacity() <= SCRATCH_KEEP);
     }
 
     /// A path whose nodes are all one point is nothing to draw, and is never
