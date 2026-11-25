@@ -201,6 +201,12 @@ or delete them all at once.
 Drag a layer sideways as well as up and down to nest it. A dashed outline shows
 where it lands, and at what depth, before you let go.
 
+**Vector layers** hold lines rather than paint, for a sticker cut or a plot.
+Select something, choose Cut path from selection or Plot path from selection on
+the Edit menu, and its outline becomes a closed line on a vector layer. The line
+is drawn over the canvas and is never part of the picture, so it stays out of
+your exports. It saves with the document and undoes like anything else.
+
 <br clear="right">
 
 ## Colour
@@ -394,6 +400,10 @@ a speed-derived approximation, and a mouse always paints at full pressure.
   vector renderer; rasterise it before saving and it comes across. Adjustment
   layers change what is below them, which Umber cannot do yet. Both are named
   when the document opens.
+- **Vector layers only make lines from a selection so far.** You cannot yet draw
+  a path by hand or move its points, trace a cut line from your artwork, or send
+  anything to a cutter or plotter. Lines that look like brush strokes and stay
+  editable are further off still.
 - **Picking a colour from outside the window is Windows only.** Inside the
   window the eyedropper works everywhere. On macOS and Linux the tool options
   strip says so, rather than the drag quietly doing nothing. There is no

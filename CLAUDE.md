@@ -1226,15 +1226,17 @@ dense 83,740. Re-run both before quoting any of it.
   class is what `back_tiles`' clear, the readback's empty value and the flip's
   `tile_load` already answer to, and a wrong class breaks a mask there first. The
   blended commit asks *both* and fails closed.
-- **`umber-version` is 4, and it is the one revision about what an older build
-  would *show* rather than drop** — every mask a full gamma curve out, silently.
+- **`umber-version` went to 4 here, and it is the one revision about what an
+  older build would *show* rather than drop** — every mask a full gamma curve out, silently.
   A version-3 document is converted on load, for the layer's mask entry and for
   mask patches in its saved history, and **that conversion is not lossless**: the
   multiplier survives to within 0.499 of a level, the byte cannot.
   `history::VERSION` did **not** move, because a mask patch can only exist in a
-  document that already declares 4. Group compositing therefore needs **5**;
-  `docs/group-compositing.md` §4.3, `docs/layer-effects.md` and
-  `docs/layer-rename.md` all still claim 4.
+  document that already declares 4. Group compositing needed **5** when this
+  was written and needs **6** now, vector layers having taken 5 (see "Vector
+  layers"); `docs/group-compositing.md` §4.3 says 6 and `docs/layer-effects.md`
+  §8.2 notes that it moved. `docs/layer-rename.md` speaks of a future revision
+  and states no figure for group compositing.
 - **`fill_layer_white` is a table write and a new mask therefore costs nothing.**
   Full reveal *is* a mask slot's empty value. `SlotClass` is what carries the two
   empty values into the three places that need them in Rust and cannot ask a
@@ -1727,6 +1729,216 @@ are the contiguous run immediately below it whose `depth` is greater.
   back per stroke it would be once a stroke. Clearing can only make a pixel
   defined, never move a defined one.
 
+#### Vector layers
+
+`umber-core::vector` is the model, `umber-app::vectorview` is the lines on
+screen, and `docs/superpowers/specs/2026-11-25-vector-layers-design.md` is the
+design. **Stage one only: a layer that holds Cut and Plot paths, made from a
+selection's outline.** Drawing and editing paths, tracing artwork and the
+machine are three later projects, and nothing here has a control for any of
+them.
+
+- **A layer is a vector layer exactly when it carries a record, and an empty
+  record is a record.** `Layer::vector` is an `Option<Box<VectorObject>>` and
+  `Some(empty)` is what a fresh one holds. Reading "has paths" as the test would
+  turn the layer back into a paintable one the moment its last path went, and a
+  layer that is a vector layer only while it is non-empty is a layer whose kind
+  changes under the artist. Same shape as text, and the same door: nothing but
+  `add_vector_layer` (and `install_vector`, import's) makes one, `set_vector`
+  refuses a layer with no record, and a layer is text or vector and never both
+  in *either* order — `set_text` refuses a vector layer and `install_vector`
+  refuses a text one.
+- **Cut and Plot never rasterise, and Ink is reserved with no control anywhere.**
+  They are lines drawn over the canvas by `ui::vector_paths`, so the layer's
+  pixels stay blank, and that is what keeps a cut line out of an export, the
+  flattened preview, the eyedropper and a smudge pickup with no code that has to
+  remember to leave it out. `a_document_export_ignores_cut_paths` is the guard
+  and **it cannot be red today**, because nothing rasterises a path: its
+  mutation must write a *different* colour into the slot, since writing the same
+  opaque picture over itself composites to itself and the guard passes — which
+  is what the first mutation did. `Ink` is in the model and the file so that
+  brush-look strokes, later, change no document already saved; `vectorview`
+  skips it through an exhaustive `match` and no panel, menu or command can
+  make one. A control for it would be a live control that lies.
+- **`VectorObject::Opaque` keeps a newer build's record whole.** A record whose
+  version is past this build's is not parsed: it is held as bytes, written back
+  byte for byte, and the layer is still a vector layer — it refuses paint, draws
+  nothing and cannot be appended to (`can_set_vector` refuses it). Dropping it
+  would make the layer paintable, and the next save would delete the paths a
+  newer Umber put there, which is the failure the version bump exists to prevent
+  arriving by the side door. The version is probed as a `u64`, so a figure past
+  `u32` is `Opaque` rather than unreadable.
+- **`print` is written only beside Ink, and a mismatch drops Ink and keeps Cut
+  and Plot.** It is the text record's fingerprint of the layer image, and it
+  means something only for paths that describe pixels. Cut and Plot describe
+  none and cannot go stale, so an older build painting on the layer cannot
+  invalidate them. Nothing in this stage writes Ink, so the pinned literal has no
+  `print` and the mismatch path is reached only by a hand-built fixture. The
+  record's own `print` is a private `{rect, hash}` because `Fingerprint` has no
+  serde, and the hash is a hex string for the text record's reason.
+- **`umber-version` is 5 for this, and group compositing therefore takes 6.**
+  The argument is the effects one, not the folder one: the paths are the whole
+  content of the layer, so an older build would open a blank layer and drop
+  `umber/vector/` for ever at its next save. It *refuses* the file instead.
+  `required_version` answers 5 where any layer carries a record — **an empty one
+  included**, for the first rule above — and what it answered before otherwise.
+  `docs/group-compositing.md` §4.3 now says 6 and says why, which is the lesson
+  of 3: the person who builds it reads the document. A record is
+  `umber/vector/<n>.json` named by `umber-vector`, the mask's and the text
+  record's shape; a record that cannot be parsed costs that layer its paths and
+  nothing else, a folder naming one loses it with a warning, and a layer naming
+  both text and vector keeps the text.
+- **The record has a derived bound and a literal pin.** `MAX_NODES` (65,536),
+  `MAX_PATHS` (4,096), `MAX_COORD` and `MAX_BRUSH_ID` are enforced where a record
+  is *installed*, so one over the bound is unwritable, and `MAX_RECORD_BYTES` is
+  derived from them with a measured worst-case node. That is why only the reader
+  needs the size gate. `MAX_BRUSH_ID` is not in the design: `Ink::brush` is the
+  one unbounded string and without a bound the derivation has no top. The whole
+  serialised text of a fixture is pinned as a literal and `role` has no serde
+  default — a path missing one is refused, not read as a Cut — for the rule
+  `Effect` records: a struct's field names are a format, and a default turns an
+  unrecognised one into a silence.
+- **`EditKind::is_saved` replaced the `is_structural` skip, and this is the
+  "Partial exhaustiveness" lesson cashed in.** `EditKind::Paths` is a bodiless
+  kind that is not structural, which is exactly the shape that fell through
+  `SaveHistory::new`'s `match edit.patches().first()` to `SaveBody::Flip` and
+  discarded the history on reload. `is_saved` is one exhaustive predicate and
+  both `SaveHistory::new` and `docimport::history`'s guard ask it, so the writer
+  and the reader cannot disagree about which kinds the file holds. `is_structural`
+  has no production caller left. `every_unsaved_kind_is_skipped` walks every kind
+  with `!is_saved`, at the first position and a middle one, and asserts the
+  count so a new unsaved kind has to be placed. A path edit is not written
+  because the record it restores is a value on a layer that a reopened undo has
+  no safe way to put back.
+- **`EditBody::Vector` names a *slot*, not a position.** An entry outlives
+  reorders and a position does not, so `restore_vector` finds the layer by the
+  slice it holds, for the reason a `PixelPatch` names one. It has **no lock gate**
+  — an undo that refuses is worse than a lock set after the edit — and on `Err`
+  it hands the record back so nothing is lost on the way out. Its cost to the
+  budget is `size_of::<EditBody>() + was.byte_len()`, and a parked layer is
+  charged for its record too: `vector_bytes` in `byte_len` is guarded by a test
+  that compares two layers differing *only* in the record, because a `>=` against
+  a parked layer is met by the slice alone and a mutation removing the term
+  survived the first guard.
+- **`vector_revision` is bumped inside every method that writes a record, and
+  inside the structural edits.** The overlay's cache keys on it. The field is
+  private to `layer.rs`, so the writers were found by grepping that file for
+  writes to it rather than from memory: `install_vector`, `add_vector_layer`,
+  `set_vector` (on success only), `restore_vector`, `flip_vectors` and
+  `translate_vectors`, plus `add_named`, `remove_many`, `reorder_to`, `group` and
+  `restore_shape`, which move a layer without touching its record. It is drawn
+  from one **process-wide counter** so a stack built to replace another can never
+  answer a number the old one did. **Visibility is deliberately not in it**:
+  `Layer::visible` is a public field the interface writes through `get_mut`, so
+  there is no method to bump from, and the overlay reads `effective_visible`
+  afresh every frame as a bitmask in the cache key. This is `slot_revision`'s
+  rule and its warning — a list enforced inside N methods still needs somebody to
+  check that N is all of them.
+- **A flip is bounded, not exact.** The design said "exact" and that is false in
+  `f32`: mirroring a non-dyadic figure about a canvas edge rounds. What holds, and
+  is tested, is that one round trip costs at most one rounding
+  (`canvas * EPSILON`) and that a thousand of them equal the first — no
+  accumulating drift. This is *not* the layer array's `flip.wgsl`, which is an
+  exact texel permutation; a path is a float. Undoing a flip is another flip, so
+  nothing is dropped: Ink is mirrored with the rest, because the pixels it
+  describes are mirrored by the same flip.
+- **A resize translates paths where it drops text records.** The text record
+  is a placement over pixels the resize may have cropped, so it goes. A path is
+  geometry, exact under a translation, and may lie outside the canvas, so a
+  shrink carries it with the picture. The offset is `CanvasCopy::plan`'s
+  destination minus its source — the plan `CanvasRenderer::resize` copies the
+  pixels by — so the two cannot disagree about where the picture went. **Ink is
+  the exception**, stripped with a notice appended to any already up (text's
+  stays), because Ink describes pixels the resize cropped or moved.
+- **The paint gate is `EditRefusal::Vector`, at `refusal_at`, and a mask is not
+  refused.** A stroke on a vector layer's *mask* changes no layer pixel and
+  cannot put the record out of step, for the reason it is allowed on text. Cut
+  and paste say a sentence through the existing refusal tables; **a lift raises
+  one too** (`float_refusal_notice`) where every other lift refusal stays silent,
+  and a canvas press with a brush raises none, or the pen going down would be a
+  dialog. "Clear layer" is *disabled* with a tooltip rather than meaning
+  "convert to paint" as it does on text: there may be no paint to keep, and
+  throwing away paths silently is the wrong reading. The one reading is
+  `editor::clear_layer_refusal`, shared by the menu item and the command so the
+  control and the gate cannot disagree. Deleting the layer is how paths go, and
+  it is undoable. `no_refusal_sentence_has_a_run_of_spaces` walks every refusal
+  through every table, because the sentences were first written with a lost
+  string continuation and came out with a run of spaces in the middle.
+- **A path from the selection is planned by `&self` and applied separately.**
+  `Editor::plan_path_from_selection` decides append, new layer or refusal from
+  the model alone, so a refusal changes nothing because the planner cannot;
+  `apply_path_plan` changes the stack and records one entry (`Paths` for an
+  append, `AddLayer` for a new layer). `App::path_from_selection` puts the float
+  down and finishes the stroke first, then reserves a slice and retries once
+  after `free_a_slot`. `apply_path_plan` is exempted by name in
+  `every_structural_edit_settles_a_float_before_it_records`, which forbids
+  `history.record(` in `editor.rs` elsewhere: its only caller has already settled
+  the float. A locked or `Opaque` active vector layer is not a refusal — the
+  paths go on a layer of their own — while a full stack, a folder at `MAX_DEPTH`
+  and a locked folder are sentences. The two commands and "New vector layer" are
+  `Action`s with no default key, and are named as the exceptions in
+  `every_action_ships_bound_unless_it_is_a_brush_tweak`.
+- **A new layer lands where Add puts it, which with a folder selected is
+  *inside* the folder.** The plan said "at top level beside it" and that was
+  wrong against the existing route: `add_named` puts a layer at the active
+  entry's depth plus one when it is a folder, and a vector layer making a second,
+  different rule would be one more thing to keep in step. A new layer inside a
+  locked folder is refused with a sentence, as Text's Place is, rather than made
+  born-locked with paths in it. The mark is on the Layers panel's flags row
+  beside Add, not in the header: it acts on neither the selection nor the ticked
+  set, and the header's strip is pinned at 104.
+- **The overlay is cached, and a still frame allocates nothing.**
+  `vectorview::VectorView::lines` keys on the document, `vector_revision`, the
+  visibility bitmask, the camera, the canvas region and the scale, flattens at a
+  quarter of a screen pixel, culls whatever misses the view and clamps each point
+  to 4096 points beyond it. The tessellated line is an `Arc<Mesh>` rebuilt only
+  when the lines, the scale or the three colours change, because egui takes a
+  path's points by value and `Shape::line` would copy every point every frame.
+  Past `MAX_POINTS` (262,144) it simply stops drawing, with a `debug` log and
+  nothing on screen — the cap is a bound on a per-frame cost, as the lasso's is.
+- **The machine lines snap themselves, and both passes are an *odd* number of
+  device pixels wide.** egui snaps a `LineSegment` (the marquee) and never a
+  path, so an axis-aligned run is rounded to the pixel grid here with egui's own
+  `Stroke::round_center_to_pixel`; diagonals are not moved. Odd widths centre on
+  a pixel centre, which is where the marquee's single pixel is centred, and the
+  underlay is exactly two device pixels wider so one underlay pixel shows on each
+  side. The overlay's screen points equal the marquee's for the same selection,
+  and `the_lines_land_where_the_marquee_does` compares them against
+  `selection_screen` itself at 150% with an off-grid camera.
+- **The palette's two derived colours, and the hue that had to move.**
+  `Palette::cut_line` and `plot_line` are a fixed hue mixed towards the end of
+  the lightness axis `accent_underlay` is *not*, bisected until the top pass
+  stands `MACHINE_LINE_CONTRAST` — `READABLE²`, 9:1 — off the underlay. That figure
+  is exact rather than generous: for artwork lying between the two passes
+  `ratio(top, under) = ratio(top, art) × ratio(art, under)`, so 9:1 is precisely
+  the condition for one of the two to reach 3:1 on **any** painting, which the
+  marquee cannot promise because its top pass is the accent, a mid tone it does
+  not get to move. The hues are **355° and 195°**: the first draft's 345° made
+  the dark themes' pink 64 from the rose link colour, under the 68 the closest
+  accent pair sets, and the sweep over all 24 theme and accent pairs put the
+  worst separation at 85. **Nobody has seen these lines in a running window.**
+  The guards measure contrast and separation; whether a 1 px line in a 3 px halo
+  looks like a line or a smear at 100% is a look.
+- **The thumbnail is the mark while there is nothing to picture.** A vector layer
+  with no Ink shows `Icon::Spline` in its row and asks for no thumbnail, through
+  `thumbs::shows_a_path_mark`, which the row and `thumbnail_slots` both read. Its
+  slot stays in the live list so a layer that later gains pixels is not
+  forgotten. `Icon::Spline` is a Lucide paste.
+- **Both writers name `vector:`, and the count guard is weak against
+  replacement.** `SaveLayer::vector` is filled by `save_layer` and by the
+  autosave's `LayerMeta`, snapshotted when the capture begins like `effects`.
+  `..SaveLayer::new` writes `None`, so a writer that forgot is silent.
+  `save_and_the_autosave_both_carry_the_vector_record` counts the literal, which
+  still passes if the value is replaced by `None`; the guards that read the file
+  are `a_save_layer_carries_the_vector_record_the_layer_holds` and
+  `an_autosave_writes_the_paths_a_save_does`.
+- **What was not looked at.** The Edit-menu rows and the Layers-panel mark have
+  no `docshot` picture, which needs a GPU adapter, and the overlay's joins on
+  curves and its halo at 150% and above have never been seen. A combined
+  selection's path is a pixel staircase and a self-crossing lasso gives a path
+  that crosses itself, which is project 3's to smooth and is said in the
+  CHANGELOG rather than hidden.
+
 ### Documents
 
 Several documents are open at once. `Session` (`umber-app/src/session.rs`) holds
@@ -1823,7 +2035,7 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   approximate — without it, reopening Umber's own file reports a loss that did
   not happen. `umber-version` is bumped only when a revision stores something an
   older build would drop silently, and an older build then **refuses** the file
-  rather than opening it with pieces missing. It is at **3**. Revision 2 was
+  rather than opening it with pieces missing. It is at **5**. Revision 2 was
   masks and clipping, because a build ignoring either shows a picture that is
   *wrong* — what the mask hid comes back, and the clipped layer paints
   everywhere. Revision 3 is **layer effects**, and that one is not about what an
@@ -1832,7 +2044,10 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   record** all ride along, because ignoring them changes no pixel — and the text
   record only rides along because of its fingerprint, without which an older
   build could paint over the layer and this one would re-render over the
-  brushwork. See "Text".
+  brushwork. See "Text". Revision 4 is the mask encoding (see "The tile
+  atlas") and revision 5 is **vector layers**, for the reason effects took 3:
+  the paths are the whole content of the layer and an older build would open it
+  blank and drop them at the next save. See "Vector layers".
 - **Umber has twenty-three blend modes and `blend.wgsl` is still the only
   statement of them.** The whole W3C separable set, Photoshop's linear burn and
   three light variants, subtract and divide, and the four non-separable modes
@@ -1972,15 +2187,16 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   `opacity` and no `composite-op`** — a group opacity is the one thing a
   flattening reader cannot reproduce, and writing one is what would earn the
   bump. `a_document_of_folders_still_declares_the_revision_it_needs` guards it.
-- **`umber-version` is at 3, and layer effects are what took it there.**
+- **`umber-version` reached 3 here, and layer effects are what took it there.**
   `docs/layer-effects.md` §8.2. The argument is not what an older build
   *shows* — a layer without its shadow is merely plainer, which is the folder
   case — it is what an older build *writes*: effects are non-destructive, the
   parameters are the whole feature, so opening and saving drops
   `umber/effects/` permanently. **`docs/group-compositing.md` §4.3 wanted 3
-  too; effects landed first, so group compositing takes 4**, and that is
+  too; effects landed first, so group compositing took 4**, and that is
   recorded in §4.3 rather than only in a Rust comment, because the person who
-  implements it reads the document.
+  implements it reads the document. It has since moved twice more, for masks and
+  for vector layers, and group compositing now takes **6**.
 - **An effects record goes outside the ORA stack, under `umber/effects/`, named
   by an attribute on the element** — the mask's shape, for the mask's reason. A
   document-wide table would need a key and every candidate is wrong: a stack
@@ -3482,8 +3698,9 @@ length. `gesture::supersedes_stroke` was the same shape in a third file, a
 `Press` enum.
 
 **The silent half is the half that damages a document, and it is worth
-following one all the way down.** `SaveHistory::new` skips an entry when
-`is_structural()`; one it does not skip falls through
+following one all the way down.** `SaveHistory::new` skipped an entry when
+`is_structural()` (it asks `is_saved()` now, which `EditKind::Paths` is what
+forced; see "Vector layers"); one it did not skip falls through
 `match edit.patches().first()` to `None => SaveBody::Flip`. So a new bodiless
 variant is written into the `.ora` **as a canvas flip**. On reload,
 `docimport::history` has a deliberate guard against exactly that outcome —

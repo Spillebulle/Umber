@@ -25,6 +25,28 @@ archive can be installed beside it.
   distributions. When an update is out, Umber says that command; on an Arch
   machine without the archive it names the exact file to fetch instead.
 
+- **Vector layers.** A new kind of layer that holds lines instead of paint.
+  Make one with the spline button beside Add on the Layers panel, or let the
+  commands below make one for you. It keeps its lines when you save and reopen,
+  follows a canvas flip, moves with the picture when you resize the canvas, and
+  every change to it is one undo step. Paint, paste and cut are refused on it
+  with a sentence, and Clear layer is greyed out, because there is no paint to
+  clear.
+- **Cut path from selection and Plot path from selection**, on the Edit menu.
+  Each turns the outline of the current selection into a closed line, on the
+  active vector layer or on a new one made for it. They are the way to get a
+  line onto a vector layer in this release.
+- **Cut and plot lines are drawn over the canvas, not into the picture.** They
+  show as a crisp two-tone line at any zoom, in a colour of their own for each
+  kind. They never appear in an export, the flattened preview, the eyedropper
+  or a smudge, so a cut line cannot end up in what you print.
+- **A selection you have combined with Add, Subtract or Intersect gives a
+  stair-stepped path**, because its outline has to be traced back out of
+  pixels. Smoothing comes later.
+- **A document with a vector layer needs this version or newer.** An older
+  Umber refuses it rather than opening it with the lines missing and saving
+  over them.
+
 ### Fixed
 
 - **A second application from the archive installs beside Umber.** The `.deb`
