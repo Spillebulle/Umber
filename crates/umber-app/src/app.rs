@@ -439,7 +439,9 @@ fn no_slice_left() -> Notice {
     Notice {
         title: "There is no room for another layer".to_string(),
         lines: vec![
-            "Umber has no texture slice left for one. Save and reopen the document              to pack them back down, though deleted layers cannot be brought back              afterwards."
+            "Umber has no texture slice left for one. Save and reopen the document \
+             to pack them back down, though deleted layers cannot be brought back \
+             afterwards."
                 .to_string(),
         ],
     }
@@ -2813,16 +2815,27 @@ impl UmberApp {
             self.editor.notice = Some(vram::slice_refused("a layer", &refused));
             return;
         }
-        let plan = match self.editor.apply_path_plan(plan) {
+        use crate::editor::PathApplyRefusal;
+        let refused = match self.editor.apply_path_plan(plan) {
             Ok(()) => None,
             // The pool is dry: give a parked slice back and try once more, as
-            // every other way of adding a layer does.
-            Err(plan) if self.free_a_slot() => self.editor.apply_path_plan(plan).err(),
-            Err(plan) => Some(plan),
+            // every other way of adding a layer does. Only a new layer is
+            // handed back for this; an append takes no slice.
+            Err(PathApplyRefusal::NoSlice(plan)) if self.free_a_slot() => {
+                self.editor.apply_path_plan(plan).err()
+            }
+            Err(why) => Some(why),
         };
-        if plan.is_some() {
-            self.editor.notice = Some(no_slice_left());
-            return;
+        match refused {
+            None => {}
+            Some(PathApplyRefusal::NoSlice(_)) => {
+                self.editor.notice = Some(no_slice_left());
+                return;
+            }
+            Some(PathApplyRefusal::Declined(notice)) => {
+                self.editor.notice = Some(notice);
+                return;
+            }
         }
         if adds_a_layer {
             let slot = self.editor.layers.active_slot();
@@ -8243,6 +8256,9 @@ mod tests {
                 }
             }
         }
+        let slice = no_slice_left();
+        sentences.push(("no slice".to_string(), slice.title));
+        sentences.extend(slice.lines.into_iter().map(|l| ("no slice".to_string(), l)));
         let resize = resize_refusal_notice();
         sentences.push(("resize".to_string(), resize.title));
         sentences.extend(resize.lines.into_iter().map(|l| ("resize".to_string(), l)));

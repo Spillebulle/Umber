@@ -280,6 +280,20 @@ pub enum PathPlan {
     },
 }
 
+/// Why [`Editor::apply_path_plan`] did not carry a plan out.
+///
+/// Two answers because they want opposite things of the caller. A new layer
+/// that found no slice is handed back to be tried again once a parked slice has
+/// been given up; an append takes no slice, so giving one up would mend nothing
+/// and the refusal it met is what to say.
+#[derive(Debug)]
+pub enum PathApplyRefusal {
+    /// A [`PathPlan::NewLayer`] that found the pool dry, handed back to retry.
+    NoSlice(PathPlan),
+    /// A [`PathPlan::Append`] the layer declined, worded.
+    Declined(Notice),
+}
+
 impl PathPlan {
     /// Does carrying this out take a slice? Exhaustive, so a third way of
     /// making paths has to say.
@@ -1659,10 +1673,12 @@ impl Editor {
 
     /// Carry a plan out and record its one undo entry.
     ///
-    /// `Err` hands the plan back where the pool has no slice, so the caller can
-    /// give a parked one up and ask again, exactly as `App::add_layer` does. It
-    /// is the only way this answers no, because [`Editor::plan_path_from_selection`]
-    /// has already judged everything else.
+    /// A new layer that finds the pool dry hands the plan back
+    /// ([`PathApplyRefusal::NoSlice`]), so the caller can give a parked slice up
+    /// and ask again, exactly as `App::add_layer` does. An append takes no
+    /// slice, so the one way it can fail, a stack that changed since the plan
+    /// judged it, comes back worded ([`PathApplyRefusal::Declined`]) with the
+    /// layer's own refusal rather than a sentence about slices.
     ///
     /// **Recording is here and not at the call site**, for the reason
     /// [`Editor::commit_made_layer`] is: a recording inside `App` is one no
@@ -1670,7 +1686,7 @@ impl Editor {
     /// ordinary structural `EditKind::AddLayer` entry, which carries the layer
     /// and its record whole, so one Ctrl+Z takes both back; an append is a
     /// `Paths` entry holding what was there before.
-    pub fn apply_path_plan(&mut self, plan: PathPlan) -> Result<(), PathPlan> {
+    pub fn apply_path_plan(&mut self, plan: PathPlan) -> Result<(), PathApplyRefusal> {
         match plan {
             PathPlan::Append { slot, after } => {
                 let index = self.layers.active_index();
@@ -1686,7 +1702,9 @@ impl Editor {
                     }
                     // Judged a moment ago by the plan, so this is a stack that
                     // changed between the two. Nothing was written.
-                    Err(_) => Err(PathPlan::Append { slot, after }),
+                    Err(why) => Err(PathApplyRefusal::Declined(path_refusal(
+                        set_refusal_sentence(why),
+                    ))),
                 }
             }
             PathPlan::NewLayer { name, record } => {
@@ -1701,7 +1719,10 @@ impl Editor {
                         self.mark_modified();
                         Ok(())
                     }
-                    None => Err(PathPlan::NewLayer { name, record }),
+                    None => Err(PathApplyRefusal::NoSlice(PathPlan::NewLayer {
+                        name,
+                        record,
+                    })),
                 }
             }
         }
@@ -4560,11 +4581,39 @@ mod tests {
     /// out. A refused plan is the notice.
     fn run_path_command(ed: &mut Editor, role: umber_core::PathRole) -> Result<(), Notice> {
         match ed.plan_path_from_selection(role)? {
-            Some(plan) => ed.apply_path_plan(plan).map_err(|_| Notice {
-                title: "no slice".to_string(),
-                lines: Vec::new(),
+            Some(plan) => ed.apply_path_plan(plan).map_err(|why| match why {
+                PathApplyRefusal::Declined(notice) => notice,
+                PathApplyRefusal::NoSlice(_) => Notice {
+                    title: "no slice".to_string(),
+                    lines: Vec::new(),
+                },
             }),
             None => Ok(()),
+        }
+    }
+
+    /// **An append that the layer declines says the layer's reason, and hands
+    /// no plan back to retry**, because an append takes no slice and freeing
+    /// one would mend nothing. The stack changes between the plan and the
+    /// carrying out (the layer is locked), which is the one way it can arise.
+    #[test]
+    fn an_append_the_layer_declines_says_why_rather_than_asking_for_a_slice() {
+        let mut ed = with_a_selection();
+        ed.layers
+            .add_vector_layer("Paths", umber_core::VectorObject::empty())
+            .expect("room");
+        let plan = ed
+            .plan_path_from_selection(umber_core::PathRole::Cut)
+            .expect("plans")
+            .expect("a selection");
+        assert!(!plan.adds_a_layer(), "the fixture must append");
+        ed.layers.active_mut().locked = true;
+        match ed.apply_path_plan(plan) {
+            Err(PathApplyRefusal::Declined(notice)) => assert_eq!(
+                notice.lines,
+                vec![set_refusal_sentence(umber_core::VectorSetRefusal::Locked).to_string()]
+            ),
+            other => panic!("expected the layer's own refusal, got {other:?}"),
         }
     }
 
