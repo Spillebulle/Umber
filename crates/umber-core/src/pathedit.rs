@@ -495,4 +495,66 @@ mod tests {
         assert_eq!(m.nodes[0].handle_out, q.nodes[0].handle_out);
         assert_eq!(cornered(m.nodes[0]).handle_out, Vec2::ZERO);
     }
+
+    fn curved_triangle() -> Path {
+        let mut p = path(&[(0.0, 0.0), (100.0, 0.0), (50.0, 80.0)], true);
+        p.nodes[2].handle_out = v(-10.0, 40.0);
+        p.nodes[0].handle_in = v(-30.0, 25.0);
+        p.nodes[0].handle_out = v(15.0, -10.0);
+        p.nodes[1].handle_in = v(-20.0, -15.0);
+        p
+    }
+
+    #[test]
+    fn a_curved_closing_split_does_not_move_the_curve() {
+        let p = curved_triangle();
+        let n = p.nodes.len();
+        let (s, i) = split(&p, n - 1, 0.4).unwrap();
+        assert_eq!(i, n);
+        assert_eq!(s.nodes.len(), n + 1);
+        let (a, b) = (polyline(&p), polyline(&s));
+        assert!(b.iter().all(|&q| off(&a, q) < 0.02));
+        assert!(a.iter().all(|&q| off(&b, q) < 0.02));
+    }
+
+    #[test]
+    fn reversing_a_closed_curve_keeps_the_curve() {
+        let p = curved_triangle();
+        let (a, b) = (polyline(&p), polyline(&reversed(&p)));
+        assert!(b.iter().all(|&q| off(&a, q) < 0.02));
+        assert!(a.iter().all(|&q| off(&b, q) < 0.02));
+    }
+
+    #[test]
+    fn a_hit_on_the_closing_edge_names_the_last_segment() {
+        let p = path(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)], true);
+        // Nearest the closing edge (100,100) -> (0,0).
+        let h = segment_at(&p, v(40.0, 45.0), 10.0).unwrap();
+        assert_eq!(h.segment, p.nodes.len() - 1);
+    }
+
+    #[test]
+    fn smoothness_has_a_one_degree_boundary() {
+        let node = |deg: f32| {
+            let mut n = Node::corner(Vec2::ZERO);
+            n.handle_out = v(10.0, 0.0);
+            let r = deg.to_radians();
+            n.handle_in = v(-r.cos(), -r.sin()) * 5.0;
+            n
+        };
+        assert!(is_smooth(&node(0.9)));
+        assert!(!is_smooth(&node(1.1)));
+    }
+
+    #[test]
+    fn smoothing_a_closed_node_wraps_to_its_neighbours() {
+        let p = path(&[(0.0, 0.0), (30.0, 30.0), (90.0, 30.0)], true);
+        let n = smoothed(&p, 0).unwrap();
+        // prev is (90,30), next is (30,30): the line runs along -x.
+        let next = v(30.0, 30.0);
+        let prev = v(90.0, 30.0);
+        let dir = (next - prev).normalize();
+        assert!((n.handle_out - dir * (next.length() / 3.0)).length() < 1e-4);
+        assert!((n.handle_in + dir * (prev.length() / 3.0)).length() < 1e-4);
+    }
 }
