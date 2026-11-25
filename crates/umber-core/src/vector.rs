@@ -162,17 +162,33 @@ impl Path {
         let Some(first) = self.nodes.first() else {
             return;
         };
-        let tolerance = tolerance.max(1.0e-3);
         out.push(first.at);
-        for pair in self.nodes.windows(2) {
-            segment(&pair[0], &pair[1], tolerance, out);
+        for cubic in self.segments() {
+            flatten_cubic(cubic, tolerance, out);
         }
-        if self.closed
-            && self.nodes.len() >= 2
-            && let Some(last) = self.nodes.last()
-        {
-            segment(last, first, tolerance, out);
-        }
+    }
+
+    /// The path's segments as the four control points of each cubic, start,
+    /// start's handle, end's handle and end, in order, the closing segment last
+    /// where the path is closed.
+    ///
+    /// The door for a caller that has to decide *per segment* whether to
+    /// flatten at all — the overlay culls a cubic by its control-point hull
+    /// before spending anything on it, because one legal path at the highest
+    /// zoom flattens to millions of points almost all of which are off screen.
+    /// [`flatten_cubic`] is what turns one into points, and
+    /// [`Path::flatten`] is this and that and nothing else, so there is still
+    /// one flattener.
+    pub fn segments(&self) -> impl Iterator<Item = [Vec2; 4]> + '_ {
+        let closing = match (self.closed, self.nodes.first(), self.nodes.last()) {
+            (true, Some(first), Some(last)) if self.nodes.len() >= 2 => Some((last, first)),
+            _ => None,
+        };
+        self.nodes
+            .windows(2)
+            .map(|pair| (&pair[0], &pair[1]))
+            .chain(closing)
+            .map(|(a, b)| [a.at, a.at + a.handle_out, b.at + b.handle_in, b.at])
     }
 
     /// The box of the nodes *and* their handles, which is a bound on the curve
@@ -193,17 +209,19 @@ impl Path {
     }
 }
 
-/// One cubic from `a` to `b`, its end point last. The start point is the
-/// caller's.
-fn segment(a: &Node, b: &Node, tolerance: f32, out: &mut Vec<Vec2>) {
-    if a.handle_out == Vec2::ZERO && b.handle_in == Vec2::ZERO {
-        out.push(b.at);
+/// Append one cubic within `tolerance` document pixels, its end point last.
+/// The start point `p[0]` is the caller's and is not emitted.
+///
+/// **The one flattener**, which [`Path::flatten`] calls per segment and the
+/// overlay calls on the segments it did not cull. A cubic whose handles both
+/// sit on their own ends is a straight line and emits only its end point.
+pub fn flatten_cubic(p: [Vec2; 4], tolerance: f32, out: &mut Vec<Vec2>) {
+    let [p0, p1, p2, p3] = p;
+    if p1 == p0 && p2 == p3 {
+        out.push(p3);
         return;
     }
-    let p0 = a.at;
-    let p1 = a.at + a.handle_out;
-    let p2 = b.at + b.handle_in;
-    let p3 = b.at;
+    let tolerance = tolerance.max(1.0e-3);
     // The standard second-difference bound on how far the curve strays from its
     // chord when cut into `n` equal steps in `t`.
     let d = (p0 - 2.0 * p1 + p2)
@@ -794,6 +812,39 @@ mod tests {
         let mut out = Vec::new();
         p.flatten(1.0e-9, &mut out);
         assert!(out.len() <= 1 + 256);
+    }
+
+    /// `segments` is every cubic in order with the closing one last, and
+    /// flattening them one by one from the first node is `flatten` exactly —
+    /// so the overlay, which culls per segment, draws the curve `flatten` does.
+    #[test]
+    fn the_segments_flatten_to_exactly_what_the_path_does() {
+        let mut p = quarter();
+        p.nodes.push(Node::corner(v(-40.0, 30.0)));
+        p.closed = true;
+        let cubics: Vec<[Vec2; 4]> = p.segments().collect();
+        assert_eq!(
+            cubics.len(),
+            3,
+            "two runs between nodes and the closing one"
+        );
+        assert_eq!(cubics[2][0], v(-40.0, 30.0));
+        assert_eq!(
+            cubics[2][3],
+            v(100.0, 0.0),
+            "the closing cubic ends on the start"
+        );
+        let mut whole = Vec::new();
+        p.flatten(0.1, &mut whole);
+        let mut pieced = vec![p.nodes[0].at];
+        for c in cubics {
+            flatten_cubic(c, 0.1, &mut pieced);
+        }
+        assert_eq!(whole, pieced);
+
+        let mut open_one = p.clone();
+        open_one.closed = false;
+        assert_eq!(open_one.segments().count(), 2);
     }
 
     #[test]

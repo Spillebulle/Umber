@@ -29,19 +29,24 @@ use umber_core::{Camera, LayerStack, PathRole};
 
 use crate::session::DocId;
 
-/// How far outside the canvas region a path's bounds may lie and still be
-/// flattened, in points. A little more than the widest pass is drawn at, so a
-/// path just off the edge is not cut off where its stroke would show.
+/// How far outside the canvas region a line is kept, in points: what a
+/// cubic's hull is culled against and what every segment is clipped to.
+///
+/// A little more than half the widest pass is drawn at, so a line clipped here
+/// ends where its stroke can no longer be seen. **Clipped, never clamped.** A
+/// point clamped per coordinate slides along each axis separately, which bends
+/// a diagonal where it *is* seen and can join two far points into a chord
+/// across the view that no path holds; a segment cut where it crosses the edge
+/// keeps every point on the true line. It also keeps every coordinate small:
+/// at [`Camera::MAX_ZOOM`] a path a million document pixels away is sixty-four
+/// million points away, which `f32` holds and a tessellator offsetting it by a
+/// pixel-wide stroke does not hold well.
 const CULL_MARGIN: f32 = 8.0;
 
-/// How far outside the canvas region an emitted point may lie, in points.
-///
-/// Clamped rather than dropped, so a path crossing the view keeps its shape
-/// where it is seen. At [`Camera::MAX_ZOOM`] a path a million document pixels
-/// away is sixty-four million screen pixels away, which `f32` holds but a
-/// tessellator offsetting it by a pixel-wide stroke does not hold *well*; four
-/// thousand points out, nothing a clamp bends can be seen.
-const CLAMP_MARGIN: f32 = 4096.0;
+/// The flattener's scratch is shrunk back to this many points when a build has
+/// left it larger. One cubic flattens to at most 257, so in practice it never
+/// grows past this; the bound is what a test can assert.
+pub const SCRATCH_KEEP: usize = 1024;
 
 /// The most points the overlay emits in one build, over every line.
 ///
@@ -99,13 +104,14 @@ pub struct VectorView {
     key: Option<Key>,
     lines: Vec<ScreenLine>,
     points: Vec<Pos2>,
-    /// The flattener's output in document pixels, reused per path.
+    /// The flattener's output in document pixels, reused per cubic.
     scratch: Vec<Vec2>,
     generation: u64,
     /// Whether the cap has been reported, so a record that meets it is said
     /// once rather than on every rebuild of a moving view.
     capped: bool,
-    /// Paths flattened since the cache was made, for the reuse guard.
+    /// Cubics flattened since the cache was made, for the reuse and culling
+    /// guards.
     #[cfg(test)]
     flattened: usize,
 }
@@ -114,8 +120,9 @@ impl VectorView {
     /// The lines to draw for `stack`, in screen points, over the canvas region
     /// `view` at `ppp` physical pixels to the point.
     ///
-    /// A stack with no vector layer returns at once, before the key is even
-    /// built, so a document that never had one pays one pass over its entries.
+    /// A stack with no vector layer returns before the key is built, so a
+    /// document that never had one pays one pass over at most
+    /// [`LayerStack::MAX`] entries, asking each whether it holds a record.
     pub fn lines<'a>(
         &'a mut self,
         doc: DocId,
@@ -171,8 +178,7 @@ impl VectorView {
             let s = camera.doc_to_screen(doc, pivot);
             pos2(s.x / ppp, s.y / ppp)
         };
-        let cull = view.expand(CULL_MARGIN);
-        let clamp = view.expand(CLAMP_MARGIN);
+        let keep = view.expand(CULL_MARGIN);
 
         let Self {
             lines,
@@ -183,8 +189,15 @@ impl VectorView {
             flattened,
             ..
         } = self;
-        for (i, layer) in stack.layers().iter().enumerate() {
-            if shown & (1 << i) == 0 {
+        let mut runs = Runs {
+            lines,
+            points,
+            role: PathRole::Cut,
+            start: 0,
+            pen: None,
+        };
+        'layers: for (i, layer) in stack.layers().iter().enumerate() {
+            if !bit(shown, i) {
                 continue;
             }
             // An opaque record answers no paths, so a record from a newer
@@ -198,49 +211,66 @@ impl VectorView {
                     // Ink is pixels on the layer, drawn by the composite.
                     PathRole::Ink => continue,
                 }
+                // The whole path first, which is one box for a path that is
+                // nowhere near, before its segments are looked at one by one.
                 let Some((lo, hi)) = path.bounds() else {
                     continue;
                 };
-                if !Rect::from_two_pos(to_screen(lo), to_screen(hi)).intersects(cull) {
+                if !Rect::from_two_pos(to_screen(lo), to_screen(hi)).intersects(keep) {
                     continue;
                 }
-                scratch.clear();
-                path.flatten(tolerance, scratch);
-                #[cfg(test)]
-                {
-                    *flattened += 1;
-                }
-                let room = MAX_POINTS - points.len();
-                let take = scratch.len().min(room);
-                let start = points.len();
-                points.extend(
-                    scratch[..take]
-                        .iter()
-                        .map(|&p| to_screen(p).clamp(clamp.min, clamp.max)),
-                );
-                if take >= 2 {
-                    lines.push(ScreenLine {
-                        role: path.role,
-                        points: start..points.len(),
-                    });
-                } else {
-                    points.truncate(start);
-                }
-                if take < scratch.len() {
-                    if !*capped {
-                        log::debug!(
-                            "the vector overlay stopped at {MAX_POINTS} points; \
-                             lines past it are not drawn"
-                        );
-                        *capped = true;
+                runs.begin(path.role);
+                for cubic in path.segments() {
+                    // **Culled by its control-point hull before anything is
+                    // spent on it.** A cubic lies inside that hull, so a hull
+                    // missing the region is a curve missing it, and this is
+                    // what keeps the budget for what can be seen: flattening a
+                    // whole path first and checking after was millions of
+                    // off-screen points for one legal path at the highest zoom.
+                    let hull = cubic.map(to_screen);
+                    if !Rect::from_points(&hull).intersects(keep) {
+                        runs.end();
+                        continue;
                     }
-                    return;
+                    scratch.clear();
+                    umber_core::vector::flatten_cubic(cubic, tolerance, scratch);
+                    #[cfg(test)]
+                    {
+                        *flattened += 1;
+                    }
+                    let mut from = hull[0];
+                    for &doc in scratch.iter() {
+                        let to = to_screen(doc);
+                        if !runs.segment(from, to, keep) {
+                            runs.end();
+                            if !*capped {
+                                log::debug!(
+                                    "the vector overlay stopped at {MAX_POINTS} points; \
+                                     lines past it are not drawn"
+                                );
+                                *capped = true;
+                            }
+                            break 'layers;
+                        }
+                        from = to;
+                    }
                 }
+                runs.end();
             }
+        }
+        if scratch.capacity() > SCRATCH_KEEP {
+            scratch.clear();
+            scratch.shrink_to(SCRATCH_KEEP);
         }
     }
 
-    /// How many paths have been flattened since this cache was made.
+    /// The scratch buffer's capacity, for the guard that it stays bounded.
+    #[cfg(test)]
+    pub fn scratch_capacity(&self) -> usize {
+        self.scratch.capacity()
+    }
+
+    /// How many cubics have been flattened since this cache was made.
     #[cfg(test)]
     pub fn flattened(&self) -> usize {
         self.flattened
@@ -259,6 +289,10 @@ impl VectorView {
 pub struct Tessellated {
     pub key: Option<MeshKey>,
     pub mesh: std::sync::Arc<egui::epaint::Mesh>,
+    /// The palette `colours` were derived from.
+    pub palette: Option<crate::theme::Palette>,
+    /// The underlay, cut and plot colours, derived once per palette.
+    pub colours: [egui::Color32; 3],
 }
 
 /// What a [`Tessellated`] mesh depends on beyond the lines: the scale it was
@@ -273,14 +307,140 @@ pub struct MeshKey {
 
 /// One bit per stack entry: set where the entry is a vector layer and its own
 /// eye and every enclosing folder's are open.
+///
+/// An entry past the sixty-fourth has no bit and is a missing line, rather
+/// than a shift overflow: a panic in a debug build, and in a release one a
+/// wrapped mask that would read some *other* layer's eye. The `const` assert
+/// above says that cannot happen today; this says what happens if it does.
 fn shown(stack: &LayerStack) -> u64 {
     let mut bits = 0u64;
     for (i, layer) in stack.layers().iter().enumerate() {
+        let Some(b) = mask_bit(i) else {
+            break;
+        };
         if layer.is_vector() && stack.effective_visible(i) {
-            bits |= 1 << i;
+            bits |= b;
         }
     }
     bits
+}
+
+/// Entry `i`'s bit in the visibility mask, or `None` past it.
+fn mask_bit(i: usize) -> Option<u64> {
+    u32::try_from(i).ok().and_then(|i| 1u64.checked_shl(i))
+}
+
+/// Is entry `i`'s bit set? False past the mask, for [`shown`]'s reason.
+fn bit(mask: u64, i: usize) -> bool {
+    mask_bit(i).is_some_and(|b| mask & b != 0)
+}
+
+/// The runs being written for one path: a path that leaves the kept region and
+/// comes back is two lines, never one joined across the outside.
+struct Runs<'a> {
+    lines: &'a mut Vec<ScreenLine>,
+    points: &'a mut Vec<Pos2>,
+    role: PathRole,
+    /// Where the open run's points begin.
+    start: usize,
+    /// The open run's last point, or `None` with no run open.
+    pen: Option<Pos2>,
+}
+
+impl Runs<'_> {
+    fn begin(&mut self, role: PathRole) {
+        self.end();
+        self.role = role;
+    }
+
+    /// Close the open run. A run of fewer than two points, or of points that
+    /// are all one point, is dropped: there is nothing to see, and a
+    /// zero-length polyline is not something to hand a tessellator.
+    fn end(&mut self) {
+        let run = &self.points[self.start..];
+        if run.len() >= 2 && run.iter().any(|p| *p != run[0]) {
+            self.lines.push(ScreenLine {
+                role: self.role,
+                points: self.start..self.points.len(),
+            });
+        } else {
+            self.points.truncate(self.start);
+        }
+        self.start = self.points.len();
+        self.pen = None;
+    }
+
+    /// Add the part of `a` to `b` inside `keep`. False when the point budget is
+    /// spent, which ends the build.
+    fn segment(&mut self, a: Pos2, b: Pos2, keep: Rect) -> bool {
+        let Some((a2, b2)) = clip(a, b, keep) else {
+            self.end();
+            return true;
+        };
+        if self.pen != Some(a2) {
+            self.end();
+            if !self.push(a2) {
+                return false;
+            }
+        }
+        if !self.push(b2) {
+            return false;
+        }
+        if b2 != b {
+            // It left the region here; whatever comes back in is a new run.
+            self.end();
+        }
+        true
+    }
+
+    fn push(&mut self, p: Pos2) -> bool {
+        if self.points.len() >= MAX_POINTS {
+            return false;
+        }
+        self.points.push(p);
+        self.pen = Some(p);
+        true
+    }
+}
+
+/// The part of `a` to `b` inside `r`, by Liang-Barsky, or `None` where it
+/// misses.
+///
+/// In `f64`, because an end can be tens of millions of points away and the
+/// parameter that brings it to the edge is then tiny. An end already inside is
+/// handed back **unchanged**, bit for bit, which is what lets consecutive
+/// segments of one run meet exactly and what keeps an on-screen path's points
+/// the marquee's.
+fn clip(a: Pos2, b: Pos2, r: Rect) -> Option<(Pos2, Pos2)> {
+    let (ax, ay) = (f64::from(a.x), f64::from(a.y));
+    let (dx, dy) = (f64::from(b.x) - ax, f64::from(b.y) - ay);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-dx, ax - f64::from(r.min.x)),
+        (dx, f64::from(r.max.x) - ax),
+        (-dy, ay - f64::from(r.min.y)),
+        (dy, f64::from(r.max.y) - ay),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+    let at = |t: f64| pos2((ax + dx * t) as f32, (ay + dy * t) as f32);
+    let a2 = if t0 == 0.0 { a } else { at(t0) };
+    let b2 = if t1 == 1.0 { b } else { at(t1) };
+    Some((a2, b2))
 }
 
 #[cfg(test)]
@@ -467,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_off_screen_is_culled_and_a_huge_one_is_clamped() {
+    fn a_path_off_screen_is_culled_and_a_huge_one_is_clipped() {
         let mut s = LayerStack::new();
         let at = s
             .add_vector_layer(
@@ -499,32 +659,221 @@ mod tests {
         .expect("legal");
         let drawn = view.lines(doc(), &s, &cam, VIEW, 1.0);
         assert_eq!(drawn.lines.len(), 1);
-        let limit = VIEW.expand(CLAMP_MARGIN);
+        let keep = VIEW.expand(CULL_MARGIN);
         for p in &drawn.points[drawn.lines[0].points.clone()] {
-            assert!(p.x.is_finite() && p.y.is_finite(), "{p:?}");
-            assert!(limit.contains(*p), "{p:?} is past the clamp");
+            assert!(keep.contains(*p), "{p:?} is outside the kept region");
+            assert_eq!(p.y, 150.0, "the clip bent the line where it is seen");
         }
+    }
+
+    /// Camera centred on the document origin at zoom 10, so a document point
+    /// `d` lands at `d * 10 + (200, 150)` and a screen point is easy to place.
+    fn origin_camera() -> Camera {
+        Camera {
+            center: Vec2::ZERO,
+            zoom: 10.0,
+        }
+    }
+
+    fn to_doc(screen: (f64, f64)) -> Vec2 {
+        Vec2::new(
+            ((screen.0 - 200.0) / 10.0) as f32,
+            ((screen.1 - 150.0) / 10.0) as f32,
+        )
+    }
+
+    /// **A diagonal with one end tens of millions of points away is drawn on
+    /// its true line.** Every emitted point is measured against the line
+    /// through the two ends, in `f64`. A per-coordinate clamp pulls the far end
+    /// in along each axis separately, which turns the line where it is seen.
+    #[test]
+    fn a_far_diagonal_stays_on_its_true_line() {
+        let near = Vec2::new(5.0, 3.0);
+        let far = Vec2::new(-999_000.0, -310_000.0);
+        let mut s = LayerStack::new();
+        s.add_vector_layer("Diagonal", record(vec![line(PathRole::Cut, far, near)]))
+            .expect("room");
+        let mut view = VectorView::default();
+        let drawn = view.lines(doc(), &s, &origin_camera(), VIEW, 1.0);
+        assert_eq!(drawn.lines.len(), 1);
+        let screen = |d: Vec2| (f64::from(d.x) * 10.0 + 200.0, f64::from(d.y) * 10.0 + 150.0);
+        let (a, b) = (screen(far), screen(near));
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        for p in &drawn.points[drawn.lines[0].points.clone()] {
+            let off = ((f64::from(p.x) - a.0) * dy - (f64::from(p.y) - a.1) * dx).abs() / len;
+            assert!(off < 0.01, "{p:?} is {off} points off the true line");
+        }
+    }
+
+    /// Two ends far off on opposite sides whose true segment passes below the
+    /// view draw nothing. Clamped per coordinate, both ends land in opposite
+    /// corners of a band round the view and the chord between them crosses it.
+    #[test]
+    fn two_far_ends_whose_segment_misses_the_view_draw_nothing() {
+        // y = 0.5 x + 1000 on screen: at x in 0..400 it is below 1000.
+        let a = to_doc((-9.99e6, -9.99e6 * 0.5 + 1000.0));
+        let b = to_doc((9.99e6, 9.99e6 * 0.5 + 1000.0));
+        let mut s = LayerStack::new();
+        s.add_vector_layer("Below", record(vec![line(PathRole::Plot, a, b)]))
+            .expect("room");
+        let mut view = VectorView::default();
+        assert_eq!(count(&mut view, &s, &origin_camera()), 0);
+    }
+
+    /// A path that goes out of the view and comes back is two lines, not one
+    /// joined across the outside.
+    #[test]
+    fn a_path_that_leaves_and_comes_back_is_two_runs() {
+        let mut s = LayerStack::new();
+        s.add_vector_layer(
+            "Loop",
+            record(vec![Path {
+                role: PathRole::Cut,
+                closed: false,
+                nodes: [
+                    (100.0, 100.0),
+                    (100.0, 5000.0),
+                    (300.0, 5000.0),
+                    (300.0, 100.0),
+                ]
+                .into_iter()
+                .map(|(x, y)| Node::corner(Vec2::new(x, y)))
+                .collect(),
+                ink: None,
+            }]),
+        )
+        .expect("room");
+        let mut view = VectorView::default();
+        let drawn = view.lines(doc(), &s, &camera(), VIEW, 1.0);
+        let edge = VIEW.max.y + CULL_MARGIN;
+        let runs: Vec<&[Pos2]> = drawn
+            .lines
+            .iter()
+            .map(|l| &drawn.points[l.points.clone()])
+            .collect();
         assert_eq!(
-            drawn.points[0].y, 150.0,
-            "the clamp bent the line where it is seen"
+            runs,
+            vec![
+                &[pos2(100.0, 100.0), pos2(100.0, edge)][..],
+                &[pos2(300.0, edge), pos2(300.0, 100.0)][..],
+            ]
         );
     }
 
-    /// A record that flattens past [`MAX_POINTS`] stops there rather than
-    /// building without bound.
+    /// A bowed cubic: from `a` to `b` with both handles pulled `bow` along y.
+    fn bowed(a: Vec2, b: Vec2, bow: f32) -> [Node; 2] {
+        [
+            Node {
+                at: a,
+                handle_in: Vec2::ZERO,
+                handle_out: Vec2::new(0.0, bow),
+                pressure: 1.0,
+            },
+            Node {
+                at: b,
+                handle_in: Vec2::new(0.0, -bow),
+                handle_out: Vec2::ZERO,
+                pressure: 1.0,
+            },
+        ]
+    }
+
+    /// Of a path's many cubics, only the one whose hull reaches the view is
+    /// flattened. Counted per cubic, so a rebuild that flattened the whole
+    /// path and threw most of it away reads as many.
     #[test]
-    fn the_points_stop_at_the_cap() {
-        // A zigzag of curves, each bowed by its handles, at the highest zoom,
-        // where every cubic asks for close to two hundred segments.
-        let nodes: Vec<Node> = (0..2_000)
-            .map(|i| {
-                let x = 199.0 + (i % 2) as f32 * 2.0;
-                Node {
-                    at: Vec2::new(x, 150.0),
-                    handle_in: Vec2::new(0.0, -100.0),
-                    handle_out: Vec2::new(0.0, 100.0),
-                    pressure: 1.0,
-                }
+    fn only_the_cubic_that_crosses_the_view_is_flattened() {
+        let mut nodes = Vec::new();
+        // Far off to the left, bowed so each would cost something to flatten.
+        for k in 0..20 {
+            let y = k as f32 * 40.0;
+            let [a, _] = bowed(Vec2::new(-5000.0, y), Vec2::new(-5000.0, y + 40.0), 30.0);
+            nodes.push(a);
+        }
+        // Into the view and across it, then far off to the right.
+        let [a, b] = bowed(Vec2::new(-5000.0, 800.0), Vec2::new(5000.0, -200.0), 0.0);
+        nodes.push(a);
+        nodes.push(b);
+        for k in 0..20 {
+            let [a, _] = bowed(Vec2::new(5000.0, k as f32 * 40.0), Vec2::ZERO, 30.0);
+            nodes.push(a);
+        }
+        let mut s = LayerStack::new();
+        s.add_vector_layer(
+            "Mostly far",
+            record(vec![Path {
+                role: PathRole::Cut,
+                closed: false,
+                nodes,
+                ink: None,
+            }]),
+        )
+        .expect("room");
+        let mut view = VectorView::default();
+        let drawn = view.lines(doc(), &s, &camera(), VIEW, 1.0);
+        assert_eq!(drawn.lines.len(), 1);
+        assert_eq!(
+            view.flattened(),
+            1,
+            "cubics nowhere near the view were flattened"
+        );
+    }
+
+    /// The point budget goes to what can be seen. A path whose first twelve
+    /// hundred cubics are just off screen — enough, flattened, to spend the
+    /// whole budget twice over at this zoom — still draws the segment that
+    /// comes into view after them.
+    #[test]
+    fn the_budget_is_spent_on_what_can_be_seen() {
+        let mut nodes: Vec<Node> = (0..1_200)
+            .map(|i| Node {
+                at: Vec2::new(300.0 + (i % 2) as f32 * 2.0, 150.0),
+                handle_in: Vec2::new(0.0, -100.0),
+                handle_out: Vec2::new(0.0, 100.0),
+                pressure: 1.0,
+            })
+            .collect();
+        nodes.push(Node::corner(Vec2::new(200.0, 150.0)));
+        let mut s = LayerStack::new();
+        s.add_vector_layer(
+            "Off to one side",
+            record(vec![Path {
+                role: PathRole::Plot,
+                closed: false,
+                nodes,
+                ink: None,
+            }]),
+        )
+        .expect("room");
+        let cam = Camera {
+            center: Vec2::new(200.0, 150.0),
+            zoom: Camera::MAX_ZOOM,
+        };
+        let mut view = VectorView::default();
+        let drawn = view.lines(doc(), &s, &cam, VIEW, 1.0);
+        assert!(
+            drawn.points.iter().any(|p| VIEW.contains(*p)),
+            "the visible segment was not drawn"
+        );
+        assert!(drawn.points.len() < MAX_POINTS);
+    }
+
+    /// A record that flattens past [`MAX_POINTS`] stops there, and building it
+    /// holds no more than one cubic's worth of scratch.
+    ///
+    /// The largest record there is — [`umber_core::vector::MAX_NODES`] nodes of
+    /// one bowed zigzag that stays inside the view — at the highest zoom. A
+    /// rebuild that flattened the whole path before looking would hold about
+    /// two million points here, on every frame of a pan.
+    #[test]
+    fn the_points_stop_at_the_cap_and_the_scratch_stays_small() {
+        let nodes: Vec<Node> = (0..umber_core::vector::MAX_NODES)
+            .map(|i| Node {
+                at: Vec2::new(199.0 + (i % 2) as f32 * 2.0, 150.0),
+                handle_in: Vec2::new(0.0, -2.0),
+                handle_out: Vec2::new(0.0, 2.0),
+                pressure: 1.0,
             })
             .collect();
         let mut s = LayerStack::new();
@@ -546,6 +895,36 @@ mod tests {
         let drawn = view.lines(doc(), &s, &cam, VIEW, 1.0);
         assert_eq!(drawn.points.len(), MAX_POINTS);
         assert_eq!(drawn.lines.len(), 1);
+        assert!(
+            drawn.points.iter().all(|p| VIEW.contains(*p)),
+            "the zigzag was meant to stay in view"
+        );
+        assert!(
+            view.scratch_capacity() <= SCRATCH_KEEP,
+            "the scratch holds {} points",
+            view.scratch_capacity()
+        );
+    }
+
+    /// A path whose nodes are all one point is nothing to draw, and is never
+    /// handed on as a zero-length line.
+    #[test]
+    fn a_path_of_one_repeated_point_draws_nothing() {
+        let mut s = LayerStack::new();
+        let p = Vec2::new(100.0, 100.0);
+        s.add_vector_layer("Dot", record(vec![line(PathRole::Cut, p, p)]))
+            .expect("room");
+        let mut view = VectorView::default();
+        assert_eq!(count(&mut view, &s, &camera()), 0);
+    }
+
+    /// The visibility mask answers "no" past its sixty-four bits rather than
+    /// overflowing the shift.
+    #[test]
+    fn an_entry_past_the_mask_is_not_shown() {
+        assert!(bit(u64::MAX, 63));
+        assert!(!bit(u64::MAX, 64));
+        assert!(!bit(u64::MAX, usize::MAX));
     }
 
     #[test]

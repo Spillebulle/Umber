@@ -553,9 +553,12 @@ const MACHINE_LINE: f32 = 1.5;
 /// `points` rounded to an **odd** whole number of device pixels, in points.
 ///
 /// Odd for the reason [`ant_width`] is whole and one step further: an odd
-/// width centres on a pixel centre, which is where egui puts the marquee's one
-/// device pixel, so a cut line made from a selection lands on the very pixels
-/// its marquee did rather than straddling them. And the underlay is the top
+/// width centres on a pixel centre. Where the marquee is one device pixel wide
+/// (100% and 125%) that is the marquee's own centre, so a cut line made from a
+/// selection lands on the very pixel its marquee did. **Where the marquee is
+/// two device pixels (150%, 175% and 200%) it is centred on a pixel boundary
+/// and this is not**: the cut line's three pixels sit half a device pixel off
+/// the marquee's centre and cover both of its two. The underlay is the top
 /// plus two device pixels, so the two passes share a parity, centre on the
 /// same pixel and leave exactly one pixel of underlay on each side; a three
 /// point underlay rounded on its own would have disagreed with the top by half
@@ -601,10 +604,16 @@ fn vector_paths(painter: &egui::Painter, p: &Palette, ed: &mut Editor, view: Rec
     }
     let ctx = painter.ctx();
     let device = ctx.pixels_per_point();
+    // The three colours are two bisections and an `ink_on` apiece, so they are
+    // derived when the palette changes rather than on every frame that draws.
+    if vector_mesh.palette != Some(*p) {
+        vector_mesh.colours = [p.accent_underlay(), p.cut_line(), p.plot_line()];
+        vector_mesh.palette = Some(*p);
+    }
     let key = crate::vectorview::MeshKey {
         generation: drawn.generation,
         ppp: device.to_bits(),
-        colours: [p.accent_underlay(), p.cut_line(), p.plot_line()],
+        colours: vector_mesh.colours,
     };
     if vector_mesh.key != Some(key) {
         vector_mesh.mesh = std::sync::Arc::new(machine_line_mesh(ctx, drawn, device, key.colours));
@@ -672,7 +681,10 @@ fn machine_line_mesh(
 /// diagonal is left exactly where it was, because there is no grid to put it
 /// on and moving it would only make a curve wobble. Neighbours wrap where the
 /// line is `closed`, or a rectangle's first corner would see only one of its
-/// two edges.
+/// two edges. **Exact float equality is the test, deliberately**: two ends of
+/// one axis-aligned document edge go through the same camera arithmetic and
+/// come out bit for bit equal, and a tolerance would snap a nearly level
+/// diagonal into a staircase.
 fn snapped(points: &[egui::Pos2], closed: bool, stroke: Stroke, ppp: f32) -> Vec<egui::Pos2> {
     let n = points.len();
     let mut out = points.to_vec();
@@ -7236,6 +7248,11 @@ mod tests {
     /// that the overlay stays an overlay: the day somebody rasterises a cut
     /// path into its layer, the sticker printed from this file has the cutting
     /// line printed round it.
+    ///
+    /// **What it guards is the composite path**: that nothing between the
+    /// record and `export_rgba` draws the paths. It cannot see a command that
+    /// writes a rasterised path *into* the layer's slot, because the fixture
+    /// clears that slot itself; such a command would need its own guard.
     ///
     /// Skips rather than fails with no adapter, and holds `gputest::lock` for
     /// its whole length — see `crate::gputest`.
