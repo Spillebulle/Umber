@@ -1563,6 +1563,7 @@ mod tests {
         tap(&mut t, v(0.0, 0.0), bare());
         t.landed(Err("full"));
         tap(&mut t, v(0.0, 50.0), bare());
+        assert!(!t.draft().unwrap().closed, "the draft is drawn open again");
         let (paths, _) = land_of(t.finish());
         assert_eq!(paths[0].nodes.len(), 4);
         assert!(!paths[0].closed);
