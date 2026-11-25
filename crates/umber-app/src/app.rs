@@ -991,6 +991,18 @@ impl UmberApp {
                     was: held,
                 })
             }
+            // The record is swapped by **slot**, for the reason the text arm
+            // above is, and there is no GPU work: the layer's pixels are drawn
+            // from the record, and whoever redraws them is the caller's. `Err`
+            // hands the record back when no layer holds the slot, so a refused
+            // step loses nothing.
+            EditBody::Vector { slot, was } => match self.editor.layers.restore_vector(slot, was) {
+                Ok(previous) => Ok(EditBody::Vector {
+                    slot,
+                    was: previous,
+                }),
+                Err(was) => Err(EditBody::Vector { slot, was }),
+            },
         }
     }
 

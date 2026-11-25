@@ -214,7 +214,9 @@ fn load(
         // than this reader. The `VERSION` comment used to be able to say
         // `kind_from_id` answered `None` for these; it no longer does, because
         // the kinds now exist.
-        if kind.is_structural() {
+        if !kind.is_saved() {
+            // Paths included: a record swap names no layer and no rectangle, so
+            // it would otherwise reach the bounds check below with `w == 0`.
             return Err(
                 "one of its entries restores a layer, which no build writes into a document".into(),
             );

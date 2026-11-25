@@ -356,6 +356,9 @@ pub enum Icon {
     /// Umber has no vector tool for it to be confused with yet, which is
     /// exactly why it should not be spent here.
     SelectPolygon,
+    /// Lucide `spline`: a curve joining two nodes. A change to a vector
+    /// layer's paths, which is what the History row of that name shows.
+    Spline,
 }
 
 /// Where a mark's geometry comes from.
@@ -407,7 +410,7 @@ impl Icon {
     /// Hand-written and therefore checkable rather than self-evident: a test
     /// indexes it from an exhaustive match, so a variant added without a row
     /// here is a compile error rather than an icon nothing ever looks at.
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 55] = [
         Self::Brush,
         Self::Eraser,
         Self::Select,
@@ -462,6 +465,7 @@ impl Icon {
         Self::SelectEllipse,
         Self::SelectLasso,
         Self::SelectPolygon,
+        Self::Spline,
     ];
 
     /// The icon's elements, copied from Lucide 1.34.0 unchanged.
@@ -961,6 +965,20 @@ impl Icon {
             Self::SelectPolygon => Art::Lucide(&[Node::Path(
                 "M10.83 2.38a2 2 0 0 1 2.34 0l8 5.74a2 2 0 0 1 .73 2.25l-3.04 9.26a2 2 0 0 1-1.9 1.37H7.04a2 2 0 0 1-1.9-1.37L2.1 10.37a2 2 0 0 1 .73-2.25z",
             )]),
+            // spline
+            Self::Spline => Art::Lucide(&[
+                Node::Circle {
+                    cx: 19.0,
+                    cy: 5.0,
+                    r: 2.0,
+                },
+                Node::Circle {
+                    cx: 5.0,
+                    cy: 19.0,
+                    r: 2.0,
+                },
+                Node::Path("M5 17A12 12 0 0 1 17 5"),
+            ]),
         }
     }
 }
@@ -1191,6 +1209,7 @@ mod tests {
                 Icon::SelectEllipse => 51,
                 Icon::SelectLasso => 52,
                 Icon::SelectPolygon => 53,
+                Icon::Spline => 54,
             }
         };
         for icon in Icon::ALL {

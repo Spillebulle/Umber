@@ -2367,6 +2367,7 @@ fn edit_icon(kind: EditKind) -> Icon {
         EditKind::Group => Icon::Folder,
         EditKind::AddMask => Icon::Mask,
         EditKind::RemoveMask => Icon::MaskOff,
+        EditKind::Paths => Icon::Spline,
     }
 }
 
