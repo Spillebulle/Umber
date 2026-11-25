@@ -8241,6 +8241,7 @@ mod tests {
             crate::editor::VECTOR_LOST_ON_FLIP_LINE,
             crate::editor::FLIP_NEWER_PATHS,
             crate::editor::RESIZE_NEWER_PATHS,
+            crate::textpanel::PLACE_VECTOR_TIP,
         ] {
             sentences.push(("clear".to_string(), tip.to_string()));
         }
