@@ -795,9 +795,11 @@ pub struct SaveLayer<'a> {
     /// by [`VECTOR_ATTR`], with the fingerprint of the layer image *this save*
     /// is writing wherever the record has ink for it to be about.
     ///
-    /// `None` in [`SaveLayer::new`], which is the whole reason a literal that
-    /// forgets it is silent: it would write a vector layer back as an empty
-    /// ordinary one. The app's two savers fill it off the layer.
+    /// `None` in [`SaveLayer::new`], so `..SaveLayer::new(..)` writes `None`
+    /// silently: a saver that forgets this field writes a vector layer back as
+    /// an empty ordinary one, with no error. The app's two savers (the explicit
+    /// Save and the autosave) are what must fill it off the layer, and the guard
+    /// that counts their construction sites lives in `umber-app`.
     pub vector: Option<&'a crate::vector::VectorObject>,
     /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
     pub depth: u8,
@@ -3069,9 +3071,15 @@ mod tests {
         assert!(!opened.stack.get(0).unwrap().is_vector());
     }
 
-    /// The bound is the record's own figure rather than the canvas's. The parse
-    /// refuses it a moment after the entry reader would, so what this holds is
-    /// the outcome and not the allocation, as the text test says of itself.
+    /// The bound is the record's own figure rather than the canvas's, and it is
+    /// the *entry reader* that must refuse it, before a byte is decompressed.
+    ///
+    /// `from_json` refuses an oversize record too, with its own sentence, so an
+    /// assertion that only sees "dropped" cannot tell the two apart and passes
+    /// with the bounded read swapped for an unbounded one. The reason text is
+    /// what differs: only the bounded read says the record "could not be read",
+    /// where the parse says it "is too large". (The text record's equivalent
+    /// test has this hole and says so in its own comment; left as it is.)
     #[test]
     fn an_over_long_vector_entry_is_refused_unread() {
         let size = UVec2::new(4, 4);
@@ -3086,12 +3094,85 @@ mod tests {
             .expect("the picture still opens");
         assert!(doc.layers[0].vector.is_none());
         assert!(
-            doc.warnings
-                .iter()
-                .any(|w| matches!(w, docimport::ImportWarning::VectorDropped { .. })),
-            "{:?}",
+            doc.warnings.iter().any(|w| matches!(
+                w,
+                docimport::ImportWarning::VectorDropped { reason, .. }
+                    if reason.contains("could not be read")
+            )),
+            "refused by the bounded entry read, not by the parse: {:?}",
             doc.warnings
         );
+    }
+
+    /// The writer's rectangle and the reader's must be the same one. Paint with
+    /// a margin on both axes, at an offset where x and y differ, so a transposed
+    /// or dropped origin on either side makes the fingerprint mismatch and the
+    /// ink go.
+    #[test]
+    fn ink_on_an_off_origin_layer_survives_a_reopen() {
+        let size = UVec2::new(128, 128);
+        let mut px = empty(size);
+        for y in 90..94usize {
+            for x in 40..44usize {
+                let at = (y * size.x as usize + x) * 4;
+                px[at..at + 4].copy_from_slice(&[10, 20, 30, 255]);
+            }
+        }
+        let record = vector_with_ink();
+        let (bytes, warnings) = vector_document(size, &px, &record);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let xml = read_stack_xml(&bytes);
+        assert!(
+            xml.contains("x=\"40\"") && xml.contains("y=\"90\""),
+            "the fixture must be trimmed to a non-zero, unequal origin:\n{xml}"
+        );
+        let doc = docimport::read_openraster(&bytes).expect("opens");
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.layers[0].vector.as_deref(), Some(&record));
+    }
+
+    /// Nothing in the format says one entry belongs to one layer, and a hand-made
+    /// or merged file may point two at it. Each gets the record.
+    #[test]
+    fn two_layers_naming_one_vector_entry_each_get_it() {
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let record = vector_paths();
+        let layers = vec![
+            layer("Plain", &px),
+            SaveLayer {
+                vector: Some(&record),
+                ..layer("Lines", &px)
+            },
+        ];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(&px),
+            history: None,
+        })
+        .expect("encode");
+        let bytes = with_stack_xml(&bytes, |xml| {
+            xml.replacen(
+                "<layer name=\"Plain\"",
+                &format!(
+                    "<layer {VECTOR_ATTR}=\"{}\" name=\"Plain\"",
+                    // "Lines" is the top layer, so file index 0.
+                    vector_src(0)
+                ),
+                1,
+            )
+        });
+        let doc = docimport::read_openraster(&bytes).expect("opens");
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.layers[0].vector.as_deref(), Some(&record));
+        assert_eq!(doc.layers[1].vector.as_deref(), Some(&record));
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().is_vector());
+        assert!(opened.stack.get(1).unwrap().is_vector());
     }
 
     /// Ink describes pixels, and these are not the pixels it described. The

@@ -624,6 +624,31 @@ pub struct Opened {
 }
 
 impl ImportedDocument {
+    /// Drop every vector record the stack would refuse, naming each.
+    ///
+    /// A record on a folder, on a layer that is also text, or past
+    /// [`crate::vector::VectorObject::check`]'s bounds cannot be installed. The
+    /// ORA reader never produces one — it makes the same three decisions as it
+    /// reads — so this is for a caller that built an `ImportedDocument` by hand,
+    /// and it is what keeps [`ImportedDocument::open`] from losing a record
+    /// without a [`ImportWarning::VectorDropped`] beside it. Idempotent.
+    pub fn settle_vector_records(&mut self) {
+        for layer in &mut self.layers {
+            let why = match layer.vector.as_deref() {
+                None => continue,
+                Some(_) if layer.folder => "A folder cannot hold paths.",
+                Some(_) if layer.text.is_some() => "The layer is also text, and keeps the text.",
+                Some(record) if record.check().is_err() => "The record is outside the limits.",
+                Some(_) => continue,
+            };
+            layer.vector = None;
+            self.warnings.push(ImportWarning::VectorDropped {
+                layer: layer.name.clone(),
+                reason: why.into(),
+            });
+        }
+    }
+
     pub fn document(&self) -> Document {
         Document::new(self.size.x, self.size.y)
             .with_background(self.background)
@@ -659,6 +684,15 @@ impl ImportedDocument {
         // between` is the guard.
 
         disable_effects_over_budget(&mut self.layers);
+
+        // The same totality for a vector record: `install_vector` refuses a
+        // folder, a text layer and a record over its bounds, and a refusal read
+        // as a shrug is a record lost with no sentence. Settled here so the
+        // install below cannot be refused, and idempotent so the reader having
+        // done it already costs nothing. The sentences land in `self.warnings`,
+        // which `open` consumes: a caller that wants to *read* them calls
+        // [`ImportedDocument::settle_vector_records`] before it looks.
+        self.settle_vector_records();
 
         let saved_history = self.history;
 
@@ -1942,6 +1976,80 @@ mod tests {
         // failed to load, say. The top layer is the safe answer, not a panic.
         assert_eq!(build(Some(9)).open().stack.active_index(), 2);
         assert_eq!(build(None).open().stack.active_index(), 2);
+    }
+
+    /// A record the stack would refuse is named and dropped rather than lost to
+    /// a `bool` nobody reads. Hand-built, because the ORA reader makes the same
+    /// three decisions itself and so can never hand `open` one of these.
+    #[test]
+    fn a_vector_record_the_stack_would_refuse_is_dropped_with_a_sentence() {
+        use crate::vector::{Node, Path, PathRole, VectorObject};
+        let size = UVec2::new(2, 2);
+        let record = || {
+            Box::new(VectorObject::Paths(vec![Path {
+                role: PathRole::Cut,
+                closed: false,
+                nodes: vec![
+                    Node::corner(glam::Vec2::new(0.0, 0.0)),
+                    Node::corner(glam::Vec2::new(1.0, 1.0)),
+                ],
+                ink: None,
+            }]))
+        };
+        let mut on_folder = ImportedLayer::folder("Group", 0, true);
+        on_folder.vector = Some(record());
+        let mut on_text = layer("Caption", size);
+        on_text.vector = Some(record());
+        on_text.text = Some(Box::new(crate::textobj::TextObject::new(
+            crate::text::TextBlock {
+                text: "x".into(),
+                size: 12.0,
+                line_spacing: 1.0,
+                tracking: 0.0,
+                align: crate::text::Align::Left,
+            },
+            crate::textobj::TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: "Archivo-Regular".into(),
+            },
+            crate::color::Color::from_srgb_u8(0, 0, 0, 255),
+            crate::textobj::Placement::identity(PixelRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }),
+        )));
+        let mut fine = layer("Lines", size);
+        fine.vector = Some(record());
+        let mut doc = ImportedDocument {
+            format: SourceFormat::OpenRaster,
+            size,
+            layers: vec![fine, on_text, on_folder],
+            active: None,
+            background: Background::Transparent,
+            dpi: None,
+            history: None,
+            warnings: vec![],
+        };
+        doc.settle_vector_records();
+        let named: Vec<&str> = doc
+            .warnings
+            .iter()
+            .map(|w| match w {
+                ImportWarning::VectorDropped { layer, .. } => layer.as_str(),
+                other => panic!("unexpected warning {other:?}"),
+            })
+            .collect();
+        assert_eq!(named, ["Caption", "Group"]);
+        assert!(doc.layers[0].vector.is_some(), "a good record is untouched");
+        // Settled once means settled: `open` asks again and finds nothing.
+        let before = doc.warnings.len();
+        doc.settle_vector_records();
+        assert_eq!(doc.warnings.len(), before);
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().is_vector());
     }
 
     #[test]
