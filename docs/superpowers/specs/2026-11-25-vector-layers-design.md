@@ -116,7 +116,11 @@ pub struct Ink {               // reserved
   emit their endpoints only.
 - Positions and handles must be finite. A path needs at least two nodes, or it
   is dropped on the way in.
-- `VectorObject::flipped(axis, doc)` mirrors every node and handle. Exact.
+- `VectorObject::flipped(axis, doc)` mirrors every node and handle. Exact for
+  figures that are binary fractions; for any other, a double flip moves a figure
+  by at most one rounding at the canvas's magnitude and repeated flips do not
+  accumulate (tested over a thousand round trips). Amended after review: the
+  first draft said "exact", which is false in `f32`.
 - `VectorObject::translated(offset)` for a canvas resize.
 - `VectorObject::from_rings(rings, role)` builds closed, all-corner paths from a
   selection's rings. It merges exactly collinear runs and nothing more, so a
