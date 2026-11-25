@@ -6869,11 +6869,11 @@ fn cut_refusal(why: EditRefusal) -> Option<Notice> {
     let (title, line) = match why {
         EditRefusal::Locked => (
             "The layer is locked",
-            "Nothing was cut. Unlock the layer in the Layers panel, or select              another one, and cut again.",
+            "Nothing was cut. Unlock the layer in the Layers panel, or select another one, and cut again.",
         ),
         EditRefusal::Text => (
             "This layer holds text",
-            "Nothing was cut. The text on this layer can still be set again,              so nothing may be taken out of it. Convert it to paint in the              Text panel, or select another layer.",
+            "Nothing was cut. The text on this layer can still be set again, so nothing may be taken out of it. Convert it to paint in the Text panel, or select another layer.",
         ),
         EditRefusal::Vector => ("This is a vector layer", CUT_VECTOR_LINE),
         EditRefusal::Folder | EditRefusal::Missing => return None,
@@ -7965,6 +7965,49 @@ mod tests {
         for line in [&cut.lines[0], &lift.lines[0], &paste.lines[0]] {
             assert!(!line.contains('\u{2014}'), "{line:?}");
             assert!(!line.contains("  "), "{line:?}");
+        }
+    }
+
+    /// **No sentence a refusal can raise has a run of spaces or a stray edge
+    /// space.** Extracting `cut_refusal` lost the `\` line continuations once
+    /// and padded two existing notices with fourteen spaces each; this walks
+    /// every refusal through every function that words one, so a lost
+    /// continuation anywhere in them fails here rather than on a screen.
+    #[test]
+    fn no_refusal_sentence_has_a_run_of_spaces() {
+        let mut sentences: Vec<(String, String)> = Vec::new();
+        for why in EditRefusal::ALL {
+            let at = |who: &str| format!("{who} {why:?}");
+            for (who, notice) in [
+                ("cut", cut_refusal(why)),
+                ("paste", Some(paste_refusal(why))),
+                ("paste float", float_refusal_notice(why, true)),
+                ("lift", float_refusal_notice(why, false)),
+            ] {
+                if let Some(notice) = notice {
+                    sentences.push((at(who), notice.title));
+                    for line in notice.lines {
+                        sentences.push((at(who), line));
+                    }
+                }
+            }
+        }
+        for tip in [
+            crate::editor::CLEAR_VECTOR_TIP,
+            "Unlock the layer to clear it.",
+        ] {
+            sentences.push(("clear".to_string(), tip.to_string()));
+        }
+        // And the one the real stack produces, so the list above cannot drift
+        // from what the function answers.
+        let mut stack = umber_core::LayerStack::new();
+        stack.add_vector_layer("P", vector_record()).expect("room");
+        let said = crate::editor::clear_layer_refusal(&stack).expect("refused");
+        sentences.push(("clear live".to_string(), said.to_string()));
+        for (who, text) in sentences {
+            assert!(!text.contains("  "), "{who}: a run of spaces in {text:?}");
+            assert_eq!(text.trim(), text, "{who}: edge space in {text:?}");
+            assert!(!text.is_empty(), "{who}: empty");
         }
     }
 
