@@ -335,6 +335,12 @@ pub struct UmberApp {
     /// is: it is the pointer's state in physical pixels, and nothing about it
     /// survives the release.
     picked_at: Option<Vec2>,
+    /// Whether a transform-tool press on a vector layer has already said so.
+    ///
+    /// See [`LiftNotice`]. On the application for the reason `picked_at` is:
+    /// it is about what the pointer has been doing, not about a document, and
+    /// its key names the document itself.
+    lift_notice: LiftNotice,
     /// A way to wake the loop from a worker.
     ///
     /// The update check and the autosave were each handed one at construction
@@ -475,6 +481,7 @@ impl UmberApp {
             put_down_at: None,
             sysclip: sysclip::Board::default(),
             picked_at: None,
+            lift_notice: LiftNotice::default(),
             opening,
         }
     }
@@ -1199,6 +1206,17 @@ impl UmberApp {
         Some(baked.draws)
     }
 
+    /// What a lift's notice is about: this document, its active layer and the
+    /// tool in hand. See [`LiftNotice`].
+    fn lift_key(&self) -> LiftKey {
+        let layers = &self.editor.layers;
+        LiftKey {
+            document: self.editor.session.active_id(),
+            layer: layers.get(layers.active_index()).map(|l| l.id()),
+            tool: self.editor.ui.tool,
+        }
+    }
+
     /// Everything a float needs from the GPU, in one place.
     ///
     /// `pixels` is `Some` for a paste and `None` for a lift out of the layer;
@@ -1243,8 +1261,13 @@ impl UmberApp {
             .active_refusal(umber_core::EditTarget::Layer)
             .filter(|why| pixels.is_some() || *why != EditRefusal::Text);
         if let Some(why) = refusal {
+            // A paste always says so. A lift says so once per layer, tool and
+            // document (`LiftNotice`), or every press of the pen on a vector
+            // layer would raise the same dialog over the canvas again.
             if let Some(notice) = float_refusal_notice(why, pixels.is_some()) {
-                self.editor.notice = Some(notice);
+                if pixels.is_some() || self.lift_notice.due(self.lift_key()) {
+                    self.editor.notice = Some(notice);
+                }
             }
             return false;
         }
@@ -4119,6 +4142,11 @@ impl UmberApp {
         // was saved or was painted on. See `crash::note_documents`.
         crash::note_documents(&self.editor.session);
 
+        // Re-arm the lift's one notice the moment the layer, the tool or the
+        // document it was about stops being the one in hand. Three reads and a
+        // comparison, so it costs the drawing path nothing.
+        self.lift_notice.observe(self.lift_key());
+
         // Also before the interface is built, and that is the whole point: a
         // slot is a slice of *one* document's texture array, so the frame after
         // a tab switch would otherwise draw the new document's rows wearing the
@@ -6925,13 +6953,58 @@ const PASTE_VECTOR_LINE: &str =
 /// pixels to take there, and the layer has no paths to move yet.
 const LIFT_VECTOR_LINE: &str = "This is a vector layer. There is nothing here to move yet.";
 
+/// What a lift's notice is about, so it can be said once rather than per press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiftKey {
+    document: crate::session::DocId,
+    /// [`umber_core::Layer::id`], which survives a reorder where an index does
+    /// not. `None` for an empty stack.
+    layer: Option<u32>,
+    tool: Tool,
+}
+
+/// **A transform-tool press on a vector layer says so once, not once a press.**
+///
+/// The lift's notice is the one a press on the canvas raises, and a press
+/// happens every time the pen goes down: unlatched, each one raised the same
+/// modal over the canvas again, which is the dialog-that-keeps-coming-back the
+/// autosave's "say it once" rule refuses. So the notice latches on the
+/// [`LiftKey`] it was raised for and stays quiet until the active layer, the
+/// tool or the document changes, which [`LiftNotice::observe`] is told every
+/// frame. A paste is not latched: it is a command with one outcome and always
+/// says so.
+///
+/// A model with no window in it, so the rule is a test rather than a sentence.
+#[derive(Clone, Copy, Debug, Default)]
+struct LiftNotice {
+    said_for: Option<LiftKey>,
+}
+
+impl LiftNotice {
+    /// Should a lift refused at `key` raise its notice? True the first time,
+    /// and latches so the next press at the same key is quiet.
+    fn due(&mut self, key: LiftKey) -> bool {
+        let due = self.said_for != Some(key);
+        self.said_for = Some(key);
+        due
+    }
+
+    /// Re-arm when what is in hand is no longer what the notice was about.
+    fn observe(&mut self, now: LiftKey) {
+        if self.said_for.is_some_and(|said| said != now) {
+            self.said_for = None;
+        }
+    }
+}
+
 /// What a lift (a press with the transform tool, not a paste) says about a
 /// refusal, if anything.
 ///
 /// A paste always says so, in [`paste_refusal`]'s words. A lift is a press on
 /// the canvas and happens every time the pen goes down, so it stays silent for
 /// every reason except the vector layer, which the artist asked for by choosing
-/// the transform tool on a layer that has nothing to lift. Exhaustive with no
+/// the transform tool on a layer that has nothing to lift, and even that is
+/// said once rather than per press ([`LiftNotice`]). Exhaustive with no
 /// catch-all, so a fifth refusal has to decide which of the two it is.
 fn float_refusal_notice(why: EditRefusal, paste: bool) -> Option<Notice> {
     if paste {
@@ -8111,6 +8184,40 @@ mod tests {
             assert_eq!(text.trim(), text, "{who}: edge space in {text:?}");
             assert!(!text.is_empty(), "{who}: empty");
         }
+    }
+
+    /// **A lift's notice is said once**, and re-armed by a change of layer, of
+    /// tool or of document, including a change and back that no press saw.
+    #[test]
+    fn a_lift_notice_is_said_once_until_what_is_in_hand_changes() {
+        let doc = crate::session::DocId::for_test(1);
+        let key = |layer: u32, tool: Tool| LiftKey {
+            document: doc,
+            layer: Some(layer),
+            tool,
+        };
+        let here = key(7, Tool::Transform);
+        let mut latch = LiftNotice::default();
+        assert!(latch.due(here), "the first press says so");
+        assert!(!latch.due(here), "the second does not");
+        latch.observe(here);
+        assert!(
+            !latch.due(here),
+            "a frame with nothing changed re-arms nothing"
+        );
+
+        latch.observe(key(8, Tool::Transform));
+        latch.observe(here);
+        assert!(latch.due(here), "another layer and back re-arms it");
+
+        latch.observe(key(7, Tool::Brush));
+        assert!(latch.due(here), "so does another tool");
+
+        latch.observe(LiftKey {
+            document: crate::session::DocId::for_test(2),
+            ..here
+        });
+        assert!(latch.due(here), "and another document");
     }
 
     /// A press with the transform tool on every other refusal stays silent, as
