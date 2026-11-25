@@ -1934,10 +1934,7 @@ impl UmberApp {
             Some(EditRefusal::Vector) => {
                 self.editor.notice = Some(Notice {
                     title: "This is a vector layer".to_string(),
-                    lines: vec![
-                        "Nothing was cut. This is a vector layer. Cut from an ordinary                          layer instead."
-                            .to_string(),
-                    ],
+                    lines: vec![CUT_VECTOR_LINE.to_string()],
                 });
                 return;
             }
@@ -6835,6 +6832,14 @@ fn flip_step_refusal(step: &'static str) -> Notice {
 /// without somebody writing what it means for a paste. The wording is the
 /// paste's own rather than [`EditRefusal::reason`]'s: that one is written for a
 /// painting gesture, and this has to say what was *not pasted* and where to go.
+const CUT_VECTOR_LINE: &str =
+    "Nothing was cut. This is a vector layer. Cut from an ordinary layer instead.";
+
+/// A const and not a literal in the match, so a test can read the sentence a
+/// lost line continuation would otherwise pad with spaces.
+const PASTE_VECTOR_LINE: &str =
+    "Nothing was pasted. This is a vector layer. Paste onto an ordinary layer instead.";
+
 fn paste_refusal(why: EditRefusal) -> Notice {
     let (title, line) = match why {
         EditRefusal::Locked => (
@@ -6857,10 +6862,7 @@ fn paste_refusal(why: EditRefusal) -> Notice {
              nothing may be pasted over it. Convert it to paint in the Text panel, \
              or select another layer.",
         ),
-        EditRefusal::Vector => (
-            "This is a vector layer",
-            "Nothing was pasted. This is a vector layer. Paste onto an ordinary              layer instead.",
-        ),
+        EditRefusal::Vector => ("This is a vector layer", PASTE_VECTOR_LINE),
         EditRefusal::Missing => (
             "No layer is selected",
             "Nothing was pasted. Select a layer in the Layers panel and paste again.",
@@ -7800,6 +7802,10 @@ mod tests {
     /// `umber-core`; that the gate is *asked* is not covered.
     #[test]
     fn every_reason_a_paste_is_refused_has_a_finished_sentence() {
+        for line in [CUT_VECTOR_LINE, PASTE_VECTOR_LINE] {
+            assert!(!line.contains("  "), "a run of spaces: {line:?}");
+        }
+        assert!(paste_refusal(EditRefusal::Vector).lines[0] == PASTE_VECTOR_LINE);
         let mut said: Vec<String> = Vec::new();
         for why in EditRefusal::ALL {
             let notice = paste_refusal(why);

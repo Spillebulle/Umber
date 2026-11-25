@@ -1840,7 +1840,13 @@ impl LayerStack {
         record: Option<Box<VectorObject>>,
     ) -> Result<Option<Box<VectorObject>>, Option<Box<VectorObject>>> {
         match self.layers.iter_mut().find(|l| l.slot() == Some(slot)) {
-            Some(layer) => Ok(std::mem::replace(&mut layer.vector, record)),
+            Some(layer) => {
+                debug_assert!(
+                    record.is_none() || layer.text.is_none(),
+                    "a layer is never both text and vector"
+                );
+                Ok(std::mem::replace(&mut layer.vector, record))
+            }
             None => Err(record),
         }
     }
@@ -4712,6 +4718,29 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_and_a_folder_beat_vector_at_the_gate() {
+        let mut s = LayerStack::new();
+        let at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        s.get_mut(at).unwrap().locked = true;
+        assert_eq!(
+            s.refusal_at(at, EditTarget::Layer),
+            Some(EditRefusal::Locked)
+        );
+        s.get_mut(at).unwrap().locked = false;
+        let folder = s.group(&[at]).expect("grouped");
+        assert_eq!(
+            s.refusal_at(folder, EditTarget::Layer),
+            Some(EditRefusal::Folder)
+        );
+        s.get_mut(folder).unwrap().locked = true;
+        assert_eq!(
+            s.refusal_at(at, EditTarget::Layer),
+            Some(EditRefusal::Locked),
+            "a locked parent folder too"
+        );
+    }
+
+    #[test]
     fn an_empty_vector_layer_is_a_vector_layer() {
         let mut s = LayerStack::new();
         assert!(!s.has_vector_layers());
@@ -4872,6 +4901,12 @@ mod tests {
         s.restore_shape(before.with_removed(removed));
         assert_eq!(s.len(), 4);
         assert_eq!(s.vector_at(1), Some(&some_paths()));
+        for other in [0, 2, 3] {
+            assert!(
+                s.vector_at(other).is_none(),
+                "entry {other} gained a record"
+            );
+        }
     }
 
     #[test]
@@ -4925,6 +4960,16 @@ mod tests {
         assert_eq!(put.as_deref(), Some(&some_paths()), "what was there");
         assert_eq!(s.vector_at(0), Some(&VectorObject::empty()));
         assert!(s.vector_at(1).is_none(), "the layer now at 1 is untouched");
+
+        // Undo has no lock gate: a locked layer is restored all the same.
+        s.get_mut(0).unwrap().locked = true;
+        assert!(s.restore_vector(slot, Some(Box::new(some_paths()))).is_ok());
+        assert_eq!(s.vector_at(0), Some(&some_paths()));
+        s.get_mut(0).unwrap().locked = false;
+        assert!(
+            s.restore_vector(slot, Some(Box::new(VectorObject::empty())))
+                .is_ok()
+        );
 
         // A slot nobody holds hands the record back.
         let missing = s.restore_vector(9_999, Some(Box::new(some_paths())));
