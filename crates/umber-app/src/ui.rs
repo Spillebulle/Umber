@@ -58,6 +58,12 @@ pub struct UiActions {
     /// only while a selection is live, so a picture copied in another
     /// application had nowhere in the interface to be pasted from.
     pub paste: bool,
+    /// Turn the selection's outline into paths of this role. Through the caller
+    /// because it puts a float down first and may make a layer, which takes a
+    /// slice on the device.
+    pub path_from_selection: Option<umber_core::PathRole>,
+    /// Make an empty vector layer above the selected entry.
+    pub new_vector_layer: bool,
     /// Put the Export dialog up. Nothing is written by this: it only asks the
     /// format, and the answer comes back as `export`.
     pub open_export: bool,
@@ -2105,6 +2111,31 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     {
         ed.deselect();
         ui.close();
+    }
+    // The two ways the selection's outline becomes lines. Directly under
+    // Deselect because both are about the selection, and disabled without one
+    // with a sentence rather than hidden, so the rows can be found before
+    // there is anything to turn into a path.
+    for (action, role, hint) in [
+        (
+            Action::CutPathFromSelection,
+            umber_core::PathRole::Cut,
+            "Turns the selection's outline into a cut line on a vector layer.",
+        ),
+        (
+            Action::PlotPathFromSelection,
+            umber_core::PathRole::Plot,
+            "Turns the selection's outline into a plot line on a vector layer.",
+        ),
+    ] {
+        if menu_item(ui, action, ed.selection.is_some())
+            .on_hover_text(hint)
+            .on_disabled_hover_text("Select something first. The outline is what becomes the line.")
+            .clicked()
+        {
+            actions.path_from_selection = Some(role);
+            ui.close();
+        }
     }
     // Cut, Copy, Paste, in that order, because that is the order every desktop
     // draws them and the order the keys sit in on the bottom row.
@@ -5269,7 +5300,11 @@ mod tests {
         // and the colour panel. They are deliberately not menu bar commands,
         // and a category leaving this list has to be decided about rather than
         // fall through `of_category`'s wildcard.
-        const OFF_THE_MENU_BAR: [&str; 3] = ["Tools", "Brush", "Colour"];
+        //
+        // Layers is the Layers panel's own: the mark beside Add is where a
+        // vector layer is made, and the menu bar has no Layer menu to put a
+        // row in.
+        const OFF_THE_MENU_BAR: [&str; 4] = ["Tools", "Brush", "Colour", "Layers"];
         for action in Action::ALL {
             let category = action.category();
             assert!(
@@ -5347,6 +5382,43 @@ mod tests {
             actions.cut_selection,
             "Cut was dead on an unlocked layer, so the row answers to nothing"
         );
+    }
+
+    /// **The two path rows are drawn whatever the selection, and answer only
+    /// to one.** `click_menu_row` panics on a row that is not drawn, so reaching
+    /// the assertion at all is the "still names itself" half; a disabled row
+    /// swallows the click, which is the "dead" half. Each row is asked for its
+    /// own role, so one wired to the other's is caught too.
+    #[test]
+    fn the_menu_rows_are_dead_without_a_selection_and_still_name_themselves() {
+        use umber_core::PathRole;
+        for (action, role) in [
+            (Action::CutPathFromSelection, PathRole::Cut),
+            (Action::PlotPathFromSelection, PathRole::Plot),
+        ] {
+            let mut ed = Editor::default();
+            let actions = click_menu_row(Menu::Edit, &mut ed, action.label());
+            assert!(
+                actions.path_from_selection.is_none(),
+                "{action:?} was live with nothing selected"
+            );
+
+            let mut ed = Editor::default();
+            ed.selection = Some(std::sync::Arc::new(
+                umber_core::Selection::rectangle(
+                    glam::Vec2::new(1.0, 1.0),
+                    glam::Vec2::new(9.0, 9.0),
+                    ed.doc.size,
+                )
+                .expect("a rectangle"),
+            ));
+            let actions = click_menu_row(Menu::Edit, &mut ed, action.label());
+            assert_eq!(
+                actions.path_from_selection,
+                Some(role),
+                "{action:?} did not ask for its own role"
+            );
+        }
     }
 
     /// The Edit menu's Undo and Redo rows go dead when a locked layer refuses

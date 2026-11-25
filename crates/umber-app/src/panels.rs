@@ -1522,6 +1522,23 @@ fn add_layer_button(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActio
     ) {
         actions.add_layer = true;
     }
+    // Beside it rather than in the header: it acts on neither the selection nor
+    // the ticked set, which is the argument that put the add mark here, and the
+    // header's strip is held to a pinned 104 points that a sixth mark would move.
+    // Disabled on the stack's own limit with the add mark's tooltip's reason.
+    if icon_button(
+        ui,
+        p,
+        Icon::Spline,
+        ed.layers.len() < LayerStack::MAX,
+        if ed.layers.len() < LayerStack::MAX {
+            "New vector layer"
+        } else {
+            "The stack is full. Delete a layer to make room."
+        },
+    ) {
+        actions.new_vector_layer = true;
+    }
 }
 
 fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
@@ -2002,6 +2019,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     locked_by_folder: !layer.locked && ed.layers.effective_locked(index),
                     link: layer.link,
                     thumb: layer.slot().and_then(|s| ed.thumbs.picture(s)),
+                    paths: crate::thumbs::shows_a_path_mark(layer),
                     picked: layer.picked,
                 },
             )

@@ -2721,6 +2721,89 @@ impl UmberApp {
         self.editor.history.free_until(move || room.has_headroom())
     }
 
+    /// Turn the selection's outline into cut or plot paths, on the active
+    /// vector layer or on a layer made for them.
+    ///
+    /// **A thin caller.** `Editor::plan_path_from_selection` decides everything
+    /// that can be decided from the model, and `Editor::apply_path_plan` changes
+    /// the stack and records the entry; what is left here is what needs a
+    /// window or a device: putting the picture down first, reserving the slice a
+    /// new layer takes, giving a parked one up when the pool is dry, and
+    /// preparing the slice on the GPU. None of those lines is under test, which
+    /// is the cost of `UmberApp` not being constructible without a window.
+    ///
+    /// The selection stays: the artist is likely to ask for the other kind next.
+    fn path_from_selection(&mut self, role: umber_core::PathRole) {
+        // The rule every path that touches the document follows. A stroke's
+        // wet scratch and a float's preview slice both stand in front of a
+        // layer, and a layer made now would take the next slice.
+        self.finish_stroke();
+        self.finish_transform();
+        let plan = match self.editor.plan_path_from_selection(role) {
+            Ok(Some(plan)) => plan,
+            // The menu rows are disabled without a selection, so this is the
+            // keystroke, which says nothing, as Copy does.
+            Ok(None) => return,
+            Err(notice) => {
+                self.editor.notice = Some(notice);
+                return;
+            }
+        };
+        let adds_a_layer = plan.adds_a_layer();
+        self.carry_out_path_plan(plan, adds_a_layer);
+    }
+
+    /// Make an empty vector layer above the active entry, for the artist to put
+    /// paths on later. The Layers panel's mark and the unbound shortcut.
+    ///
+    /// The same route as a layer made from the selection, with an empty record,
+    /// so the two cannot disagree about where it goes or what undoes it.
+    fn add_vector_layer(&mut self) {
+        self.finish_stroke();
+        self.finish_transform();
+        match self.editor.plan_new_vector_layer() {
+            Ok(plan) => self.carry_out_path_plan(plan, true),
+            Err(notice) => self.editor.notice = Some(notice),
+        }
+    }
+
+    /// The half of both commands that needs a device.
+    fn carry_out_path_plan(&mut self, plan: crate::editor::PathPlan, adds_a_layer: bool) {
+        // **The device's refusal after the stack's own**, `add_layer`'s order.
+        // The plan has already answered a full stack and a nested-too-deep
+        // folder, so a refusal here is graphics memory and says so.
+        if adds_a_layer && let Err(refused) = self.reserve_a_slice() {
+            self.editor.notice = Some(vram::slice_refused("a layer", &refused));
+            return;
+        }
+        let plan = match self.editor.apply_path_plan(plan) {
+            Ok(()) => None,
+            // The pool is dry: give a parked slice back and try once more, as
+            // every other way of adding a layer does.
+            Err(plan) if self.free_a_slot() => self.editor.apply_path_plan(plan).err(),
+            Err(plan) => Some(plan),
+        };
+        if plan.is_some() {
+            self.editor.notice = Some(no_slice_left());
+            return;
+        }
+        if adds_a_layer {
+            let slot = self.editor.layers.active_slot();
+            let needed = self.editor.layers.slot_capacity_needed();
+            let id = self.editor.session.active_id();
+            if let Some(gfx) = self.gfx.as_mut()
+                && let Some(canvas) = gfx.canvases.get_mut(&id)
+            {
+                canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
+                // A recycled slot still holds the last layer's pixels.
+                if let Some(slot) = slot {
+                    canvas.clear_layer(&gfx.gpu.queue, slot);
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
     fn add_layer(&mut self) {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
@@ -3172,6 +3255,9 @@ impl UmberApp {
             Action::Copy => self.copy_selection(),
             Action::Cut => self.cut_selection(),
             Action::Paste => self.paste(),
+            Action::CutPathFromSelection => self.path_from_selection(umber_core::PathRole::Cut),
+            Action::PlotPathFromSelection => self.path_from_selection(umber_core::PathRole::Plot),
+            Action::NewVectorLayer => self.add_vector_layer(),
             Action::FlipCanvasHorizontal => self.flip_canvas(umber_core::FlipAxis::Horizontal),
             Action::FlipCanvasVertical => self.flip_canvas(umber_core::FlipAxis::Vertical),
             Action::BrushTool => self.pick_tool(Tool::Brush),
@@ -4583,6 +4669,12 @@ impl UmberApp {
         }
         if actions.paste {
             self.paste();
+        }
+        if let Some(role) = actions.path_from_selection {
+            self.path_from_selection(role);
+        }
+        if actions.new_vector_layer {
+            self.add_vector_layer();
         }
         if actions.open_export {
             self.editor.export_form.open = true;
@@ -7080,7 +7172,15 @@ mod tests {
         // exempted by name because it runs from `finish_transform`, where the
         // commit is what is happening.
         let record = concat!("history", ".record(");
-        let allowed = concat!("fn commit_made_", "layer");
+        // `apply_path_plan` is the second, and what makes it safe is its one
+        // caller: `App::carry_out_path_plan` is reached only from the two
+        // commands that put the float down and finish the stroke before they
+        // plan anything, so a shape recorded there never names a layer a
+        // placement is holding in the air.
+        let allowed = [
+            concat!("fn commit_made_", "layer"),
+            concat!("fn apply_path_", "plan"),
+        ];
         for (what, text) in [
             ("panels.rs", shipped(include_str!("panels.rs"))),
             ("editor.rs", shipped(include_str!("editor.rs"))),
@@ -7099,7 +7199,7 @@ mod tests {
                 }
                 assert!(
                     // `contains`, because the allowed one is `pub fn`.
-                    owner.contains(allowed),
+                    allowed.iter().any(|name| owner.contains(name)),
                     "`{what}` records a history entry in `{owner}`: {trimmed}. \
                      Neither of these files can put a float down first, so what \
                      they want recorded goes through `UiActions` and `App` does it."

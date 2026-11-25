@@ -251,6 +251,64 @@ pub struct Floating {
     pub made: Option<MadeLayer>,
 }
 
+/// The names a layer made from the selection's outline is given.
+///
+/// Said by the command rather than by the artist, which is what lets a layer
+/// holding cut lines be told from one holding plot lines in a list of
+/// thirty. `Ink` has no command that makes it, but the match that picks a name
+/// is exhaustive over the role so a fourth cannot arrive unnamed.
+pub const CUT_LAYER_NAME: &str = "Cut lines";
+pub const PLOT_LAYER_NAME: &str = "Plot lines";
+pub const INK_LAYER_NAME: &str = "Ink lines";
+/// What the Layers panel's mark names an empty one.
+pub const VECTOR_LAYER_NAME: &str = "Vector layer";
+
+/// What turning the selection's outline into paths will do. See
+/// [`Editor::plan_path_from_selection`].
+#[derive(Clone, Debug)]
+pub enum PathPlan {
+    /// Paths added to the active vector layer. Carries the whole record the
+    /// layer will hold, already checked, and the slot an undo names it by.
+    Append {
+        slot: u32,
+        after: Box<umber_core::VectorObject>,
+    },
+    /// A layer of its own, above the active entry.
+    NewLayer {
+        name: &'static str,
+        record: Box<umber_core::VectorObject>,
+    },
+}
+
+impl PathPlan {
+    /// Does carrying this out take a slice? Exhaustive, so a third way of
+    /// making paths has to say.
+    pub fn adds_a_layer(&self) -> bool {
+        match self {
+            PathPlan::Append { .. } => false,
+            PathPlan::NewLayer { .. } => true,
+        }
+    }
+}
+
+fn path_refusal(sentence: &str) -> Notice {
+    Notice {
+        title: "No path was made".to_string(),
+        lines: vec![sentence.to_string()],
+    }
+}
+
+/// The sentence for a vector layer declining a record. Exhaustive, so a new
+/// reason has to be worded rather than falling to a shrug.
+fn set_refusal_sentence(why: umber_core::VectorSetRefusal) -> &'static str {
+    match why {
+        umber_core::VectorSetRefusal::Missing => "There is no layer to put the path on.",
+        umber_core::VectorSetRefusal::NotVector => "That layer does not hold paths.",
+        umber_core::VectorSetRefusal::Locked => "Unlock the layer to add paths to it.",
+        umber_core::VectorSetRefusal::Record(why) => why.sentence(),
+    }
+}
+
 /// A layer a float created for itself, what was selected before it did, and the
 /// stack shape its undo entry will be made of.
 ///
@@ -1418,6 +1476,169 @@ impl Editor {
             *made.before,
         ));
         self.mark_modified();
+    }
+
+    /// What the Edit menu's two path commands would do with the selection as it
+    /// stands, or the sentence for why not. `Ok(None)` is "no selection", which
+    /// the menu rows are disabled for and a keystroke simply ignores.
+    ///
+    /// **The whole decision, with nothing changed.** Append to the active vector
+    /// layer, or make a layer of its own, or refuse: all three are settled here
+    /// from the model alone so a guard can drive them with no window, and
+    /// `App::path_from_selection` is left to put the picture down, reserve the
+    /// slice and carry the plan out. A refusal therefore changes nothing at all,
+    /// which is structural: nothing here takes `&mut self`.
+    ///
+    /// A locked or opaque vector layer is not a refusal: the paths go on a layer
+    /// of their own beside it, which is what the artist would have had to do by
+    /// hand. What *is* refused is a layer that is full, because the remedy there
+    /// is theirs to choose.
+    pub fn plan_path_from_selection(
+        &self,
+        role: umber_core::PathRole,
+    ) -> Result<Option<PathPlan>, Notice> {
+        let Some(selection) = self.selection.as_ref() else {
+            return Ok(None);
+        };
+        let paths = umber_core::VectorObject::from_rings(selection.rings(), role);
+        if paths.is_empty() {
+            return Err(path_refusal(
+                umber_core::vector::VectorRefusal::Impossible.sentence(),
+            ));
+        }
+        let active = self.layers.active_index();
+        if let Some(existing) = self.layers.vector_at(active)
+            && !existing.is_opaque()
+            && !self.layers.effective_locked(active)
+            && let Some(slot) = self.layers.active_slot()
+        {
+            let after = existing
+                .appended(paths)
+                .map_err(|why| path_refusal(why.sentence()))?;
+            return match self.layers.can_set_vector(active, &after) {
+                Ok(()) => Ok(Some(PathPlan::Append {
+                    slot,
+                    after: Box::new(after),
+                })),
+                Err(why) => Err(path_refusal(set_refusal_sentence(why))),
+            };
+        }
+        let record = umber_core::VectorObject::empty()
+            .appended(paths)
+            .map_err(|why| path_refusal(why.sentence()))?;
+        let name = match role {
+            umber_core::PathRole::Cut => CUT_LAYER_NAME,
+            umber_core::PathRole::Plot => PLOT_LAYER_NAME,
+            umber_core::PathRole::Ink => INK_LAYER_NAME,
+        };
+        self.plan_new_layer(name, record).map(Some)
+    }
+
+    /// An empty vector layer above the active entry, for the Layers panel's
+    /// mark. The same gate as a layer made from the selection.
+    pub fn plan_new_vector_layer(&self) -> Result<PathPlan, Notice> {
+        self.plan_new_layer(VECTOR_LAYER_NAME, umber_core::VectorObject::empty())
+    }
+
+    /// The refusals a new layer has, in the order the stack states them, and the
+    /// plan where there are none. **One function for both ways in**, so the
+    /// two commands cannot come to refuse different things.
+    fn plan_new_layer(
+        &self,
+        name: &'static str,
+        record: umber_core::VectorObject,
+    ) -> Result<PathPlan, Notice> {
+        // The stack's limits before anything else, one sentence per reason,
+        // because the remedies differ.
+        match self.layers.add_refusal() {
+            Some(umber_core::AddRefusal::StackFull) => {
+                return Err(Notice {
+                    title: "There is no room for another layer".to_string(),
+                    lines: vec![format!(
+                        "This document already has {} entries, which is all Umber holds. \
+                         Delete a layer to make room.",
+                        LayerStack::MAX
+                    )],
+                });
+            }
+            Some(umber_core::AddRefusal::TooDeep) => {
+                return Err(Notice {
+                    title: "That folder is nested as deep as it goes".to_string(),
+                    lines: vec![
+                        "A layer inside it would be one level too deep. Select a layer \
+                         outside it."
+                            .to_string(),
+                    ],
+                });
+            }
+            None => {}
+        }
+        // A layer born inside a locked folder would be locked at once, holding
+        // paths nobody could then change.
+        if self.layers.new_layer_would_be_locked() {
+            return Err(Notice {
+                title: "That folder is locked".to_string(),
+                lines: vec![
+                    "A new layer inside it would be locked too. Unlock the folder, or \
+                     select a layer outside it."
+                        .to_string(),
+                ],
+            });
+        }
+        Ok(PathPlan::NewLayer {
+            name,
+            record: Box::new(record),
+        })
+    }
+
+    /// Carry a plan out and record its one undo entry.
+    ///
+    /// `Err` hands the plan back where the pool has no slice, so the caller can
+    /// give a parked one up and ask again, exactly as `App::add_layer` does. It
+    /// is the only way this answers no, because [`Editor::plan_path_from_selection`]
+    /// has already judged everything else.
+    ///
+    /// **Recording is here and not at the call site**, for the reason
+    /// [`Editor::commit_made_layer`] is: a recording inside `App` is one no
+    /// guard in this crate can drive without a device. A new layer is the
+    /// ordinary structural `EditKind::AddLayer` entry, which carries the layer
+    /// and its record whole, so one Ctrl+Z takes both back; an append is a
+    /// `Paths` entry holding what was there before.
+    pub fn apply_path_plan(&mut self, plan: PathPlan) -> Result<(), PathPlan> {
+        match plan {
+            PathPlan::Append { slot, after } => {
+                let index = self.layers.active_index();
+                match self.layers.set_vector(index, *after.clone()) {
+                    Ok(was) => {
+                        self.history.record(umber_core::Edit::vector(
+                            slot,
+                            was,
+                            Some(umber_core::Timestamp::now()),
+                        ));
+                        self.mark_modified();
+                        Ok(())
+                    }
+                    // Judged a moment ago by the plan, so this is a stack that
+                    // changed between the two. Nothing was written.
+                    Err(_) => Err(PathPlan::Append { slot, after }),
+                }
+            }
+            PathPlan::NewLayer { name, record } => {
+                // Before the add, so restoring the shape takes the layer out.
+                let before = self.layers.shape(self.doc.layer_bytes());
+                match self.layers.add_vector_layer(name, (*record).clone()) {
+                    Some(_) => {
+                        self.history.record(umber_core::Edit::new(
+                            umber_core::EditKind::AddLayer,
+                            before,
+                        ));
+                        self.mark_modified();
+                        Ok(())
+                    }
+                    None => Err(PathPlan::NewLayer { name, record }),
+                }
+            }
+        }
     }
 
     /// Take back a layer a text placement made.
@@ -4183,6 +4404,216 @@ mod tests {
              which is not the step following the camera"
         );
     }
+    // --- paths from the selection ------------------------------------------
+
+    /// An editor with a rectangular selection standing, which is all the
+    /// command needs to see.
+    fn with_a_selection() -> Editor {
+        let mut ed = Editor::default();
+        let doc = ed.doc.size;
+        ed.selection = Some(Arc::new(
+            Selection::rectangle(Vec2::new(10.0, 20.0), Vec2::new(60.0, 80.0), doc)
+                .expect("a rectangle"),
+        ));
+        ed
+    }
+
+    /// Plan and carry out, as the App method does with the device parts left
+    /// out. A refused plan is the notice.
+    fn run_path_command(ed: &mut Editor, role: umber_core::PathRole) -> Result<(), Notice> {
+        match ed.plan_path_from_selection(role)? {
+            Some(plan) => ed.apply_path_plan(plan).map_err(|_| Notice {
+                title: "no slice".to_string(),
+                lines: Vec::new(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// What the stack is, to compare before and after a refusal: every entry's
+    /// identity in order, and the selection among them.
+    fn stack_ids(ed: &Editor) -> (Vec<u32>, usize) {
+        (
+            ed.layers.layers().iter().map(|l| l.id()).collect(),
+            ed.layers.active_index(),
+        )
+    }
+
+    fn active_paths(ed: &Editor) -> Vec<umber_core::Path> {
+        ed.layers
+            .vector_at(ed.layers.active_index())
+            .map(|v| v.paths().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// A rectangle's outline is one closed path of four corners, on a layer made
+    /// for it above the one that was selected, named for what it holds, and
+    /// the whole of it one undo entry that takes the layer back out.
+    #[test]
+    fn a_path_from_a_rectangle_selection_is_four_nodes_on_a_new_layer() {
+        let mut ed = with_a_selection();
+        let was = ed.layers.active_index();
+        let position = ed.history.position();
+
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("room");
+
+        assert_eq!(ed.layers.len(), 2);
+        assert_eq!(ed.layers.active_index(), was + 1, "above the active one");
+        let layer = ed.layers.get(ed.layers.active_index()).unwrap();
+        assert_eq!(layer.name, CUT_LAYER_NAME);
+        assert!(layer.is_vector());
+        let paths = active_paths(&ed);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].nodes.len(), 4);
+        assert!(paths[0].closed);
+        assert_eq!(paths[0].role, umber_core::PathRole::Cut);
+        assert!(ed.selection.is_some(), "the selection stays");
+
+        assert_eq!(ed.history.position(), position + 1, "one entry");
+        let entry = ed.history.take_undo().expect("the add");
+        assert_eq!(entry.kind, umber_core::EditKind::AddLayer);
+        let umber_core::EditBody::Structure(shape) = entry.body else {
+            panic!("a new layer records a shape");
+        };
+        ed.layers.restore_shape(*shape);
+        assert_eq!(ed.layers.len(), 1, "undo took the layer back out");
+        assert!(!ed.layers.has_vector_layers());
+    }
+
+    /// The second command lands on the layer the first made, as an entry that
+    /// puts back exactly the first path.
+    #[test]
+    fn a_second_path_lands_on_the_active_vector_layer() {
+        let mut ed = with_a_selection();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("first");
+        let position = ed.history.position();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("second");
+
+        assert_eq!(ed.layers.len(), 2, "no third layer");
+        assert_eq!(active_paths(&ed).len(), 2);
+        assert_eq!(ed.history.position(), position + 1);
+        let entry = ed.history.take_undo().expect("the append");
+        assert_eq!(entry.kind, umber_core::EditKind::Paths);
+        let umber_core::EditBody::Vector { slot, was } = entry.body else {
+            panic!("an append records a record");
+        };
+        ed.layers.restore_vector(slot, was).expect("the layer");
+        assert_eq!(active_paths(&ed).len(), 1, "undo left the first path");
+    }
+
+    #[test]
+    fn plot_makes_plot_paths() {
+        let mut ed = with_a_selection();
+        run_path_command(&mut ed, umber_core::PathRole::Plot).expect("room");
+        let layer = ed.layers.get(ed.layers.active_index()).unwrap();
+        assert_eq!(layer.name, PLOT_LAYER_NAME);
+        assert_eq!(active_paths(&ed).len(), 1);
+        assert!(
+            active_paths(&ed)
+                .iter()
+                .all(|p| p.role == umber_core::PathRole::Plot)
+        );
+    }
+
+    /// Nothing selected is no plan and no change.
+    #[test]
+    fn no_selection_plans_nothing() {
+        let ed = Editor::default();
+        assert!(
+            ed.plan_path_from_selection(umber_core::PathRole::Cut)
+                .expect("not a refusal")
+                .is_none()
+        );
+    }
+
+    /// **A refusal changes nothing, and a lock or a folder is a different
+    /// answer rather than a refusal.** A locked vector layer sends the paths to
+    /// a layer of their own beside it; a full stack is a sentence with the stack
+    /// byte for byte what it was; a folder selected takes the layer inside it,
+    /// exactly as the Add control does.
+    #[test]
+    fn the_command_changes_nothing_when_refused() {
+        // A locked active vector layer: a new layer instead.
+        let mut ed = with_a_selection();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("first");
+        let made = ed.layers.active_index();
+        ed.layers.get_mut(made).unwrap().locked = true;
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("beside it");
+        assert_eq!(ed.layers.len(), 3);
+        assert_eq!(
+            ed.layers.vector_at(made).unwrap().paths().len(),
+            1,
+            "the locked layer was written to"
+        );
+        assert_eq!(active_paths(&ed).len(), 1);
+
+        // A full stack: a notice, and nothing at all moved.
+        let mut ed = with_a_selection();
+        while ed.layers.len() < LayerStack::MAX {
+            ed.layers.add().expect("room");
+        }
+        let before = stack_ids(&ed);
+        let position = ed.history.position();
+        let notice = run_path_command(&mut ed, umber_core::PathRole::Cut).expect_err("full");
+        assert!(!notice.lines.is_empty());
+        assert_eq!(ed.layers.len(), LayerStack::MAX);
+        assert_eq!(stack_ids(&ed), before);
+        assert_eq!(ed.history.position(), position);
+        assert!(!ed.layers.has_vector_layers());
+
+        // A folder selected: the layer goes inside it, as Add does.
+        let mut ed = with_a_selection();
+        let folder = ed.layers.group(&[0]).expect("a folder");
+        ed.layers.set_active(folder);
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("inside");
+        let layer = ed.layers.get(ed.layers.active_index()).unwrap();
+        assert!(layer.is_vector());
+        assert_eq!(layer.depth, 1, "inside the folder, like Add");
+
+        // And inside a locked folder is a sentence, with nothing changed.
+        let mut ed = with_a_selection();
+        let folder = ed.layers.group(&[0]).expect("a folder");
+        ed.layers.get_mut(folder).unwrap().locked = true;
+        ed.layers.set_active(folder);
+        let before = stack_ids(&ed);
+        let position = ed.history.position();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect_err("locked");
+        assert_eq!(stack_ids(&ed), before);
+        assert_eq!(ed.history.position(), position);
+    }
+
+    /// No sentence the command raises has a run of spaces or a stray edge
+    /// space: a lost `\` continuation pads one with the file's indentation.
+    #[test]
+    fn no_path_notice_has_a_run_of_spaces() {
+        let mut said: Vec<Notice> = Vec::new();
+        let mut ed = with_a_selection();
+        while ed.layers.len() < LayerStack::MAX {
+            ed.layers.add().expect("room");
+        }
+        said.extend(run_path_command(&mut ed, umber_core::PathRole::Cut).err());
+        let mut ed = with_a_selection();
+        let folder = ed.layers.group(&[0]).expect("a folder");
+        ed.layers.get_mut(folder).unwrap().locked = true;
+        ed.layers.set_active(folder);
+        said.extend(run_path_command(&mut ed, umber_core::PathRole::Cut).err());
+        assert_eq!(said.len(), 2, "both refusals must have been raised");
+        for why in [
+            umber_core::VectorSetRefusal::Missing,
+            umber_core::VectorSetRefusal::NotVector,
+            umber_core::VectorSetRefusal::Locked,
+        ] {
+            said.push(path_refusal(set_refusal_sentence(why)));
+        }
+        for notice in said {
+            for text in std::iter::once(&notice.title).chain(notice.lines.iter()) {
+                assert!(!text.contains("  "), "a run of spaces in {text:?}");
+                assert_eq!(text.trim(), text);
+                assert!(!text.contains('\u{2014}'), "an em-dash in {text:?}");
+            }
+        }
+    }
+
     /// A placement makes its layer, records nothing, and gets its one entry at
     /// the commit.
     ///

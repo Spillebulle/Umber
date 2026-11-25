@@ -2734,6 +2734,10 @@ pub struct LayerRow<'a> {
     /// yet. Distinguishing them would mean a spinner on every row of a freshly
     /// opened document for the two frames it takes.
     pub thumb: Option<&'a egui::TextureHandle>,
+    /// A vector layer with nothing to draw but paths: the row shows the path
+    /// mark where a picture would be and no thumbnail is ever asked for. See
+    /// `thumbs::shows_a_path_mark`.
+    pub paths: bool,
     /// Ticked for a bulk operation. Drawn on every row whether or not anything
     /// is ticked: a box that only appeared once you had found the first one is
     /// a feature nobody finds.
@@ -2955,6 +2959,21 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
             painter,
             Rect::from_min_size(thumb.left_top() + vec2(11.0, 5.0), Vec2::splat(14.0)),
             Icon::Folder,
+            if visible && !row.hidden_by_folder {
+                p.text
+            } else {
+                p.text_dim
+            },
+        );
+    } else if row.paths {
+        // The mark where a picture would be, on the plain chip: paths carry no
+        // pixels yet, so a checker would promise a picture the layer does not
+        // have. Dimmed with the eye exactly as the folder mark is.
+        painter.rect_filled(thumb, 3.0, p.window);
+        icons::draw(
+            painter,
+            thumb.shrink(4.0),
+            Icon::Spline,
             if visible && !row.hidden_by_folder {
                 p.text
             } else {

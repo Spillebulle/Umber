@@ -23,6 +23,12 @@ pub enum Action {
     Copy,
     Cut,
     Paste,
+    // The three paths-and-layers commands. Unbound by default: a vector layer
+    // is a new thing and a chord nobody asked for would collide with what a
+    // painter's hands already know, the argument the brush tweaks make.
+    CutPathFromSelection,
+    PlotPathFromSelection,
+    NewVectorLayer,
     FlipCanvasHorizontal,
     FlipCanvasVertical,
     BrushTool,
@@ -67,7 +73,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 39] = [
+    pub const ALL: [Action; 42] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
@@ -77,6 +83,9 @@ impl Action {
         Action::Copy,
         Action::Cut,
         Action::Paste,
+        Action::CutPathFromSelection,
+        Action::PlotPathFromSelection,
+        Action::NewVectorLayer,
         Action::FlipCanvasHorizontal,
         Action::FlipCanvasVertical,
         Action::BrushTool,
@@ -126,6 +135,9 @@ impl Action {
             Action::Copy => "Copy",
             Action::Cut => "Cut",
             Action::Paste => "Paste",
+            Action::CutPathFromSelection => "Cut path from selection",
+            Action::PlotPathFromSelection => "Plot path from selection",
+            Action::NewVectorLayer => "New vector layer",
             Action::FlipCanvasHorizontal => "Flip canvas horizontally",
             Action::FlipCanvasVertical => "Flip canvas vertically",
             Action::BrushTool => "Brush tool",
@@ -177,7 +189,10 @@ impl Action {
             | Action::Deselect
             | Action::Copy
             | Action::Cut
-            | Action::Paste => "Edit",
+            | Action::Paste
+            | Action::CutPathFromSelection
+            | Action::PlotPathFromSelection => "Edit",
+            Action::NewVectorLayer => "Layers",
             // Its own group rather than "Edit": these change the document
             // itself rather than the last thing done to it, and they are the
             // pair every other application files under Image.
@@ -1649,6 +1664,18 @@ mod tests {
         let bindings = defaults();
         for action in Action::ALL {
             if crate::tweaks::of_action(action).is_some() {
+                continue;
+            }
+            // The three vector commands ship unbound, for the tweaks' reason,
+            // and are named here rather than excused by a predicate so that a
+            // fourth has to be added on purpose.
+            if [
+                Action::CutPathFromSelection,
+                Action::PlotPathFromSelection,
+                Action::NewVectorLayer,
+            ]
+            .contains(&action)
+            {
                 continue;
             }
             assert!(
