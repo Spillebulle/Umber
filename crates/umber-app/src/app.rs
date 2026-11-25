@@ -996,13 +996,7 @@ impl UmberApp {
             // from the record, and whoever redraws them is the caller's. `Err`
             // hands the record back when no layer holds the slot, so a refused
             // step loses nothing.
-            EditBody::Vector { slot, was } => match self.editor.layers.restore_vector(slot, was) {
-                Ok(previous) => Ok(EditBody::Vector {
-                    slot,
-                    was: previous,
-                }),
-                Err(was) => Err(EditBody::Vector { slot, was }),
-            },
+            EditBody::Vector { slot, was } => reverse_vector(&mut self.editor.layers, slot, was),
         }
     }
 
@@ -1222,7 +1216,10 @@ impl UmberApp {
         // the arrangement that gate exists to replace: one call, one answer, and
         // the interface can say *which*.
         //
-        // A *paste* says so and a lift does not, which is not an inconsistency:
+        // A *paste* says so and a lift does not, with one exception: a lift on
+        // a vector layer, which has no pixels to take and would otherwise do
+        // nothing at all with nothing said (`float_refusal_notice`). That is
+        // not an inconsistency either, but read the rest first:
         // a paste is an explicit command with one obvious outcome, where a
         // press on the canvas with the transform tool in hand happens every
         // time somebody puts the pen down. A notice raised by that would be a
@@ -1246,8 +1243,8 @@ impl UmberApp {
             .active_refusal(umber_core::EditTarget::Layer)
             .filter(|why| pixels.is_some() || *why != EditRefusal::Text);
         if let Some(why) = refusal {
-            if pixels.is_some() {
-                self.editor.notice = Some(paste_refusal(why));
+            if let Some(notice) = float_refusal_notice(why, pixels.is_some()) {
+                self.editor.notice = Some(notice);
             }
             return false;
         }
@@ -1903,46 +1900,17 @@ impl UmberApp {
         //
         // Exhaustive with no catch-all, so a fifth refusal cannot arrive
         // without somebody deciding whether a cut is allowed through it.
-        match self
+        if let Some(why) = self
             .editor
             .layers
             .active_refusal(umber_core::EditTarget::Layer)
         {
-            Some(EditRefusal::Locked) => {
-                self.editor.notice = Some(Notice {
-                    title: "The layer is locked".to_string(),
-                    lines: vec![
-                        "Nothing was cut. Unlock the layer in the Layers panel, or select \
-                         another one, and cut again."
-                            .to_string(),
-                    ],
-                });
-                return;
+            // Silent for a folder and a missing layer, which the `active_slot`
+            // read below would return for anyway.
+            if let Some(notice) = cut_refusal(why) {
+                self.editor.notice = Some(notice);
             }
-            Some(EditRefusal::Text) => {
-                self.editor.notice = Some(Notice {
-                    title: "This layer holds text".to_string(),
-                    lines: vec![
-                        "Nothing was cut. The text on this layer can still be set again, \
-                         so nothing may be taken out of it. Convert it to paint in the \
-                         Text panel, or select another layer."
-                            .to_string(),
-                    ],
-                });
-                return;
-            }
-            Some(EditRefusal::Vector) => {
-                self.editor.notice = Some(Notice {
-                    title: "This is a vector layer".to_string(),
-                    lines: vec![CUT_VECTOR_LINE.to_string()],
-                });
-                return;
-            }
-            // Silent, for the reason the copy above is silent about a folder: a
-            // folder is a perfectly ordinary thing to have selected, and the
-            // `active_slot` read below already returns for both of these.
-            Some(EditRefusal::Folder | EditRefusal::Missing) => return,
-            None => {}
+            return;
         }
         let (rect, mask) = self.take_region();
         // Nothing to cut out of a folder: it holds no pixels of its own, so
@@ -2637,7 +2605,12 @@ impl UmberApp {
     fn clear_active_layer(&mut self) {
         // **The one gate a lock has on clearing.** The menu item is disabled to
         // match, so this only catches a shortcut.
-        if self.editor.layers.active_is_locked() {
+        //
+        // **And the vector layer's.** It has no pixels to clear, and the
+        // history is thrown out below, so letting a clear through would cost
+        // somebody their undo for a command that did nothing. The menu item is
+        // disabled from the same reading, `editor::clear_layer_refusal`.
+        if editor::clear_layer_refusal(&self.editor.layers).is_some() {
             return;
         }
         // Abandoned rather than committed: clearing the layer is the artist
@@ -4967,7 +4940,9 @@ impl UmberApp {
         // is the scheduler's.
         self.stop_autosave_of(id);
         let doc = change.doc;
-        let resized = self.editor.apply_canvas(doc);
+        let resized = self.editor.apply_canvas(doc, change.anchor);
+        // The paths moved by the same plan the pixels are about to, in the
+        // model; what is left is the repaint, which is below.
         // What the new array has to hold. Read *after* `apply_canvas`, which is
         // what drops the selection and clears the history — neither of which
         // moves a claim, but the number has to be the one the stack ends the
@@ -6506,6 +6481,10 @@ fn save_layer<'a>(
         // paint with nothing said. `docformat` takes the fingerprint from the
         // image *this* save is writing, so nothing stale can be handed over.
         text: layer.text(),
+        // And the paths, for the same reason and with the same silence: a save
+        // that forgot this would write a vector layer back as an ordinary one,
+        // and nothing would say a layer had stopped being editable.
+        vector: layer.vector(),
         clipped: layer.clipped,
         locked: layer.locked,
         link: layer.link,
@@ -6698,6 +6677,25 @@ fn swap_text_at_slot(
     held
 }
 
+/// `App::reverse`'s vector arm, as a function so it can be driven without an
+/// `UmberApp`, which cannot be built in a test.
+///
+/// `Err` hands the record back when no layer holds the slot, so a refused step
+/// loses nothing and the entry returns to the stack it came from.
+fn reverse_vector(
+    layers: &mut umber_core::LayerStack,
+    slot: u32,
+    was: Option<Box<umber_core::VectorObject>>,
+) -> Result<EditBody, EditBody> {
+    match layers.restore_vector(slot, was) {
+        Ok(previous) => Ok(EditBody::Vector {
+            slot,
+            was: previous,
+        }),
+        Err(was) => Err(EditBody::Vector { slot, was }),
+    }
+}
+
 /// The smallest rectangle holding both.
 ///
 /// A free function so the arithmetic is checked without a device, which is what
@@ -6821,6 +6819,71 @@ fn flip_step_refusal(step: &'static str) -> Notice {
     }
 }
 
+/// The cut's sentence for a vector layer, a const for the reason the paste's is:
+/// a test reads the sentence a lost line continuation would pad with spaces.
+const CUT_VECTOR_LINE: &str =
+    "Nothing was cut. This is a vector layer. Cut from an ordinary layer instead.";
+
+/// A const and not a literal in the match, so a test can read the sentence a
+/// lost line continuation would otherwise pad with spaces.
+const PASTE_VECTOR_LINE: &str =
+    "Nothing was pasted. This is a vector layer. Paste onto an ordinary layer instead.";
+
+/// What a lift with the transform tool says on a vector layer. A lift has no
+/// pixels to take there, and the layer has no paths to move yet.
+const LIFT_VECTOR_LINE: &str = "This is a vector layer. There is nothing here to move yet.";
+
+/// What a lift (a press with the transform tool, not a paste) says about a
+/// refusal, if anything.
+///
+/// A paste always says so, in [`paste_refusal`]'s words. A lift is a press on
+/// the canvas and happens every time the pen goes down, so it stays silent for
+/// every reason except the vector layer, which the artist asked for by choosing
+/// the transform tool on a layer that has nothing to lift. Exhaustive with no
+/// catch-all, so a fifth refusal has to decide which of the two it is.
+fn float_refusal_notice(why: EditRefusal, paste: bool) -> Option<Notice> {
+    if paste {
+        return Some(paste_refusal(why));
+    }
+    match why {
+        EditRefusal::Vector => Some(Notice {
+            title: "This is a vector layer".to_string(),
+            lines: vec![LIFT_VECTOR_LINE.to_string()],
+        }),
+        // Locked, a folder and nothing selected are ordinary states a press
+        // lands on; `Text` is let through the gate for a lift, so it never
+        // arrives here at all.
+        EditRefusal::Locked | EditRefusal::Folder | EditRefusal::Text | EditRefusal::Missing => {
+            None
+        }
+    }
+}
+
+/// What a refused cut says, or `None` where the refusal is silent.
+///
+/// A folder is a perfectly ordinary thing to have selected and nothing is
+/// selected only by accident, so both stay quiet; the other three say what did
+/// not happen. Exhaustive with no catch-all, and a free function so the
+/// sentence that is *shown* is the one a test can read.
+fn cut_refusal(why: EditRefusal) -> Option<Notice> {
+    let (title, line) = match why {
+        EditRefusal::Locked => (
+            "The layer is locked",
+            "Nothing was cut. Unlock the layer in the Layers panel, or select              another one, and cut again.",
+        ),
+        EditRefusal::Text => (
+            "This layer holds text",
+            "Nothing was cut. The text on this layer can still be set again,              so nothing may be taken out of it. Convert it to paint in the              Text panel, or select another layer.",
+        ),
+        EditRefusal::Vector => ("This is a vector layer", CUT_VECTOR_LINE),
+        EditRefusal::Folder | EditRefusal::Missing => return None,
+    };
+    Some(Notice {
+        title: title.to_string(),
+        lines: vec![line.to_string()],
+    })
+}
+
 /// What to tell somebody whose paste was refused.
 ///
 /// A free function for the reason [`combined_selection_op`] is one: the sentences
@@ -6832,14 +6895,6 @@ fn flip_step_refusal(step: &'static str) -> Notice {
 /// without somebody writing what it means for a paste. The wording is the
 /// paste's own rather than [`EditRefusal::reason`]'s: that one is written for a
 /// painting gesture, and this has to say what was *not pasted* and where to go.
-const CUT_VECTOR_LINE: &str =
-    "Nothing was cut. This is a vector layer. Cut from an ordinary layer instead.";
-
-/// A const and not a literal in the match, so a test can read the sentence a
-/// lost line continuation would otherwise pad with spaces.
-const PASTE_VECTOR_LINE: &str =
-    "Nothing was pasted. This is a vector layer. Paste onto an ordinary layer instead.";
-
 fn paste_refusal(why: EditRefusal) -> Notice {
     let (title, line) = match why {
         EditRefusal::Locked => (
@@ -7671,29 +7726,8 @@ mod tests {
         //   moment somebody wrote down what the guard was for. So the source is
         //   cut at `//` first. That can clip a string holding a `//`, which
         //   only ever lowers a count and therefore only makes this stricter.
-        let uncommented = |source: &str| {
-            source
-                .lines()
-                .map(|line| line.split("//").next().unwrap_or(line))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let named = |source: &str, field: &str| {
-            source
-                .match_indices(field)
-                .filter(|(at, _)| {
-                    let before = source[..*at]
-                        .chars()
-                        .next_back()
-                        .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != ':');
-                    let after = source[at + field.len()..]
-                        .chars()
-                        .next()
-                        .is_none_or(|c| c != ':');
-                    before && after
-                })
-                .count()
-        };
+        let uncommented = uncommented_source;
+        let named = count_named;
         for (file, whole) in [
             ("app.rs", include_str!("app.rs")),
             ("autosave.rs", include_str!("autosave.rs")),
@@ -7720,6 +7754,233 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `source` with everything from each `//` to the end of its line removed.
+    ///
+    /// Shared by the two construction-site guards, so the rule for what counts
+    /// as a statement of a field is stated once. See the long comment inside
+    /// `every_writer_of_a_save_layer_states_its_effects_and_its_text` for why it
+    /// is what it is.
+    fn uncommented_source(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How many times `field` is named as a field in `source`: at a word
+    /// boundary, and not as the first half of a path.
+    fn count_named(source: &str, field: &str) -> usize {
+        source
+            .match_indices(field)
+            .filter(|(at, _)| {
+                let before = source[..*at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != ':');
+                let after = source[at + field.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c != ':');
+                before && after
+            })
+            .count()
+    }
+
+    /// **Both writers of a document name `vector:`**, the twin of the guard above
+    /// for the field whose absence is the same kind of silent.
+    ///
+    /// `..SaveLayer::new` writes `None`, so a writer that forgot the field would
+    /// write a vector layer back as an ordinary one: every pixel intact, the
+    /// paths gone, and nothing anywhere saying so. Both writers were wired in
+    /// one change for the reason `text:` was.
+    ///
+    /// It counts at the same word boundary and outside comments (see the guard
+    /// above, which measured both), and **that is its whole reach**: it sees that
+    /// a construction site names the field, not that it names it right. The
+    /// behavioural half is `an_autosave_writes_the_paths_a_save_does`, and the
+    /// save path's is `a_save_layer_carries_the_vector_record_the_layer_holds`.
+    ///
+    /// Mutated: deleting Save's `vector:` line fails this on 0 against 1.
+    /// Deleting the autosave's passes it, `autosave.rs` naming the field on
+    /// `LayerMeta` and in `snapshot` as well, and fails the behavioural test.
+    #[test]
+    fn save_and_the_autosave_both_carry_the_vector_record() {
+        for (file, whole) in [
+            ("app.rs", include_str!("app.rs")),
+            ("autosave.rs", include_str!("autosave.rs")),
+        ] {
+            let source = uncommented_source(whole.split("#[cfg(test)]").next().unwrap_or(whole));
+            let literals = source.match_indices("SaveLayer {").count();
+            assert!(literals > 0, "{file} builds no SaveLayer any more");
+            let stated = count_named(&source, "vector:");
+            assert!(
+                stated >= literals,
+                "{file} builds {literals} SaveLayer(s) outside its tests and names \
+                 `vector:` {stated} time(s); `..SaveLayer::new` supplies `None`, so \
+                 the one that does not writes a vector layer back as an ordinary one"
+            );
+        }
+    }
+
+    /// The Save path's own helper hands the layer's record to the writer, which
+    /// is the half of the guard above that reads *what* was named.
+    #[test]
+    fn a_save_layer_carries_the_vector_record_the_layer_holds() {
+        let mut stack = umber_core::LayerStack::new();
+        let record = vector_record();
+        let at = stack
+            .add_vector_layer("Paths", record.clone())
+            .expect("room");
+        let layer = stack.get(at).expect("added");
+        let saved = save_layer(layer, umber_core::docformat::Canvas::Deferred, None);
+        assert_eq!(saved.vector, Some(&record), "Save dropped the paths");
+        let plain = save_layer(
+            stack.get(0).expect("the first layer"),
+            umber_core::docformat::Canvas::Deferred,
+            None,
+        );
+        assert!(plain.vector.is_none());
+    }
+
+    /// A record with something in it, for the tests that need paths to compare.
+    fn vector_record() -> umber_core::VectorObject {
+        umber_core::VectorObject::empty()
+            .appended(vec![umber_core::Path {
+                role: umber_core::PathRole::Cut,
+                closed: false,
+                nodes: vec![
+                    umber_core::Node::corner(glam::Vec2::new(5.0, 6.0)),
+                    umber_core::Node::corner(glam::Vec2::new(50.0, 60.0)),
+                ],
+                ink: None,
+            }])
+            .expect("a small record is legal")
+    }
+
+    /// **Undo puts the old record back and redo the new one**, through the same
+    /// function `App::reverse`'s vector arm is, with the entry `Edit::vector`
+    /// records.
+    ///
+    /// The slot is what names the layer, so the layer is reordered between the
+    /// edit and the undo: a position recorded beside the entry would put the
+    /// paths on whichever layer had moved into that row.
+    #[test]
+    fn undoing_a_path_edit_puts_the_old_record_back_and_redo_the_new() {
+        let mut ed = Editor::default();
+        let old = vector_record();
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", old.clone())
+            .expect("room");
+        let slot = ed.layers.get(at).and_then(umber_core::Layer::slot).unwrap();
+        // The edit: a longer record replaces the old one, and the entry holds
+        // what was there.
+        let new = old
+            .appended(vec![umber_core::Path {
+                role: umber_core::PathRole::Plot,
+                closed: true,
+                nodes: vec![
+                    umber_core::Node::corner(glam::Vec2::new(1.0, 2.0)),
+                    umber_core::Node::corner(glam::Vec2::new(3.0, 4.0)),
+                ],
+                ink: None,
+            }])
+            .expect("legal");
+        let was = ed
+            .layers
+            .set_vector(at, new.clone())
+            .expect("allowed")
+            .expect("it held one");
+        ed.history.record(Edit::vector(
+            slot,
+            Some(was),
+            Some(umber_core::Timestamp::from_unix_millis(1)),
+        ));
+        assert!(ed.layers.reorder(at, 0), "moved beneath the plain layer");
+
+        // Undo, as `App::undo` does it.
+        let edit = ed.history.take_undo().expect("recorded");
+        assert_eq!(edit.kind, EditKind::Paths);
+        let inverse = reverse_vector_for_test(&mut ed, edit.body).expect("found by slot");
+        ed.history
+            .push_redo(Edit::made_at(edit.kind, edit.at, inverse));
+        assert_eq!(ed.layers.vector_at(0), Some(&old), "undo did not restore");
+
+        // Redo, as `App::redo` does it.
+        let edit = ed.history.take_redo().expect("pushed");
+        let inverse = reverse_vector_for_test(&mut ed, edit.body).expect("found by slot");
+        ed.history
+            .push_undo(Edit::made_at(edit.kind, edit.at, inverse));
+        assert_eq!(ed.layers.vector_at(0), Some(&new), "redo did not reapply");
+    }
+
+    /// Drives `reverse_vector` with a body the way `App::reverse` hands it one.
+    fn reverse_vector_for_test(ed: &mut Editor, body: EditBody) -> Result<EditBody, EditBody> {
+        match body {
+            EditBody::Vector { slot, was } => reverse_vector(&mut ed.layers, slot, was),
+            EditBody::Pixels(_)
+            | EditBody::Structure(_)
+            | EditBody::Flip
+            | EditBody::Text { .. } => panic!("not a vector entry"),
+        }
+    }
+
+    /// A step that cannot find the layer loses nothing: the record comes back in
+    /// the `Err`, which is what lets the entry return to the stack it left.
+    #[test]
+    fn a_refused_path_undo_hands_the_record_back() {
+        let mut layers = umber_core::LayerStack::new();
+        let record = Box::new(vector_record());
+        match reverse_vector(&mut layers, 999, Some(record.clone())) {
+            Err(EditBody::Vector { slot, was }) => {
+                assert_eq!(slot, 999);
+                assert_eq!(was, Some(record));
+            }
+            Ok(_) | Err(_) => panic!("a missing slot was carried out or lost the record"),
+        }
+    }
+
+    /// **What a cut says on a vector layer is `CUT_VECTOR_LINE`**, the sentence
+    /// `cut_selection` raises, and a lift says its own and a paste its own.
+    ///
+    /// Through the functions the commands call, because `UmberApp` cannot be
+    /// built in a test.
+    #[test]
+    fn the_notice_a_refused_cut_lift_and_paste_raise_for_a_vector_layer_is_the_const() {
+        let cut = cut_refusal(EditRefusal::Vector).expect("a cut says so");
+        assert_eq!(cut.lines, vec![CUT_VECTOR_LINE.to_string()]);
+        let paste = float_refusal_notice(EditRefusal::Vector, true).expect("a paste says so");
+        assert_eq!(paste.lines, vec![PASTE_VECTOR_LINE.to_string()]);
+        let lift = float_refusal_notice(EditRefusal::Vector, false).expect("a lift says so");
+        assert_eq!(
+            lift.lines,
+            vec!["This is a vector layer. There is nothing here to move yet.".to_string()]
+        );
+        // The three differ: a notice that says "pasted" over a lift is wrong.
+        assert_ne!(cut.lines, paste.lines);
+        assert_ne!(lift.lines, paste.lines);
+        for line in [&cut.lines[0], &lift.lines[0], &paste.lines[0]] {
+            assert!(!line.contains('\u{2014}'), "{line:?}");
+            assert!(!line.contains("  "), "{line:?}");
+        }
+    }
+
+    /// A press with the transform tool on every other refusal stays silent, as
+    /// it always did, and a cut on a folder or no layer does too. The pen going
+    /// down is not a dialog.
+    #[test]
+    fn only_a_vector_layer_makes_a_lift_speak() {
+        for why in EditRefusal::ALL {
+            let said = float_refusal_notice(why, false).is_some();
+            assert_eq!(said, why == EditRefusal::Vector, "{why:?}");
+        }
+        assert!(cut_refusal(EditRefusal::Folder).is_none());
+        assert!(cut_refusal(EditRefusal::Missing).is_none());
+        assert!(cut_refusal(EditRefusal::Locked).is_some());
+        assert!(cut_refusal(EditRefusal::Text).is_some());
     }
 
     /// The box a refused Ctrl+Z or Ctrl+Y raises says what did not happen, in

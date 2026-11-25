@@ -1996,13 +1996,15 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // canvas dialog's own line: clearing is the last command that
     // is not an undoable edit, so it takes the history with it and
     // there is no way back afterwards.
+    //
+    // Enabled and worded from `clear_layer_refusal`, the reading
+    // `App::clear_active_layer` gates on, so the item cannot be lit for
+    // something the command declines.
+    let why_not = crate::editor::clear_layer_refusal(&ed.layers);
     if ui
-        .add_enabled(
-            !ed.layers.active_is_locked(),
-            egui::Button::new("Clear layer"),
-        )
+        .add_enabled(why_not.is_none(), egui::Button::new("Clear layer"))
         .on_hover_text("Empties the layer, and clears the undo history with it.")
-        .on_disabled_hover_text("Unlock the layer to clear it.")
+        .on_disabled_hover_text(why_not.unwrap_or_default())
         .clicked()
     {
         actions.clear = true;

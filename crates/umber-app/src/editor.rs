@@ -299,6 +299,35 @@ pub struct MadeLayer {
     pub before: Box<umber_core::StackShape>,
 }
 
+/// What a resize says when it takes the Ink off a vector layer's paths.
+///
+/// A const so a test can read the sentence that was shown.
+pub const VECTOR_INK_LINE: &str =
+    "Strokes on vector layers became ordinary paint, because the canvas changed size.";
+
+/// The sentence on a disabled "Clear layer" over a vector layer.
+pub const CLEAR_VECTOR_TIP: &str =
+    "A vector layer has no paint to clear. Delete the layer to remove its paths.";
+
+/// Why the active layer cannot be cleared, or `None` where it can.
+///
+/// **The one statement**, read by the menu item's enabled state and its
+/// tooltip and by `App::clear_active_layer`'s own gate, so a control cannot be
+/// lit for something the command then declines. Lock first: unlocking is the
+/// remedy that costs nothing, and a vector layer's remedy is to delete it.
+pub fn clear_layer_refusal(layers: &umber_core::LayerStack) -> Option<&'static str> {
+    if layers.active_is_locked() {
+        return Some("Unlock the layer to clear it.");
+    }
+    if layers
+        .get(layers.active_index())
+        .is_some_and(umber_core::Layer::is_vector)
+    {
+        return Some(CLEAR_VECTOR_TIP);
+    }
+    None
+}
+
 /// "one text layer" or "3 text layers", for a notice that has to count them.
 ///
 /// A function rather than `"{n} text layer(s)"` because a bracketed plural is a
@@ -1674,8 +1703,11 @@ impl Editor {
     ///
     /// The history is cleared here rather than left to the caller so it cannot
     /// be forgotten by one of two call sites.
-    pub fn apply_canvas(&mut self, doc: Document) -> bool {
+    pub fn apply_canvas(&mut self, doc: Document, anchor: umber_core::Anchor) -> bool {
         let resized = doc.size != self.doc.size;
+        // Read before `self.doc` is replaced: the plan is a statement about the
+        // old canvas and the new one together.
+        let moved = umber_core::CanvasCopy::plan(self.doc.size, doc.size, anchor);
         // Only a real change is a change: pressing Apply on a dialog nobody
         // touched must not put a dot on the tab and start asking about
         // unsaved work.
@@ -1713,6 +1745,30 @@ impl Editor {
                         text_layers(dropped)
                     )],
                 });
+            }
+            // **A vector layer's paths move with the picture instead.** Unlike
+            // a text placement they are exact under a translation, and the
+            // offset is the one the pixels move by: `CanvasCopy::plan`'s
+            // destination minus its source, which is the same plan
+            // `CanvasRenderer::resize` copies by, so the paths cannot disagree
+            // with the pixels about where the picture went. A shrink may carry
+            // a path off the canvas, which is legal: a path is geometry, and
+            // the part that is gone was never going to be drawn.
+            let by = moved.to.as_vec2() - moved.from.as_vec2();
+            let inked = self.layers.translate_vectors(by);
+            if inked > 0 {
+                // Appended to a notice already up rather than replacing it, so
+                // a document holding both kinds of layer hears about both.
+                let line = VECTOR_INK_LINE.to_string();
+                match self.notice.as_mut() {
+                    Some(up) => up.lines.push(line),
+                    None => {
+                        self.notice = Some(Notice {
+                            title: "Strokes are paint now".to_string(),
+                            lines: vec![line],
+                        })
+                    }
+                }
             }
             // Keep the zoom, but not the ability to be looking at a part of the
             // canvas that no longer exists.
@@ -1829,6 +1885,11 @@ impl Editor {
         // `Placement::flipped` — which is why a flip does not cost a text layer
         // its record the way a resize does, and it has to be, because undoing a
         // flip is another flip.
+        // And a vector layer's paths, which are exact under a mirror (Ink
+        // included, since the pixels it describes are mirrored by this same
+        // flip), so a flip takes nothing from a vector layer and its undo,
+        // which is another flip, puts every node back where it was.
+        self.layers.flip_vectors(axis, doc);
         let dropped = self.layers.flip_text(axis, doc);
         if dropped > 0 {
             // Rare rather than unreachable, and the difference is worth stating.
@@ -3371,6 +3432,190 @@ mod tests {
         assert!(ed.notice.is_none(), "nothing was lost, so nothing is said");
     }
 
+    /// One path of one node, for the vector tests below.
+    fn a_path_at(at: Vec2, ink: bool) -> umber_core::Path {
+        umber_core::Path {
+            role: if ink {
+                umber_core::PathRole::Ink
+            } else {
+                umber_core::PathRole::Cut
+            },
+            closed: false,
+            // Two nodes at least: `VectorObject::check` refuses a path of one.
+            nodes: vec![
+                umber_core::Node::corner(at),
+                umber_core::Node::corner(at + Vec2::new(20.0, 20.0)),
+            ],
+            ink: ink.then(|| umber_core::vector::Ink {
+                brush: "round".into(),
+                size: 4.0,
+                colour: [0.1, 0.2, 0.3, 1.0],
+            }),
+        }
+    }
+
+    fn a_record_of(paths: Vec<umber_core::Path>) -> umber_core::VectorObject {
+        umber_core::VectorObject::empty()
+            .appended(paths)
+            .expect("a small record is legal")
+    }
+
+    /// **A canvas flip mirrors a vector layer's paths with its pixels, and its
+    /// undo, which is another flip, puts every node back.**
+    ///
+    /// At `Editor::flip_canvas`, the one place a flip reaches the model, and
+    /// called for the flip and again for the undo. Ink is mirrored too, which is
+    /// the difference from a resize.
+    #[test]
+    fn a_canvas_flip_and_its_undo_leave_paths_where_they_were() {
+        use umber_core::FlipAxis;
+        let mut ed = Editor::default();
+        let before = a_record_of(vec![
+            a_path_at(Vec2::new(10.0, 20.0), false),
+            a_path_at(Vec2::new(30.0, 40.0), true),
+        ]);
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", before.clone())
+            .expect("room");
+        let width = ed.doc.size.x as f32;
+
+        ed.flip_canvas(FlipAxis::Horizontal);
+        let flipped = ed.layers.vector_at(at).expect("still a record").clone();
+        assert_eq!(
+            flipped.paths()[0].nodes[0].at,
+            Vec2::new(width - 10.0, 20.0)
+        );
+        assert!(flipped.has_ink(), "a flip keeps Ink, a resize does not");
+        assert_ne!(flipped, before, "nothing was mirrored at all");
+
+        ed.flip_canvas(FlipAxis::Horizontal);
+        assert_eq!(ed.layers.vector_at(at), Some(&before));
+        assert!(ed.notice.is_none(), "nothing was lost, so nothing is said");
+    }
+
+    /// **A resize moves paths by exactly the offset the pixels move by**, which
+    /// is `CanvasCopy::plan`'s destination minus its source, whatever the
+    /// anchor and whether the canvas grew or was cropped.
+    #[test]
+    fn a_resize_moves_paths_with_the_picture() {
+        use umber_core::{Anchor, CanvasCopy};
+        let start = Vec2::new(10.0, 10.0);
+        let base = Editor::default().doc.size;
+        // The plan is what the GPU copies by, so the paths are checked against
+        // it and not against arithmetic restated here.
+        for new in [
+            glam::UVec2::new(base.x + 100, base.y + 50),
+            glam::UVec2::new(base.x - 100, base.y - 50),
+            glam::UVec2::new(base.x + 100, base.y - 50),
+        ] {
+            for anchor in Anchor::GRID {
+                let mut ed = Editor::default();
+                let at = ed
+                    .layers
+                    .add_vector_layer("Paths", a_record_of(vec![a_path_at(start, false)]))
+                    .expect("room");
+                assert!(ed.apply_canvas(Document::new(new.x, new.y), anchor));
+                let plan = CanvasCopy::plan(base, new, anchor);
+                let by = plan.to.as_vec2() - plan.from.as_vec2();
+                assert_eq!(
+                    ed.layers.vector_at(at).expect("kept").paths()[0].nodes[0].at,
+                    start + by,
+                    "{anchor:?} to {new}"
+                );
+                assert!(ed.notice.is_none(), "geometry moved cleanly: said nothing");
+            }
+        }
+        // And one answer written out, which is what tells a real offset from a
+        // plan read the wrong way round: half of (100, 50) is (50, 25).
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", a_record_of(vec![a_path_at(start, false)]))
+            .expect("room");
+        assert!(ed.apply_canvas(
+            Document::new(base.x + 100, base.y + 50),
+            umber_core::Anchor::Centre
+        ));
+        assert_eq!(
+            ed.layers.vector_at(at).unwrap().paths()[0].nodes[0].at,
+            Vec2::new(60.0, 35.0)
+        );
+    }
+
+    /// A resize strips Ink and says so once, and says nothing for a size that
+    /// did not change.
+    #[test]
+    fn a_resize_that_strips_ink_says_so() {
+        use umber_core::Anchor;
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer(
+                "Inked",
+                a_record_of(vec![a_path_at(Vec2::new(5.0, 5.0), true)]),
+            )
+            .expect("room");
+        let same = ed.doc;
+        assert!(!ed.apply_canvas(same, Anchor::Centre));
+        assert!(ed.notice.is_none(), "an untouched dialog said something");
+        assert!(ed.layers.vector_at(at).unwrap().has_ink());
+
+        let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
+        assert!(ed.apply_canvas(bigger, Anchor::TopLeft));
+        assert!(!ed.layers.vector_at(at).unwrap().has_ink());
+        let notice = ed.notice.as_ref().expect("the loss was silent");
+        assert_eq!(notice.lines, vec![VECTOR_INK_LINE.to_string()]);
+        assert!(!VECTOR_INK_LINE.contains('\u{2014}'));
+    }
+
+    /// With text and inked paths both in the document the resize says both,
+    /// rather than the second notice replacing the first.
+    #[test]
+    fn a_resize_that_loses_text_and_ink_says_both() {
+        let mut ed = Editor::default();
+        assert!(ed.layers.set_text(0, a_record("A caption")));
+        ed.layers
+            .add_vector_layer(
+                "Inked",
+                a_record_of(vec![a_path_at(Vec2::new(5.0, 5.0), true)]),
+            )
+            .expect("room");
+        let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
+        assert!(ed.apply_canvas(bigger, umber_core::Anchor::Centre));
+        let notice = ed.notice.as_ref().expect("said");
+        assert_eq!(notice.lines.len(), 2, "{:?}", notice.lines);
+        assert!(notice.lines[0].contains("one text layer"));
+        assert_eq!(notice.lines[1], VECTOR_INK_LINE);
+    }
+
+    /// "Clear layer" is refused on a vector layer by the one reading the menu
+    /// item and the command share, and lock still comes first.
+    #[test]
+    fn clear_layer_is_refused_on_a_vector_layer() {
+        let mut ed = Editor::default();
+        assert_eq!(
+            clear_layer_refusal(&ed.layers),
+            None,
+            "a plain layer clears"
+        );
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", umber_core::VectorObject::empty())
+            .expect("room");
+        assert_eq!(clear_layer_refusal(&ed.layers), Some(CLEAR_VECTOR_TIP));
+        assert_eq!(
+            CLEAR_VECTOR_TIP,
+            "A vector layer has no paint to clear. Delete the layer to remove its paths."
+        );
+        ed.layers.get_mut(at).unwrap().locked = true;
+        assert_eq!(
+            clear_layer_refusal(&ed.layers),
+            Some("Unlock the layer to clear it."),
+            "a locked one is told to unlock first"
+        );
+    }
+
     /// **A resize takes every record off and says how many**, for the reason it
     /// clears the history: a placement is a rectangle of a canvas that no longer
     /// exists, and a canvas that shrank has cropped the pixels the record
@@ -3387,7 +3632,7 @@ mod tests {
 
         // The same size is not a resize.
         let same = ed.doc;
-        assert!(!ed.apply_canvas(same));
+        assert!(!ed.apply_canvas(same, umber_core::Anchor::Centre));
         assert!(
             ed.layers.text_at(0).is_some(),
             "an untouched dialog dropped it"
@@ -3395,7 +3640,7 @@ mod tests {
         assert!(ed.notice.is_none());
 
         let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
-        assert!(ed.apply_canvas(bigger));
+        assert!(ed.apply_canvas(bigger, umber_core::Anchor::Centre));
         assert!(
             ed.layers.text_at(0).is_none(),
             "a resized document kept a placement of the canvas it no longer has"
