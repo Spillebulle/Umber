@@ -59,6 +59,7 @@ mod panels;
 /// twice before it was written once.
 #[cfg(test)]
 mod paneltest;
+mod pathtool;
 mod prefs;
 mod recoverdlg;
 mod session;
