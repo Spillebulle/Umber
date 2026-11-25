@@ -416,6 +416,37 @@ impl VectorObject {
         Ok(next)
     }
 
+    /// This record with path `index` replaced by `path`, or why not. Changes
+    /// nothing on a refusal. An index off the end is `Impossible`, since there
+    /// is no path to replace.
+    pub fn with_path(&self, index: usize, path: Path) -> Result<Self, VectorRefusal> {
+        let mut paths = match self {
+            VectorObject::Paths(p) => p.clone(),
+            VectorObject::Opaque(_) => return Err(VectorRefusal::Opaque),
+        };
+        let slot = paths.get_mut(index).ok_or(VectorRefusal::Impossible)?;
+        *slot = path;
+        let next = VectorObject::Paths(paths);
+        next.check()?;
+        Ok(next)
+    }
+
+    /// This record with path `index` taken out and the rest shifted down, or
+    /// why not.
+    pub fn without_path(&self, index: usize) -> Result<Self, VectorRefusal> {
+        let mut paths = match self {
+            VectorObject::Paths(p) => p.clone(),
+            VectorObject::Opaque(_) => return Err(VectorRefusal::Opaque),
+        };
+        if index >= paths.len() {
+            return Err(VectorRefusal::Impossible);
+        }
+        paths.remove(index);
+        let next = VectorObject::Paths(paths);
+        next.check()?;
+        Ok(next)
+    }
+
     /// The record on a mirrored canvas.
     ///
     /// A flip is **not** exactly its own inverse in `f32`: `c - (c - x)` rounds
@@ -788,6 +819,40 @@ mod tests {
         let mut cut = open(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]);
         cut.closed = true;
         VectorObject::Paths(vec![cut, curved])
+    }
+
+    #[test]
+    fn replacing_a_path_out_of_bounds_is_refused() {
+        let far = open(&[(0.0, 0.0), (MAX_COORD * 2.0, 0.0)]);
+        assert_eq!(fixture().with_path(0, far), Err(VectorRefusal::Impossible));
+        let fine = open(&[(0.0, 0.0), (3.0, 0.0)]);
+        let got = fixture().with_path(1, fine.clone()).unwrap();
+        assert_eq!(got.paths()[1], fine);
+        assert_eq!(got.paths().len(), 2);
+    }
+
+    #[test]
+    fn an_opaque_record_takes_no_replacement() {
+        let opaque = VectorObject::Opaque(vec![1, 2, 3]);
+        let p = open(&[(0.0, 0.0), (1.0, 0.0)]);
+        assert_eq!(opaque.with_path(0, p), Err(VectorRefusal::Opaque));
+        assert_eq!(opaque.without_path(0), Err(VectorRefusal::Opaque));
+    }
+
+    #[test]
+    fn removing_a_path_shifts_the_rest() {
+        let f = fixture();
+        let second = f.paths()[1].clone();
+        let got = f.without_path(0).unwrap();
+        assert_eq!(got.paths(), &[second]);
+    }
+
+    #[test]
+    fn an_index_off_the_end_is_refused() {
+        let f = fixture();
+        assert_eq!(f.without_path(2), Err(VectorRefusal::Impossible));
+        let p = open(&[(0.0, 0.0), (1.0, 0.0)]);
+        assert_eq!(f.with_path(2, p), Err(VectorRefusal::Impossible));
     }
 
     #[test]

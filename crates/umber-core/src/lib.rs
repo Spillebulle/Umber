@@ -29,6 +29,7 @@ pub mod layer;
 pub mod overlay;
 pub mod palette;
 pub mod palimport;
+pub mod pathedit;
 mod pattern_table;
 pub mod preset;
 pub mod preview;
