@@ -1764,6 +1764,31 @@ impl LayerStack {
 
     // --- vector -------------------------------------------------------------
 
+    /// Make the layer at `index` a vector layer holding `record`, where it is a
+    /// layer a file has just built and nothing has touched.
+    ///
+    /// **Import's door and nobody else's**, which is why it is `pub(crate)`:
+    /// [`LayerStack::add_vector_layer`] makes a layer, and an import has already
+    /// made its layers from the file's own stack and needs the record put on one.
+    /// False for an index off the end, a folder (no pixels for paths to stand
+    /// beside), a layer that is already text, one that already holds a record,
+    /// and a record that fails [`VectorObject::check`]. The text refusal is the
+    /// other half of the rule [`LayerStack::set_text`] keeps from its side, so a
+    /// layer is a text record or a vector record and never both, whichever
+    /// order the two arrive in.
+    pub(crate) fn install_vector(&mut self, index: usize, record: VectorObject) -> bool {
+        if record.check().is_err() {
+            return false;
+        }
+        match self.layers.get_mut(index) {
+            Some(layer) if !layer.folder && layer.text.is_none() && layer.vector.is_none() => {
+                layer.vector = Some(Box::new(record));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Add a vector layer holding `record`, and select it.
     ///
     /// `None` where [`LayerStack::add_refusal`] would refuse, where the pool has

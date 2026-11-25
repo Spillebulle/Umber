@@ -756,9 +756,10 @@ having been made rather than assumed — because the consequence, an older Umber
 next person to read this will want to know somebody chose it on purpose.
 
 **Which number — settled.** `docs/group-compositing.md` §4.3 also proposed 3.
-**Effects landed first and took 3, so group compositing takes 4**, and that is
+**Effects landed first and took 3, so group compositing took 4**, and that is
 now written in §4.3 itself rather than only here, because the person who builds
-it reads that document and not this one.
+it reads that document and not this one. It has since moved again, to 6, for the
+linear mask and vector layers; §4.3 has the account.
 `required_version` emitting the lowest revision that describes the file does the
 rest: a document with effects and no isolated group declares only what effects
 need, and every document without either still declares 1 or 2 and still opens in

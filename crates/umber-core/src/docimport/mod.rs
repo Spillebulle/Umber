@@ -444,6 +444,16 @@ pub struct ImportedLayer {
     /// of those raises an [`ImportWarning::TextDropped`] and the layer opens as
     /// ordinary paint, which is what it now is. See [`crate::textobj`].
     pub text: Option<Box<crate::textobj::TextObject>>,
+    /// The paths this layer draws, where the file said so.
+    ///
+    /// `None` for every format but Umber's own, and `None` where the record was
+    /// unreadable ([`ImportWarning::VectorDropped`]). A record from a newer Umber
+    /// is **kept**, as [`crate::vector::VectorObject::Opaque`], so the next save
+    /// writes it back whole ([`ImportWarning::VectorNeedsNewer`]). A record
+    /// whose ink no longer matches its pixels arrives with the ink taken off
+    /// ([`ImportWarning::VectorInkDropped`]). Never set together with
+    /// [`ImportedLayer::text`]: the reader keeps the text one.
+    pub vector: Option<Box<crate::vector::VectorObject>>,
     /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
     ///
     /// Only ORA can carry nesting today. `.kra` has groups and `.psd` has them
@@ -475,6 +485,7 @@ impl ImportedLayer {
             locked: false,
             link: None,
             text: None,
+            vector: None,
             depth: 0,
             folder: false,
         }
@@ -542,6 +553,7 @@ impl fmt::Debug for ImportedLayer {
             .field("locked", &self.locked)
             .field("link", &self.link)
             .field("text", &self.text.is_some())
+            .field("vector", &self.vector.is_some())
             .finish()
     }
 }
@@ -693,6 +705,18 @@ impl ImportedDocument {
                 debug_assert!(
                     placed,
                     "a reader put a text record on an entry that cannot hold one"
+                );
+            }
+            // The paths, through `install_vector` for the reason the text record
+            // goes through `set_text`: the stack refuses a folder and a layer
+            // that is already text, and a refusal is the model's to make. The
+            // reader keeps one record per layer, so a `false` here means a
+            // caller hand-built something it should not have.
+            if let Some(vector) = layer.vector {
+                let placed = stack.install_vector(i, *vector);
+                debug_assert!(
+                    placed,
+                    "a reader put a vector record on an entry that cannot hold one"
                 );
             }
             // Through `set_effect` rather than onto the field, because
@@ -1103,6 +1127,27 @@ pub enum ImportWarning {
     /// make. Re-rendering then would destroy that painting, so the record goes
     /// and the picture stays. Nothing in the picture is ever lost to this.
     TextDropped { layer: String, reason: String },
+    /// The layer's paths were made by a newer Umber. They are kept whole and
+    /// saved back, and this build can neither draw nor change them.
+    ///
+    /// Raised only where the file named a record, like every warning here. The
+    /// document itself opened, because a record's own `version` is judged apart
+    /// from [`crate::docformat::VERSION`]: that one refuses a *file*, this one
+    /// keeps a *record* it cannot read.
+    VectorNeedsNewer { layer: String },
+    /// The layer's paths could not be read and were left out. The layer opens as
+    /// an ordinary empty one and every pixel is untouched.
+    ///
+    /// Also what a record naming a folder, or a layer that already names text,
+    /// becomes: two records on one layer would each claim its pixels, and a
+    /// folder has none.
+    VectorDropped { layer: String, reason: String },
+    /// Some strokes on the layer described pixels that have since been painted
+    /// over, so they are ordinary paint now. The Cut and Plot paths are kept.
+    ///
+    /// The same fingerprint and the same reason [`ImportWarning::TextDropped`]
+    /// has, applied to the half of a record that is about pixels.
+    VectorInkDropped { layer: String },
 }
 
 impl fmt::Display for ImportWarning {
@@ -1171,6 +1216,18 @@ impl fmt::Display for ImportWarning {
             Self::TextDropped { layer, reason } => write!(
                 f,
                 "Layer “{layer}” was saved as text, and {reason}, so it opens as ordinary paint. Every pixel is there; the text cannot be edited again."
+            ),
+            Self::VectorNeedsNewer { layer } => write!(
+                f,
+                "The paths on “{layer}” were made by a newer Umber. They are kept and saved back, but cannot be shown or changed here."
+            ),
+            Self::VectorDropped { layer, reason } => write!(
+                f,
+                "The paths on “{layer}” could not be read and were left out. {reason}"
+            ),
+            Self::VectorInkDropped { layer } => write!(
+                f,
+                "Some strokes on “{layer}” were painted over elsewhere and are now ordinary paint."
             ),
         }
     }

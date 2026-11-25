@@ -64,6 +64,9 @@
 //!   anything in it. Text declares nothing, so such a build opens the file, and
 //!   the fingerprint in the record is what stands in for the version — it is
 //!   why [`VERSION`] did not have to move, not a nicety beside it.
+//! * **[`VECTOR_ATTR`]** on a vector layer, naming a record under
+//!   `umber/vector/`. Text's shape, but it **did** take [`VERSION`] to 5: see
+//!   that constant.
 //! * **[`CLIP_ATTR`]**, **[`LOCK_ATTR`]** and **[`LINK_ATTR`]** on `<layer>`,
 //!   each spelled `"true"` and each written only when set.
 //! * **[`SELECTED_ATTR`]** on one `<layer>` — which layer was being painted on.
@@ -263,13 +266,26 @@ pub const EXTENSION: &str = "ora";
 /// which states what that costs. It is **not** a lossless round trip and is not
 /// claimed to be.
 ///
+/// **5 is a vector layer**, and it is the effects argument over again rather
+/// than the mask's. The pixels of a vector layer are blank by design and its
+/// paths are the whole of what it holds, so an older build would open the file
+/// as an empty layer, ignore [`VECTOR_ATTR`], and the next save would drop
+/// `umber/vector/` for ever, having done nothing but open and save. That build
+/// refuses the file instead. A layer with a record and no ink is not text, whose
+/// fingerprint stands in for a revision: there is no picture here for a
+/// fingerprint to keep honest.
+///
 /// **`docs/group-compositing.md` §4.3 also proposes 3, for a folder with an
-/// opacity or a blend mode of its own. Effects landed first and took 3; this
-/// took 4, so group compositing takes 5.** Only one feature can have a number,
-/// and the decision belongs in whichever lands next rather than to
-/// [`required_version`] to reconcile. That document still says 4 and has not
-/// been rewritten here, because it is somebody's design and this is a comment.
-pub const VERSION: u32 = 4;
+/// opacity or a blend mode of its own. Effects landed first and took 3, the
+/// linear mask took 4 and vector layers took 5, so group compositing takes
+/// 6.** Only one feature can have a number, and the decision belongs in
+/// whichever lands next rather than to [`required_version`] to reconcile.
+pub const VERSION: u32 = 5;
+
+/// The revision a vector layer declares, named for the reason
+/// [`LINEAR_MASK_VERSION`] is: it is read in more than one place, and a literal
+/// in each is how they come to disagree.
+pub const VECTOR_VERSION: u32 = 5;
 
 /// The first revision whose mask bytes are the linear multiplier.
 ///
@@ -325,7 +341,12 @@ fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
     // Clipping keeps 2 on its own: a clipped layer with no mask carries nothing
     // whose meaning changed, and pushing it to 4 would shut it out of every
     // older Umber for a flag those builds read correctly.
-    if layers().any(|l| l.mask.is_some()) {
+    //
+    // **A vector record is presence, like an effect**, and an empty one counts:
+    // the layer is a vector layer whether or not it holds a path.
+    if layers().any(|l| l.vector.is_some()) {
+        VECTOR_VERSION
+    } else if layers().any(|l| l.mask.is_some()) {
         4
     } else if layers().any(|l| !l.effects.is_empty()) {
         3
@@ -410,6 +431,21 @@ pub fn mask_src(index: usize) -> String {
 /// way back in discards the record and keeps the picture. See
 /// [`crate::textobj`], and `docs/text-tool.md` §3.
 pub const TEXT_ATTR: &str = "umber-text";
+
+/// `<layer>` attribute naming the archive entry holding a vector layer's paths.
+///
+/// Outside the ORA stack under `umber/vector/`, the text record's shape and for
+/// its reason: a path is a figure with a decimal point in it and `stack.xml` is
+/// the one file every other reader parses. **Unlike [`TEXT_ATTR`] this took
+/// [`VERSION`] to 5** — see there for why a record with no picture beside it has
+/// nothing to stand in for the number.
+pub const VECTOR_ATTR: &str = "umber-vector";
+
+/// Where a vector layer's record goes inside the archive. Indexed as
+/// [`text_src`] is, by the layer's position in the *file*, top first.
+pub fn vector_src(index: usize) -> String {
+    format!("umber/vector/{index:03}.json")
+}
 
 /// Where a layer's text record goes inside the archive.
 ///
@@ -755,6 +791,14 @@ pub struct SaveLayer<'a> {
     /// writing — never one the caller supplies, because a fingerprint the model
     /// carried could be stale and this one cannot. See [`crate::textobj`].
     pub text: Option<&'a crate::textobj::TextObject>,
+    /// The paths of a vector layer. Written under `umber/vector/` and pointed at
+    /// by [`VECTOR_ATTR`], with the fingerprint of the layer image *this save*
+    /// is writing wherever the record has ink for it to be about.
+    ///
+    /// `None` in [`SaveLayer::new`], which is the whole reason a literal that
+    /// forgets it is silent: it would write a vector layer back as an empty
+    /// ordinary one. The app's two savers fill it off the layer.
+    pub vector: Option<&'a crate::vector::VectorObject>,
     /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
     pub depth: u8,
     /// This entry is a folder: it becomes a nested `<stack>` and has no `src`,
@@ -785,6 +829,7 @@ impl<'a> SaveLayer<'a> {
             locked: false,
             link: None,
             text: None,
+            vector: None,
             depth: 0,
             folder: false,
         }
@@ -877,6 +922,15 @@ pub enum SaveWarning {
         layer: String,
         why: crate::textobj::NotRecorded,
     },
+    /// The layer's paths could not be written, so the layer is an empty one in
+    /// the file. Nothing was painted on a vector layer, so nothing else is lost.
+    ///
+    /// `why` is the record's own refusal, which is what the artist can act on:
+    /// too many points and a figure that is not a figure are different remedies.
+    VectorNotRecorded {
+        layer: String,
+        why: crate::vector::VectorRefusal,
+    },
     /// Some layers carry effects, which no other OpenRaster reader can see.
     ///
     /// Named in the same breath as an approximated blend mode because it is
@@ -922,6 +976,11 @@ impl std::fmt::Display for SaveWarning {
                 "Layer “{layer}”: {}, so it was saved as paint. The picture is complete, but \
                  the text cannot be edited again after the document is reopened.",
                 why.reason()
+            ),
+            Self::VectorNotRecorded { layer, why } => write!(
+                f,
+                "Layer “{layer}”: its paths could not be saved. {} The layer was saved empty.",
+                why.sentence()
             ),
             Self::EffectsNotPortable { layers } => write!(
                 f,
@@ -1646,6 +1705,38 @@ fn write_archive<W: Write + std::io::Seek>(
             None => None,
         };
 
+        // The vector record, beside the text one and for the same reasons: an
+        // entry of its own, fingerprinted against the image **this save** is
+        // writing so the print cannot be stale. `to_json` writes the print only
+        // where the record has ink for it to be about, so an ordinary record
+        // carries none and the fingerprint costs nothing.
+        //
+        // An empty record is written: a vector layer with no path yet is still
+        // a vector layer, and an attribute-less layer would reopen as paint.
+        // A refusal writes nothing and is named, so no attribute points at a
+        // gap.
+        let vector_entry = match layer.vector {
+            Some(vector) => {
+                let print = placed.fingerprint();
+                match vector.to_json(Some(&print)) {
+                    Ok(json) => {
+                        let src = vector_src(i);
+                        zip.start_file(&src, deflated())?;
+                        zip.write_all(&json)?;
+                        Some(src)
+                    }
+                    Err(why) => {
+                        warnings.push(SaveWarning::VectorNotRecorded {
+                            layer: layer.name.to_string(),
+                            why,
+                        });
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         // The effects, as RON under `umber/effects/`, where no other reader
         // will look. `docs/layer-effects.md` §8.1 and [`EFFECTS_ATTR`].
         //
@@ -1692,6 +1783,7 @@ fn write_archive<W: Write + std::io::Seek>(
                 selected,
                 mask_src.as_deref(),
                 text_entry.as_deref(),
+                vector_entry.as_deref(),
                 effects_src.as_deref(),
             ),
         });
@@ -1990,6 +2082,7 @@ fn layer_xml(
     selected: bool,
     mask: Option<&str>,
     text: Option<&str>,
+    vector: Option<&str>,
     effects: Option<&str>,
 ) -> String {
     let mut out = format!(
@@ -2015,6 +2108,9 @@ fn layer_xml(
     // effects entry beside it.
     if let Some(text) = text {
         out.push_str(&format!(" {TEXT_ATTR}=\"{text}\""));
+    }
+    if let Some(vector) = vector {
+        out.push_str(&format!(" {VECTOR_ATTR}=\"{vector}\""));
     }
     if let Some(effects) = effects {
         out.push_str(&format!(" {EFFECTS_ATTR}=\"{effects}\""));
@@ -2706,6 +2802,458 @@ mod tests {
             "a layer with no attribute says nothing at all: {:?}",
             doc.warnings
         );
+    }
+
+    // --- vector layers ------------------------------------------------------
+
+    fn corner_path(
+        role: crate::vector::PathRole,
+        points: &[(f32, f32)],
+        closed: bool,
+    ) -> crate::vector::Path {
+        use crate::vector::{Node, Path};
+        Path {
+            role,
+            closed,
+            nodes: points
+                .iter()
+                .map(|&(x, y)| Node::corner(glam::Vec2::new(x, y)))
+                .collect(),
+            ink: None,
+        }
+    }
+
+    /// A cut square and a plotted curve with handles, which is what the
+    /// ordinary record holds. Handles, because a corner-only fixture cannot tell
+    /// the handle fields from each other.
+    fn vector_paths() -> crate::vector::VectorObject {
+        use crate::vector::{Node, Path, PathRole, VectorObject};
+        let plot = Path {
+            role: PathRole::Plot,
+            closed: false,
+            nodes: vec![
+                Node {
+                    at: glam::Vec2::new(0.5, 1.25),
+                    handle_in: glam::Vec2::new(-1.0, 0.5),
+                    handle_out: glam::Vec2::new(2.0, -0.75),
+                    pressure: 1.0,
+                },
+                Node::corner(glam::Vec2::new(3.0, 2.5)),
+            ],
+            ink: None,
+        };
+        VectorObject::Paths(vec![
+            corner_path(
+                PathRole::Cut,
+                &[(0.0, 0.0), (3.0, 0.0), (3.0, 3.0), (0.0, 3.0)],
+                true,
+            ),
+            plot,
+        ])
+    }
+
+    /// The paths above and a stroke that describes pixels.
+    fn vector_with_ink() -> crate::vector::VectorObject {
+        use crate::vector::{Ink, PathRole, VectorObject};
+        let mut paths = vector_paths().paths().to_vec();
+        paths.push(crate::vector::Path {
+            ink: Some(Ink {
+                brush: "pack01-drybrush".into(),
+                size: 6.0,
+                colour: [0.1, 0.2, 0.3, 1.0],
+            }),
+            ..corner_path(PathRole::Ink, &[(0.0, 1.0), (3.0, 1.0)], false)
+        });
+        VectorObject::Paths(paths)
+    }
+
+    fn vector_document(
+        size: UVec2,
+        px: &[u8],
+        record: &crate::vector::VectorObject,
+    ) -> (Vec<u8>, Vec<SaveWarning>) {
+        let layers = vec![SaveLayer {
+            vector: Some(record),
+            ..layer("Lines", px)
+        }];
+        encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(px),
+            history: None,
+        })
+        .expect("encode")
+    }
+
+    fn entry_bytes(bytes: &[u8], name: &str) -> Vec<u8> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut held = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name(name).unwrap(), &mut held).unwrap();
+        held
+    }
+
+    /// The archive with one more entry in it.
+    fn add_entry(bytes: &[u8], name: &str, body: Vec<u8>) -> Vec<u8> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut out = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).unwrap();
+            let held_name = entry.name().to_string();
+            let mut held = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut held).unwrap();
+            out.start_file(&held_name, stored()).unwrap();
+            out.write_all(&held).unwrap();
+        }
+        out.start_file(name, stored()).unwrap();
+        out.write_all(&body).unwrap();
+        out.finish().unwrap().into_inner()
+    }
+
+    /// Cut and Plot paths come back equal, out of an entry of their own and not
+    /// out of `stack.xml`.
+    #[test]
+    fn a_vector_record_survives_a_save_and_a_reopen() {
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let record = vector_paths();
+        let (bytes, warnings) = vector_document(size, &px, &record);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let xml = read_stack_xml(&bytes);
+        assert!(
+            xml.contains(&format!("{VECTOR_ATTR}=\"{}\"", vector_src(0))),
+            "{xml}"
+        );
+        assert_eq!(vector_src(0), "umber/vector/000.json");
+        assert!(
+            !xml.contains("1.25"),
+            "no figure may be in stack.xml:\n{xml}"
+        );
+
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.layers[0].vector.as_deref(), Some(&record));
+
+        let opened = doc.open();
+        assert_eq!(opened.stack.vector_at(0), Some(&record));
+    }
+
+    #[test]
+    fn an_empty_vector_layer_is_still_one_after_reopening() {
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let record = crate::vector::VectorObject::empty();
+        let (bytes, _) = vector_document(size, &px, &record);
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.layers[0].vector.as_deref(), Some(&record));
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().is_vector());
+    }
+
+    #[test]
+    fn a_document_with_a_vector_layer_declares_revision_5() {
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let (bytes, _) = vector_document(size, &px, &vector_paths());
+        let xml = read_stack_xml(&bytes);
+        assert!(xml.contains(&format!("{VERSION_ATTR}=\"5\"")), "{xml}");
+        assert_eq!(VERSION, 5);
+        assert_eq!(VECTOR_VERSION, 5);
+
+        // The highest wins whichever way round, and an empty record counts: the
+        // layer is a vector layer whether or not it holds a path.
+        let mask = solid(size, [128, 128, 128, 255]);
+        let record = crate::vector::VectorObject::empty();
+        let vector = || SaveLayer {
+            vector: Some(&record),
+            ..layer("V", &px)
+        };
+        let masked = || SaveLayer {
+            mask: Some(Canvas::Held(&mask)),
+            ..layer("M", &px)
+        };
+        assert_eq!(required_version(&[vector()]), 5);
+        assert_eq!(required_version(&[masked(), vector()]), 5);
+        assert_eq!(required_version(&[vector(), masked()]), 5);
+    }
+
+    /// The existing ladder, unchanged. `a_document_declares_the_lowest_revision_
+    /// that_describes_it` is the full sweep; this is the claim that adding the
+    /// fifth revision moved none of the others.
+    #[test]
+    fn a_document_without_one_declares_what_it_did_before() {
+        let size = UVec2::new(2, 2);
+        let px = solid(size, [7, 8, 9, 255]);
+        let mask = solid(size, [128, 128, 128, 255]);
+        let effects = [Effect::drop_shadow()];
+        let plain = || layer("Ink", &px);
+        assert_eq!(required_version(&[plain()]), 1);
+        assert_eq!(
+            required_version(&[SaveLayer {
+                clipped: true,
+                ..plain()
+            }]),
+            2
+        );
+        assert_eq!(
+            required_version(&[SaveLayer {
+                effects: &effects,
+                ..plain()
+            }]),
+            3
+        );
+        assert_eq!(
+            required_version(&[SaveLayer {
+                mask: Some(Canvas::Held(&mask)),
+                ..plain()
+            }]),
+            4
+        );
+    }
+
+    /// A record from a newer Umber is kept whole and written back untouched.
+    #[test]
+    fn an_opaque_record_is_written_back_byte_for_byte() {
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let (bytes, _) = vector_document(size, &px, &vector_paths());
+        // A newer record, with a field this build has never heard of and
+        // whitespace nobody would write, so equality of the bytes is not an
+        // accident of re-serialising.
+        let future = b"{ \"version\": 2,\n  \"paths\": [], \"curves\": [1, 2, 3] }".to_vec();
+        let bytes = with_entry(&bytes, &vector_src(0), future.clone());
+
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        let record = doc.layers[0].vector.as_deref().expect("kept");
+        assert!(record.is_opaque());
+        assert!(
+            doc.warnings.iter().any(|w| matches!(
+                w,
+                docimport::ImportWarning::VectorNeedsNewer { layer } if layer == "Lines"
+            )),
+            "{:?}",
+            doc.warnings
+        );
+
+        let (again, warnings) = vector_document(size, &px, record);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(entry_bytes(&again, &vector_src(0)), future);
+    }
+
+    #[test]
+    fn an_unparseable_record_costs_the_layer_its_paths_only() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let (bytes, _) = vector_document(size, &px, &vector_paths());
+        let doc = docimport::read_openraster(&with_entry(
+            &bytes,
+            &vector_src(0),
+            b"not json at all".to_vec(),
+        ))
+        .expect("the picture still opens");
+        assert!(doc.layers[0].vector.is_none());
+        assert_eq!(doc.layers[0].dense(size), px, "the pixels are untouched");
+        assert!(
+            doc.warnings.iter().any(|w| matches!(
+                w,
+                docimport::ImportWarning::VectorDropped { layer, .. } if layer == "Lines"
+            )),
+            "{:?}",
+            doc.warnings
+        );
+        let opened = doc.open();
+        assert!(!opened.stack.get(0).unwrap().is_vector());
+    }
+
+    /// The bound is the record's own figure rather than the canvas's. The parse
+    /// refuses it a moment after the entry reader would, so what this holds is
+    /// the outcome and not the allocation, as the text test says of itself.
+    #[test]
+    fn an_over_long_vector_entry_is_refused_unread() {
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let (bytes, _) = vector_document(size, &px, &vector_paths());
+        let long = format!(
+            "{{\"version\":1,\"paths\":[],\"pad\":\"{}\"}}",
+            "x".repeat(crate::vector::MAX_RECORD_BYTES + 16)
+        )
+        .into_bytes();
+        let doc = docimport::read_openraster(&with_entry(&bytes, &vector_src(0), long))
+            .expect("the picture still opens");
+        assert!(doc.layers[0].vector.is_none());
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| matches!(w, docimport::ImportWarning::VectorDropped { .. })),
+            "{:?}",
+            doc.warnings
+        );
+    }
+
+    /// Ink describes pixels, and these are not the pixels it described. The
+    /// geometry is the artist's all the same.
+    #[test]
+    fn ink_whose_pixels_changed_is_dropped_and_cut_is_kept() {
+        use crate::vector::PathRole;
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let (bytes, _) = vector_document(size, &px, &vector_with_ink());
+
+        // The record as a save would have written it, stamped with a print that
+        // is one hash away from the image in the file.
+        let wrong = crate::textobj::Fingerprint {
+            rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            hash: 12345,
+        };
+        let record = vector_with_ink().to_json(Some(&wrong)).unwrap();
+        let doc =
+            docimport::read_openraster(&with_entry(&bytes, &vector_src(0), record)).expect("opens");
+
+        let kept = doc.layers[0].vector.as_deref().expect("the paths stay");
+        assert_eq!(*kept, vector_with_ink().without_ink());
+        let roles: Vec<_> = kept.paths().iter().map(|p| p.role).collect();
+        assert_eq!(roles, [PathRole::Cut, PathRole::Plot]);
+        assert!(
+            doc.warnings.iter().any(|w| matches!(
+                w,
+                docimport::ImportWarning::VectorInkDropped { layer } if layer == "Lines"
+            )),
+            "{:?}",
+            doc.warnings
+        );
+    }
+
+    #[test]
+    fn ink_whose_pixels_match_is_kept() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let record = vector_with_ink();
+        let (bytes, warnings) = vector_document(size, &px, &record);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let doc = docimport::read_openraster(&bytes).expect("opens");
+        assert_eq!(doc.layers[0].vector.as_deref(), Some(&record));
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        // And one pixel moved makes it a mismatch, so the match above is the
+        // fingerprint doing work and not the ink being kept unconditionally.
+        let mut over = px.clone();
+        over[0] = 255;
+        let moved = docimport::read_openraster(&with_entry(
+            &bytes,
+            "data/layer000.png",
+            encode_png(size, &over).unwrap(),
+        ))
+        .expect("opens");
+        assert!(!moved.layers[0].vector.as_deref().unwrap().has_ink());
+    }
+
+    /// Two records on one layer would each claim its pixels. The text record is
+    /// the older and is the one kept.
+    #[test]
+    fn a_layer_naming_text_and_vector_keeps_the_text() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let bytes = text_document(size, &px);
+        let record = vector_paths().to_json(None).unwrap();
+        let bytes = with_stack_xml(&bytes, |xml| {
+            xml.replacen(
+                &format!("{TEXT_ATTR}="),
+                &format!("{VECTOR_ATTR}=\"{}\" {TEXT_ATTR}=", vector_src(0)),
+                1,
+            )
+        });
+        let bytes = add_entry(&bytes, &vector_src(0), record);
+
+        let doc = docimport::read_openraster(&bytes).expect("opens");
+        assert!(doc.layers[0].text.is_some());
+        assert!(doc.layers[0].vector.is_none());
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| matches!(w, docimport::ImportWarning::VectorDropped { .. })),
+            "{:?}",
+            doc.warnings
+        );
+        let opened = doc.open();
+        assert!(opened.stack.text_at(0).is_some());
+    }
+
+    /// A folder holds no pixels, so a record naming one is a mistake somebody
+    /// else's writer made, and is dropped with the same sentence.
+    #[test]
+    fn a_folder_naming_a_vector_record_loses_it() {
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let layers = vec![
+            SaveLayer {
+                depth: 1,
+                ..layer("Inside", &px)
+            },
+            SaveLayer::folder("Group", 0, true),
+        ];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: Canvas::Held(&px),
+            history: None,
+        })
+        .expect("encode");
+        let bytes = with_stack_xml(&bytes, |xml| {
+            xml.replacen(
+                "<stack name=\"Group\"",
+                &format!("<stack {VECTOR_ATTR}=\"{}\" name=\"Group\"", vector_src(7)),
+                1,
+            )
+        });
+        let doc = docimport::read_openraster(&bytes).expect("opens");
+        assert!(doc.layers.iter().all(|l| l.vector.is_none()));
+        assert!(
+            doc.warnings.iter().any(|w| matches!(
+                w,
+                docimport::ImportWarning::VectorDropped { layer, .. } if layer == "Group"
+            )),
+            "{:?}",
+            doc.warnings
+        );
+    }
+
+    /// A record the writer refuses is not written, and no attribute points at
+    /// the gap. The pixels are the layer's ordinary PNG either way.
+    #[test]
+    fn a_record_that_cannot_be_written_is_named_and_leaves_no_attribute() {
+        use crate::vector::{Node, Path, PathRole, VectorObject};
+        let size = UVec2::new(4, 4);
+        let px = empty(size);
+        let bad = VectorObject::Paths(vec![Path {
+            role: PathRole::Cut,
+            closed: false,
+            nodes: vec![
+                Node::corner(glam::Vec2::new(f32::NAN, 0.0)),
+                Node::corner(glam::Vec2::new(1.0, 0.0)),
+            ],
+            ink: None,
+        }]);
+        let (bytes, warnings) = vector_document(size, &px, &bad);
+        assert_eq!(
+            warnings,
+            vec![SaveWarning::VectorNotRecorded {
+                layer: "Lines".into(),
+                why: crate::vector::VectorRefusal::Impossible,
+            }]
+        );
+        assert!(!read_stack_xml(&bytes).contains(VECTOR_ATTR));
     }
 
     // --- folders ------------------------------------------------------------
@@ -4520,6 +5068,7 @@ mod tests {
         merged: Vec<u8>,
         effects: Vec<Effect>,
         text: crate::textobj::TextObject,
+        vector: crate::vector::VectorObject,
     }
 
     impl BothWays {
@@ -4563,6 +5112,9 @@ mod tests {
                     // The text layer, so the fingerprint's rectangle is taken
                     // over an off-origin box as well as `stack.xml`'s `x`/`y`.
                     patch(71),
+                    // The vector layer's, off-origin too: its ink is
+                    // fingerprinted against this image.
+                    patch(89),
                 ],
                 // **No two channels alike**, and a real mask slice carries the
                 // same value in all three. That is the point: a mask is written
@@ -4587,6 +5139,7 @@ mod tests {
                     .collect(),
                 effects: vec![Effect::drop_shadow()],
                 text: text_object(),
+                vector: vector_with_ink(),
             }
         }
 
@@ -4619,6 +5172,10 @@ mod tests {
                     depth: 1,
                     text: Some(&self.text),
                     ..SaveLayer::new("Caption", BlendMode::Normal, px(3))
+                },
+                SaveLayer {
+                    vector: Some(&self.vector),
+                    ..SaveLayer::new("Lines", BlendMode::Normal, px(4))
                 },
             ]
         }
@@ -4804,7 +5361,9 @@ mod tests {
         // a time produce them at all.
         assert_eq!(
             source.asked,
-            ["layer 3", "layer 2", "layer 0", "mask 0", "merged",],
+            [
+                "layer 4", "layer 3", "layer 2", "layer 0", "mask 0", "merged"
+            ],
             "the writer asked in the wrong order, or asked twice"
         );
 
@@ -4869,7 +5428,9 @@ mod tests {
         assert_eq!(warnings, held_warnings);
         assert_eq!(
             source.asked,
-            ["layer 3", "layer 2", "layer 0", "mask 0", "merged"],
+            [
+                "layer 4", "layer 3", "layer 2", "layer 0", "mask 0", "merged"
+            ],
             "the writer asked in the wrong order, or asked twice"
         );
 
@@ -4901,7 +5462,7 @@ mod tests {
         let written = std::fs::read(&path).expect("read back");
         assert_eq!(written, expected);
         let opened = docimport::read_openraster(&written).expect("reopens");
-        assert_eq!(opened.layers.len(), 4, "the folder and three layers");
+        assert_eq!(opened.layers.len(), 5, "the folder and four layers");
         let _ = std::fs::remove_file(&path);
     }
 

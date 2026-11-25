@@ -72,6 +72,7 @@ use crate::effect::{self, Effect};
 use crate::geom::PixelRect;
 use crate::layer::{BlendMode, LayerStack};
 use crate::textobj;
+use crate::vector::{self, VectorObject};
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
 
@@ -123,6 +124,14 @@ struct LayerSpec {
     /// pixels, so there is nothing for a record to describe, and
     /// `LayerStack::set_text` refuses one.
     text_src: Option<String>,
+    /// `umber-vector`: the archive entry holding this layer's paths. See
+    /// [`docformat::VECTOR_ATTR`].
+    ///
+    /// Read off a nested `<stack>` as well, unlike `text_src`, and for the
+    /// opposite reason: a record naming a folder is somebody else's writer's
+    /// mistake, and reading it is what lets the reader *say* so rather than
+    /// letting a vector layer vanish into a folder with no word.
+    vector_src: Option<String>,
     /// `umber-effects`: the archive entry holding this layer's effects, outside
     /// the ORA layer stack. See [`docformat::EFFECTS_ATTR`].
     ///
@@ -439,6 +448,7 @@ fn parse_stack(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<Stack, I
                                 // refuses one too, which is the model's half of
                                 // the same rule.
                                 text_src: None,
+                                vector_src: attrs.string(docformat::VECTOR_ATTR),
                                 effects_src: None,
                                 clipped: false,
                                 locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
@@ -502,6 +512,7 @@ fn parse_stack(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<Stack, I
                                 .and_then(docformat::background_from_id),
                             mask_src: attrs.string(docformat::MASK_ATTR),
                             text_src: attrs.string(docformat::TEXT_ATTR),
+                            vector_src: attrs.string(docformat::VECTOR_ATTR),
                             effects_src: attrs.string(docformat::EFFECTS_ATTR),
                             clipped: attrs.get(docformat::CLIP_ATTR) == Some("true"),
                             locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
@@ -559,6 +570,14 @@ fn load_layer(
         let mut folder = ImportedLayer::folder(spec.name.clone(), spec.depth, spec.visible);
         folder.locked = spec.locked;
         folder.link = spec.link;
+        // Said, not passed over: a record naming a folder is dropped, and the
+        // artist is told which one.
+        if spec.vector_src.is_some() {
+            warnings.push(ImportWarning::VectorDropped {
+                layer: spec.name.clone(),
+                reason: "A folder cannot hold paths.".into(),
+            });
+        }
         return Ok(folder);
     }
     let png = container::read_optional_entry(zip, &spec.src, FORMAT)
@@ -593,6 +612,9 @@ fn load_layer(
     // it wrote — see `textobj::Fingerprint`, which says why the canvas-sized
     // layer-texture buffer is the wrong thing to hash.
     let text = load_text(zip, spec, &image, warnings);
+    // The vector record is judged against the same image, for the same reason,
+    // and beside the text one so the two are decided together.
+    let vector = load_vector(zip, spec, &image, warnings);
 
     // **One piece: the layer's own rectangle clipped to the canvas.** An ORA
     // layer is one PNG at an offset, so that rectangle is exactly what the file
@@ -609,6 +631,7 @@ fn load_layer(
 
     let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
     layer.text = text;
+    layer.vector = vector;
     // How many `<stack>` elements this layer was inside. Carried even though
     // the layer itself is not a folder: it is what puts the layer *in* one.
     layer.depth = spec.depth;
@@ -827,6 +850,91 @@ fn load_text(
         return refuse("its pixels are no longer the ones the text made".into());
     }
     Some(Box::new(text))
+}
+
+/// The paths of a vector layer, when the file names a record.
+///
+/// Text's shape with three differences, each of which is the record's own.
+///
+/// **A record from a newer Umber is kept**, as `Opaque`, and not dropped: the
+/// paths are the whole of what the layer holds, so dropping them would turn an
+/// open-and-save into the loss the revision exists to prevent. It is judged
+/// before the fingerprint, which a record this build cannot read has no way to
+/// be compared through.
+///
+/// **A mismatched fingerprint costs only the ink.** Cut and Plot are geometry
+/// and say nothing about pixels, so a layer whose pixels were painted over
+/// keeps them; what is dropped is the half of the record that described the
+/// pixels that are gone.
+///
+/// **A layer that also names text keeps the text.** Two records would each claim
+/// the layer's pixels, and the text one was there first. The check comes before
+/// the read so a record that is never going to be installed is never decoded.
+fn load_vector(
+    zip: &mut Zip<'_>,
+    spec: &LayerSpec,
+    image: &flat::Image,
+    warnings: &mut Vec<ImportWarning>,
+) -> Option<Box<VectorObject>> {
+    let src = spec.vector_src.as_ref()?;
+    let mut refuse = |reason: String| -> Option<Box<VectorObject>> {
+        warnings.push(ImportWarning::VectorDropped {
+            layer: spec.name.clone(),
+            reason,
+        });
+        None
+    };
+    if spec.text_src.is_some() {
+        return refuse("The layer is also text, and keeps the text.".into());
+    }
+    // Bounded at the record's own figure, which the canvas does not bound: see
+    // `vector::MAX_RECORD_BYTES`.
+    let bytes = match container::read_optional_entry_bounded(
+        zip,
+        src,
+        FORMAT,
+        vector::MAX_RECORD_BYTES as u64,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return refuse("The record is not in the file.".into()),
+        Err(e) => return refuse(format!("The record could not be read ({e}).")),
+    };
+    let (record, print) = match VectorObject::from_json(&bytes) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return refuse(match e {
+                vector::RecordError::TooLarge => "The record is too large.".to_string(),
+                vector::RecordError::Unreadable(why) => format!("The record is damaged ({why})."),
+            });
+        }
+    };
+    if record.is_opaque() {
+        warnings.push(ImportWarning::VectorNeedsNewer {
+            layer: spec.name.clone(),
+        });
+        return Some(Box::new(record));
+    }
+    // A record with no ink wrote no print and has nothing for one to guard.
+    let Some(print) = print else {
+        return Some(Box::new(record));
+    };
+    let rect = match (u32::try_from(spec.x), u32::try_from(spec.y)) {
+        (Ok(x), Ok(y)) => Some(PixelRect {
+            x,
+            y,
+            width: image.size.x,
+            height: image.size.y,
+        }),
+        // Cannot be what this writer wrote, and cannot be compared: a mismatch.
+        _ => None,
+    };
+    if rect.is_some_and(|rect| print.matches(rect, &image.rgba)) {
+        return Some(Box::new(record));
+    }
+    warnings.push(ImportWarning::VectorInkDropped {
+        layer: spec.name.clone(),
+    });
+    Some(Box::new(record.without_ink()))
 }
 
 /// Last resort: the composite every ORA is required to carry.
