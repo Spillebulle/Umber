@@ -1422,6 +1422,25 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_node_is_dropped_not_indexed() {
+        let long = smooth_record();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&long));
+        edit_tap(&mut t, v(100.0, 0.0), on(&long));
+        assert_eq!(t.pick().unwrap().node, Some(2));
+        // The same path, now two nodes long: node 2 is off its end.
+        let short = edit_record();
+        assert_eq!(t.corner(on(&short)), Commit::Nothing);
+        assert_eq!(
+            t.pick(),
+            Some(Pick {
+                path: 0,
+                node: None
+            })
+        );
+    }
+
+    #[test]
     fn escape_lets_go_of_the_node_then_the_path() {
         let rec = edit_record();
         let mut t = with_node_picked(&rec);
