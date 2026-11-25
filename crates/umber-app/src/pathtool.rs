@@ -564,6 +564,20 @@ mod tests {
     }
 
     #[test]
+    fn the_last_node_wins_where_both_ends_are_in_reach() {
+        // Ends ten apart, press between them: both within the hit radius.
+        let rec = VectorObject::Paths(vec![open(
+            PathRole::Cut,
+            &[(0.0, 0.0), (40.0, 0.0), (10.0, 0.0)],
+            false,
+        )]);
+        let mut t = PathTool::default();
+        t.press(v(5.0, 0.0), false, on(&rec));
+        let at: Vec<Vec2> = t.draft().unwrap().nodes.iter().map(|n| n.at).collect();
+        assert_eq!(at, vec![v(0.0, 0.0), v(40.0, 0.0), v(10.0, 0.0)]);
+    }
+
+    #[test]
     fn a_closed_paths_node_does_not_continue_it() {
         let rec = VectorObject::Paths(vec![open(
             PathRole::Plot,
