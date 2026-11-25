@@ -5268,6 +5268,13 @@ mod tests {
             Err(VectorSetRefusal::NotVector),
             "a text layer has no vector record to set"
         );
+        // Import's door too, which is the other half of "never both, in either
+        // order": `install_vector` refuses a text layer on its own account.
+        assert!(
+            !s.install_vector(0, some_paths()),
+            "import put a record on a text layer"
+        );
+        assert!(s.vector_at(0).is_none());
         let at = s.add_vector_layer("Paths", some_paths()).expect("room");
         assert!(
             !s.set_text(at, some_text()),

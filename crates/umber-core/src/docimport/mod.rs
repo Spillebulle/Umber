@@ -2052,6 +2052,54 @@ mod tests {
         assert!(opened.stack.get(0).unwrap().is_vector());
     }
 
+    /// The third arm: a record outside `check`'s bounds is dropped with its own
+    /// reason, and a good record beside it is untouched. The bad record is one
+    /// node past `MAX_COORD`, which only a hand-built import can carry, since the
+    /// ORA reader makes the same decision as it reads.
+    #[test]
+    fn settling_drops_a_record_outside_the_limits_and_says_so() {
+        use crate::vector::{MAX_COORD, Node, Path, PathRole, VectorObject};
+        let size = UVec2::new(1, 1);
+        let record = |x: f32| {
+            Box::new(VectorObject::Paths(vec![Path {
+                role: PathRole::Cut,
+                closed: false,
+                nodes: vec![
+                    Node::corner(glam::Vec2::new(x, 0.0)),
+                    Node::corner(glam::Vec2::new(1.0, 1.0)),
+                ],
+                ink: None,
+            }]))
+        };
+        let mut far = layer("Far", size);
+        far.vector = Some(record(MAX_COORD * 2.0));
+        let mut fine = layer("Lines", size);
+        fine.vector = Some(record(0.0));
+        let mut doc = ImportedDocument {
+            format: SourceFormat::OpenRaster,
+            size,
+            layers: vec![fine, far],
+            active: None,
+            background: Background::Transparent,
+            dpi: None,
+            history: None,
+            warnings: vec![],
+        };
+        doc.settle_vector_records();
+        assert!(doc.layers[1].vector.is_none(), "the bad record was kept");
+        assert!(doc.layers[0].vector.is_some(), "a good record was dropped");
+        match doc.warnings.as_slice() {
+            [ImportWarning::VectorDropped { layer, reason }] => {
+                assert_eq!(layer, "Far");
+                assert_eq!(reason, "The record is outside the limits.");
+            }
+            other => panic!("expected one VectorDropped, got {other:?}"),
+        }
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().is_vector());
+        assert!(!opened.stack.get(1).unwrap().is_vector());
+    }
+
     #[test]
     fn a_single_layer_import_does_not_add_a_spare() {
         // LayerStack::new() already has one layer; adding one per import layer

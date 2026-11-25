@@ -3542,6 +3542,80 @@ mod tests {
         );
     }
 
+    /// **No mark on the flags row lands on another, and none runs off the
+    /// column**, with the vector layer's mark beside Add, at the design's width
+    /// and at the narrowest a column may be dragged.
+    ///
+    /// Measured off the rectangles egui recorded for the widgets it laid out,
+    /// not off the arithmetic the row does: the row wraps, and a mark that
+    /// overran would be drawn over its neighbour rather than reflowed, which no
+    /// assertion about the code could see. The two marks the flags row adds,
+    /// `ui::ICON_BUTTON` square, are found side by side on one line first, so
+    /// the sweep cannot pass by having measured nothing.
+    #[test]
+    fn the_flags_row_marks_never_overlap_at_any_column_width() {
+        use crate::dock::limits;
+        use crate::editor::Editor;
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Rect, pos2, vec2};
+
+        let palette = Palette::of(ThemeKind::Graphite);
+        for width in [metrics::PANEL, limits::SIDEBAR_MIN_WIDTH] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            crate::theme::apply(&ctx, &palette);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 600.0))),
+                ..Default::default()
+            };
+            let mut ed = Editor::default();
+            ed.layers.add();
+            for _ in 0..2 {
+                let _ = ctx.run_ui(input.clone(), |ui| {
+                    let mut actions = crate::ui::UiActions::default();
+                    super::layers_body(ui, &palette, &mut ed, &mut actions);
+                });
+            }
+            let square = |r: &Rect, side: f32| {
+                (r.width() - side).abs() < 0.01 && (r.height() - side).abs() < 0.01
+            };
+            let marks: Vec<Rect> = ctx.viewport(|vp| {
+                vp.prev_pass
+                    .widgets
+                    .layers()
+                    .flat_map(|(_, rects)| rects.iter())
+                    .map(|w| w.rect)
+                    .filter(|r| {
+                        square(r, crate::ui::ICON_BUTTON) || square(r, crate::widgets::ICON_TOGGLE)
+                    })
+                    .collect()
+            });
+            let buttons: Vec<&Rect> = marks
+                .iter()
+                .filter(|r| square(r, crate::ui::ICON_BUTTON))
+                .collect();
+            assert!(
+                buttons.iter().any(|a| buttons
+                    .iter()
+                    .any(|b| (a.top() - b.top()).abs() < 0.01 && b.left() > a.left())),
+                "at {width}: the Add and vector marks were not found side by side"
+            );
+            for (i, a) in marks.iter().enumerate() {
+                assert!(
+                    a.left() >= -0.01 && a.right() <= width + 0.01,
+                    "at {width}: a mark at {a:?} runs off the column"
+                );
+                for b in &marks[i + 1..] {
+                    let overlap = a.intersect(*b);
+                    assert!(
+                        overlap.width() <= 0.01 || overlap.height() <= 0.01,
+                        "at {width}: marks at {a:?} and {b:?} overlap"
+                    );
+                }
+            }
+        }
+    }
+
     /// A module header never draws its title under its own controls, and never
     /// on a second line.
     ///

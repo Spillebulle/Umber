@@ -1580,7 +1580,21 @@ impl Editor {
         let Some(selection) = self.selection.as_ref() else {
             return Ok(None);
         };
-        let paths = umber_core::VectorObject::from_rings(selection.rings(), role);
+        self.plan_path_from_rings(selection.rings(), role).map(Some)
+    }
+
+    /// [`Editor::plan_path_from_selection`] over the rings it was handed.
+    ///
+    /// Apart so a guard can reach the refusal for rings that collapse to
+    /// nothing: a `Selection` with coverage always has rings that enclose
+    /// something, so the public constructors cannot build that case, and the
+    /// arm would otherwise be untested.
+    fn plan_path_from_rings(
+        &self,
+        rings: &[Vec<Vec2>],
+        role: umber_core::PathRole,
+    ) -> Result<PathPlan, Notice> {
+        let paths = umber_core::VectorObject::from_rings(rings, role);
         if paths.is_empty() {
             return Err(path_refusal(
                 umber_core::vector::VectorRefusal::Impossible.sentence(),
@@ -1596,10 +1610,10 @@ impl Editor {
                 .appended(paths)
                 .map_err(|why| path_refusal(why.sentence()))?;
             return match self.layers.can_set_vector(active, &after) {
-                Ok(()) => Ok(Some(PathPlan::Append {
+                Ok(()) => Ok(PathPlan::Append {
                     slot,
                     after: Box::new(after),
-                })),
+                }),
                 Err(why) => Err(path_refusal(set_refusal_sentence(why))),
             };
         }
@@ -1611,7 +1625,7 @@ impl Editor {
             umber_core::PathRole::Plot => PLOT_LAYER_NAME,
             umber_core::PathRole::Ink => INK_LAYER_NAME,
         };
-        self.plan_new_layer(name, record).map(Some)
+        self.plan_new_layer(name, record)
     }
 
     /// An empty vector layer above the active entry, for the Layers panel's
@@ -4589,6 +4603,41 @@ mod tests {
                 },
             }),
             None => Ok(()),
+        }
+    }
+
+    /// Rings that collapse to nothing, here a ring that doubles back on itself
+    /// along one line, are refused with the record's own Impossible sentence
+    /// on an ordinary layer and on a vector layer alike, and nothing changes.
+    #[test]
+    fn rings_that_enclose_nothing_are_refused_as_impossible() {
+        let a = Vec2::new(10.0, 10.0);
+        let b = Vec2::new(40.0, 10.0);
+        let rings = vec![vec![a, b, a, b], vec![a, a, a]];
+        let mut ed = Editor::default();
+        for vector in [false, true] {
+            if vector {
+                ed.layers
+                    .add_vector_layer("Paths", umber_core::VectorObject::empty())
+                    .expect("room");
+            }
+            let before = (stack_ids(&ed), active_paths(&ed), ed.history.len());
+            let notice = ed
+                .plan_path_from_rings(&rings, umber_core::PathRole::Cut)
+                .expect_err("collapsed rings were planned");
+            assert_eq!(
+                notice.lines,
+                vec![
+                    umber_core::vector::VectorRefusal::Impossible
+                        .sentence()
+                        .to_string()
+                ],
+                "vector layer active: {vector}"
+            );
+            assert_eq!(
+                (stack_ids(&ed), active_paths(&ed), ed.history.len()),
+                before
+            );
         }
     }
 
