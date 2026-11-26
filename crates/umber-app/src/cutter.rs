@@ -646,8 +646,31 @@ pub fn found_lines(paths: &[String]) -> Vec<String> {
     }
     paths
         .iter()
-        .map(|p| format!("Found a Silhouette at {p}"))
+        .map(|p| match shown_path(p) {
+            Some(shown) => format!("Found a Silhouette at {shown}"),
+            None => "Found a Silhouette (path not shown)".to_string(),
+        })
         .collect()
+}
+
+/// A device path as it may be shown, with the machine's serial number taken
+/// out: `\\?\usb#vid_0b4d&pid_113a#<serial>#{guid}`. The serial is the segment
+/// after the product id, and a log is something people paste into a public
+/// report. A path not in exactly that shape is `None`, because a redaction
+/// that guesses which segment is the serial can guess wrong and show it.
+pub fn shown_path(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('#').collect();
+    let [bus, ids, serial, class] = parts[..] else {
+        return None;
+    };
+    let ids_lower = ids.to_ascii_lowercase();
+    let shaped = bus.to_ascii_lowercase().ends_with("usb")
+        && ids_lower.starts_with("vid_")
+        && ids_lower.contains("&pid_")
+        && !serial.is_empty()
+        && class.starts_with('{')
+        && class.ends_with('}');
+    shaped.then(|| format!("{bus}#{ids}#<serial>#{class}"))
 }
 
 /// The sentence a worker that died before answering is reported with.
@@ -3057,17 +3080,50 @@ mod tests {
             }
         }
 
+        /// The segment after the product id is the machine's serial number,
+        /// and a log is something people paste into a public report.
+        #[test]
+        fn a_device_path_is_shown_without_its_serial_number() {
+            let guid = "{28d78fad-5a12-11d1-ae5b-0000f803a8c2}";
+            assert_eq!(
+                shown_path(&format!(r"\\?\usb#vid_0b4d&pid_113a#ABC123#{guid}")).as_deref(),
+                Some(format!(r"\\?\usb#vid_0b4d&pid_113a#<serial>#{guid}").as_str())
+            );
+            // Windows writes these in either case, and a composite device
+            // adds an interface number after the product id.
+            assert_eq!(
+                shown_path(&format!(
+                    r"\\?\USB#VID_0B4D&PID_113A&MI_00#7&1a2b3c&0&0000#{guid}"
+                ))
+                .as_deref(),
+                Some(format!(r"\\?\USB#VID_0B4D&PID_113A&MI_00#<serial>#{guid}").as_str())
+            );
+            // Anything else is not shown at all, rather than half redacted.
+            for odd in [
+                "",
+                "b",
+                r"\\?\usb#vid_0b4d&pid_113a#ABC123",
+                r"\\?\usb#vid_0b4d#ABC123#{guid}",
+                r"\\?\usb#vid_0b4d&pid_113a#ABC123#extra#{guid}",
+                r"\\?\usb#vid_0b4d&pid_113a##{guid}",
+            ] {
+                assert_eq!(shown_path(odd), None, "{odd}");
+            }
+        }
+
         #[test]
         fn the_paths_found_are_logged_before_the_open() {
             assert_eq!(
                 found_lines(&[]),
                 vec!["No Silhouette cutter found on USB.".to_string()]
             );
+            let path = r"\\?\usb#vid_0b4d&pid_113a#ABC123#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}";
             assert_eq!(
-                found_lines(&["a".to_string(), "b".to_string()]),
+                found_lines(&[path.to_string(), "b".to_string()]),
                 vec![
-                    "Found a Silhouette at a".to_string(),
-                    "Found a Silhouette at b".to_string()
+                    r"Found a Silhouette at \\?\usb#vid_0b4d&pid_113a#<serial>#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}"
+                        .to_string(),
+                    "Found a Silhouette (path not shown)".to_string()
                 ]
             );
             // Whatever the opener logs reaches the log, ahead of any transfer.

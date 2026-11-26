@@ -35,8 +35,12 @@ fn main() -> ExitCode {
         println!("No Silhouette is visible to the USB printing driver.");
     } else {
         println!("Silhouette interfaces found:");
+        // Without the serial number, so the output can be pasted into a report.
         for p in &paths {
-            println!("  {p}");
+            match cutter::shown_path(p) {
+                Some(shown) => println!("  {shown}"),
+                None => println!("  a Silhouette (path not shown)"),
+            }
         }
     }
 
