@@ -45,6 +45,9 @@ pub(crate) const WINDOWS_ONLY: &str = "Sending to a cutter works on Windows only
 const NO_MARKS: &str = "This document has no registration marks. Switch them on in the File menu.";
 const MARKS_DO_NOT_FIT: &str = "This page cannot hold registration marks.";
 const STOPPING: &str = "Stopping. The cutter is finishing the part it was already sent.";
+const BLADE_DEPTH: &str = "For the AutoBlade. Off leaves the blade as it was last set.";
+/// The depth the rail starts at the first time it is switched on.
+const FIRST_DEPTH: u8 = 3;
 
 /// What the dialog has asked `App` to do, spent once after the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +110,9 @@ pub struct CutterForm {
     /// How many times the summary has been planned, which is what a test
     /// reads to say it is not planned every frame.
     planned: usize,
+    /// The blade depth last on the rail, so switching the depth off and on
+    /// again brings back the figure rather than resetting it.
+    last_depth: u8,
 }
 
 impl Default for CutterForm {
@@ -123,6 +129,7 @@ impl Default for CutterForm {
             worker: None,
             summary: None,
             planned: 0,
+            last_depth: FIRST_DEPTH,
         }
     }
 }
@@ -223,17 +230,7 @@ impl CutterForm {
                 CutterPhase::Checking
             }
             Work::Send(job) => {
-                let s = job.settings();
-                self.push_line(format!(
-                    "Send: {}, pressure {}, speed {}, passes {}, registration marks {}, {} paths, {:.1} mm",
-                    offered(s.role).unwrap_or("Cut"),
-                    s.pressure,
-                    s.speed,
-                    s.passes,
-                    if s.use_marks { "on" } else { "off" },
-                    job.path_count(),
-                    job.length_mm()
-                ));
+                self.push_line(send_header(job));
                 CutterPhase::Sending(Stage::Connecting)
             }
         };
@@ -323,6 +320,27 @@ impl CutterForm {
     pub fn log_text(&self) -> &str {
         &self.log_text
     }
+}
+
+/// The log's first line for a job: every setting it was sent with, as the
+/// job holds them, so a report says what the machine was actually told.
+fn send_header(job: &Job) -> String {
+    let s = job.settings();
+    let depth = match s.blade_depth() {
+        Some(d) => format!("blade depth {d}"),
+        None => "blade depth not set".to_string(),
+    };
+    format!(
+        "Send: {}, pressure {}, speed {}, passes {}, {depth}, registration marks {}, {} paths, \
+         {:.1} mm",
+        offered(s.role).unwrap_or("Cut"),
+        s.pressure,
+        s.speed,
+        s.passes,
+        if s.use_marks { "on" } else { "off" },
+        job.path_count(),
+        job.length_mm()
+    )
 }
 
 /// "3 paths, 412 mm of cutting".
@@ -448,6 +466,31 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 whole_row(ui, p, "Speed", &mut s.speed, 1, 10);
                 ui.add_space(8.0);
                 whole_row(ui, p, "Passes", &mut s.passes, 1, 5);
+
+                // A pen has no blade, so the depth is offered for a cut alone.
+                match form.role {
+                    PathRole::Cut => {
+                        ui.add_space(12.0);
+                        let mut on = form.cut.depth.is_some();
+                        widgets::toggle_row(ui, p, "Set blade depth", &mut on);
+                        form.cut.depth = match (on, form.cut.depth) {
+                            (true, Some(d)) => Some(d),
+                            (true, None) => Some(form.last_depth),
+                            (false, Some(d)) => {
+                                form.last_depth = d;
+                                None
+                            }
+                            (false, None) => None,
+                        };
+                        if let Some(d) = form.cut.depth.as_mut() {
+                            ui.add_space(8.0);
+                            whole_row(ui, p, "Blade depth", d, 0, 10);
+                        }
+                        ui.add_space(4.0);
+                        caption(ui, p, BLADE_DEPTH);
+                    }
+                    PathRole::Plot | PathRole::Ink => {}
+                }
             });
             ui.add_space(12.0);
 
@@ -826,6 +869,72 @@ mod tests {
     }
 
     #[test]
+    fn the_blade_depth_is_offered_for_a_cut_alone() {
+        let mut h = Harness::new();
+        let mut ed = opened();
+        let shot = h.settled(&mut ed);
+        assert!(shot.has("Set blade depth"), "{:?}", shot.words());
+        assert!(shot.has(BLADE_DEPTH));
+        assert!(!shot.has("Blade depth"), "the rail is drawn while off");
+        assert_eq!(ed.cutter.cut.depth, None);
+
+        // The depth switch is the last pill on the form.
+        let pill = shot.toggles.last().unwrap().center();
+        let shot = h.click(&mut ed, pill);
+        assert_eq!(ed.cutter.cut.depth, Some(FIRST_DEPTH));
+        let shot = if shot.has("Blade depth") {
+            shot
+        } else {
+            h.settled(&mut ed)
+        };
+        assert!(shot.has("Blade depth"), "{:?}", shot.words());
+        // The job planned from the form carries it, and the summary was
+        // planned again for it.
+        let job = ed.cutter.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(job.setup_block().ends_with(b"TF3,1\x03"));
+
+        // Off and on again brings back the figure that was on the rail.
+        ed.cutter.cut.depth = Some(7);
+        let shot = h.settled(&mut ed);
+        h.click(&mut ed, shot.toggles.last().unwrap().center());
+        assert_eq!(ed.cutter.cut.depth, None);
+        let shot = h.settled(&mut ed);
+        h.click(&mut ed, shot.toggles.last().unwrap().center());
+        assert_eq!(ed.cutter.cut.depth, Some(7));
+
+        // Plot draws none of it, and keeps none of it.
+        let shot = h.press(&mut ed, "Plot");
+        for gone in ["Set blade depth", "Blade depth", BLADE_DEPTH] {
+            assert!(!shot.has(gone), "{gone} offered for a pen");
+        }
+        assert_eq!(ed.cutter.settings().depth, None);
+    }
+
+    #[test]
+    fn the_log_header_says_the_blade_depth() {
+        let ed = opened();
+        let mut form = CutterForm::default();
+        let job = form.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(
+            send_header(&job).contains(", blade depth not set, "),
+            "{}",
+            send_header(&job)
+        );
+        form.cut.depth = Some(4);
+        let job = form.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(
+            send_header(&job).contains(", blade depth 4, "),
+            "{}",
+            send_header(&job)
+        );
+        // A plot job is never sent one, so its header never claims one.
+        form.role = PathRole::Plot;
+        form.plot.depth = Some(4);
+        let job = form.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(send_header(&job).contains(", blade depth not set, "));
+    }
+
+    #[test]
     fn a_refusal_is_shown_and_send_is_disabled() {
         let mut h = Harness::new();
         let mut ed = Editor::default();
@@ -853,8 +962,9 @@ mod tests {
             "{:?}",
             shot.words()
         );
-        // The pill is drawn and pressing it changes nothing.
-        assert_eq!(shot.toggles.len(), 1, "{:?}", shot.toggles);
+        // The pill is drawn and pressing it changes nothing. The marks are
+        // the first pill; the blade depth's is below it.
+        assert_eq!(shot.toggles.len(), 2, "{:?}", shot.toggles);
         let pill = shot.toggles[0].center();
         h.click(&mut ed, pill);
         assert!(ed.cutter.settings().use_marks);

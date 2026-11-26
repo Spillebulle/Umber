@@ -67,6 +67,9 @@ pub struct JobSettings {
     pub speed: u8,
     /// How many times every path is followed, `1..=5`.
     pub passes: u8,
+    /// The AutoBlade's depth, `0..=10`, or `None` to leave the blade as it
+    /// was last set. Sent only for a cut: a pen has no blade.
+    pub depth: Option<u8>,
 }
 
 impl JobSettings {
@@ -84,6 +87,16 @@ impl JobSettings {
             pressure,
             speed,
             passes: 1,
+            depth: None,
+        }
+    }
+
+    /// The blade depth a job with these settings sends: the depth for a cut,
+    /// and never one for a pen, whatever the field holds.
+    pub fn blade_depth(&self) -> Option<u8> {
+        match self.role {
+            PathRole::Cut => self.depth,
+            PathRole::Plot | PathRole::Ink => None,
         }
     }
 
@@ -94,6 +107,7 @@ impl JobSettings {
             pressure: self.pressure.clamp(1, 33),
             speed: self.speed.clamp(1, 10),
             passes: self.passes.clamp(1, 5),
+            depth: self.depth.map(|d| d.min(10)),
             ..*self
         }
     }
@@ -371,6 +385,11 @@ impl Job {
         ] {
             command(&mut out, &c);
         }
+        // The AutoBlade's depth, last, where the reference implementation
+        // sends it: after the force, the speed, the offset and the lift.
+        if let Some(d) = s.blade_depth() {
+            command(&mut out, &format!("TF{d},1"));
+        }
         out
     }
 
@@ -549,6 +568,55 @@ mod tests {
             etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX5,1·!8,1·FC0,1,1·FE0,1·")
         );
         assert!(!setup.windows(4).any(|w| w == b"FC18"));
+    }
+
+    #[test]
+    fn a_cut_job_with_a_depth_says_so() {
+        let sq = square(PathRole::Cut, 20.0, 30.0);
+        let settings = JobSettings {
+            depth: Some(3),
+            ..JobSettings::new(PathRole::Cut)
+        };
+        let job = plan(&[&sq], &settings, &a4(true)).unwrap();
+        // The reference sends TF last in the tool setup, after the force,
+        // the speed, the blade offset and the lift.
+        assert_eq!(
+            job.setup_block(),
+            etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX10,1·!5,1·FC18,1,1·FE0,1·TF3,1·")
+        );
+        // Zero is a depth, not "unset".
+        let zero = JobSettings {
+            depth: Some(0),
+            ..settings
+        };
+        let job = plan(&[&sq], &zero, &a4(true)).unwrap();
+        assert!(job.setup_block().ends_with(&etx("FE0,1·TF0,1·")));
+        // Past the dial is the end of the dial.
+        let deep = JobSettings {
+            depth: Some(99),
+            ..settings
+        };
+        let job = plan(&[&sq], &deep, &a4(true)).unwrap();
+        assert!(job.setup_block().ends_with(&etx("FE0,1·TF10,1·")));
+        assert_eq!(job.settings().depth, Some(10));
+    }
+
+    #[test]
+    fn a_plot_job_never_sets_a_blade_depth() {
+        let sq = square(PathRole::Plot, 20.0, 30.0);
+        for depth in [None, Some(0), Some(3), Some(10), Some(200)] {
+            let settings = JobSettings {
+                depth,
+                ..JobSettings::new(PathRole::Plot)
+            };
+            let job = plan(&[&sq], &settings, &a4(true)).unwrap();
+            assert_eq!(
+                job.setup_block(),
+                etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX5,1·!8,1·FC0,1,1·FE0,1·"),
+                "{depth:?}"
+            );
+            assert!(!job.setup_block().windows(2).any(|w| w == b"TF"));
+        }
     }
 
     #[test]
@@ -887,6 +955,9 @@ mod tests {
             (c.use_marks, c.pressure, c.speed, c.passes),
             (true, 10, 5, 1)
         );
+        for role in PathRole::ALL {
+            assert_eq!(JobSettings::new(role).depth, None, "{role:?}");
+        }
         let p = JobSettings::new(PathRole::Plot);
         assert_eq!(
             (p.use_marks, p.pressure, p.speed, p.passes),

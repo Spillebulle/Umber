@@ -2298,6 +2298,16 @@ conversation is a rule about a scripted fake until somebody has.
   on the half-unit edge tolerance rounded to 4061 after `Z5940,4060`. `SO0` is
   deliberately not sent: it moves the origin for the next job, which a roll
   feed wants and a print-and-cut sheet does not. Do not "tidy" a command.
+- **The blade depth is `TF<d>,1`, last in the setup, and only for a cut.**
+  `JobSettings::depth` is `None` by default and then the setup block is byte
+  for byte what it was before the field existed; `Some(d)` is clamped to
+  `0..=10` and sent after `FE0,1`, which is where the reference sends it,
+  after the force, the speed, the offset and the lift. `blade_depth()` is the
+  one statement of "is a depth sent", matched exhaustively on the role, and a
+  pen is never sent one whatever the field holds. The reference sends it only
+  after asking the machine which tool is in the holder (`ESC NAK`) and finding
+  an AutoBlade or nothing; Umber does not ask, so a depth sent with another
+  blade in the holder does whatever the machine does with it.
 - **The conversation's rules**, each of which is a cut in the wrong place if
   broken. See `cutter.rs`'s module docs and `send`'s.
   - **Nothing is ever written twice.** Every write in `conversation` is a `?`. A
