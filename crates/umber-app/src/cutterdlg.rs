@@ -33,9 +33,13 @@ const WIDTH: f32 = 420.0;
 /// The log's height, fixed so a growing log scrolls rather than growing the
 /// dialog.
 const LOG_HEIGHT: f32 = 160.0;
-/// The most lines the log keeps. A long job writes several lines a block, and
-/// what matters in a report is usually the end.
+/// The most lines the log keeps. Past it, lines are let go from the middle.
 pub const MAX_LOG_LINES: usize = 2000;
+/// The lines at the start of the log that are never let go: the version,
+/// the firmware, the setup and the marks search, which are what a report
+/// from the machine needs most and what a long job's polling used to push
+/// out first.
+pub const LOG_HEAD_LINES: usize = 200;
 
 /// Whether this platform has a link at all.
 const SUPPORTED: bool = cfg!(windows);
@@ -118,6 +122,11 @@ pub struct CutterForm {
     pub outcome: Option<Result<String, String>>,
     /// The work in flight. Only one at a time.
     pub worker: Option<Worker>,
+    /// The log's last line is this status exchange, seen this many times in
+    /// a row.
+    repeated: Option<(String, usize)>,
+    /// Lines let go from the middle of the log so far.
+    left_out: usize,
     summary: Option<Summary>,
     /// How many times the summary has been planned, which is what a test
     /// reads to say it is not planned every frame.
@@ -142,6 +151,8 @@ impl Default for CutterForm {
             log_text: String::new(),
             outcome: None,
             worker: None,
+            repeated: None,
+            left_out: 0,
             summary: None,
             planned: 0,
             last_depth: FIRST_DEPTH,
@@ -313,19 +324,69 @@ impl CutterForm {
         self.trim_log();
     }
 
+    /// Add a line, folding a status query and its answer into one line, and
+    /// a run of identical exchanges into that line with a count.
     fn push_line(&mut self, line: String) {
+        let answers_a_query = line.starts_with("< ")
+            && self.log.last().map(String::as_str) == Some(crate::cutter::STATUS_LOG_LINE);
+        if !answers_a_query {
+            // A query waits for its answer with `repeated` left as it was,
+            // because the line before it is what the exchange may repeat.
+            if line != crate::cutter::STATUS_LOG_LINE {
+                self.repeated = None;
+            }
+            self.append(line);
+            return;
+        }
+        self.pop_line();
+        let exchange = format!("{}  {line}", crate::cutter::STATUS_LOG_LINE);
+        match self.repeated.take() {
+            Some((last, seen)) if last == exchange => {
+                let seen = seen + 1;
+                self.pop_line();
+                self.append(format!("{exchange}  (x {seen})"));
+                self.repeated = Some((exchange, seen));
+            }
+            Some(_) | None => {
+                self.append(exchange.clone());
+                self.repeated = Some((exchange, 1));
+            }
+        }
+    }
+
+    fn append(&mut self, line: String) {
         self.log_text.push_str(&line);
         self.log_text.push('\n');
         self.log.push(line);
     }
 
-    /// Drop the oldest lines past [`MAX_LOG_LINES`], once per batch.
+    fn pop_line(&mut self) {
+        if let Some(line) = self.log.pop() {
+            self.log_text.truncate(self.log_text.len() - line.len() - 1);
+        }
+    }
+
+    /// Past [`MAX_LOG_LINES`], let lines go from the middle, once per batch:
+    /// the first [`LOG_HEAD_LINES`] stay, then one line saying how many were
+    /// left out, then the newest.
     fn trim_log(&mut self) {
         if self.log.len() <= MAX_LOG_LINES {
             return;
         }
         let excess = self.log.len() - MAX_LOG_LINES;
-        self.log.drain(..excess);
+        if self.left_out == 0 {
+            // Room for the marker as well.
+            let gone = excess + 1;
+            self.log.drain(LOG_HEAD_LINES..LOG_HEAD_LINES + gone);
+            self.left_out = gone;
+            self.log
+                .insert(LOG_HEAD_LINES, left_out_line(self.left_out));
+        } else {
+            let from = LOG_HEAD_LINES + 1;
+            self.log.drain(from..from + excess);
+            self.left_out += excess;
+            self.log[LOG_HEAD_LINES] = left_out_line(self.left_out);
+        }
         self.log_text.clear();
         for line in &self.log {
             self.log_text.push_str(line);
@@ -398,6 +459,10 @@ fn shown_vector_layers(layers: &LayerStack) -> u64 {
         }
     }
     h
+}
+
+fn left_out_line(n: usize) -> String {
+    format!("... {n} lines left out ...")
 }
 
 /// The log's first line for a job: every setting it was sent with, as the
@@ -1338,17 +1403,102 @@ mod tests {
         );
     }
 
+    /// A long job writes a status query and reads its answer four times a
+    /// second; the log keeps one line for a run of identical ones.
     #[test]
-    fn the_log_keeps_the_newest_lines() {
+    fn a_repeated_status_exchange_is_one_line_with_a_count() {
+        let query = crate::cutter::STATUS_LOG_LINE;
+        let exchange = |reply: &str| {
+            vec![
+                Event::Line(query.to_string()),
+                Event::Line(reply.to_string()),
+            ]
+        };
+        let mut form = CutterForm::default();
+        form.absorb(vec![Event::Line("> 3 FG\\x03".to_string())]);
+        form.absorb(exchange("< 2 0\\x03"));
+        assert_eq!(
+            form.log,
+            vec!["> 3 FG\\x03".to_string(), format!("{query}  < 2 0\\x03")]
+        );
+        form.absorb(vec![Event::Line("> 5 M0,0\\x03".to_string())]);
+        // 214 polls, some of them a batch apiece and some arriving together.
+        for _ in 0..100 {
+            form.absorb(exchange("< 2 1\\x03"));
+        }
+        form.absorb((0..114).flat_map(|_| exchange("< 2 1\\x03")).collect());
+        assert_eq!(
+            form.log.last().unwrap(),
+            &format!("{query}  < 2 1\\x03  (x 214)")
+        );
+        assert_eq!(form.log.len(), 4, "{:?}", form.log);
+        // A different answer is a line of its own, and so is a failed read.
+        form.absorb(exchange("< 2 0\\x03"));
+        form.absorb(exchange("< failed: Timeout"));
+        form.absorb(exchange("< failed: Timeout"));
+        assert_eq!(
+            &form.log[4..],
+            &[
+                format!("{query}  < 2 0\\x03"),
+                format!("{query}  < failed: Timeout  (x 2)"),
+            ]
+        );
+        // Anything between two exchanges keeps them apart.
+        form.absorb(vec![Event::Line("x 6 0\\x03".to_string())]);
+        form.absorb(exchange("< failed: Timeout"));
+        assert_eq!(
+            form.log.last().unwrap(),
+            &format!("{query}  < failed: Timeout")
+        );
+        assert_eq!(form.log_text(), form.log.join("\n") + "\n");
+    }
+
+    /// What a report needs most is the start: the firmware, the setup and
+    /// the marks. The middle of a long job is what is let go.
+    #[test]
+    fn the_head_of_the_log_is_never_lost() {
         let mut form = CutterForm::default();
         form.absorb(
-            (0..2500)
+            (0..5000)
                 .map(|i| Event::Line(format!("line {i}")))
                 .collect(),
         );
         assert_eq!(form.log.len(), MAX_LOG_LINES);
-        assert_eq!(form.log[0], "line 500");
-        assert_eq!(form.log.last().unwrap(), "line 2499");
+        for i in 0..LOG_HEAD_LINES {
+            assert_eq!(form.log[i], format!("line {i}"));
+        }
+        let kept = MAX_LOG_LINES - 1;
+        assert_eq!(
+            form.log[LOG_HEAD_LINES],
+            format!("... {} lines left out ...", 5000 - kept)
+        );
+        assert_eq!(
+            form.log[LOG_HEAD_LINES + 1],
+            format!("line {}", 5000 - (kept - LOG_HEAD_LINES))
+        );
+        assert_eq!(form.log.last().unwrap(), "line 4999");
+        assert_eq!(form.log_text(), form.log.join("\n") + "\n");
+
+        // More later: still one marker, counting everything left out.
+        form.absorb(
+            (5000..5010)
+                .map(|i| Event::Line(format!("line {i}")))
+                .collect(),
+        );
+        assert_eq!(form.log.len(), MAX_LOG_LINES);
+        assert_eq!(form.log[0], "line 0");
+        assert_eq!(
+            form.log[LOG_HEAD_LINES],
+            format!("... {} lines left out ...", 5010 - kept)
+        );
+        assert_eq!(
+            form.log
+                .iter()
+                .filter(|l| l.ends_with("left out ..."))
+                .count(),
+            1
+        );
+        assert_eq!(form.log.last().unwrap(), "line 5009");
         assert_eq!(form.log_text(), form.log.join("\n") + "\n");
     }
 

@@ -41,6 +41,9 @@ const INIT: &[u8] = b"\x1b\x04";
 const FIRMWARE: &[u8] = b"FG\x03";
 /// Ask for the status.
 const STATUS: &[u8] = b"\x1b\x05";
+/// How a status query reads in the log, which is what the dialog folds a run
+/// of identical exchanges by. Pinned against [`log_line`] in a test.
+pub const STATUS_LOG_LINE: &str = "> 2 \\x1b\\x05";
 /// The one reply that means the marks were found.
 const MARKS_FOUND: &[u8] = b"    0\x03";
 
@@ -2560,6 +2563,11 @@ mod tests {
             lines[0],
             format!("> 200 {} ... (200 bytes)", "D".repeat(96))
         );
+    }
+
+    #[test]
+    fn a_status_query_is_logged_as_the_line_the_dialog_folds_by() {
+        assert_eq!(log_line('>', STATUS), STATUS_LOG_LINE);
     }
 
     #[test]
