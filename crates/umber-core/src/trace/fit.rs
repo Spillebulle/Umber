@@ -10,8 +10,9 @@
 //!   side of it is a corner, and only the sharpest within that reach survives.
 //!   The reach is what lets marching squares' chamfered right angle still read
 //!   as one corner, and what keeps a grown outline's rounded corner (radius at
-//!   least the margin) from reading as one: over eight cells of arc a circle of
-//!   radius ten turns by about 46 degrees.
+//!   least the margin) from reading as one: the chords four cells either side
+//!   of a vertex on a circle of radius ten turn by about 23 degrees, which is
+//!   `4/r` radians, so the turn passes the threshold near a radius of four.
 //! - **Each run between corners is Schneider's algorithm**: chord-length
 //!   parameters, least-squares handle lengths along fixed end tangents, up to
 //!   [`NEWTON_PASSES`] of Newton reparameterisation when the fit is close, and
