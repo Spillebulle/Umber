@@ -2063,7 +2063,9 @@ drawn by hand.
   to say when that index may have stopped meaning what it meant. A foreign
   change drops the pick, since a fresh one is a click away. A continued draft is
   only *detached* (it then lands as a new path), because dropping it costs what
-  the artist drew and detaching costs at most a duplicate. **What decides the
+  the artist drew and detaching costs at most a duplicate. One given nothing yet
+  is dropped instead, since it holds only the path's old nodes and would land as
+  a copy of a path nobody drew. **What decides the
   detach is the path, not the count.** A layer or document change detaches
   outright; on a foreign revision `PathTool::still_continues` keeps the draft
   only if path `i` is still an open line of the draft's role whose nodes equal

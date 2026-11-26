@@ -294,8 +294,20 @@ impl PathTool {
 
     /// The active layer changed under a draft that continues one of its
     /// paths. The draft now lands as a new path and the old one is untouched.
+    ///
+    /// **A continuation given nothing yet is dropped instead.** It holds only
+    /// the path's own nodes as they were when it was taken up, so landing it
+    /// as a new path would put down a copy of a path nobody drew, beside the
+    /// edit that made the detach happen.
     pub fn detach(&mut self) {
         self.touch();
+        if self.untouched_continuation() {
+            self.draft = None;
+            self.draft_role = None;
+            self.base_len = 0;
+            self.base_reversed = false;
+            return;
+        }
         if let Some(draft) = self.draft.as_mut() {
             draft.continues = None;
             self.base_len = 0;

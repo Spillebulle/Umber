@@ -6588,11 +6588,24 @@ mod tests {
             Some(0),
             "the press took the line up"
         );
+        path_tap(&mut ed, Vec2::new(150.0, 50.0));
+        let index = ed.layers.active_index();
         ed.layers.set_active(0);
         ed.follow_path_ground();
         let draft = ed.path_tool.draft().expect("still up");
         assert_eq!(draft.continues, None, "it lands as a new path now");
-        assert_eq!(draft.nodes.len(), 2, "with every node it had");
+        assert_eq!(draft.nodes.len(), 3, "with every node it had");
+
+        // Taken up and given nothing, there is nothing drawn to keep: a
+        // detach drops it rather than leaving a copy of the path to land.
+        ed.path_tool.abandon();
+        ed.layers.set_active(index);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(100.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+        ed.layers.set_active(0);
+        ed.follow_path_ground();
+        assert!(ed.path_tool.draft().is_none(), "an untouched continuation");
     }
 
     /// **The reviewer's sequence: a count that comes back equal is not the
@@ -6608,6 +6621,10 @@ mod tests {
         ed.follow_path_ground();
         path_tap(&mut ed, Vec2::new(100.0, 200.0));
         assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+        // A node first: a continuation given nothing is dropped by a detach
+        // (`a_ctrl_edit_of_a_path_taken_up_and_given_nothing_leaves_no_copy`),
+        // and the case here is one with something drawn to keep.
+        path_tap(&mut ed, Vec2::new(150.0, 225.0));
 
         let index = ed.layers.active_index();
         let jumped = umber_core::VectorObject::empty()
@@ -6621,7 +6638,7 @@ mod tests {
         assert_eq!(paths.len(), 3, "appended, not replaced");
         assert_eq!(paths[0], a);
         assert_eq!(paths[1], b);
-        assert_eq!(paths[2].nodes.len(), 3, "B and the node added to it");
+        assert_eq!(paths[2].nodes.len(), 4, "B and the nodes added to it");
     }
 
     /// A foreign edit that leaves the continued path where it was keeps the
@@ -6656,6 +6673,9 @@ mod tests {
         ed.follow_path_ground();
         path_tap(&mut ed, Vec2::new(100.0, 0.0));
         assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+        // Something drawn, so the detach keeps the draft rather than dropping
+        // an untouched continuation.
+        path_tap(&mut ed, Vec2::new(150.0, 50.0));
 
         path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
         ed.path_press(Vec2::new(0.0, 0.0), true);
@@ -6664,7 +6684,6 @@ mod tests {
         assert_eq!(record_of(&ed).paths()[0].nodes[0].at, Vec2::new(0.0, 50.0));
         assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), None);
 
-        path_tap(&mut ed, Vec2::new(150.0, 50.0));
         assert!(ed.path_key(PathKey::Finish));
         let paths = record_of(&ed).paths().to_vec();
         assert_eq!(paths.len(), 2, "a new path beside the edited one");
@@ -6682,6 +6701,35 @@ mod tests {
                 Vec2::new(150.0, 50.0)
             ]
         );
+    }
+
+    /// **A path taken up and then Ctrl-edited, with nothing drawn, leaves the
+    /// edited path alone.** The edit detaches the draft, and a draft holding
+    /// only the path's old nodes would land as a copy of the path before the
+    /// edit. It is dropped instead: Enter afterwards records nothing.
+    #[test]
+    fn a_ctrl_edit_of_a_path_taken_up_and_given_nothing_leaves_no_copy() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.follow_path_ground();
+        let history = ed.history.len();
+        path_tap(&mut ed, Vec2::new(100.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+
+        path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+        ed.path_press(Vec2::new(0.0, 0.0), true);
+        ed.path_moved(Vec2::new(0.0, 50.0), false);
+        ed.path_release(Vec2::new(0.0, 50.0));
+        ed.path_key(PathKey::Finish);
+
+        let paths = record_of(&ed).paths().to_vec();
+        assert_eq!(paths.len(), 1, "no copy of the pre-edit path");
+        assert_eq!(
+            paths[0].nodes[0].at,
+            Vec2::new(0.0, 50.0),
+            "the edit stands"
+        );
+        assert_eq!(ed.history.len(), history + 1, "the edit's entry alone");
+        assert!(ed.path_tool.draft().is_none());
     }
 
     /// A Ctrl press in Draw on a layer that cannot be edited says why, for a
