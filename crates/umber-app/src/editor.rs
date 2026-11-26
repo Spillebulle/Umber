@@ -2456,8 +2456,11 @@ impl Editor {
     ///
     /// **No float can be up under a commit that writes, and that is what lets
     /// this record.** A float exists only with the transform tool in hand, and
-    /// the Path tool is settled before the tool can change, so there is no
-    /// draft and no pick for a `Land` or a `Set` to come from while one stands.
+    /// every way a float begins settles the Path tool before it: a lift needs
+    /// the transform tool already in hand, and a paste or a text placement
+    /// (`App::float_a_clip`) settles first, because the tool change at its end
+    /// would otherwise settle with the float up. So there is no draft and no
+    /// pick for a `Land` or a `Set` to come from while one stands.
     /// `Nothing` is a different matter: the window's close, the tab's close
     /// mark and File > Close document settle the tool with a float still up,
     /// and an empty hand settles to `Nothing`, so the assertion sits in the two

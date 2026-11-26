@@ -2070,6 +2070,15 @@ impl UmberApp {
     fn float_a_clip(&mut self, clip: &Clip, verb: &str) -> bool {
         self.finish_transform();
         self.finish_stroke();
+        // The paste ends in the transform tool, and the `set_tool` below is
+        // where the Path tool would otherwise be settled, with the float
+        // already up: a draft landing under a standing float. So the draft is
+        // settled here, first, and a layer it made is wiped before the float
+        // reads the stack.
+        if self.editor.ui.tool == Tool::Path {
+            self.editor.settle_path_tool_noting();
+            self.drain_path_layers();
+        }
 
         let doc = self.editor.doc.size;
         // Into the middle of the selection where there is one — "put it into
@@ -7384,6 +7393,51 @@ mod tests {
                 .trim_start()
                 .starts_with(concat!("self.", "undo_command();")),
             "the menu's Undo does not go through undo_command"
+        );
+    }
+
+    /// **No float is begun with the Path tool still in hand.** A source scan,
+    /// for the reason the one below gives: `UmberApp` cannot be built here. A
+    /// paste ends in the transform tool, and changing tool is what settles the
+    /// Path tool, so settling after `begin_float` lands a draft under a
+    /// standing float. Every function that begins one either settles first or
+    /// is `transform_press`, which runs with the transform tool already in
+    /// hand.
+    #[test]
+    fn no_float_is_begun_with_the_path_tool_in_hand() {
+        let source = include_str!("app.rs");
+        let body = &source[..source
+            .find(concat!("mod ", "tests {"))
+            .expect("the test module")];
+        let begin = concat!("self.", "begin_float(");
+        let settle = concat!("self.editor.", "settle_path_tool_noting()");
+        let mut within = "";
+        let mut settled = false;
+        let mut callers = Vec::new();
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            let decl = trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| trimmed.strip_prefix("pub "))
+                .unwrap_or(trimmed);
+            if let Some(rest) = decl.strip_prefix("fn ") {
+                within = rest.split('(').next().unwrap_or("");
+                settled = false;
+            }
+            if line.contains(settle) {
+                settled = true;
+            }
+            if line.contains(begin) {
+                callers.push(within);
+                assert!(
+                    settled || within == "transform_press",
+                    "{within} begins a float before settling the Path tool"
+                );
+            }
+        }
+        assert!(
+            callers.contains(&"float_a_clip") && callers.contains(&"transform_press"),
+            "the scan found the callers it is about: {callers:?}"
         );
     }
 
