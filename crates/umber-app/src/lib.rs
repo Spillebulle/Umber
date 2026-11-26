@@ -87,6 +87,7 @@ mod themelib;
 /// Umber as a command-line thumbnailer, for the freedesktop contract.
 mod thumbnail;
 mod thumbs;
+mod tracedlg;
 mod tweaks;
 mod ui;
 /// Checking for, fetching and installing a new release.

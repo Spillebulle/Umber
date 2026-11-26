@@ -356,6 +356,10 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     crate::exportdlg::show(root, &p, ed, &mut exporting);
     actions.export = exporting.export;
 
+    // Here for the same reason again. It answers by raising
+    // `Editor::trace_requested`, because the alpha it traces is the GPU's.
+    crate::tracedlg::show(root, &p, ed);
+
     // Before the close prompt, and above it: this one is the answer to "the
     // window is closing", which supersedes any question about a single tab.
     match tabs::quit_prompt(root, &p, ed) {
