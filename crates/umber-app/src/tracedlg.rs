@@ -481,7 +481,7 @@ mod tests {
     fn refusal() -> Option<tabs::Notice> {
         Some(tabs::Notice {
             title: "Nothing to trace".to_owned(),
-            lines: vec!["The layers in view are empty.".to_owned()],
+            lines: vec!["There is nothing to trace. The layers in view are empty.".to_owned()],
         })
     }
 

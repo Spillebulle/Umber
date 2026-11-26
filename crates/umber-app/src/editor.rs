@@ -346,9 +346,14 @@ impl TraceSource {
 
     /// What a trace that found nothing says. Exhaustive, so a third source
     /// has to say what "nothing" means for it.
+    ///
+    /// **Each line says it on its own, without the title.** `add_notice` puts
+    /// a line under a notice already up, whose title is somebody else's, and
+    /// "The layers in view are empty." under that reads as a fact rather than
+    /// as why nothing was traced.
     fn nothing_line(self) -> &'static str {
         match self {
-            TraceSource::Everything => "The layers in view are empty.",
+            TraceSource::Everything => "There is nothing to trace. The layers in view are empty.",
             TraceSource::ThisLayer => "There is nothing to trace on this layer.",
         }
     }
@@ -7624,7 +7629,10 @@ mod tests {
     fn a_trace_of_nothing_is_a_sentence_and_changes_nothing() {
         let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
         for (source, line) in [
-            (TraceSource::Everything, "The layers in view are empty."),
+            (
+                TraceSource::Everything,
+                "There is nothing to trace. The layers in view are empty.",
+            ),
             (
                 TraceSource::ThisLayer,
                 "There is nothing to trace on this layer.",
@@ -7648,6 +7656,32 @@ mod tests {
                 assert_eq!((stack_ids(&ed), ed.history.len()), before);
                 assert!(!ed.session.active_tab().modified);
             }
+        }
+    }
+
+    /// A trace refused while another notice is up lands under that notice's
+    /// title, so its line has to say what it is about without its own.
+    #[test]
+    fn a_trace_refusal_under_another_notice_still_says_nothing_was_traced() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        let faint = vec![umber_core::trace::THRESHOLD - 1; 64 * 64];
+        for source in TraceSource::ALL {
+            let mut ed = a_small_editor();
+            ed.add_notice(Notice {
+                title: "Some paths were not kept".to_string(),
+                lines: vec!["Another line.".to_string()],
+            });
+            let refusal = ed
+                .plan_trace(&faint, source, &settings)
+                .expect_err("nothing was planned");
+            ed.add_notice(refusal);
+            let up = ed.notice.as_ref().expect("a notice is up");
+            assert_eq!(up.title, "Some paths were not kept");
+            let line = up.lines.last().expect("the refusal's line");
+            assert!(
+                line.to_lowercase().contains("nothing to trace"),
+                "{source:?}: {line:?}"
+            );
         }
     }
 
