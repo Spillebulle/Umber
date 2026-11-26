@@ -1,8 +1,10 @@
 //! Tracing artwork into outlines.
 //!
-//! This is the pure-CPU half that turns a grid of alpha coverage into closed
-//! polylines; fitting curves to them is a later step. Nothing here knows about
-//! a GPU or a window.
+//! Pure CPU, in three steps: [`region`] crops a document's alpha to what is
+//! worth tracing and averages it down to a working grid, [`rings`] turns that
+//! grid into closed polylines, and [`trace`] fits cubic nodes to them through
+//! [`fit_closed`] and hands back paths in document pixels. Nothing here knows
+//! about a GPU or a window.
 //!
 //! - **Inside is a threshold, not a halfway point.** A cell at or above
 //!   [`THRESHOLD`] counts. Anything fainter is not printed strongly enough to
@@ -28,8 +30,11 @@
 mod fit;
 
 use std::collections::VecDeque;
+use std::ops::RangeInclusive;
 
-use glam::{UVec2, Vec2};
+use glam::{IVec2, UVec2, Vec2};
+
+use crate::vector::{Path, PathRole};
 
 pub use fit::{CORNER_DEGREES, fit_closed, fit_open};
 
@@ -37,8 +42,186 @@ pub use fit::{CORNER_DEGREES, fit_closed, fit_open};
 pub const THRESHOLD: u8 = 26;
 /// A connected piece of inside smaller than this many cells is removed.
 pub const MIN_SPECK: usize = 4;
-/// The largest margin, in cells, that [`rings`] will honour.
+/// The largest margin, in cells, that [`rings`] will honour, and in document
+/// pixels, that [`region`] and [`trace`] will.
 pub const MAX_MARGIN: f32 = 512.0;
+/// The most cells [`region`] is asked to leave in a working grid.
+pub const MAX_CELLS: usize = 8_000_000;
+/// The fitter's tolerance, in document pixels.
+pub const SMOOTHING: RangeInclusive<f32> = 0.25..=8.0;
+/// A ring enclosing less than this many cells is not an outline. A one-cell
+/// line at the threshold contours as a sliver a few hundredths of a cell wide,
+/// which encloses nothing anybody could cut.
+const MIN_AREA: f32 = 1.0;
+
+/// What [`trace`] is asked for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TraceSettings {
+    /// Document pixels the outline stands off the artwork.
+    pub margin: f32,
+    /// The fitter's tolerance, in document pixels; see [`SMOOTHING`].
+    pub smoothing: f32,
+    /// Outline the holes as well as the outer edge.
+    pub keep_holes: bool,
+    /// The role every path is given.
+    pub role: PathRole,
+}
+
+impl TraceSettings {
+    /// No margin, a tolerance of one pixel, holes filled.
+    pub fn new(role: PathRole) -> Self {
+        Self {
+            margin: 0.0,
+            smoothing: 1.0,
+            keep_holes: false,
+            role,
+        }
+    }
+}
+
+/// The part of a document's alpha worth tracing, ready for [`trace`].
+///
+/// Cell `(i, j)` covers the `cell`-square of document pixels whose top-left
+/// corner is `origin + (i, j) * cell`. `origin` may be negative and the region
+/// may reach past the document, because the margin is padded in as well;
+/// anything off the document is empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    pub origin: IVec2,
+    pub cell: u32,
+    pub size: UVec2,
+    pub alpha: Vec<u8>,
+}
+
+/// `margin`, clamped to `0.0..=MAX_MARGIN`, with NaN as zero.
+fn clamp_margin(margin: f32) -> f32 {
+    if margin > 0.0 {
+        margin.min(MAX_MARGIN)
+    } else {
+        0.0
+    }
+}
+
+/// Crop `alpha` (document-sized) to what is inside, pad by `margin`, and
+/// average down by a whole factor until it is at most `max_cells`.
+/// `None` when nothing reaches [`THRESHOLD`], or `alpha` is not `doc` long.
+///
+/// The padding is counted in the budget because the grid [`rings`] grows over
+/// is that large too. A cell of an averaged grid is the plain mean of the
+/// pixels it covers, with anything off the document counted as empty.
+pub fn region(doc: UVec2, alpha: &[u8], margin: f32, max_cells: usize) -> Option<Region> {
+    let (w, h) = (doc.x as usize, doc.y as usize);
+    if w == 0 || h == 0 || alpha.len() != w * h {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for (y, row) in alpha.chunks_exact(w).enumerate() {
+        let Some(first) = row.iter().position(|&a| a >= THRESHOLD) else {
+            continue;
+        };
+        let last = row.iter().rposition(|&a| a >= THRESHOLD).unwrap_or(first);
+        x0 = x0.min(first);
+        x1 = x1.max(last + 1);
+        y0 = y0.min(y);
+        y1 = y + 1;
+    }
+    if x0 == usize::MAX {
+        return None;
+    }
+    let pad = clamp_margin(margin).ceil() as i64;
+    let (lx, ly) = (x0 as i64 - pad, y0 as i64 - pad);
+    let rw = (x1 - x0) as u64 + 2 * pad as u64;
+    let rh = (y1 - y0) as u64 + 2 * pad as u64;
+    let budget = max_cells.max(1) as u64;
+    let cells = |f: u64| rw.div_ceil(f) * rh.div_ceil(f);
+    // A guess from the area, then walked to the smallest factor that fits.
+    let mut f = (((rw * rh) as f64 / budget as f64).sqrt() as u64).max(1);
+    while f > 1 && cells(f - 1) <= budget {
+        f -= 1;
+    }
+    while cells(f) > budget {
+        f += 1;
+    }
+    let (sw, sh) = (rw.div_ceil(f) as usize, rh.div_ceil(f) as usize);
+    let f = f as usize;
+    let mut sums = vec![0u64; sw * sh];
+    let ys = ly.max(0) as usize..(ly + rh as i64).min(h as i64) as usize;
+    let xs = lx.max(0) as usize..(lx + rw as i64).min(w as i64) as usize;
+    for y in ys {
+        let row = &alpha[y * w..(y + 1) * w];
+        let base = (y as i64 - ly) as usize / f * sw;
+        for x in xs.clone() {
+            sums[base + (x as i64 - lx) as usize / f] += u64::from(row[x]);
+        }
+    }
+    let area = (f * f) as u64;
+    Some(Region {
+        origin: IVec2::new(lx as i32, ly as i32),
+        cell: f as u32,
+        size: UVec2::new(sw as u32, sh as u32),
+        alpha: sums
+            .into_iter()
+            .map(|s| ((s + area / 2) / area) as u8)
+            .collect(),
+    })
+}
+
+/// Closed paths in document pixels, largest first.
+///
+/// `margin` is clamped to `0.0..=MAX_MARGIN` and `smoothing` to
+/// [`SMOOTHING`] (NaN as its default of 1.0), and both are turned into cells
+/// by dividing by `region.cell`. The tolerance is never less than a quarter of
+/// a cell: on an averaged grid that is the finest detail there is, and asking
+/// for less fits the grid's own staircase. A ring enclosing less than a cell,
+/// or that fits to fewer than two nodes, is dropped. With `keep_holes` a hole
+/// is a closed path like any other, sorted by the size of what it encloses.
+pub fn trace(region: &Region, settings: &TraceSettings) -> Vec<Path> {
+    let cell = region.cell.max(1) as f32;
+    let margin = clamp_margin(settings.margin) / cell;
+    let smoothing = if settings.smoothing.is_nan() {
+        1.0
+    } else {
+        settings
+            .smoothing
+            .clamp(*SMOOTHING.start(), *SMOOTHING.end())
+    };
+    let tolerance = (smoothing / cell).max(*SMOOTHING.start());
+    let cov = Coverage {
+        size: region.size,
+        alpha: &region.alpha,
+    };
+    let mut found: Vec<(f32, Vec<Vec2>)> = rings(&cov, margin, settings.keep_holes)
+        .into_iter()
+        .map(|r| (ring_area(&r).abs(), r))
+        .filter(|(area, _)| *area >= MIN_AREA)
+        .collect();
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let origin = region.origin.as_vec2();
+    found
+        .iter()
+        .filter_map(|(_, ring)| {
+            let nodes = fit_closed(ring, tolerance);
+            if nodes.len() < 2 {
+                return None;
+            }
+            let nodes = nodes
+                .into_iter()
+                .map(|mut n| {
+                    n.at = origin + n.at * cell;
+                    n.handle_in *= cell;
+                    n.handle_out *= cell;
+                    n
+                })
+                .collect();
+            Some(Path {
+                role: settings.role,
+                closed: true,
+                nodes,
+                ink: None,
+            })
+        })
+        .collect()
+}
 
 /// One byte of alpha per cell, row-major, `size.x * size.y` long.
 pub struct Coverage<'a> {
@@ -405,7 +588,7 @@ mod tests {
         (lo..hi).contains(&x) && (lo..hi).contains(&y)
     }
 
-    fn trace(size: UVec2, alpha: &[u8], margin: f32, holes: bool) -> Vec<Vec<Vec2>> {
+    fn outline(size: UVec2, alpha: &[u8], margin: f32, holes: bool) -> Vec<Vec<Vec2>> {
         rings(&Coverage { size, alpha }, margin, holes)
     }
 
@@ -419,14 +602,14 @@ mod tests {
     #[test]
     fn an_empty_grid_has_no_rings() {
         let (s, a) = grid(10, 10, |_, _| 0);
-        assert!(trace(s, &a, 0.0, false).is_empty());
-        assert!(trace(s, &a, 5.0, true).is_empty());
+        assert!(outline(s, &a, 0.0, false).is_empty());
+        assert!(outline(s, &a, 5.0, true).is_empty());
     }
 
     #[test]
     fn a_block_at_margin_zero_is_outlined_on_its_own_edge() {
         let (s, a) = grid(20, 20, |x, y| if block(x, y, 5, 15) { 255 } else { 0 });
-        let r = trace(s, &a, 0.0, false);
+        let r = outline(s, &a, 0.0, false);
         assert_eq!(r.len(), 1);
         let (lo, hi) = bounds(&r[0]);
         assert!((lo - Vec2::splat(5.0)).abs().max_element() < 0.6, "{lo}");
@@ -438,7 +621,7 @@ mod tests {
     #[test]
     fn a_margin_grows_the_outline_by_a_round_offset() {
         let (s, a) = grid(20, 20, |x, y| if block(x, y, 5, 15) { 255 } else { 0 });
-        let r = trace(s, &a, 6.0, false);
+        let r = outline(s, &a, 6.0, false);
         assert_eq!(r.len(), 1);
         let want = 100.0 + 40.0 * 6.0 + PI * 36.0;
         let area = ring_area(&r[0]);
@@ -468,9 +651,9 @@ mod tests {
     #[test]
     fn a_faint_haze_is_outside() {
         let (s, a) = grid(12, 12, |x, y| if block(x, y, 3, 9) { 25 } else { 0 });
-        assert!(trace(s, &a, 0.0, false).is_empty());
+        assert!(outline(s, &a, 0.0, false).is_empty());
         let (s, a) = grid(12, 12, |x, y| if block(x, y, 3, 9) { 26 } else { 0 });
-        assert_eq!(trace(s, &a, 0.0, false).len(), 1);
+        assert_eq!(outline(s, &a, 0.0, false).len(), 1);
     }
 
     #[test]
@@ -482,7 +665,7 @@ mod tests {
                 0
             }
         });
-        assert!(trace(s, &a, 10.0, false).is_empty());
+        assert!(outline(s, &a, 10.0, false).is_empty());
         let (s, a) = grid(12, 12, |x, y| {
             if y == 5 && (4..8).contains(&x) {
                 255
@@ -490,7 +673,7 @@ mod tests {
                 0
             }
         });
-        assert_eq!(trace(s, &a, 0.0, false).len(), 1);
+        assert_eq!(outline(s, &a, 0.0, false).len(), 1);
         // Diagonal neighbours are connected.
         let (s, a) = grid(12, 12, |x, y| {
             if x == y && (3..7).contains(&x) {
@@ -499,7 +682,7 @@ mod tests {
                 0
             }
         });
-        assert_eq!(trace(s, &a, 0.0, false).len(), 1);
+        assert_eq!(outline(s, &a, 0.0, false).len(), 1);
     }
 
     fn holed(x: u32, y: u32) -> u8 {
@@ -513,10 +696,10 @@ mod tests {
     #[test]
     fn a_hole_is_filled_unless_asked_for() {
         let (s, a) = grid(40, 40, holed);
-        let filled = trace(s, &a, 0.0, false);
+        let filled = outline(s, &a, 0.0, false);
         assert_eq!(filled.len(), 1);
         assert!((ring_area(&filled[0]) - 900.0).abs() < 20.0);
-        let kept = trace(s, &a, 0.0, true);
+        let kept = outline(s, &a, 0.0, true);
         assert_eq!(kept.len(), 2);
         assert_eq!(kept.iter().filter(|r| ring_area(r) < 0.0).count(), 1);
         assert_eq!(kept.iter().filter(|r| ring_area(r) > 0.0).count(), 1);
@@ -531,15 +714,15 @@ mod tests {
                 holed(x, y)
             }
         });
-        assert_eq!(trace(s, &a, 0.0, false).len(), 1);
-        assert_eq!(trace(s, &a, 0.0, true).len(), 3);
+        assert_eq!(outline(s, &a, 0.0, false).len(), 1);
+        assert_eq!(outline(s, &a, 0.0, true).len(), 3);
     }
 
     #[test]
     fn artwork_touching_the_grid_edge_still_closes() {
         let (s, a) = grid(20, 20, |_, _| 255);
         for margin in [0.0, 4.0] {
-            let r = trace(s, &a, margin, false);
+            let r = outline(s, &a, margin, false);
             assert_eq!(r.len(), 1, "margin {margin}");
             let ring = &r[0];
             assert!(ring.len() >= 4);
@@ -565,8 +748,8 @@ mod tests {
                 0
             }
         });
-        assert_eq!(trace(s, &a, 2.0, false).len(), 2);
-        assert_eq!(trace(s, &a, 4.0, false).len(), 1);
+        assert_eq!(outline(s, &a, 2.0, false).len(), 2);
+        assert_eq!(outline(s, &a, 4.0, false).len(), 1);
     }
 
     #[test]
@@ -583,7 +766,7 @@ mod tests {
                 0
             }
         });
-        let r = trace(s, &a, 0.0, false);
+        let r = outline(s, &a, 0.0, false);
         assert_eq!(r.len(), 1);
         let (_, hi) = bounds(&r[0]);
         // Inside column 8, short of its edge: a binary field would put the line
@@ -594,7 +777,7 @@ mod tests {
     #[test]
     fn a_grid_of_the_wrong_length_has_no_rings() {
         let a = vec![255u8; 99];
-        assert!(trace(UVec2::new(10, 10), &a, 0.0, false).is_empty());
+        assert!(outline(UVec2::new(10, 10), &a, 0.0, false).is_empty());
     }
 
     #[test]
@@ -602,7 +785,7 @@ mod tests {
         // The figure `rings`' docs give: a circle of `margin + 0.5` about the
         // corner cell's centre, against `margin` beyond the corner itself.
         let (s, a) = grid(40, 40, |x, y| if block(x, y, 15, 25) { 255 } else { 0 });
-        let r = trace(s, &a, 6.0, false);
+        let r = outline(s, &a, 6.0, false);
         let p = r[0]
             .iter()
             .copied()
@@ -611,5 +794,261 @@ mod tests {
             .unwrap();
         let short = 6.0 - (Vec2::splat(15.0) - p).length();
         assert!(short > 0.15 && short < 0.25, "{short}");
+    }
+
+    use crate::pathedit::is_smooth;
+    use crate::vector::PathRole;
+
+    fn flat_bounds(path: &Path) -> (Vec2, Vec2) {
+        let mut pts = Vec::new();
+        path.flatten(0.1, &mut pts);
+        bounds(&pts)
+    }
+
+    fn disc(doc: UVec2, centre: Vec2, r: f32) -> Vec<u8> {
+        grid(doc.x, doc.y, |x, y| {
+            if (Vec2::new(x as f32, y as f32) + 0.5).distance(centre) <= r {
+                255
+            } else {
+                0
+            }
+        })
+        .1
+    }
+
+    fn settings(margin: f32) -> TraceSettings {
+        TraceSettings {
+            margin,
+            ..TraceSettings::new(PathRole::Cut)
+        }
+    }
+
+    #[test]
+    fn settings_start_from_no_margin_and_a_pixel_of_smoothing() {
+        let s = TraceSettings::new(PathRole::Plot);
+        assert_eq!(s.margin, 0.0);
+        assert_eq!(s.smoothing, 1.0);
+        assert!(!s.keep_holes);
+        assert_eq!(s.role, PathRole::Plot);
+    }
+
+    #[test]
+    fn a_traced_block_keeps_four_corners() {
+        let (s, a) = grid(80, 80, |x, y| if block(x, y, 10, 70) { 255 } else { 0 });
+        let region = region(s, &a, 0.0, MAX_CELLS).unwrap();
+        let paths = trace(&region, &settings(0.0));
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].nodes.len(), 4, "{:?}", paths[0].nodes);
+        for n in &paths[0].nodes {
+            assert!(!is_smooth(n), "{n:?}");
+            let near = [10.0f32, 70.0]
+                .iter()
+                .flat_map(|&x| [10.0f32, 70.0].map(|y| Vec2::new(x, y)))
+                .any(|c| c.distance(n.at) <= 1.0);
+            assert!(near, "{}", n.at);
+        }
+    }
+
+    #[test]
+    fn a_grown_block_has_round_corners() {
+        let (s, a) = grid(100, 100, |x, y| if block(x, y, 20, 80) { 255 } else { 0 });
+        let region = region(s, &a, 10.0, MAX_CELLS).unwrap();
+        let paths = trace(&region, &settings(10.0));
+        assert_eq!(paths.len(), 1);
+        let nodes = &paths[0].nodes;
+        assert!(nodes.len() <= 12, "{}", nodes.len());
+        for n in nodes {
+            let corner = (n.at.x < 20.0 || n.at.x > 80.0) && (n.at.y < 20.0 || n.at.y > 80.0);
+            if corner {
+                assert!(is_smooth(n), "a hard corner in the rounding: {n:?}");
+            }
+        }
+        let (lo, hi) = flat_bounds(&paths[0]);
+        assert!((lo - Vec2::splat(10.0)).abs().max_element() < 1.0, "{lo}");
+        assert!((hi - Vec2::splat(90.0)).abs().max_element() < 1.0, "{hi}");
+    }
+
+    #[test]
+    fn a_faint_line_too_thin_to_enclose_anything_is_dropped() {
+        let (s, a) = grid(30, 10, |x, y| {
+            if y == 4 && (5..25).contains(&x) {
+                THRESHOLD
+            } else {
+                0
+            }
+        });
+        let slivers = outline(s, &a, 0.0, false);
+        assert!(!slivers.is_empty());
+        assert!(slivers.iter().all(|r| ring_area(r).abs() < 1.0));
+        let region = region(s, &a, 0.0, MAX_CELLS).unwrap();
+        assert!(trace(&region, &settings(0.0)).is_empty());
+        // Grown, the same line is an outline.
+        let region = super::region(s, &a, 2.0, MAX_CELLS).unwrap();
+        assert_eq!(trace(&region, &settings(2.0)).len(), 1);
+    }
+
+    #[test]
+    fn a_traced_disc_lands_where_it_was_drawn() {
+        let doc = UVec2::new(400, 300);
+        let a = disc(doc, Vec2::new(250.0, 120.0), 40.0);
+        let region = region(doc, &a, 10.0, MAX_CELLS).unwrap();
+        assert_eq!(region.cell, 1);
+        let paths = trace(&region, &settings(10.0));
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(path.role, PathRole::Cut);
+        assert!(path.closed);
+        assert!(path.nodes.len() <= 16, "{}", path.nodes.len());
+        let (lo, hi) = flat_bounds(path);
+        assert!(
+            (lo - Vec2::new(200.0, 70.0)).abs().max_element() <= 1.5,
+            "{lo}"
+        );
+        assert!(
+            (hi - Vec2::new(300.0, 170.0)).abs().max_element() <= 1.5,
+            "{hi}"
+        );
+    }
+
+    #[test]
+    fn a_region_over_the_ceiling_is_averaged_down_and_still_lands_in_place() {
+        let doc = UVec2::new(400, 300);
+        let a = disc(doc, Vec2::new(250.0, 120.0), 40.0);
+        let region = region(doc, &a, 10.0, 5_000).unwrap();
+        assert!(region.cell > 1);
+        assert!((region.size.x * region.size.y) as usize <= 5_000);
+        assert_eq!(region.alpha.len(), (region.size.x * region.size.y) as usize);
+        let paths = trace(&region, &settings(10.0));
+        assert_eq!(paths.len(), 1);
+        let slack = region.cell as f32 + 1.5;
+        let (lo, hi) = flat_bounds(&paths[0]);
+        assert!(
+            (lo - Vec2::new(200.0, 70.0)).abs().max_element() <= slack,
+            "{lo}"
+        );
+        assert!(
+            (hi - Vec2::new(300.0, 170.0)).abs().max_element() <= slack,
+            "{hi}"
+        );
+    }
+
+    #[test]
+    fn a_region_reaches_past_the_document_by_the_margin() {
+        let (s, a) = grid(50, 40, |x, y| {
+            if x < 10 && (5..20).contains(&y) {
+                255
+            } else {
+                0
+            }
+        });
+        let r = region(s, &a, 7.5, MAX_CELLS).unwrap();
+        assert_eq!(r.origin, IVec2::new(-8, -3));
+        assert_eq!(r.size, UVec2::new(26, 31));
+        assert_eq!(r.cell, 1);
+        // Off the document is empty, and the document is copied as it was.
+        assert_eq!(r.alpha[0], 0);
+        assert_eq!(r.alpha[8 * 26 + 8], 255);
+    }
+
+    #[test]
+    fn nothing_inside_is_no_region() {
+        let (s, a) = grid(30, 30, |_, _| 0);
+        assert!(region(s, &a, 5.0, MAX_CELLS).is_none());
+        let (s, a) = grid(30, 30, |_, _| THRESHOLD - 1);
+        assert!(region(s, &a, 5.0, MAX_CELLS).is_none());
+        assert!(region(UVec2::new(30, 30), &a[1..], 5.0, MAX_CELLS).is_none());
+        assert!(region(UVec2::ZERO, &[], 5.0, MAX_CELLS).is_none());
+    }
+
+    #[test]
+    fn paths_come_largest_first() {
+        let doc = UVec2::new(300, 200);
+        let small = disc(doc, Vec2::new(50.0, 100.0), 12.0);
+        let large = disc(doc, Vec2::new(200.0, 100.0), 40.0);
+        let middle = disc(doc, Vec2::new(110.0, 60.0), 20.0);
+        let a: Vec<u8> = (0..small.len())
+            .map(|i| small[i].max(large[i]).max(middle[i]))
+            .collect();
+        let region = region(doc, &a, 0.0, MAX_CELLS).unwrap();
+        let paths = trace(&region, &settings(0.0));
+        assert_eq!(paths.len(), 3);
+        let widths: Vec<f32> = paths
+            .iter()
+            .map(|p| {
+                let (lo, hi) = flat_bounds(p);
+                hi.x - lo.x
+            })
+            .collect();
+        assert!(widths[0] > widths[1] && widths[1] > widths[2], "{widths:?}");
+    }
+
+    #[test]
+    fn a_kept_hole_is_a_closed_path_of_its_own() {
+        let (s, a) = grid(40, 40, holed);
+        let region = region(s, &a, 0.0, MAX_CELLS).unwrap();
+        let paths = trace(
+            &region,
+            &TraceSettings {
+                keep_holes: true,
+                ..settings(0.0)
+            },
+        );
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|p| p.closed && p.nodes.len() >= 2));
+        let (lo, hi) = flat_bounds(&paths[1]);
+        assert!((lo - Vec2::splat(15.0)).abs().max_element() < 1.0, "{lo}");
+        assert!((hi - Vec2::splat(25.0)).abs().max_element() < 1.0, "{hi}");
+        assert_eq!(trace(&region, &settings(0.0)).len(), 1);
+    }
+
+    #[test]
+    fn a_margin_past_the_ceiling_is_clamped() {
+        let doc = UVec2::new(64, 64);
+        let a = disc(doc, Vec2::new(32.0, 32.0), 10.0);
+        let budget = 40_000;
+        let over = region(doc, &a, 1.0e6, budget).unwrap();
+        let at = region(doc, &a, MAX_MARGIN, budget).unwrap();
+        assert_eq!(over, at);
+        let far = trace(&over, &settings(f32::INFINITY));
+        let ceiling = trace(&at, &settings(MAX_MARGIN));
+        assert_eq!(far, ceiling);
+        assert_eq!(far.len(), 1);
+        let (lo, hi) = flat_bounds(&far[0]);
+        let slack = over.cell as f32 + 1.5;
+        let reach = 10.0 + MAX_MARGIN;
+        assert!(
+            (lo - Vec2::splat(32.0 - reach)).abs().max_element() <= slack,
+            "{lo}"
+        );
+        assert!(
+            (hi - Vec2::splat(32.0 + reach)).abs().max_element() <= slack,
+            "{hi}"
+        );
+        // Below the floor and not a number are both no margin at all.
+        let none = region(doc, &a, -5.0, budget).unwrap();
+        assert_eq!(none, region(doc, &a, f32::NAN, budget).unwrap());
+        assert_eq!(
+            trace(&none, &settings(-5.0)),
+            trace(&none, &settings(f32::NAN))
+        );
+    }
+
+    #[test]
+    fn smoothing_outside_its_range_is_clamped() {
+        let doc = UVec2::new(200, 200);
+        let a = disc(doc, Vec2::new(100.0, 100.0), 60.0);
+        let region = region(doc, &a, 0.0, MAX_CELLS).unwrap();
+        let with = |smoothing: f32| {
+            trace(
+                &region,
+                &TraceSettings {
+                    smoothing,
+                    ..settings(0.0)
+                },
+            )
+        };
+        assert_eq!(with(100.0), with(*SMOOTHING.end()));
+        assert_eq!(with(0.0), with(*SMOOTHING.start()));
+        assert_eq!(with(f32::NAN), with(1.0));
     }
 }
