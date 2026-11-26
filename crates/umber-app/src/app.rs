@@ -37,7 +37,7 @@ use umber_core::{
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, EffectFrame, FloatParams, FloatSource, Gpu,
-    LayerDraw, ProbeParams, Vram,
+    LayerDraw, LayerEffects, ProbeParams, Vram,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -429,6 +429,36 @@ pub(crate) fn release_finished_textures(
     for id in finished {
         renderer.free_texture(id);
     }
+}
+
+/// Bake `stack`'s effects on document `id`'s canvas and hand back the draws the
+/// composite takes. `UmberApp::baked_draws`' body, apart so a stack other than
+/// the screen's (a trace's, with layers hidden) is baked by the same lines.
+/// `None` where the document has no canvas.
+fn bake_stack(
+    gfx: &mut Graphics,
+    id: DocId,
+    base: u32,
+    stack: &[LayerEffects<'_>],
+    frame: EffectFrame,
+) -> Option<Vec<LayerDraw>> {
+    let canvas = gfx.canvases.get_mut(&id)?;
+    let mut encoder = gfx
+        .gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bake-effects"),
+        });
+    let baked = canvas.bake_effects(
+        &gfx.gpu.device,
+        &gfx.gpu.queue,
+        &mut encoder,
+        base,
+        stack,
+        frame,
+    );
+    gfx.gpu.queue.submit(Some(encoder.finish()));
+    Some(baked.draws)
 }
 
 /// What to say when the slot pool has nothing left for a text placement's layer.
@@ -1197,24 +1227,7 @@ impl UmberApp {
             stroke: self.editor.stroke_style,
             stroke_live: self.editor.stroke.is_active(),
         };
-        let gfx = self.gfx.as_mut()?;
-        let canvas = gfx.canvases.get_mut(&id)?;
-        let mut encoder = gfx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bake-effects"),
-            });
-        let baked = canvas.bake_effects(
-            &gfx.gpu.device,
-            &gfx.gpu.queue,
-            &mut encoder,
-            base,
-            &stack,
-            frame,
-        );
-        gfx.gpu.queue.submit(Some(encoder.finish()));
-        Some(baked.draws)
+        bake_stack(self.gfx.as_mut()?, id, base, &stack, frame)
     }
 
     /// What a lift's notice is about: this document, its active layer and the
@@ -2806,19 +2819,22 @@ impl UmberApp {
         self.finish_stroke();
         self.finish_transform();
         match self.editor.plan_new_vector_layer() {
-            Ok(plan) => self.carry_out_path_plan(plan, true),
+            Ok(plan) => {
+                self.carry_out_path_plan(plan, true);
+            }
             Err(notice) => self.editor.notice = Some(notice),
         }
     }
 
-    /// The half of both commands that needs a device.
-    fn carry_out_path_plan(&mut self, plan: crate::editor::PathPlan, adds_a_layer: bool) {
+    /// The half of every path command that needs a device. True when the plan
+    /// was carried out; false when a refusal was raised as a notice instead.
+    fn carry_out_path_plan(&mut self, plan: crate::editor::PathPlan, adds_a_layer: bool) -> bool {
         // **The device's refusal after the stack's own**, `add_layer`'s order.
         // The plan has already answered a full stack and a nested-too-deep
         // folder, so a refusal here is graphics memory and says so.
         if adds_a_layer && let Err(refused) = self.reserve_a_slice() {
             self.editor.notice = Some(vram::slice_refused("a layer", &refused));
-            return;
+            return false;
         }
         use crate::editor::PathApplyRefusal;
         let refused = match self.editor.apply_path_plan(plan) {
@@ -2835,11 +2851,11 @@ impl UmberApp {
             None => {}
             Some(PathApplyRefusal::NoSlice(_)) => {
                 self.editor.notice = Some(no_slice_left());
-                return;
+                return false;
             }
             Some(PathApplyRefusal::Declined(why)) => {
                 self.editor.notice = Some(crate::editor::path_refusal(why));
-                return;
+                return false;
             }
         }
         if adds_a_layer {
@@ -2855,6 +2871,59 @@ impl UmberApp {
                     canvas.clear_layer(&gfx.gpu.queue, slot);
                 }
             }
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Trace the artwork into cut or plot paths, as the trace outline dialog
+    /// asks, and land them as the selection commands land theirs.
+    ///
+    /// **A thin caller**, like `path_from_selection`: `Editor::plan_trace`
+    /// decides everything the model can, and what is here needs the device.
+    /// The order is the rule: everything in the air is settled first (the
+    /// stroke, the float, a Path tool draft, as `float_a_clip` settles it),
+    /// then the coverage is read, then planned, then carried out. A draft
+    /// landing after the plan would change the stack the plan was made
+    /// against, and a stroke or a float would be read half done.
+    ///
+    /// The draws are baked as an export's are, so a shadow or an outline
+    /// effect is traced with the layer that casts it. On success the dialog
+    /// closes; a refusal leaves it up behind the notice, so the artist can
+    /// change a setting and try again. With no device or no canvas there is
+    /// nothing to read and nothing happens.
+    fn trace_outline(&mut self) {
+        self.finish_stroke();
+        self.finish_transform();
+        if self.editor.ui.tool == Tool::Path {
+            self.editor.settle_path_tool_noting();
+            self.drain_path_layers();
+        }
+        let form = self.editor.ui.trace;
+        let id = self.editor.session.active_id();
+        let base = self.editor.effect_slot_base();
+        let frame = EffectFrame {
+            active_index: self.editor.active_draw_index(),
+            stroke: self.editor.stroke_style,
+            stroke_live: self.editor.stroke.is_active(),
+        };
+        let stack = self.editor.trace_effected_draws(form.source);
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(draws) = bake_stack(gfx, id, base, &stack, frame) else {
+            return;
+        };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
+        let alpha = canvas.export_coverage(&gfx.gpu.device, &gfx.gpu.queue, &draws);
+        match self.editor.plan_trace(&alpha, form.source, &form.settings) {
+            Ok(plan) => {
+                let adds_a_layer = plan.adds_a_layer();
+                if self.carry_out_path_plan(plan, adds_a_layer) {
+                    self.editor.ui.trace.open = false;
+                }
+            }
+            Err(notice) => self.editor.notice = Some(notice),
         }
         self.request_redraw();
     }
@@ -3327,6 +3396,7 @@ impl UmberApp {
             Action::Paste => self.paste(),
             Action::CutPathFromSelection => self.path_from_selection(umber_core::PathRole::Cut),
             Action::PlotPathFromSelection => self.path_from_selection(umber_core::PathRole::Plot),
+            Action::TraceOutline => self.editor.open_trace(),
             Action::NewVectorLayer => self.add_vector_layer(),
             Action::FlipCanvasHorizontal => self.flip_canvas(umber_core::FlipAxis::Horizontal),
             Action::FlipCanvasVertical => self.flip_canvas(umber_core::FlipAxis::Vertical),
@@ -4782,6 +4852,9 @@ impl UmberApp {
         }
         if let Some(role) = actions.path_from_selection {
             self.path_from_selection(role);
+        }
+        if std::mem::take(&mut self.editor.trace_requested) {
+            self.trace_outline();
         }
         if actions.new_vector_layer {
             self.add_vector_layer();
@@ -7439,6 +7512,46 @@ mod tests {
             callers.contains(&"float_a_clip") && callers.contains(&"transform_press"),
             "the scan found the callers it is about: {callers:?}"
         );
+    }
+
+    /// **A trace settles everything in the air before it reads the artwork.**
+    /// A source scan, for the reason the one above gives. A stroke's wet
+    /// scratch and a float's preview slice both stand in front of a layer, and
+    /// a Path tool draft landing after the plan would change the stack the plan
+    /// was made against.
+    #[test]
+    fn a_trace_settles_the_stroke_the_float_and_the_draft_before_reading() {
+        let source = include_str!("app.rs");
+        let body = &source[..source
+            .find(concat!("mod ", "tests {"))
+            .expect("the test module")];
+        let markers = [
+            concat!("self.", "finish_stroke()"),
+            concat!("self.", "finish_transform()"),
+            concat!("self.editor.", "settle_path_tool_noting()"),
+            concat!(".export", "_coverage("),
+        ];
+        let mut within = "";
+        let mut first: [Option<usize>; 4] = [None; 4];
+        for (n, line) in body.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("fn ") {
+                within = rest.split('(').next().unwrap_or("");
+            }
+            if within != "trace_outline" {
+                continue;
+            }
+            for (i, marker) in markers.iter().enumerate() {
+                if line.contains(marker) && first[i].is_none() {
+                    first[i] = Some(n);
+                }
+            }
+        }
+        let read = first[3].expect("trace_outline reads the coverage");
+        for (i, marker) in markers[..3].iter().enumerate() {
+            let at = first[i].unwrap_or_else(|| panic!("trace_outline never calls {marker}"));
+            assert!(at < read, "trace_outline calls {marker} after reading");
+        }
     }
 
     /// **Every structural edit puts a floating transform down before it

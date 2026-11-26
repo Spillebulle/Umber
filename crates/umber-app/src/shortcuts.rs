@@ -28,6 +28,8 @@ pub enum Action {
     // painter's hands already know, the argument the brush tweaks make.
     CutPathFromSelection,
     PlotPathFromSelection,
+    // Unbound for the same reason, and it opens a dialog rather than acting.
+    TraceOutline,
     NewVectorLayer,
     FlipCanvasHorizontal,
     FlipCanvasVertical,
@@ -74,7 +76,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 43] = [
+    pub const ALL: [Action; 44] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
@@ -86,6 +88,7 @@ impl Action {
         Action::Paste,
         Action::CutPathFromSelection,
         Action::PlotPathFromSelection,
+        Action::TraceOutline,
         Action::NewVectorLayer,
         Action::FlipCanvasHorizontal,
         Action::FlipCanvasVertical,
@@ -139,6 +142,7 @@ impl Action {
             Action::Paste => "Paste",
             Action::CutPathFromSelection => "Cut path from selection",
             Action::PlotPathFromSelection => "Plot path from selection",
+            Action::TraceOutline => "Trace outline…",
             Action::NewVectorLayer => "New vector layer",
             Action::FlipCanvasHorizontal => "Flip canvas horizontally",
             Action::FlipCanvasVertical => "Flip canvas vertically",
@@ -194,7 +198,8 @@ impl Action {
             | Action::Cut
             | Action::Paste
             | Action::CutPathFromSelection
-            | Action::PlotPathFromSelection => "Edit",
+            | Action::PlotPathFromSelection
+            | Action::TraceOutline => "Edit",
             Action::NewVectorLayer => "Layers",
             // Its own group rather than "Edit": these change the document
             // itself rather than the last thing done to it, and they are the
@@ -1680,13 +1685,14 @@ mod tests {
             if crate::tweaks::of_action(action).is_some() {
                 continue;
             }
-            // The three vector commands ship unbound, for the tweaks' reason,
+            // The vector commands ship unbound, for the tweaks' reason,
             // and are named here rather than excused by a predicate so that a
             // fourth has to be added on purpose.
             if [
                 Action::CutPathFromSelection,
                 Action::PlotPathFromSelection,
                 Action::NewVectorLayer,
+                Action::TraceOutline,
             ]
             .contains(&action)
             {
@@ -1698,6 +1704,79 @@ mod tests {
             );
         }
     }
+    /// Trace outline is listed, filed under Edit, named as a command that opens
+    /// a dialog, and bound to nothing.
+    #[test]
+    fn the_trace_action_is_listed_unbound_under_edit() {
+        assert!(Action::ALL.contains(&Action::TraceOutline));
+        assert_eq!(Action::TraceOutline.category(), "Edit");
+        assert_eq!(Action::TraceOutline.label(), "Trace outline…");
+        assert!(
+            defaults().iter().all(|b| b.action != Action::TraceOutline),
+            "Trace outline ships bound"
+        );
+    }
+
+    /// **Every variant is in [`Action::ALL`].** The match is exhaustive, so a
+    /// new variant cannot compile without an arm, and each arm marks its own
+    /// cell: a variant left out of `ALL` leaves its cell unmarked. An arm
+    /// given a cell past the end panics, which is the same failure louder.
+    #[test]
+    fn every_action_is_in_all() {
+        let mut seen = [false; Action::ALL.len()];
+        for action in Action::ALL {
+            let cell = match action {
+                Action::Save => 0,
+                Action::SaveAs => 1,
+                Action::Export => 2,
+                Action::Undo => 3,
+                Action::Redo => 4,
+                Action::Deselect => 5,
+                Action::Copy => 6,
+                Action::Cut => 7,
+                Action::Paste => 8,
+                Action::CutPathFromSelection => 9,
+                Action::PlotPathFromSelection => 10,
+                Action::TraceOutline => 11,
+                Action::NewVectorLayer => 12,
+                Action::FlipCanvasHorizontal => 13,
+                Action::FlipCanvasVertical => 14,
+                Action::BrushTool => 15,
+                Action::EraserTool => 16,
+                Action::SelectTool => 17,
+                Action::TransformTool => 18,
+                Action::PathTool => 19,
+                Action::EyedropperTool => 20,
+                Action::PanTool => 21,
+                Action::ZoomTool => 22,
+                Action::SizeDown => 23,
+                Action::SizeUp => 24,
+                Action::OpacityDown => 25,
+                Action::OpacityUp => 26,
+                Action::HardnessDown => 27,
+                Action::HardnessUp => 28,
+                Action::SpacingDown => 29,
+                Action::SpacingUp => 30,
+                Action::RoundnessDown => 31,
+                Action::RoundnessUp => 32,
+                Action::AirbrushDown => 33,
+                Action::AirbrushUp => 34,
+                Action::AngleDown => 35,
+                Action::AngleUp => 36,
+                Action::PickupDown => 37,
+                Action::PickupUp => 38,
+                Action::SwapColours => 39,
+                Action::FitView => 40,
+                Action::ActualSize => 41,
+                Action::ZoomIn => 42,
+                Action::ZoomOut => 43,
+            };
+            assert!(!seen[cell], "{action:?} is listed twice");
+            seen[cell] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "a variant is missing from ALL");
+    }
+
     use std::collections::HashSet;
 
     const CTRL: ModifiersState = ModifiersState::CONTROL;

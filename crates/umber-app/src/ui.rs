@@ -2701,6 +2701,15 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
             ui.close();
         }
     }
+    // Always live: it opens a dialog, and whether there is anything to trace
+    // depends on the source chosen there, so it is said once Trace is pressed.
+    if menu_item(ui, Action::TraceOutline, true)
+        .on_hover_text("Draws a cut or plot line round the artwork, on a vector layer.")
+        .clicked()
+    {
+        ed.open_trace();
+        ui.close();
+    }
     // Cut, Copy, Paste, in that order, because that is the order every desktop
     // draws them and the order the keys sit in on the bottom row.
     //
