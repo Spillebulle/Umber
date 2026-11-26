@@ -415,6 +415,10 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
             // First, so the marquee and the transform box are drawn over the
             // machine lines: a selection made on top of a cut line is the thing
             // being worked on, and the cut line is the thing it was made from.
+            // Under the cut lines, because a cut line crossing a mark is the
+            // thing to see: the mark is where the sensor looks, the line is
+            // what will be cut there.
+            sheet_marks(ui.painter(), &p, ed, rect);
             vector_paths(ui.painter(), &p, ed, rect);
             path_tool_marks(ui.painter(), &p, ed, rect);
             selection_outline(ui, &p, ed, rect);
@@ -579,6 +583,60 @@ fn odd_device_width(points: f32, pixels_per_point: f32) -> f32 {
     let ppp = pixels_per_point.max(1e-3);
     let pixels = ((points * ppp - 1.0) * 0.5).round().max(0.0) * 2.0 + 1.0;
     pixels / ppp
+}
+
+/// The document's registration marks, where the Print sheet will put them,
+/// and the corners artwork has to stay out of.
+///
+/// Read off `sheet::Marks` and nothing else, so the overlay and the printed
+/// sheet cannot disagree about where a mark is: the model's millimetres become
+/// document pixels at the document's own resolution and then go through the
+/// overlay's one mapping, the cut lines' and the marquee's.
+///
+/// **Each fill is two-tone**, the accent with a one-device-pixel outline of
+/// [`Palette::accent_underlay`] round it, the marquee's pair, because a mark
+/// sits on somebody's painting and a single ink chosen against white paper
+/// vanishes on a dark one. The keep-clear corners are an outline alone in the
+/// dim accent: they are advice about where not to paint, not marks, and a
+/// fill would hide the very artwork they are warning about.
+///
+/// Nothing is drawn without the flag, and nothing where the model declines the
+/// page: `toggle_sheet_marks` and `apply_canvas` keep those two from
+/// disagreeing, and a document read from a file that disagrees anyway draws no
+/// marks rather than marks the sheet would not print.
+fn sheet_marks(painter: &egui::Painter, p: &Palette, ed: &mut Editor, view: Rect) {
+    if !ed.doc.marks {
+        return;
+    }
+    let Ok(marks) = umber_core::sheet::Marks::for_document(&ed.doc) else {
+        return;
+    };
+    let per_mm = 1.0 / umber_core::sheet::mm_per_pixel(ed.doc.dpi);
+    let to_screen = crate::vectorview::screen_mapping(&ed.camera, view, ed.pixels_per_point);
+    let on_screen = |r: umber_core::sheet::RectMm| {
+        Rect::from_min_max(to_screen(r.min * per_mm), to_screen(r.max * per_mm))
+    };
+    let device = painter.ctx().pixels_per_point().max(1e-3);
+    let hairline = 1.0 / device;
+    let painter = painter.with_clip_rect(view);
+    for zone in marks.keep_clear() {
+        painter.rect_stroke(
+            on_screen(zone),
+            0.0,
+            Stroke::new(hairline, p.accent_dim),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let under = Stroke::new(hairline, p.accent_underlay());
+    for fill in marks.fills() {
+        painter.add(egui::epaint::RectShape::new(
+            on_screen(fill),
+            0.0,
+            p.accent,
+            under,
+            egui::StrokeKind::Outside,
+        ));
+    }
 }
 
 /// Every visible vector layer's cut and plot paths, as solid two-tone lines.
@@ -2592,6 +2650,20 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         .clicked()
     {
         actions.open_export = true;
+        ui.close();
+    }
+    // A tick rather than a row that acts, as the Window menu draws its one
+    // switch, because what it says is whether this document has marks. The
+    // label is the action's, so the row and the Shortcuts page name it alike.
+    // Enabled whatever the page: a refusal is said in a notice with the
+    // reason, which a dead row could only hint at in a tooltip.
+    let mut marks = ed.doc.marks;
+    if ui
+        .checkbox(&mut marks, Action::ToggleSheetMarks.label())
+        .on_hover_text("Prints three marks the cutter uses to line its cuts up with the print.")
+        .clicked()
+    {
+        ed.toggle_sheet_marks();
         ui.close();
     }
 }
@@ -7987,6 +8059,124 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&second, &third),
             "a camera move kept the old mesh"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Registration marks
+    // -----------------------------------------------------------------------
+
+    /// 1000 pixels square at 300 dpi is 84.7 mm, which holds a 64.7 mm span:
+    /// room for the marks, at a zoom that puts the whole page in the field.
+    fn editor_for_marks(marks: bool) -> Editor {
+        let mut ed = Editor::default();
+        ed.doc = umber_core::Document::new(1000, 1000)
+            .with_dpi(300.0)
+            .with_marks(marks);
+        ed.pixels_per_point = 1.0;
+        ed.camera = umber_core::Camera {
+            zoom: 0.2,
+            center: glam::Vec2::new(500.37, 500.21),
+        };
+        ed
+    }
+
+    const MARKS_FIELD: egui::Vec2 = egui::vec2(320.0, 240.0);
+
+    /// The shapes one frame of `sheet_marks` hands egui, untessellated, with
+    /// the canvas rect they were drawn against.
+    fn sheet_mark_shapes(palette: &Palette, ed: &mut Editor) -> (Vec<egui::Shape>, Rect) {
+        let ctx = fresh_context(palette);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), MARKS_FIELD)),
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let mut view = None;
+        let output = ctx.run_ui(input, |ui| {
+            let rect = ui.max_rect();
+            super::sheet_marks(ui.painter(), palette, ed, rect);
+            view = Some(rect);
+        });
+        let shapes = output.shapes.into_iter().map(|c| c.shape).collect();
+        (shapes, view.expect("the frame ran"))
+    }
+
+    fn shapes_inside(shapes: &[egui::Shape], view: Rect) -> usize {
+        shapes
+            .iter()
+            .filter(|s| s.visual_bounding_rect().intersects(view))
+            .count()
+    }
+
+    /// **Nothing is drawn for a document without marks**, five or more things
+    /// are once the command switches them on, and the count falls back to
+    /// where it started when it switches them off again. Through
+    /// `toggle_sheet_marks`, so the flag the overlay reads is the one the
+    /// command writes.
+    #[test]
+    fn registration_marks_are_drawn_only_when_the_document_has_them() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let mut ed = editor_for_marks(false);
+        let (shapes, view) = sheet_mark_shapes(&palette, &mut ed);
+        let off = shapes_inside(&shapes, view);
+
+        ed.toggle_sheet_marks();
+        assert!(ed.doc.marks, "the page has room, so the command took");
+        let (shapes, view) = sheet_mark_shapes(&palette, &mut ed);
+        let on = shapes_inside(&shapes, view);
+        assert!(
+            on >= off + 5,
+            "switching the marks on drew {on} shapes against {off}"
+        );
+
+        ed.toggle_sheet_marks();
+        let (shapes, view) = sheet_mark_shapes(&palette, &mut ed);
+        assert_eq!(
+            shapes_inside(&shapes, view),
+            off,
+            "the marks outlived the flag"
+        );
+    }
+
+    /// **The square is drawn where the model puts it.** The filled rectangle
+    /// in the accent is found among the shapes and its rectangle compared with
+    /// the model's first fill, turned into document pixels at the document's
+    /// resolution and mapped by the overlay's one mapping. The camera's
+    /// fractional centre is what stops a mapping that dropped the pivot or the
+    /// zoom landing on the answer anyway.
+    #[test]
+    fn the_marks_overlay_sits_where_the_model_puts_them() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let mut ed = editor_for_marks(true);
+        let (shapes, view) = sheet_mark_shapes(&palette, &mut ed);
+        let marks = umber_core::sheet::Marks::for_document(&ed.doc).expect("room");
+        let per_mm = 1.0 / umber_core::sheet::mm_per_pixel(ed.doc.dpi);
+        let to_screen = crate::vectorview::screen_mapping(&ed.camera, view, ed.pixels_per_point);
+        let square = marks.fills()[0];
+        let want = Rect::from_min_max(
+            to_screen(square.min * per_mm),
+            to_screen(square.max * per_mm),
+        );
+
+        let filled: Vec<Rect> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) if r.fill == palette.accent => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filled.len(),
+            5,
+            "one filled mark for each of the model's five"
+        );
+        let near = |a: egui::Pos2, b: egui::Pos2| (a - b).length() <= 0.5;
+        assert!(
+            filled
+                .iter()
+                .any(|r| near(r.min, want.min) && near(r.max, want.max)),
+            "no filled mark at {want:?}; drew {filled:?}"
         );
     }
 

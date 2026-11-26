@@ -3285,6 +3285,29 @@ impl Editor {
         }
     }
 
+    /// Switch the document's registration marks on or off.
+    ///
+    /// Switching them on is refused where the page cannot hold them, with the
+    /// model's own sentence for why, so the flag never claims marks that
+    /// `sheet::Marks` would decline to place: the same rule `apply_canvas`
+    /// keeps when a resize takes the room away. A refusal changes nothing, so
+    /// it leaves the tab alone; either real change marks it modified, because
+    /// the flag is written into the `.ora` and closing would lose it.
+    pub fn toggle_sheet_marks(&mut self) {
+        if self.doc.marks {
+            self.doc.marks = false;
+        } else if let Err(reason) = umber_core::sheet::Marks::for_document(&self.doc) {
+            self.add_notice(Notice {
+                title: "No room for registration marks".to_string(),
+                lines: vec![reason.sentence().to_string()],
+            });
+            return;
+        } else {
+            self.doc.marks = true;
+        }
+        self.mark_modified();
+    }
+
     /// Note that the live document has changed, so closing it would lose work.
     pub fn mark_modified(&mut self) {
         self.session.mark_modified();
@@ -4941,6 +4964,52 @@ mod tests {
         assert_eq!(
             notice.lines,
             vec!["The new canvas size cannot hold registration marks, so they were switched off."]
+        );
+    }
+
+    /// 300 pixels square at 300 dpi is 25 mm, which has no room for a 60 mm
+    /// span: the flag stays off, the tab is untouched, and the notice carries
+    /// the model's own sentence.
+    #[test]
+    fn toggling_marks_on_a_page_too_small_refuses_and_says_why() {
+        let mut ed = Editor {
+            doc: Document::new(300, 300).with_dpi(300.0),
+            ..Editor::default()
+        };
+        ed.toggle_sheet_marks();
+        assert!(!ed.doc.marks, "the flag was set on a page with no room");
+        assert!(
+            !ed.session.active_tab().modified,
+            "a refusal changed nothing"
+        );
+        let notice = ed.notice.as_ref().expect("said why");
+        assert_eq!(notice.title, "No room for registration marks");
+        assert_eq!(
+            notice.lines,
+            vec![umber_core::sheet::NoMarks::TooSmall.sentence().to_string()]
+        );
+    }
+
+    /// On and off are both changes to the document, each puts the dot on the
+    /// tab, and neither says anything on a page that fits.
+    #[test]
+    fn toggling_marks_marks_the_document_modified() {
+        let mut ed = Editor {
+            doc: Document::new(1748, 2480).with_dpi(300.0),
+            ..Editor::default()
+        };
+        assert!(!ed.session.active_tab().modified);
+        ed.toggle_sheet_marks();
+        assert!(ed.doc.marks, "a page that fits refused the marks");
+        assert!(ed.session.active_tab().modified, "switching on left no dot");
+        assert!(ed.notice.is_none());
+
+        ed.session.active_tab_mut().modified = false;
+        ed.toggle_sheet_marks();
+        assert!(!ed.doc.marks);
+        assert!(
+            ed.session.active_tab().modified,
+            "switching off left no dot"
         );
     }
 

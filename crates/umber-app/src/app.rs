@@ -3398,6 +3398,7 @@ impl UmberApp {
             // Only the dialog. The chord asks the question; it does not write a
             // file behind the artist's back.
             Action::Export => self.editor.export_form.open = true,
+            Action::ToggleSheetMarks => self.editor.toggle_sheet_marks(),
             // The answer matters only to `jump_history`, which has several
             // steps to abandon; one keystroke has nothing to stop.
             Action::Undo => self.undo_command(),
