@@ -416,9 +416,14 @@ impl Stopper<'_> {
     }
 }
 
-/// The end of a stopped job: let the machine finish what it holds, send it
-/// home with the tool up, and wait for that too. Any failure on the way is
-/// that failure, and is reported in place of the stop.
+/// The end of a stopped job: send the machine home with the tool up, and wait
+/// for that too. Any failure on the way is that failure, and is reported in
+/// place of the stop.
+///
+/// Called only straight after a [`wait_ready`] that ended in Ready, which is
+/// what letting the machine finish what it holds *is*: that wait went on
+/// through every Moving after the stop was seen. So the end block follows a
+/// Ready reply with no query of its own in between.
 fn go_home(
     link: &mut dyn Link,
     job: &Job,
@@ -430,7 +435,6 @@ fn go_home(
         flag: &AtomicBool::new(true),
         said: true,
     };
-    wait_ready(link, timing, &mut stopped, progress)?;
     link.write(&job.end_block())?;
     wait_ready(link, timing, &mut stopped, progress)?;
     Err(SendError::Stopped)
