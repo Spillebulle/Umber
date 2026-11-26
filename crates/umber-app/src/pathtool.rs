@@ -155,6 +155,9 @@ pub struct PathTool {
     draft_role: Option<PathRole>,
     /// How many nodes the continued path had, so a pop cannot eat into it.
     base_len: usize,
+    /// The continued path was taken up from its first node, so the draft's
+    /// base is the path reversed.
+    base_reversed: bool,
     held: Held,
     hover: Option<Vec2>,
     said: Option<&'static str>,
@@ -175,6 +178,7 @@ impl Default for PathTool {
             draft: None,
             draft_role: None,
             base_len: 0,
+            base_reversed: false,
             held: Held::Nothing,
             hover: None,
             said: None,
@@ -266,6 +270,50 @@ impl PathTool {
         if let Some(draft) = self.draft.as_mut() {
             draft.continues = None;
             self.base_len = 0;
+            self.base_reversed = false;
+        }
+    }
+
+    /// Whether the path a continued draft names in `record` is still the
+    /// path it took up: an open line of the same role whose nodes are the
+    /// draft's base, reversed where it was taken from the first node. True
+    /// where the draft continues nothing, since there is nothing to detach.
+    ///
+    /// **Content, not count.** An undo, a redo or a History jump can leave the
+    /// count where it was while the index names another path, and a landing
+    /// that trusted the index would replace a path nobody touched. Asked only
+    /// when the record has moved, so the comparison is not on the frame path.
+    pub fn still_continues(&self, record: Option<&VectorObject>) -> bool {
+        let Some(draft) = self.draft.as_ref() else {
+            return true;
+        };
+        let Some(index) = draft.continues else {
+            return true;
+        };
+        let Some(path) = record.and_then(|r| r.paths().get(index)) else {
+            return false;
+        };
+        if path.closed
+            || !is_line(path)
+            || Some(path.role) != self.draft_role
+            || path.nodes.len() != self.base_len
+            || draft.nodes.len() < self.base_len
+        {
+            return false;
+        }
+        let base = &draft.nodes[..self.base_len];
+        if self.base_reversed {
+            // `pathedit::reversed`, compared node by node without the copy.
+            path.nodes.iter().rev().zip(base).all(|(on, up)| {
+                let turned = Node {
+                    handle_in: on.handle_out,
+                    handle_out: on.handle_in,
+                    ..*on
+                };
+                turned == *up
+            })
+        } else {
+            path.nodes == base
         }
     }
 
@@ -357,8 +405,9 @@ impl PathTool {
         let hit = ground.reach.hit;
 
         let Some(draft) = self.draft.as_mut() else {
-            if let Some((draft, role)) = continuation(ground, at, hit) {
+            if let Some((draft, role, reversed)) = continuation(ground, at, hit) {
                 self.base_len = draft.nodes.len();
+                self.base_reversed = reversed;
                 self.draft_role = Some(role);
                 self.draft = Some(draft);
                 self.held = Held::Continuing;
@@ -879,7 +928,7 @@ fn shaped(held: &Held, at: Vec2, alone: bool) -> Option<Path> {
 /// An open path with an end node under the press, as a draft that goes on at
 /// that end. The last node wins where both ends are in reach, because that is
 /// the end a path being drawn grows from.
-fn continuation(ground: Ground<'_>, at: Vec2, hit: f32) -> Option<(Draft, PathRole)> {
+fn continuation(ground: Ground<'_>, at: Vec2, hit: f32) -> Option<(Draft, PathRole, bool)> {
     let record = ground.paths?;
     for (index, path) in record.paths().iter().enumerate() {
         // An open Ink path is not a line, and landing it would strip its ink.
@@ -889,10 +938,10 @@ fn continuation(ground: Ground<'_>, at: Vec2, hit: f32) -> Option<(Draft, PathRo
         let (Some(first), Some(last)) = (path.nodes.first(), path.nodes.last()) else {
             continue;
         };
-        let nodes = if last.at.distance(at) <= hit {
-            path.nodes.clone()
+        let (nodes, reversed) = if last.at.distance(at) <= hit {
+            (path.nodes.clone(), false)
         } else if first.at.distance(at) <= hit {
-            pathedit::reversed(path).nodes
+            (pathedit::reversed(path).nodes, true)
         } else {
             continue;
         };
@@ -903,6 +952,7 @@ fn continuation(ground: Ground<'_>, at: Vec2, hit: f32) -> Option<(Draft, PathRo
                 continues: Some(index),
             },
             path.role,
+            reversed,
         ));
     }
     None

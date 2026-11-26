@@ -404,9 +404,6 @@ pub struct PathGround {
     pub slot: Option<u32>,
     /// [`LayerStack::vector_revision`].
     pub revision: u64,
-    /// How many paths the active layer's record holds, `None` where it holds
-    /// no record.
-    pub paths: Option<usize>,
 }
 
 /// What a change of ground asks of the tool.
@@ -415,7 +412,8 @@ pub struct Follow {
     /// Drop the pick: it names a path by index, and the index may now name
     /// another path or none.
     pub let_go: bool,
-    /// Make a draft that continues a path land as a new one instead.
+    /// Make a draft that continues a path land as a new one instead, whatever
+    /// the record now holds: the document or the active layer changed.
     pub detach: bool,
 }
 
@@ -429,11 +427,14 @@ pub struct Follow {
 /// lands as a new path and the old one stays as it was, which can cost a
 /// duplicate and can never cost a path.
 ///
-/// The draft is detached on a change of document or active layer, and where the
-/// active record's path count moved, which is the change that can make
-/// `continues` name another path. A structural edit elsewhere in the stack
-/// moves the revision without moving one index on this layer, and detaching
-/// then would leave the continued path doubled for nothing.
+/// The draft is detached on a change of document or active layer outright. On
+/// any other foreign revision it is detached unless the path it names is still
+/// the path it took up, which is `PathTool::still_continues`'s reading of the
+/// record and not this model's: **a count is not enough**, because an undo or a
+/// History jump can leave the count where it was while the index names another
+/// path. A structural edit elsewhere in the stack moves the revision without
+/// touching this layer's paths, so the content check keeps the draft attached
+/// there and the continued path is not doubled for nothing.
 ///
 /// The tool's own edits move the revision too, and must not let go of the pick
 /// they just set, so [`PathWatch::own_edit`] takes them in without a follow.
@@ -453,7 +454,7 @@ impl PathWatch {
                 let moved = was.document != now.document || was.slot != now.slot;
                 Follow {
                     let_go: moved || was.revision != now.revision,
-                    detach: moved || was.paths != now.paths,
+                    detach: moved,
                 }
             }
         };
@@ -461,13 +462,12 @@ impl PathWatch {
         follow
     }
 
-    /// The tool changed the record itself. The revision and the count it left
-    /// are taken in; the document and the slot are not, so an edit that made a
-    /// new layer still lets go of a pick on the old one at the next look.
+    /// The tool changed the record itself. The revision it left is taken in;
+    /// the document and the slot are not, so an edit that made a new layer
+    /// still lets go of a pick on the old one at the next look.
     pub fn own_edit(&mut self, now: PathGround) {
         if let Some(seen) = self.seen.as_mut() {
             seen.revision = now.revision;
-            seen.paths = now.paths;
         }
     }
 }
@@ -2115,10 +2115,6 @@ impl Editor {
             document: self.session.active_id(),
             slot: self.layers.active_slot(),
             revision: self.layers.vector_revision(),
-            paths: self
-                .layers
-                .vector_at(self.layers.active_index())
-                .map(|record| record.paths().len()),
         }
     }
 
@@ -2128,13 +2124,16 @@ impl Editor {
     /// release and key the tool is handed, so an undo landing between two
     /// frames cannot hand the next press a pick that names another path.
     ///
-    /// A handful of reads and a comparison. It allocates nothing.
+    /// A handful of reads and a comparison while nothing moves, and it
+    /// allocates nothing. A foreign revision under a continued draft also
+    /// compares the continued path's nodes, once, against the draft's base.
     pub fn follow_path_ground(&mut self) {
         let follow = self.path_watch.observe(self.path_ground_now());
         if follow.let_go {
             self.path_tool.let_go();
         }
-        if follow.detach {
+        let record = self.layers.vector_at(self.layers.active_index());
+        if follow.detach || (follow.let_go && !self.path_tool.still_continues(record)) {
             self.path_tool.detach();
         }
     }
@@ -6538,6 +6537,57 @@ mod tests {
         assert_eq!(draft.nodes.len(), 2, "with every node it had");
     }
 
+    /// **The reviewer's sequence: a count that comes back equal is not the
+    /// same path.** The record is [B, C] when path 0 (B) is taken up; a jump
+    /// makes it [A, B], two paths again, with index 0 now naming A. The landing
+    /// must not replace A: B carried on lands as a new path and A and B stand.
+    #[test]
+    fn a_jump_that_keeps_the_count_detaches_a_draft_whose_path_moved() {
+        let a = line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0));
+        let b = line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0));
+        let c = line(Vec2::new(0.0, 400.0), Vec2::new(100.0, 400.0));
+        let mut ed = with_paths(vec![b.clone(), c]);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(100.0, 200.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+
+        let index = ed.layers.active_index();
+        let jumped = umber_core::VectorObject::empty()
+            .appended(vec![a.clone(), b.clone()])
+            .expect("a record");
+        ed.layers.set_vector(index, jumped).expect("set");
+        path_tap(&mut ed, Vec2::new(150.0, 250.0));
+        assert!(ed.path_key(PathKey::Finish));
+
+        let paths = record_of(&ed).paths().to_vec();
+        assert_eq!(paths.len(), 3, "appended, not replaced");
+        assert_eq!(paths[0], a);
+        assert_eq!(paths[1], b);
+        assert_eq!(paths[2].nodes.len(), 3, "B and the node added to it");
+    }
+
+    /// A foreign edit that leaves the continued path where it was keeps the
+    /// draft attached: the content check decides in both directions, so an
+    /// edit to another path does not leave the continued one doubled. Taken
+    /// from the first node, so the comparison runs reversed.
+    #[test]
+    fn a_foreign_edit_that_leaves_the_continued_path_alone_keeps_the_draft_attached() {
+        let a = line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0));
+        let b = line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0));
+        let mut ed = with_paths(vec![a, b]);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(0.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+
+        let index = ed.layers.active_index();
+        let moved = record_of(&ed)
+            .with_path(1, line(Vec2::new(0.0, 300.0), Vec2::new(100.0, 300.0)))
+            .expect("a record");
+        ed.layers.set_vector(index, moved).expect("set");
+        ed.follow_path_ground();
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+    }
+
     #[test]
     fn an_undo_of_someone_elses_edit_lets_go_of_the_pick() {
         let mut ed = with_paths(vec![
@@ -6828,67 +6878,59 @@ mod tests {
 
     // --- what the tool watches ---------------------------------------------
 
-    fn ground(document: u64, slot: u32, revision: u64, paths: usize) -> PathGround {
+    fn ground(document: u64, slot: u32, revision: u64) -> PathGround {
         PathGround {
             document: DocId::for_test(document),
             slot: Some(slot),
             revision,
-            paths: Some(paths),
         }
     }
 
     #[test]
     fn the_first_look_gives_nothing_up() {
         let mut watch = PathWatch::default();
-        assert_eq!(watch.observe(ground(1, 1, 1, 1)), Follow::default());
-        assert_eq!(watch.observe(ground(1, 1, 1, 1)), Follow::default());
+        assert_eq!(watch.observe(ground(1, 1, 1)), Follow::default());
+        assert_eq!(watch.observe(ground(1, 1, 1)), Follow::default());
     }
 
+    /// A foreign revision lets go of the pick and leaves the detach to the
+    /// content check, which the watch cannot make.
     #[test]
-    fn a_foreign_revision_lets_go_and_detaches_only_where_the_count_moved() {
+    fn a_foreign_revision_lets_go_and_leaves_the_detach_to_the_record() {
         let mut watch = PathWatch::default();
-        watch.observe(ground(1, 1, 1, 3));
+        watch.observe(ground(1, 1, 1));
         assert_eq!(
-            watch.observe(ground(1, 1, 2, 3)),
+            watch.observe(ground(1, 1, 2)),
             Follow {
                 let_go: true,
                 detach: false
             },
-            "an edit elsewhere moves no index on this layer"
-        );
-        assert_eq!(
-            watch.observe(ground(1, 1, 3, 2)),
-            Follow {
-                let_go: true,
-                detach: true
-            },
-            "a path gone can shift the one the draft continues"
         );
     }
 
     #[test]
     fn a_change_of_document_or_layer_gives_both_up() {
         let mut watch = PathWatch::default();
-        watch.observe(ground(1, 1, 1, 1));
+        watch.observe(ground(1, 1, 1));
         let both = Follow {
             let_go: true,
             detach: true,
         };
-        assert_eq!(watch.observe(ground(1, 2, 1, 1)), both, "another layer");
-        assert_eq!(watch.observe(ground(2, 2, 1, 1)), both, "another document");
+        assert_eq!(watch.observe(ground(1, 2, 1)), both, "another layer");
+        assert_eq!(watch.observe(ground(2, 2, 1)), both, "another document");
     }
 
     #[test]
     fn the_tools_own_edit_is_taken_in_and_a_new_layer_still_lets_go() {
         let mut watch = PathWatch::default();
-        watch.observe(ground(1, 1, 1, 1));
-        watch.own_edit(ground(1, 1, 2, 2));
-        assert_eq!(watch.observe(ground(1, 1, 2, 2)), Follow::default());
+        watch.observe(ground(1, 1, 1));
+        watch.own_edit(ground(1, 1, 2));
+        assert_eq!(watch.observe(ground(1, 1, 2)), Follow::default());
         // A landing that made a layer: the revision is its own, the slot is
         // not, so a pick on the old layer still goes.
-        watch.own_edit(ground(1, 7, 3, 1));
+        watch.own_edit(ground(1, 7, 3));
         assert_eq!(
-            watch.observe(ground(1, 7, 3, 1)),
+            watch.observe(ground(1, 7, 3)),
             Follow {
                 let_go: true,
                 detach: true
