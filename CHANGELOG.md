@@ -52,6 +52,12 @@ archive can be installed beside it.
   Each turns the outline of the current selection into a closed line, on the
   active vector layer or on a new one made for it. A path no longer lands on a
   hidden layer; it goes on a new one instead.
+- **Trace outline**, on the Edit menu. It draws a smooth closed line round each
+  piece of artwork, as a cut or a plot line on a vector layer, standing off by a
+  margin you set. The dialog shows the margin in millimetres too. Trace
+  everything in view or just the selected layer or folder, and keep the holes
+  inside a shape if you want them cut as well. Shadows and outline effects are
+  traced with the layer that casts them. The result is one undo step.
 - **Cut and plot lines are drawn over the canvas, not into the picture.** They
   show as a crisp two-tone line at any zoom, in a colour of their own for each
   kind. They never appear in an export, the flattened preview, the eyedropper

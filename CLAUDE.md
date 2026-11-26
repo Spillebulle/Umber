@@ -2143,6 +2143,80 @@ drawn by hand.
   (`update::Exit::Quit` and `Restart`) discards unsaved work without a prompt, a
   draft included; that is pre-existing.
 
+#### Trace outline
+
+`umber-core::trace` is the algorithm (crop and average down, distance
+transform, marching squares, then `trace::fit`), `CanvasRenderer::export_coverage`
+is the one readback, `Editor::plan_trace` decides everything the model can, and
+`tracedlg.rs` is the form. The design is
+`docs/superpowers/specs/2026-11-26-trace-outline-design.md`. The paths land
+through `carry_out_path_plan`, the route the selection commands take, as one
+undo entry.
+
+- **It is a CPU distance transform and not the outline effect's GPU distance
+  field**, though the effect already grows a shape on the device. Reading that
+  back ties an explicit command to the effect cache's working set and budget,
+  cannot be tested without a device, and still leaves the contouring and the
+  fitting to do on the CPU. The exact Euclidean transform gives round offsets
+  and the whole of it is tested with no device at all.
+- **The background is left out of the composite pass by a parameter**, the
+  `[f32; 4]` `composite_over` takes, set to transparent's all-zeroes identity
+  for that one draw. Subtracting it afterwards cannot work: a white-backed
+  document's flattened alpha is 1 everywhere, so what the artwork covered is
+  gone by the time the bytes arrive, and the trace is one rectangle the size of
+  the page. Toggling `self.background` on the renderer for the read is a
+  mutation of document state with a failure path that can leave it changed,
+  and the screen would composite against whatever the read left behind. A
+  value in a field the shader already reads is neither, and is still the
+  screen's own flattening, so masks, clipping, opacity and hidden layers are
+  honoured by construction.
+- **Inside is `THRESHOLD` (26 of 255, about 10%), not a halfway point.** A soft
+  brush edge would otherwise push the line outwards by its whole falloff, for
+  ink too faint to print. **A piece smaller than `MIN_SPECK` (4 cells) is
+  removed**, so a stray pixel does not become a sticker of its own.
+- **A margin is measured from the ink's pixel edge, and any cell at or above
+  the threshold counts as wholly inside.** The field is `margin + 0.5 -
+  distance` between cell centres, so a straight edge lands exactly `margin`
+  beyond the artwork and a corner is a circle about the corner cell's centre,
+  which falls about 0.21 of a cell short of a true offset on the diagonal
+  (`sqrt(2)/2 - 1/2`; the test pins it). On a grid `region` has averaged down
+  to stay under `MAX_CELLS` the same rule makes a grown outline the offset of a
+  staircase, so it is faceted and costs nodes: a margin-10 disc is 2 nodes at
+  one pixel a cell and 14 at two. The repair is a sub-cell distance in `rings`,
+  never a looser fitter.
+- **Holes are decided on the grown shape**, not on the artwork. A gap the
+  margin closes is not a hole any more; one it does not close is filled unless
+  Keep holes is on, because a sticker with its middle cut out is rarely what
+  anybody meant.
+- **Effects are traced, because they print.** `App::trace_outline` bakes
+  `trace_effected_draws` exactly as an export does, so a drop shadow or an
+  outline effect is inside the cut. A vector layer's own Cut and Plot paths are
+  not: they are drawn over the canvas and never composited, which is the rule
+  that keeps them out of an export too.
+- **`trace::fit` is the fitter freehand drawing will use**, which is why
+  `fit_open` exists with nothing calling it. Corners first, then Schneider's
+  algorithm between them. One consequence worth knowing before a report of
+  "the circle came out square": at margin zero a circle under about 7.6 cells
+  of radius turns by more than `CORNER_DEGREES` across the eight cells of arc
+  `CORNER_REACH` looks over, so its vertices read as corners and it fits as a
+  polygon. A margin of that size or more rounds it, since a grown corner's
+  radius is at least the margin.
+- **An empty `trace` after a non-empty `region` is "nothing to trace"**, the
+  same notice as `region` answering `None`. Thin faint content can survive the
+  crop and vanish in the averaging, and treating the two as one is what stops
+  a successful-looking command landing an empty layer.
+- **The dialog stays open behind a refusal's notice**, which no dialog did
+  before it, so its Escape and click-outside go through `Modal::should_close`
+  and never a raw key read: egui's top-modal rule is what lets the Escape that
+  dismisses the notice leave the form standing.
+  `dismissing_a_notice_over_the_dialog_leaves_the_dialog_up` is the guard and
+  fails under a raw read.
+- **Knowingly not built.** A live preview (retune by undoing and running
+  again; the form remembers its settings for the session), centre-line tracing
+  for plot lines, clipping the result to the canvas (a margin may carry an
+  outline past the edge, and what a machine does with that is the next
+  project's), and persisting the settings across runs.
+
 ### Documents
 
 Several documents are open at once. `Session` (`umber-app/src/session.rs`) holds
