@@ -285,3 +285,39 @@ model and a panel by what egui drew; no test asserts wall-clock time.
 Nobody building this can look at a window or hold a pen. Colours and weights
 of the marks over real artwork, the feel of the hit radius, and the pen path
 are reasoned and tested as models, and need the artist's eye afterwards.
+
+## As built: where the tool differs from the text above
+
+Recorded after the build on branch `path-tool`. Each of these was decided
+during the build without the artist; any of them can be reversed.
+
+- **A canvas flip mirrors a draft in hand.** The text above says anything that
+  moves the canvas settles the draft first. A flip reached through the History
+  panel cannot settle first, so the draft is mirrored with the picture.
+- **Closing a tab or the window lands the draft before the prompt appears.**
+  Pressing Cancel on that prompt leaves the path on the layer rather than back
+  in hand.
+- **Taking a path up and adding nothing changes nothing.** No undo entry, no
+  unsaved mark, and the path is not reversed.
+- **Undo into the part of a continued path that was already there abandons the
+  whole draft**, leaving the path as it was.
+- **A continued draft stops being a continuation** when the layer in hand
+  changes, when the path it was taken from is no longer the same path, or when
+  that path is edited with Ctrl held. It then lands as a new path.
+- **A continued draft keeps the role of the path it came from**, whatever the
+  Cut and Plot switch shows.
+- **A drag that would put a path too far from the canvas** is refused with the
+  tool's own sentence: "That would put the path too far from the canvas."
+- **Ctrl with a press on a layer that cannot be edited says why** on the strip.
+- **Escape during a drag cancels the drag only.** A second Escape abandons the
+  draft.
+- **Enter with a single point down does nothing.**
+- **"Close path" is drawn disabled, with a tooltip, under three points**,
+  rather than not drawn.
+- **The selected path stays selected when an edit is refused**, and moves with
+  the path when an edit reorders the record.
+- **A frame in which nothing changed does no work over the selected path.**
+  The preview is rebuilt when the path, the selection, the camera or the
+  pointer's aim changes, and that rebuild allocates.
+- **A new layer that finds no room** shows the existing remedy's wording
+  rather than a sentence of this tool's own.
