@@ -99,6 +99,16 @@ windows-sys = { version = "0.61", features = [
     # that is not Umber's own. See `src/syspick.rs`. No new system library: GDI
     # is in every Windows process already.
     "Win32_Graphics_Gdi",
+    # The cutter's link (`src/cutter.rs`): `SetupDiGetClassDevsW` and its
+    # siblings find the USB printing interface a Silhouette enumerates as,
+    # `CreateFileW`/`ReadFile`/`WriteFile` talk to it overlapped, and
+    # `CancelIoEx`/`GetOverlappedResult` make a timed-out read finish before its
+    # buffer goes. `Win32_Security` only because `CreateFileW` and
+    # `CreateEventW` name `SECURITY_ATTRIBUTES` in their signatures.
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Security",
 ] }
 
 # The desktop's clipboard (`sysclip.rs`), for pictures. Text goes out through

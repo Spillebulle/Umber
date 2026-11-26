@@ -344,6 +344,477 @@ impl<L: Link, F: FnMut(String)> Link for Logged<L, F> {
     }
 }
 
+/// Whether a device interface path names a Silhouette, and the product
+/// asked for where one is.
+///
+/// A path reads `\\?\usb#vid_0b4d&pid_113a#<instance>#{<interface>}`, so the
+/// ids are the `&`-separated tokens of the second `#` field and nowhere else:
+/// an instance string is the device's own and may hold anything.
+#[cfg(any(windows, test))]
+fn is_cutter(path: &str, product: Option<u16>) -> bool {
+    let path = path.to_ascii_lowercase();
+    let Some(ids) = path.split('#').nth(1) else {
+        return false;
+    };
+    let has = |token: String| ids.split('&').any(|t| t == token);
+    has(format!("vid_{VENDOR:04x}"))
+        && match product {
+            Some(pid) => has(format!("pid_{pid:04x}")),
+            None => true,
+        }
+}
+
+/// The first whole reply out of what has arrived, ETX included. What follows
+/// the ETX stays for the next reply.
+#[cfg(any(windows, test))]
+fn take_reply(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let end = pending.iter().position(|&b| b == ETX)?;
+    Some(pending.drain(..=end).collect())
+}
+
+/// The machine on Windows' USB printing class driver, which is what a
+/// Silhouette enumerates as.
+///
+/// **Nobody has run this against a machine.** It is written to what the
+/// documentation says each call does, and every signature was read from the
+/// `windows-sys` source rather than remembered.
+pub struct UsbPrint {
+    #[cfg(windows)]
+    handle: win::Handle,
+    /// What has arrived and not yet been handed out as a reply.
+    #[cfg(windows)]
+    pending: Vec<u8>,
+    /// There is no link off Windows, so no value of this type exists there.
+    #[cfg(not(windows))]
+    _none: std::convert::Infallible,
+}
+
+impl UsbPrint {
+    /// Open the first machine of `product` that is plugged in.
+    pub fn open(product: u16) -> Result<UsbPrint, LinkError> {
+        #[cfg(windows)]
+        {
+            let path = win::interface_paths()
+                .into_iter()
+                .find(|p| is_cutter(p, Some(product)))
+                .ok_or(LinkError::NotFound)?;
+            Ok(UsbPrint {
+                handle: win::open(&path)?,
+                pending: Vec::new(),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = product;
+            Err(LinkError::Unsupported)
+        }
+    }
+
+    /// Every Silhouette interface path that is plugged in, whatever the model.
+    pub fn paths() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            win::interface_paths()
+                .into_iter()
+                .filter(|p| is_cutter(p, None))
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            Vec::new()
+        }
+    }
+}
+
+impl Link for UsbPrint {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+        #[cfg(windows)]
+        {
+            win::write(&self.handle, bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = bytes;
+            Err(LinkError::Unsupported)
+        }
+    }
+
+    fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+        #[cfg(windows)]
+        {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(reply) = take_reply(&mut self.pending) {
+                    return Ok(reply);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    // Whatever part of a reply did arrive stays in `pending`.
+                    return Err(LinkError::Timeout);
+                }
+                let mut buf = [0u8; win::READ_BYTES];
+                let got = win::read(&self.handle, &mut buf, deadline - now)?;
+                self.pending.extend_from_slice(&buf[..got]);
+                if got == 0 {
+                    // A read that completes empty is not a reason to spin.
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(Duration::from_millis(10).min(left));
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = timeout;
+            Err(LinkError::Unsupported)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for UsbPrint {
+    fn drop(&mut self) {
+        win::cancel_all(&self.handle);
+        // The handle itself is closed by its own drop, after this.
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use std::cell::UnsafeCell;
+    use std::ptr::{null, null_mut};
+    use std::time::Duration;
+
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W, SetupDiDestroyDeviceInfoList,
+        SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+    };
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
+        ERROR_OPERATION_ABORTED, ERROR_SHARING_VIOLATION, FALSE, GENERIC_READ, GENERIC_WRITE,
+        GetLastError, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile,
+    };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows_sys::core::GUID;
+
+    use super::LinkError;
+
+    /// `GUID_DEVINTERFACE_USBPRINT`.
+    const USBPRINT: GUID = GUID::from_u128(0x28d78fad_5a12_11d1_ae5b_0000f803a8c2);
+    /// Bytes asked for by one `ReadFile`.
+    pub const READ_BYTES: usize = 64;
+    /// How long one write may take to be accepted. A block is at most a
+    /// kilobyte and the machine is asked to be ready before each, so a write
+    /// that has not gone in this long is not going to.
+    const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+    /// More interfaces than this on one machine is a broken enumeration.
+    const MAX_INTERFACES: u32 = 1024;
+
+    /// A kernel handle owned by this value and closed when it goes.
+    pub struct Handle(HANDLE);
+
+    // SAFETY: a `Handle` is owned by exactly one value, which moves between
+    // threads whole and is only ever used by the thread that holds it, and the
+    // kernel object it names may be used from any thread. It is closed once, on
+    // drop.
+    unsafe impl Send for Handle {}
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a valid handle this value owns (it is never
+            // constructed from an invalid one) and nothing uses it after this.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Cancel every operation on the handle, before it is closed.
+    pub fn cancel_all(handle: &Handle) {
+        // SAFETY: a null OVERLAPPED asks for every outstanding operation on a
+        // valid handle to be cancelled. Every operation this module starts has
+        // already completed before its function returned, so this is a guard
+        // against nothing being left rather than a cancellation anything waits on.
+        unsafe {
+            CancelIoEx(handle.0, null());
+        }
+    }
+
+    fn last_error() -> u32 {
+        // SAFETY: no preconditions; reads this thread's last error code.
+        unsafe { GetLastError() }
+    }
+
+    fn io(what: &str, code: u32) -> LinkError {
+        LinkError::Io(format!("{what} failed with Windows error {code}"))
+    }
+
+    /// The device paths of every present USB printing interface.
+    pub fn interface_paths() -> Vec<String> {
+        // SAFETY: a valid GUID pointer, no enumerator, no window; the flags ask
+        // for present device interfaces of that class.
+        let set: HDEVINFO = unsafe {
+            SetupDiGetClassDevsW(
+                &USBPRINT,
+                null(),
+                null_mut(),
+                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+            )
+        };
+        if set == INVALID_HANDLE_VALUE as HDEVINFO {
+            return Vec::new();
+        }
+        let set = DevInfo(set);
+        let mut paths = Vec::new();
+        for index in 0..MAX_INTERFACES {
+            let mut data = SP_DEVICE_INTERFACE_DATA {
+                cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: a live device information set, the class GUID it was
+            // built for, and `data` with its size set as the call requires.
+            let ok =
+                unsafe { SetupDiEnumDeviceInterfaces(set.0, null(), &USBPRINT, index, &mut data) };
+            if ok == FALSE {
+                // ERROR_NO_MORE_ITEMS at the end of the list; any other error
+                // also leaves nothing more to read.
+                break;
+            }
+            if let Some(path) = detail_path(&set, &data) {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    /// The device path of one interface.
+    fn detail_path(set: &DevInfo, data: &SP_DEVICE_INTERFACE_DATA) -> Option<String> {
+        let header = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+        let mut needed = 0u32;
+        // SAFETY: asking for the size alone: a null buffer of size zero, with
+        // `needed` to receive the size. It is expected to fail with
+        // ERROR_INSUFFICIENT_BUFFER, which is why the answer is not checked.
+        unsafe {
+            SetupDiGetDeviceInterfaceDetailW(set.0, data, null_mut(), 0, &mut needed, null_mut());
+        }
+        let needed_bytes = needed as usize;
+        if needed_bytes < header {
+            return None;
+        }
+        // Eight-byte cells, so the buffer is aligned for the struct on every
+        // target and holds at least `needed` bytes.
+        let mut buf = vec![0u64; needed_bytes.div_ceil(8)];
+        let detail = buf.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+        // SAFETY: `detail` points to at least `header` writable bytes, aligned
+        // for the struct. `cbSize` is the size of the fixed header (8 on 64-bit,
+        // 6 on 32-bit, where the struct is packed), which is what the call
+        // checks, and the unaligned write is right for the packed layout too.
+        unsafe {
+            std::ptr::addr_of_mut!((*detail).cbSize).write_unaligned(header as u32);
+        }
+        // SAFETY: the buffer is `needed` bytes long, as the first call asked.
+        let ok = unsafe {
+            SetupDiGetDeviceInterfaceDetailW(set.0, data, detail, needed, null_mut(), null_mut())
+        };
+        if ok == FALSE {
+            return None;
+        }
+        let offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+        let chars = (needed_bytes - offset) / 2;
+        // SAFETY: `DevicePath` starts `offset` bytes into a buffer of
+        // `needed_bytes`, so `chars` u16s from there are inside it. A u16 read
+        // is aligned because the buffer is eight-byte aligned and the offset
+        // even (4 on every target).
+        let wide = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr().cast::<u8>().add(offset).cast::<u16>(), chars)
+        };
+        let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+        Some(String::from_utf16_lossy(&wide[..len]))
+    }
+
+    /// A device information set, destroyed when it goes.
+    struct DevInfo(HDEVINFO);
+
+    impl Drop for DevInfo {
+        fn drop(&mut self) {
+            // SAFETY: a set returned by SetupDiGetClassDevsW, destroyed once.
+            unsafe {
+                SetupDiDestroyDeviceInfoList(self.0);
+            }
+        }
+    }
+
+    /// Open an interface for overlapped reads and writes, exclusively.
+    pub fn open(path: &str) -> Result<Handle, LinkError> {
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: a NUL-terminated wide path, no sharing, no security
+        // attributes, no template.
+        let h = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
+            return Err(match last_error() {
+                ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED => LinkError::Busy,
+                ERROR_FILE_NOT_FOUND => LinkError::NotFound,
+                code => io("Opening the cutter", code),
+            });
+        }
+        Ok(Handle(h))
+    }
+
+    /// A manual-reset event, unsignalled.
+    fn event() -> Result<Handle, LinkError> {
+        // SAFETY: no security attributes, manual reset, initially unsignalled,
+        // no name.
+        let h = unsafe { CreateEventW(null(), TRUE, FALSE, null()) };
+        if h.is_null() {
+            return Err(io("Creating an event", last_error()));
+        }
+        Ok(Handle(h))
+    }
+
+    fn millis(d: Duration) -> u32 {
+        d.as_millis().clamp(1, u128::from(u32::MAX - 1)) as u32
+    }
+
+    /// Wait for an overlapped operation for up to `wait`, and make sure it has
+    /// finished before returning, cancelling it if it has not. Answers the
+    /// bytes it moved and whether it finished on its own.
+    ///
+    /// The OVERLAPPED is reached through a raw pointer only: the kernel writes
+    /// to it while the operation runs, so no Rust reference to it may be alive
+    /// over that time.
+    ///
+    /// # Safety
+    ///
+    /// `ov` must point to the OVERLAPPED of an operation started on `handle`,
+    /// with `event` its event, and both it and the buffer the operation uses
+    /// must stay where they are until this returns, which is the whole point:
+    /// once this returns the operation has completed and neither is in use.
+    unsafe fn settle(
+        handle: &Handle,
+        ov: *const OVERLAPPED,
+        event: &Handle,
+        wait: Duration,
+    ) -> Result<(u32, bool), u32> {
+        // SAFETY: the event is a valid handle owned by the caller.
+        let woke = unsafe { WaitForSingleObject(event.0, millis(wait)) };
+        let mut moved = 0u32;
+        if woke == WAIT_OBJECT_0 {
+            // SAFETY: per this function's contract; the operation is complete,
+            // so waiting returns at once.
+            let ok = unsafe { GetOverlappedResult(handle.0, ov, &mut moved, TRUE) };
+            if ok == FALSE {
+                return Err(last_error());
+            }
+            return Ok((moved, true));
+        }
+        // Timed out, or the wait itself failed: in either case the operation
+        // may still be running, and the buffer and the OVERLAPPED must not be
+        // released until it is not.
+        // SAFETY: cancels only this operation, which belongs to `handle`.
+        unsafe {
+            CancelIoEx(handle.0, ov);
+        }
+        // SAFETY: per this function's contract; waiting here is what makes the
+        // operation finished before anything it uses goes away.
+        let ok = unsafe { GetOverlappedResult(handle.0, ov, &mut moved, TRUE) };
+        if ok == FALSE {
+            let code = last_error();
+            if code != ERROR_OPERATION_ABORTED {
+                return Err(code);
+            }
+        }
+        // Bytes that arrived before the cancel took are kept.
+        Ok((moved, false))
+    }
+
+    /// A fresh OVERLAPPED for one operation, signalling `event`.
+    fn overlapped(event: &Handle) -> UnsafeCell<OVERLAPPED> {
+        UnsafeCell::new(OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        })
+    }
+
+    /// One overlapped read of up to `buf.len()` bytes, waited for up to `wait`.
+    /// Answers how many arrived, which may be none.
+    pub fn read(handle: &Handle, buf: &mut [u8], wait: Duration) -> Result<usize, LinkError> {
+        let event = event()?;
+        let ov = overlapped(&event);
+        let len = buf.len().min(u32::MAX as usize) as u32;
+        // SAFETY: a valid handle opened for overlapped reads, `len` writable
+        // bytes at `buf`, no byte count pointer (an overlapped read reports it
+        // through GetOverlappedResult), and an OVERLAPPED with its own event.
+        // `buf` is borrowed for this whole function and `ov` and `event` are
+        // locals, so all three stay put until `settle` has seen the operation
+        // finish.
+        let ok = unsafe { ReadFile(handle.0, buf.as_mut_ptr(), len, null_mut(), ov.get()) };
+        if ok == FALSE {
+            let code = last_error();
+            if code != ERROR_IO_PENDING {
+                return Err(io("Reading from the cutter", code));
+            }
+        }
+        // SAFETY: `ov` belongs to the read just started on `handle`, `event` is
+        // its event, and nothing here touches or releases `buf`, `ov` or
+        // `event` until this returns.
+        let (got, _) = unsafe { settle(handle, ov.get(), &event, wait) }
+            .map_err(|code| io("Reading from the cutter", code))?;
+        Ok((got as usize).min(buf.len()))
+    }
+
+    /// One overlapped write of all of `bytes`. Anything short of all of them is
+    /// a failure, and the caller does not retry one.
+    pub fn write(handle: &Handle, bytes: &[u8]) -> Result<(), LinkError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| LinkError::Io(format!("a write of {} bytes is too long", bytes.len())))?;
+        let event = event()?;
+        let ov = overlapped(&event);
+        // SAFETY: a valid handle opened for overlapped writes, `len` readable
+        // bytes at `bytes`, no byte count pointer, and an OVERLAPPED with its
+        // own event; `bytes`, `ov` and `event` outlive the operation because
+        // `settle` sees it finish before this returns.
+        let ok = unsafe { WriteFile(handle.0, bytes.as_ptr(), len, null_mut(), ov.get()) };
+        if ok == FALSE {
+            let code = last_error();
+            if code != ERROR_IO_PENDING {
+                return Err(io("Writing to the cutter", code));
+            }
+        }
+        // SAFETY: as for the read.
+        let (wrote, finished) = unsafe { settle(handle, ov.get(), &event, WRITE_TIMEOUT) }
+            .map_err(|code| io("Writing to the cutter", code))?;
+        // A write cut off by the timeout may have delivered some of the block,
+        // and that is exactly the case that must end the job rather than be
+        // tried again.
+        if !finished {
+            return Err(LinkError::Timeout);
+        }
+        if wrote != len {
+            return Err(LinkError::Io(format!(
+                "only {wrote} of {len} bytes reached the cutter"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +1267,50 @@ mod tests {
             lines,
             vec!["> 5 M0,0\\x03 failed: Io(\"scripted\")".to_string()]
         );
+    }
+
+    #[test]
+    fn the_cutter_is_told_from_a_printer_by_its_ids() {
+        const GUID: &str = "{28d78fad-5a12-11d1-ae5b-0000f803a8c2}";
+        let portrait = format!("\\\\?\\usb#vid_0b4d&pid_113a#7&1a2b3c&0&1#{GUID}");
+        let other = format!("\\\\?\\usb#vid_0b4d&pid_1137#5&9f&0&2#{GUID}");
+        let printer = format!("\\\\?\\usb#vid_04b8&pid_0005#x#{GUID}");
+        let shouting = format!("\\\\?\\USB#VID_0B4D&PID_113A#7&1A2B#{GUID}");
+        // A longer id that merely starts with Silhouette's, and an id that
+        // only appears in a serial number.
+        let longer = format!("\\\\?\\usb#vid_0b4d1&pid_113a#x#{GUID}");
+        let in_serial = format!("\\\\?\\usb#vid_04b8&pid_0005#vid_0b4d&pid_113a#{GUID}");
+
+        assert!(is_cutter(&portrait, Some(PORTRAIT_3)));
+        assert!(is_cutter(&portrait, None));
+        assert!(is_cutter(&shouting, Some(PORTRAIT_3)));
+        assert!(!is_cutter(&other, Some(PORTRAIT_3)));
+        assert!(is_cutter(&other, None));
+        assert!(!is_cutter(&printer, None));
+        assert!(!is_cutter(&printer, Some(PORTRAIT_3)));
+        assert!(!is_cutter(&longer, None));
+        assert!(!is_cutter(&in_serial, None));
+        assert!(!is_cutter("", None));
+    }
+
+    #[test]
+    fn a_reply_is_split_at_etx_and_the_rest_kept() {
+        let mut pending = b"    0\x030\x03CAM".to_vec();
+        assert_eq!(take_reply(&mut pending), Some(b"    0\x03".to_vec()));
+        assert_eq!(take_reply(&mut pending), Some(b"0\x03".to_vec()));
+        assert_eq!(take_reply(&mut pending), None);
+        assert_eq!(pending, b"CAM");
+        pending.extend_from_slice(b"EO\x03");
+        assert_eq!(take_reply(&mut pending), Some(b"CAMEO\x03".to_vec()));
+        assert!(pending.is_empty());
+    }
+
+    /// The worker the dialog sends a job from owns the link, so it must be
+    /// able to take it to another thread.
+    #[test]
+    fn the_usb_link_can_go_to_a_worker_thread() {
+        fn send_able<T: Send>() {}
+        send_able::<UsbPrint>();
+        send_able::<Box<dyn Link + Send>>();
     }
 }
