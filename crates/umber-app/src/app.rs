@@ -2940,6 +2940,70 @@ impl UmberApp {
         self.request_redraw();
     }
 
+    /// Carry out what the Send to cutter dialog asked for, once.
+    ///
+    /// A send settles the stroke, the float and a Path tool draft exactly as
+    /// [`Self::trace_outline`] does, so the paths read are the ones on screen,
+    /// and then plans the job through the form's own `plan_job`, the same call
+    /// the dialog's summary is drawn from. A refusal is the outcome and starts
+    /// nothing. The worker owns the job it is handed, so a tab switched or
+    /// closed while it runs changes nothing it sends.
+    ///
+    /// **This is the one place a real machine is opened.** Every test hands
+    /// the worker an opener of its own.
+    fn spend_cutter_request(&mut self) {
+        use crate::cutter::{self, Link, Timing, Work};
+        use crate::cutterdlg::CutterRequest;
+
+        let Some(request) = self.editor.cutter_request.take() else {
+            return;
+        };
+        let work = match request {
+            CutterRequest::Stop => {
+                self.editor.cutter.stop();
+                self.request_redraw();
+                return;
+            }
+            // One piece of work at a time; `begin` refuses a second as well,
+            // and this keeps a send from settling a draft for nothing.
+            CutterRequest::Check | CutterRequest::Send if self.editor.cutter.busy() => return,
+            CutterRequest::Check => Work::Check,
+            CutterRequest::Send => {
+                self.finish_stroke();
+                self.finish_transform();
+                if self.editor.ui.tool == Tool::Path {
+                    self.editor.settle_path_tool_noting();
+                    self.drain_path_layers();
+                }
+                match self
+                    .editor
+                    .cutter
+                    .plan_job(&self.editor.layers, &self.editor.doc)
+                {
+                    Ok(job) => Work::Send(job),
+                    Err(refusal) => {
+                        self.editor.cutter.outcome = Some(Err(refusal.sentence()));
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            }
+        };
+        let open: cutter::Opener = Box::new(|log| {
+            for line in cutter::found_lines(&cutter::UsbPrint::paths()) {
+                log(line);
+            }
+            cutter::UsbPrint::open(cutter::PORTRAIT_3)
+                .map(|link| Box::new(link) as Box<dyn Link + Send>)
+        });
+        let proxy = self.proxy.clone();
+        self.editor.cutter.begin(work, open, Timing::REAL, move || {
+            // The loop is gone once the window has closed. Nothing to do.
+            let _ = proxy.send_event(Wake);
+        });
+        self.request_redraw();
+    }
+
     fn add_layer(&mut self) {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
@@ -3399,6 +3463,8 @@ impl UmberApp {
             // file behind the artist's back.
             Action::Export => self.editor.export_form.open = true,
             Action::ExportPrintSheet => self.export_print_sheet(),
+            // Only the dialog, for Export's reason.
+            Action::SendToCutter => self.editor.open_cutter(),
             Action::ToggleSheetMarks => self.editor.toggle_sheet_marks(),
             // The answer matters only to `jump_history`, which has several
             // steps to abandon; one keystroke has nothing to stop.
@@ -4382,6 +4448,10 @@ impl UmberApp {
         // the measurement in `loading.rs`.
         self.collect_loading();
 
+        // And the cutter's worker: a stage, a log line or the outcome that
+        // arrived while the loop slept is drawn in the frame its wake asked for.
+        self.editor.cutter.pump();
+
         // What the panic hook is allowed to say about the artist's documents.
         // The hook cannot borrow the editor — it has no reference to one, and
         // the frame that panicked may be halfway through changing it — so the
@@ -4969,6 +5039,7 @@ impl UmberApp {
         if std::mem::take(&mut self.editor.trace_requested) {
             self.trace_outline();
         }
+        self.spend_cutter_request();
         if actions.new_vector_layer {
             self.add_vector_layer();
         }

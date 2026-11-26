@@ -2670,6 +2670,17 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         actions.export_print_sheet = true;
         ui.close();
     }
+    // Opens the dialog and nothing more, so it needs no request: the dialog's
+    // own buttons are what ask `App` for work.
+    if menu_item(ui, Action::SendToCutter, true)
+        .on_hover_text(
+            "Sends the cut or plot paths to a Silhouette Portrait 3 plugged in over USB.",
+        )
+        .clicked()
+    {
+        ed.open_cutter();
+        ui.close();
+    }
     // A tick rather than a row that acts, as the Window menu draws its one
     // switch, because what it says is whether this document has marks. The
     // label and the key are the action's, through `menu_toggle`, so the row
@@ -5734,6 +5745,21 @@ mod tests {
         let actions = click_menu_row(Menu::File, &mut ed, Action::ExportPrintSheet.label());
         assert!(actions.export_print_sheet, "the row asked for nothing");
         assert!(!actions.open_export, "the row opened the Export dialog");
+    }
+
+    /// The cutter's row opens the Send to cutter dialog, and asks the caller
+    /// for nothing its print sheet neighbour asks for.
+    #[test]
+    fn the_cutter_row_opens_the_send_to_cutter_dialog() {
+        let mut ed = Editor::default();
+        assert!(!ed.cutter.open);
+        let actions = click_menu_row(Menu::File, &mut ed, Action::SendToCutter.label());
+        assert!(ed.cutter.open, "the row did not open the dialog");
+        assert!(
+            !actions.export_print_sheet,
+            "the row asked for a print sheet"
+        );
+        assert_eq!(ed.cutter_request, None, "the row asked the cutter for work");
     }
 
     /// **The marks switch names its key once one is bound**, on its own row.
