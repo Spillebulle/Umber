@@ -1497,8 +1497,8 @@ mod tests {
                 .collect(),
         );
         assert_eq!(form.log.len(), MAX_LOG_LINES);
-        for i in 0..LOG_HEAD_LINES {
-            assert_eq!(form.log[i], format!("line {i}"));
+        for (i, line) in form.log.iter().enumerate().take(LOG_HEAD_LINES) {
+            assert_eq!(*line, format!("line {i}"));
         }
         let kept = MAX_LOG_LINES - 1;
         assert_eq!(

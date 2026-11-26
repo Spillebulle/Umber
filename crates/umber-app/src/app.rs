@@ -8315,7 +8315,7 @@ mod tests {
 
         let back = umber_core::docimport::import(&path).expect("reopen");
         assert_eq!(back.layers.len(), stack.len(), "the stack changed length");
-        for at in 0..stack.len() {
+        for (at, layer) in back.layers.iter().enumerate() {
             // **One piece at the origin**, because these layers are solid and
             // `docformat::trim` therefore writes each at its full size. Read
             // off the piece rather than a canvas: `ImportedLayer::pixels` is a
@@ -8324,7 +8324,7 @@ mod tests {
             // as the bytes is what keeps this a check on the *picture* — a
             // layer that came back at the wrong offset would otherwise pass on
             // its first four bytes.
-            let piece = &back.layers[at].pixels[0];
+            let piece = &layer.pixels[0];
             assert_eq!(
                 (
                     piece.rect.x,
@@ -8341,7 +8341,7 @@ mod tests {
                 "layer {at} came back holding another layer's pixels"
             );
             assert_eq!(
-                back.layers[at].mask.is_some(),
+                layer.mask.is_some(),
                 stack.layers()[at].mask().is_some(),
                 "layer {at}'s mask moved"
             );
