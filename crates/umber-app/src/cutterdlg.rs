@@ -475,7 +475,7 @@ fn send_header(job: &Job) -> String {
     };
     format!(
         "Send: {}, pressure {}, speed {}, passes {}, {depth}, registration marks {}, cutting mat \
-         {}, {} paths, {:.1} mm",
+         {}, {} {}, {:.1} mm",
         offered(s.role).unwrap_or("Cut"),
         s.pressure,
         s.speed,
@@ -483,6 +483,11 @@ fn send_header(job: &Job) -> String {
         if s.use_marks { "on" } else { "off" },
         if s.mat { "on" } else { "off" },
         job.path_count(),
+        if job.path_count() == 1 {
+            "path"
+        } else {
+            "paths"
+        },
         job.length_mm()
     )
 }
@@ -498,8 +503,9 @@ fn summary_line(job: &Job, role: PathRole) -> String {
     format!("{n} {paths}, {:.0} mm of {doing}", job.length_mm())
 }
 
-/// The line naming what a running job is doing.
-fn stage_line(phase: CutterPhase) -> Option<String> {
+/// The line naming what a running job is doing. `role` is the job's: the
+/// form is disabled while one runs, so the role in front cannot change.
+fn stage_line(phase: CutterPhase, role: PathRole) -> Option<String> {
     match phase {
         CutterPhase::Idle => None,
         CutterPhase::Checking | CutterPhase::Sending(Stage::Connecting) => {
@@ -509,7 +515,11 @@ fn stage_line(phase: CutterPhase) -> Option<String> {
             Some("Finding the registration marks".to_string())
         }
         CutterPhase::Sending(Stage::Cutting { block, of }) => {
-            Some(format!("Cutting, block {} of {of}", block + 1))
+            let doing = match role {
+                PathRole::Cut | PathRole::Ink => "Cutting",
+                PathRole::Plot => "Drawing",
+            };
+            Some(format!("{doing}, block {} of {of}", block + 1))
         }
         CutterPhase::Sending(Stage::Finishing) => Some("Finishing".to_string()),
         CutterPhase::Sending(Stage::Stopping) | CutterPhase::Stopping => Some(STOPPING.to_string()),
@@ -662,7 +672,7 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor) {
             }
             ui.add_space(12.0);
 
-            if let Some(stage) = stage_line(phase) {
+            if let Some(stage) = stage_line(phase, form.role) {
                 line(ui, p, &stage);
                 if hung {
                     ui.add_space(4.0);
@@ -1143,6 +1153,19 @@ mod tests {
         assert!(send_header(&job).contains(", blade depth not set, "));
     }
 
+    #[test]
+    fn the_log_header_counts_one_path_as_a_path() {
+        let ed = opened();
+        let form = CutterForm::default();
+        let job = form.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert_eq!(job.path_count(), 1);
+        assert!(
+            send_header(&job).contains(", 1 path, "),
+            "{}",
+            send_header(&job)
+        );
+    }
+
     /// The eye is not part of the vector revision, so the summary has to be
     /// keyed on it separately, or a layer shown again goes on being refused.
     #[test]
@@ -1262,6 +1285,16 @@ mod tests {
         ed.cutter.phase = CutterPhase::Sending(Stage::Cutting { block: 2, of: 12 });
         let shot = h.settled(&mut ed);
         assert!(shot.has("Cutting, block 3 of 12"), "{:?}", shot.words());
+        // A pen draws, and the line says so.
+        ed.cutter.role = PathRole::Plot;
+        let drawing = h.settled(&mut ed);
+        assert!(
+            drawing.has("Drawing, block 3 of 12"),
+            "{:?}",
+            drawing.words()
+        );
+        assert!(!drawing.has("Cutting"), "{:?}", drawing.words());
+        ed.cutter.role = PathRole::Cut;
         assert_eq!(shot.buttons.len(), 1, "{:?}", shot.words());
         assert!(shot.buttons[0].contains(shot.at("Stop")));
         for gone in ["Send", "Check connection", "Close"] {

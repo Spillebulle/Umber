@@ -178,7 +178,11 @@ impl Failure {
             | SendError::Stopped => false,
         };
         if self.blocks_sent > 0 && !says_so {
-            s.push_str(" Part of the sheet may already be cut. Check it before sending again.");
+            // The same for a pen, so it names both.
+            s.push_str(
+                " Part of the sheet may already be cut or drawn on. Check it before sending \
+                 again.",
+            );
         }
         s
     }
@@ -212,11 +216,11 @@ impl SendError {
             }
             SendError::MarksNotFound(raw) => format!(
                 "The cutter did not report finding the registration marks, so nothing was \
-                 cut. It answered: {}.",
+                 cut or drawn. It answered: {}.",
                 escaped(raw)
             ),
             SendError::MarksTimedOut => "The cutter did not answer while looking for the \
-                                         registration marks. Nothing was cut."
+                                         registration marks. Nothing was cut or drawn."
                 .to_string(),
             SendError::Unknown(raw) => format!(
                 "The cutter gave an answer Umber does not understand ({}), so nothing more was \
@@ -1992,7 +1996,9 @@ mod tests {
         assert_eq!(link.writes.last(), Some(&job.end_block()));
     }
 
-    const PART_CUT: &str = " Part of the sheet may already be cut. Check it before sending again.";
+    /// Said the same for a pen, so it names both.
+    const PART_CUT: &str =
+        " Part of the sheet may already be cut or drawn on. Check it before sending again.";
 
     #[test]
     fn a_failure_after_the_first_cut_says_the_sheet_may_be_part_cut() {
@@ -2456,13 +2462,13 @@ mod tests {
         }
         assert_eq!(
             sentences[6],
-            "The cutter did not report finding the registration marks, so nothing was cut. \
-             It answered:     1\\x03."
+            "The cutter did not report finding the registration marks, so nothing was cut \
+             or drawn. It answered:     1\\x03."
         );
         assert_eq!(
             sentences[7],
             "The cutter did not answer while looking for the registration marks. Nothing \
-             was cut."
+             was cut or drawn."
         );
         assert!(sentences[8].contains("3\\x03"), "{}", sentences[8]);
         assert_eq!(
