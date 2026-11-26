@@ -1733,10 +1733,10 @@ are the contiguous run immediately below it whose `depth` is greater.
 
 `umber-core::vector` is the model, `umber-app::vectorview` is the lines on
 screen, and `docs/superpowers/specs/2026-11-25-vector-layers-design.md` is the
-design. **Stage one only: a layer that holds Cut and Plot paths, made from a
-selection's outline.** Drawing and editing paths, tracing artwork and the
-machine are three later projects, and nothing here has a control for any of
-them.
+design. **Stage one: a layer that holds Cut and Plot paths, made from a
+selection's outline.** Drawing and editing them is "The Path tool", below;
+tracing artwork and the machine are later projects, and nothing here has a
+control for either.
 
 - **A layer is a vector layer exactly when it carries a record, and an empty
   record is a record.** `Layer::vector` is an `Option<Box<VectorObject>>` and
@@ -1992,6 +1992,122 @@ them.
   selection's path is a pixel staircase and a self-crossing lasso gives a path
   that crosses itself, which is project 3's to smooth and is said in the
   CHANGELOG rather than hidden.
+
+#### The Path tool
+
+`umber-core::pathedit` is the geometry (pure functions over `Path`, each
+returning a new value so the caller can diff for undo), `umber-app::pathtool`
+is the model (presses, moves, releases and keys in document space, no winit and
+no drawing), `Editor` turns its commits into record swaps and undo entries, and
+`ui::path_marks` and `vectorview::PathPreview` paint it. The design is
+`docs/superpowers/specs/2026-11-25-path-tool-design.md`. There is one kind of
+path: one made from a selection is edited by exactly the same means as one
+drawn by hand.
+
+- **The layer's record is not written during a drag.** The original stays drawn
+  by the overlay and the edited copy is painted over it from the tool's own
+  state; the record is swapped once, at the release. That keeps the overlay
+  cache and `vector_revision` out of the pointer path, makes "one gesture, one
+  undo entry" structural rather than disciplined, and means an autosave cannot
+  see a half-dragged path. `Interaction::Pathing` is not idle, so none starts
+  mid-gesture either. A drag that ends where it began, and a strip press that
+  changes nothing, record nothing (`apply_path_edit` returns early on an equal
+  record).
+- **`Tool::Path` resolves to `Press::Path` in `gesture.rs`, and no event arm
+  matches on `Tool`.** A pen reaches it exactly as a mouse does. `Press::ALL`
+  and `every_press_is_filed_in_its_own_place_in_all` keep the list honest.
+- **A held gesture ended by anything but its release goes through
+  `Editor::interrupt_path_gesture`.** A press of another gesture, a pinch and
+  the window losing focus all take `Pathing` away with no release coming, so
+  the node the press was placing is taken back (and the draft ends if it was the
+  only one), a closing press reopens the draft, and a drag is dropped without
+  committing. It acts on `Pathing` only. The `app.rs` call sites cannot be
+  driven without an `App`; the model half and the Editor half are tested.
+- **Undo with a draft up belongs to the draft.** It takes the last node off,
+  redo is swallowed, and neither touches `History`, so no redo stack is lost to
+  a node. `App::undo_command` is the keyboard's and the menu's route, and
+  `ui::step_rows` draws Undo as "Undo point" and Redo disabled while a draft is
+  up. `jump_history` still steps the history directly, because a row names an
+  entry and a draft is in none.
+- **A draft that cannot land stays up and the strip says why.** A full stack, no
+  slice, too many paths or nodes: nothing drawn is lost and the artist can make
+  room. The one notice, "The path being drawn was not kept", is raised on
+  leaving the tool (or a tab switch or a resize), never on a canvas press, so a
+  pen going down is never a dialog. `plan_paths` is the one door a finished path
+  lands by, shared with the selection commands; `path_edit_refusal` is the one
+  reading of whether the active layer may be edited, by effective visibility and
+  lock. **A hidden layer takes no path**: it lands on a new layer instead, so
+  nothing is added where it would not be drawn.
+- **Close and quit settle the draft before the unsaved prompt is computed.**
+  `settle_before_closing` (only for the tab in front) and
+  `settle_before_quitting` run before `modified` is read, so a kept path counts
+  as unsaved work and the ordinary prompt asks about it.
+- **A draft rides a canvas flip, and a resize settles it.** `PathTool::mirror`
+  uses `Node::flipped`, the arithmetic `VectorObject::flipped` maps over, and is
+  called inside `Editor::flip_canvas`, so a flip reached by undo, redo or a
+  History jump carries the draft as the command does; settling there would
+  record a landing inside the history being walked. A resize clears the
+  history, so it settles first.
+- **The pick is let go on a foreign revision and `detach`ed on a layer change.**
+  A pick and a continued draft name a path by index, and `PathWatch` compares
+  the document, the slot, `vector_revision` and the path count to say when that
+  index stops meaning what it meant. A foreign change drops the pick, since a
+  fresh one is a click away. A continued draft is only *detached* (it then lands
+  as a new path), because dropping it costs what the artist drew and detaching
+  costs at most a duplicate. The watch runs at the top of `render` and again at
+  the start of every press, release, key and settle, because an undo can arrive
+  between two events with no frame between them; the tool's own commits go
+  through `own_edit` and keep their pick. `a_stale_pick_never_reaches_the_next_key`
+  is the guard.
+- **Marks and hit test share `Editor::path_nodes_shown`, and its cap is 2048.**
+  Past `NODE_MARK_CAP` nodes in view no node mark is drawn and node and handle
+  hits are off (segment hits still work), because a path traced from a lasso can
+  hold tens of thousands and a mark per node per frame is the cost the standing
+  rule forbids. The answer is cached by document, revision, pick and view, and
+  the scan stops as soon as it knows. `ui::path_marks` is the one statement of
+  where a mark is, read by the painter and the tests, and handles belong to the
+  picked node (and the draft's last) alone.
+- **The preview mesh is cached by value.** `PathPaint` keeps an `Arc<Mesh>` and
+  the lines it was made from, rebuilt only when the lines, the scale or a colour
+  differ (`a_still_path_in_hand_is_tessellated_once`). A dependency list would
+  go stale; a few dozen points compared by value cannot. `machine_line_mesh`
+  still builds a fresh tessellator per rebuild, so a path in hand allocates when
+  it changes and not when it stands still.
+- **A layer the tool makes has its slice wiped at the end of every event as well
+  as in `render`.** `Editor` has no renderer, so it queues the slot
+  (`path_layers_made`), and `App::drain_path_layers` empties the queue after
+  every `window_event` and at the top of the frame's reads. Draining only in
+  `render` left a window in which a landing made by a release, Enter or a close
+  could be read, by a save, an export, a copy or an undo, before the recycled
+  slice was cleared. `a_landed_layer_is_handed_to_the_wipe_once` covers the
+  queue; that `App` calls the drain at the end of every event is not testable
+  without a device.
+- **Ink paths are never hit or continued.** An Ink path describes pixels and is
+  not a line, and landing a continued one would strip its ink. The reading is an
+  exhaustive `match` on the role.
+- **Changing the role never changes the default by picking.** The Cut / Plot
+  switch shows the pick's role while there is one and the default otherwise;
+  pressed with a pick it changes that path alone. Switching mode leaves a draft
+  up, since neither Enter nor leaving the tool has happened
+  (`switching_mode_leaves_the_draft_up`).
+- **`lucide.rs` reads packed arc flags.** Lucide writes an arc's flags against
+  the next number (`00-2.756`), and a lexer reading a flag as a number deforms
+  the mark rather than breaking it. `Lexer::flag` reads one character, guarded
+  by `an_arcs_flags_may_run_into_the_number_after_them`; `number_tokens` still
+  tokenises flags as numbers, so `every_number_in_every_icon_parses` cannot see
+  a regression there. The brief for the rail mark carried `pen-tool` path data
+  that is not what Lucide publishes: fetch the file rather than trusting a
+  brief.
+- **What nobody has looked at.** The marks over real artwork (their colours and
+  weights are reasoned and measured, not seen), the feel of the 8-point hit
+  radius, the pen path, and the icon sheet for `pen-tool`. A pinch does not take
+  back a node the first finger placed.
+- **Knowingly left.** Freehand drawing fitted to a curve (it belongs with
+  tracing), rectangle and ellipse path shapes, selecting several nodes or paths,
+  snapping and nudging, and editing a layer that is not the active one. Cancel on
+  a close prompt leaves the draft landed on a layer. The update-install exit
+  (`update::Exit::Quit` and `Restart`) discards unsaved work without a prompt, a
+  draft included; that is pre-existing.
 
 ### Documents
 

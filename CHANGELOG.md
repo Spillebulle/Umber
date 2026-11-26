@@ -33,10 +33,25 @@ archive can be installed beside it.
   sentence, and the brush does not paint on it. Clear layer is greyed out,
   because there is no paint to clear. The transform tool says once that there
   is nothing on it to move, not every time you press.
+- **The Path tool.** Press `P` or pick it on the tool rail. In Draw, click to
+  place a corner, drag to pull out a curve, and click the first point to close
+  the path. Press Enter to finish an open one, Backspace to take back the last
+  point and Escape to abandon it. Click the end of an open path to carry on from
+  it. While you are drawing, Undo takes back the last point.
+- **Edit paths by hand.** In Edit, click a line to pick it, drag a point or a
+  handle, drag a line to move the whole path, or click a line to add a point on
+  it. Delete removes the picked point or path. The options strip switches
+  between Draw and Edit and between Cut and Plot, closes or opens a path, and
+  makes a point a corner or smooth. Every change is one undo step. Paths made
+  from a selection are edited the same way.
+- **A path that has nowhere to go stays on screen**, with the reason on the
+  options strip, so nothing you drew is lost. Changing tool, switching tab or
+  closing the document puts a path you were drawing on a layer. A canvas flip
+  carries it with the picture.
 - **Cut path from selection and Plot path from selection**, on the Edit menu.
   Each turns the outline of the current selection into a closed line, on the
-  active vector layer or on a new one made for it. They are the way to get a
-  line onto a vector layer in this release.
+  active vector layer or on a new one made for it. A path no longer lands on a
+  hidden layer; it goes on a new one instead.
 - **Cut and plot lines are drawn over the canvas, not into the picture.** They
   show as a crisp two-tone line at any zoom, in a colour of their own for each
   kind. They never appear in an export, the flattened preview, the eyedropper

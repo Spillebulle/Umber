@@ -207,6 +207,11 @@ the Edit menu, and its outline becomes a closed line on a vector layer. The line
 is drawn over the canvas and is never part of the picture, so it stays out of
 your exports. It saves with the document and undoes like anything else.
 
+The **Path tool** (`P`) draws those lines by hand. Click for a corner, drag for
+a curve, and click the first point to close the path. Switch to Edit to move
+points and handles, add a point on a line, or make a point a corner or smooth.
+Each path is either Cut or Plot, and you can switch it at any time.
+
 <br clear="right">
 
 ## Colour
@@ -366,6 +371,7 @@ wrong.
 |---|---|
 | Left drag | Use the selected tool |
 | `B` / `E` / `S` / `T` / `I` / `H` / `Z` | Brush / eraser / select / transform / eyedropper / pan / zoom |
+| `P` | Path tool |
 | `Ctrl` + `D` | Deselect |
 | `Ctrl` + `C` / `X` / `V` | Copy / cut / paste |
 | `Shift` / `Ctrl` / both + drag with Select | Add to the selection / take away / keep the overlap |
@@ -400,9 +406,10 @@ a speed-derived approximation, and a mouse always paints at full pressure.
   vector renderer; rasterise it before saving and it comes across. Adjustment
   layers change what is below them, which Umber cannot do yet. Both are named
   when the document opens.
-- **Vector layers only make lines from a selection so far.** You cannot yet draw
-  a path by hand or move its points, trace a cut line from your artwork, or send
-  anything to a cutter or plotter. Lines that look like brush strokes and stay
+- **Vector layers are only half there.** You can draw paths and reshape them,
+  but you cannot yet draw freehand and have it fitted to a curve, select
+  several points at once, trace a cut line from your artwork, or send anything
+  to a cutter, plotter or printer. Lines that look like brush strokes and stay
   editable are further off still.
 - **Picking a colour from outside the window is Windows only.** Inside the
   window the eyedropper works everywhere. On macOS and Linux the tool options
