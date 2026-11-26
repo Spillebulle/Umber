@@ -244,7 +244,9 @@ pub fn write(out: &mut impl Write, sheet: &Sheet<'_>) -> Result<(), SheetError> 
     let xref = out.at;
     out.write_all(b"xref\n0 7\n0000000000 65535 f \n")?;
     for offset in &offsets[1..] {
-        write!(out, "{offset:010} 00000 n \n")?;
+        // Every entry is exactly twenty bytes: the space before the newline
+        // is the first of its two end-of-line bytes.
+        writeln!(out, "{offset:010} 00000 n ")?;
     }
     write!(
         out,
