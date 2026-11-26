@@ -25,7 +25,7 @@ use std::ops::Range;
 
 use egui::{Pos2, Rect, pos2};
 use glam::Vec2;
-use umber_core::{Camera, LayerStack, PathRole};
+use umber_core::{Camera, LayerStack, Path, PathRole};
 
 use crate::session::DocId;
 
@@ -173,20 +173,8 @@ impl VectorView {
         self.lines.clear();
         self.points.clear();
         let ppp = ppp.max(1e-3);
-        let zoom = camera.zoom.max(1e-6);
-        // `0.25 / zoom / ppp` document pixels. The camera maps a document pixel
-        // to `zoom` device pixels, so `0.25 / zoom` alone would be a quarter of
-        // a device pixel; the second division makes it a quarter of a device
-        // pixel at 100% and finer than that at every larger scale (an eighth at
-        // 200%). Finer than anybody can tell from the curve, at the cost of a
-        // few more points on a high-density display; coarser shows facets.
-        let tolerance = 0.25 / zoom / ppp;
-        // The marquee's pivot: this frame's canvas rect, in physical pixels.
-        let pivot = Vec2::new(view.center().x, view.center().y) * ppp;
-        let to_screen = |doc: Vec2| {
-            let s = camera.doc_to_screen(doc, pivot);
-            pos2(s.x / ppp, s.y / ppp)
-        };
+        let tolerance = flatten_tolerance(camera, ppp);
+        let to_screen = screen_mapping(camera, view, ppp);
         let keep = view.expand(CULL_MARGIN);
 
         let Self {
@@ -222,58 +210,25 @@ impl VectorView {
                     // Ink is pixels on the layer, drawn by the composite.
                     PathRole::Ink => continue,
                 }
-                // The whole path first, which is one box for a path that is
-                // nowhere near, before its segments are looked at one by one.
-                let Some((lo, hi)) = path.bounds() else {
-                    continue;
-                };
-                if !Rect::from_two_pos(to_screen(lo), to_screen(hi)).intersects(keep) {
-                    continue;
+                let traced = trace_path(path, &mut runs, scratch, &to_screen, keep, tolerance);
+                #[cfg(test)]
+                {
+                    *flattened += traced.flattened;
+                    *scratch_peak = (*scratch_peak).max(traced.peak);
                 }
-                runs.begin(path.role);
-                for cubic in path.segments() {
-                    // **Culled by its control-point hull before anything is
-                    // spent on it.** A cubic lies inside that hull, so a hull
-                    // missing the region is a curve missing it, and this is
-                    // what keeps the budget for what can be seen: flattening a
-                    // whole path first and checking after was millions of
-                    // off-screen points for one legal path at the highest zoom.
-                    let hull = cubic.map(to_screen);
-                    if !Rect::from_points(&hull).intersects(keep) {
-                        runs.end();
-                        continue;
+                if traced.capped {
+                    if !*capped {
+                        log::debug!(
+                            "the vector overlay stopped at {MAX_POINTS} points; \
+                             lines past it are not drawn"
+                        );
+                        *capped = true;
                     }
-                    scratch.clear();
-                    umber_core::vector::flatten_cubic(cubic, tolerance, scratch);
-                    #[cfg(test)]
-                    {
-                        *flattened += 1;
-                        *scratch_peak = (*scratch_peak).max(scratch.len());
-                    }
-                    let mut from = hull[0];
-                    for &doc in scratch.iter() {
-                        let to = to_screen(doc);
-                        if !runs.segment(from, to, keep) {
-                            runs.end();
-                            if !*capped {
-                                log::debug!(
-                                    "the vector overlay stopped at {MAX_POINTS} points; \
-                                     lines past it are not drawn"
-                                );
-                                *capped = true;
-                            }
-                            break 'layers;
-                        }
-                        from = to;
-                    }
+                    break 'layers;
                 }
-                runs.end();
             }
         }
-        if scratch.capacity() > SCRATCH_KEEP {
-            scratch.clear();
-            scratch.shrink_to(SCRATCH_KEEP);
-        }
+        shrink_scratch(scratch);
     }
 
     /// The scratch buffer's capacity, for the guard that it stays bounded.
@@ -286,6 +241,182 @@ impl VectorView {
     #[cfg(test)]
     pub fn flattened(&self) -> usize {
         self.flattened
+    }
+}
+
+/// The flattener's tolerance in document pixels: `0.25 / zoom / ppp`.
+///
+/// The camera maps a document pixel to `zoom` device pixels, so `0.25 / zoom`
+/// alone would be a quarter of a device pixel; the second division makes it a
+/// quarter of a device pixel at 100% and finer than that at every larger scale
+/// (an eighth at 200%). Finer than anybody can tell from the curve, at the cost
+/// of a few more points on a high-density display; coarser shows facets.
+fn flatten_tolerance(camera: &Camera, ppp: f32) -> f32 {
+    0.25 / camera.zoom.max(1e-6) / ppp.max(1e-3)
+}
+
+/// Document pixels to screen points over the canvas region `view`, at `ppp`
+/// physical pixels to the point: **the one statement of the overlay's mapping**,
+/// the marquee's own (this frame's canvas rect, in physical pixels, as the
+/// camera's pivot, then divided by the scale). The cut lines, the path in hand
+/// and every mark on it call this and nothing else, so a mark cannot sit off
+/// the line it belongs to.
+pub fn screen_mapping(
+    camera: &Camera,
+    view: Rect,
+    ppp: f32,
+) -> impl Fn(Vec2) -> Pos2 + Copy + use<> {
+    let ppp = ppp.max(1e-3);
+    let camera = *camera;
+    let pivot = Vec2::new(view.center().x, view.center().y) * ppp;
+    move |doc: Vec2| {
+        let s = camera.doc_to_screen(doc, pivot);
+        pos2(s.x / ppp, s.y / ppp)
+    }
+}
+
+/// What tracing one path did, for the caller to total.
+struct Traced {
+    /// The point budget ran out; the build ends here.
+    capped: bool,
+    /// Cubics flattened, for the culling guards.
+    #[cfg(test)]
+    flattened: usize,
+    /// The most points the scratch held at once.
+    #[cfg(test)]
+    peak: usize,
+}
+
+/// One path's runs, culled and clipped to `keep`: the body both the cached
+/// overlay and [`PathPreview`] share, so a path in hand is drawn by exactly the
+/// arithmetic the same path will be once it has landed.
+fn trace_path(
+    path: &Path,
+    runs: &mut Runs<'_>,
+    scratch: &mut Vec<Vec2>,
+    to_screen: &impl Fn(Vec2) -> Pos2,
+    keep: Rect,
+    tolerance: f32,
+) -> Traced {
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut traced = Traced {
+        capped: false,
+        #[cfg(test)]
+        flattened: 0,
+        #[cfg(test)]
+        peak: 0,
+    };
+    // The whole path first, which is one box for a path that is nowhere near,
+    // before its segments are looked at one by one.
+    let Some((lo, hi)) = path.bounds() else {
+        return traced;
+    };
+    if !Rect::from_two_pos(to_screen(lo), to_screen(hi)).intersects(keep) {
+        return traced;
+    }
+    runs.begin(path.role);
+    for cubic in path.segments() {
+        // **Culled by its control-point hull before anything is spent on it.**
+        // A cubic lies inside that hull, so a hull missing the region is a
+        // curve missing it, and this is what keeps the budget for what can be
+        // seen: flattening a whole path first and checking after was millions
+        // of off-screen points for one legal path at the highest zoom.
+        let hull = cubic.map(to_screen);
+        if !Rect::from_points(&hull).intersects(keep) {
+            runs.end();
+            continue;
+        }
+        scratch.clear();
+        umber_core::vector::flatten_cubic(cubic, tolerance, scratch);
+        #[cfg(test)]
+        {
+            traced.flattened += 1;
+            traced.peak = traced.peak.max(scratch.len());
+        }
+        let mut from = hull[0];
+        for &doc in scratch.iter() {
+            let to = to_screen(doc);
+            if !runs.segment(from, to, keep) {
+                runs.end();
+                traced.capped = true;
+                return traced;
+            }
+            from = to;
+        }
+    }
+    runs.end();
+    traced
+}
+
+/// Give back a scratch a build has left larger than [`SCRATCH_KEEP`].
+fn shrink_scratch(scratch: &mut Vec<Vec2>) {
+    if scratch.capacity() > SCRATCH_KEEP {
+        scratch.clear();
+        scratch.shrink_to(SCRATCH_KEEP);
+    }
+}
+
+/// Screen-space runs for a handful of paths that are on no layer: the draft,
+/// its rubber band, the dragged path, the picked path. Rebuilt on every call,
+/// into buffers it keeps, so a warm frame allocates nothing here.
+///
+/// **Not cached, deliberately.** A draft moves with the pointer and the paths
+/// are a few nodes; a key like [`VectorView`]'s would be a different number on
+/// every frame this is used. The runs come from [`trace_path`], the overlay's
+/// own body, so a path is clipped and culled exactly as it will be once it is
+/// on a layer.
+#[derive(Default)]
+pub struct PathPreview {
+    lines: Vec<ScreenLine>,
+    points: Vec<Pos2>,
+    scratch: Vec<Vec2>,
+    generation: u64,
+}
+
+impl PathPreview {
+    /// The lines of `paths`, in screen points over `view` at `ppp`. A path with
+    /// the Ink role is skipped, as the overlay skips it.
+    pub fn lines<'a>(
+        &'a mut self,
+        paths: &[&Path],
+        camera: &Camera,
+        view: Rect,
+        ppp: f32,
+    ) -> Lines<'a> {
+        self.lines.clear();
+        self.points.clear();
+        self.generation = self.generation.wrapping_add(1);
+        let tolerance = flatten_tolerance(camera, ppp);
+        let to_screen = screen_mapping(camera, view, ppp);
+        let keep = view.expand(CULL_MARGIN);
+        let Self {
+            lines,
+            points,
+            scratch,
+            ..
+        } = self;
+        let mut runs = Runs {
+            lines,
+            points,
+            role: PathRole::Cut,
+            start: 0,
+            pen: None,
+        };
+        for path in paths {
+            match path.role {
+                PathRole::Cut | PathRole::Plot => {}
+                PathRole::Ink => continue,
+            }
+            if trace_path(path, &mut runs, scratch, &to_screen, keep, tolerance).capped {
+                break;
+            }
+        }
+        shrink_scratch(scratch);
+        Lines {
+            lines: &self.lines,
+            points: &self.points,
+            generation: self.generation,
+        }
     }
 }
 
@@ -961,6 +1092,105 @@ mod tests {
         assert!(
             view.key.is_none(),
             "the cache was keyed for a plain document"
+        );
+    }
+
+    #[test]
+    fn a_preview_of_a_straight_path_is_its_two_screen_points() {
+        let path = line(
+            PathRole::Cut,
+            Vec2::new(50.0, 100.0),
+            Vec2::new(350.0, 120.0),
+        );
+        let mut preview = PathPreview::default();
+        let drawn = preview.lines(&[&path], &camera(), VIEW, 1.0);
+        assert_eq!(drawn.lines.len(), 1);
+        assert_eq!(
+            &drawn.points[drawn.lines[0].points.clone()],
+            &[pos2(50.0, 100.0), pos2(350.0, 120.0)]
+        );
+        // The mapping the marks use is the one that put them there.
+        let to_screen = screen_mapping(&camera(), VIEW, 1.0);
+        assert_eq!(to_screen(Vec2::new(50.0, 100.0)), pos2(50.0, 100.0));
+        let none = preview.lines(&[], &camera(), VIEW, 1.0);
+        assert!(none.lines.is_empty() && none.points.is_empty());
+    }
+
+    #[test]
+    fn a_preview_is_culled_and_clipped_like_the_overlay() {
+        let mut preview = PathPreview::default();
+        let far = line(
+            PathRole::Cut,
+            Vec2::new(1.0e6, 1.0e6),
+            Vec2::new(1.0e6 - 10.0, 1.0e6),
+        );
+        assert!(
+            preview
+                .lines(&[&far], &camera(), VIEW, 1.0)
+                .lines
+                .is_empty(),
+            "a path off screen was drawn"
+        );
+        let wide = line(
+            PathRole::Plot,
+            Vec2::new(-1.0e6, 150.0),
+            Vec2::new(1.0e6, 150.0),
+        );
+        let drawn = preview.lines(&[&far, &wide], &camera(), VIEW, 1.0);
+        assert_eq!(drawn.lines.len(), 1);
+        assert_eq!(drawn.lines[0].role, PathRole::Plot);
+        let keep = VIEW.expand(CULL_MARGIN);
+        for p in &drawn.points[drawn.lines[0].points.clone()] {
+            assert!(keep.contains(*p), "{p:?} is outside the kept region");
+            assert_eq!(p.y, 150.0);
+        }
+        // Ink is pixels, not a line.
+        let ink = line(
+            PathRole::Ink,
+            Vec2::new(50.0, 100.0),
+            Vec2::new(350.0, 100.0),
+        );
+        assert!(
+            preview
+                .lines(&[&ink], &camera(), VIEW, 1.0)
+                .lines
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_preview_keeps_its_buffers() {
+        let path = Path {
+            role: PathRole::Cut,
+            closed: false,
+            nodes: vec![
+                Node {
+                    at: Vec2::new(50.0, 100.0),
+                    handle_in: Vec2::ZERO,
+                    handle_out: Vec2::new(80.0, -60.0),
+                    pressure: 1.0,
+                },
+                Node::corner(Vec2::new(350.0, 100.0)),
+            ],
+            ink: None,
+        };
+        let mut preview = PathPreview::default();
+        preview.lines(&[&path], &camera(), VIEW, 1.0);
+        let caps = (
+            preview.lines.capacity(),
+            preview.points.capacity(),
+            preview.scratch.capacity(),
+        );
+        assert!(caps.0 > 0 && caps.1 > 0 && caps.2 > 0);
+        preview.lines(&[&path], &camera(), VIEW, 1.0);
+        assert_eq!(
+            caps,
+            (
+                preview.lines.capacity(),
+                preview.points.capacity(),
+                preview.scratch.capacity()
+            ),
+            "a second frame grew a buffer"
         );
     }
 }

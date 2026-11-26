@@ -1256,6 +1256,10 @@ pub struct Editor {
     /// drains it before anything composites. Empty except for the frame a
     /// layer is made in, so it allocates once and then never.
     pub path_layers_made: Vec<(DocId, u32)>,
+    /// What the Path tool paints with: the preview's buffers, the paths built
+    /// from the draft and the marks. Above the `--- documents ---` line because
+    /// it is a cache of what is drawn. See `ui::path_tool_marks`.
+    pub path_paint: crate::ui::PathPaint,
     /// Scratch for the outline being painted this frame.
     ///
     /// Held rather than built per frame for the reason
@@ -1432,6 +1436,7 @@ impl Default for Editor {
             path_tool: crate::pathtool::PathTool::default(),
             path_watch: PathWatch::default(),
             path_layers_made: Vec::new(),
+            path_paint: crate::ui::PathPaint::default(),
             selection_outline: Vec::new(),
             selection_screen: Vec::new(),
             selection_dashes: Vec::new(),
