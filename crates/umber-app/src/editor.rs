@@ -2431,18 +2431,22 @@ impl Editor {
     /// [`Editor::apply_path_edit`]. Either way the tool hears the outcome, so a
     /// refusal keeps the draft up and says why on the strip.
     ///
-    /// **No float can be up here, and that is what lets this record.** A float
-    /// exists only with the transform tool in hand, and the Path tool is
-    /// settled before the tool can change, so there is no draft and no pick for
-    /// a commit to come from while one stands.
+    /// **No float can be up under a commit that writes, and that is what lets
+    /// this record.** A float exists only with the transform tool in hand, and
+    /// the Path tool is settled before the tool can change, so there is no
+    /// draft and no pick for a `Land` or a `Set` to come from while one stands.
+    /// `Nothing` is a different matter: the window's close, the tab's close
+    /// mark and File > Close document settle the tool with a float still up,
+    /// and an empty hand settles to `Nothing`, so the assertion sits in the two
+    /// arms that write and not above the match.
     pub fn carry_out(&mut self, commit: crate::pathtool::Commit) {
-        debug_assert!(
-            self.float.is_none(),
-            "the Path tool committed while a float was up"
-        );
         match commit {
             crate::pathtool::Commit::Nothing => {}
             crate::pathtool::Commit::Land { paths, replaces } => {
+                debug_assert!(
+                    self.float.is_none(),
+                    "the Path tool landed a path while a float was up"
+                );
                 let outcome = match self.plan_paths(paths, replaces) {
                     Err(why) => Err(why),
                     Ok(plan) => self.land_path_plan(plan),
@@ -2453,6 +2457,10 @@ impl Editor {
                 self.path_tool.landed(outcome);
             }
             crate::pathtool::Commit::Set(after) => {
+                debug_assert!(
+                    self.float.is_none(),
+                    "the Path tool edited a path while a float was up"
+                );
                 let outcome = self.apply_path_edit(after);
                 if outcome.is_ok() {
                     self.path_watch.own_edit(self.path_ground_now());
@@ -6098,6 +6106,33 @@ mod tests {
         assert!(ed.path_tool.draft().is_none());
         assert!(ed.session.active_tab().modified, "so the prompt asks");
         assert_eq!(record_of(&ed).paths().len(), 1);
+    }
+
+    /// Three settle sites (the window's close, the tab's close mark, File >
+    /// Close document) do not put a float down first, so a settle with a float
+    /// up and nothing in the tool's hand must be a quiet no-op rather than a
+    /// debug assertion. The float is a transform tool's lift, which is the
+    /// state those sites reach.
+    #[test]
+    fn settling_with_a_float_up_and_nothing_in_hand_changes_nothing() {
+        let mut ed = path_editor();
+        ed.float = Some(Floating {
+            xf: umber_core::Transform::identity(umber_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }),
+            slot: ed.layers.active_slot().expect("a slot"),
+            lifted: true,
+            drag: None,
+            made: None,
+        });
+        let (entries, history) = (ed.layers.len(), ed.history.len());
+        assert!(ed.settle_path_tool().is_none());
+        ed.settle_before_quitting();
+        assert_eq!((ed.layers.len(), ed.history.len()), (entries, history));
+        assert!(ed.float.is_some(), "the float is not the settle's to touch");
     }
 
     #[test]
