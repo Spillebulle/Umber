@@ -3025,15 +3025,18 @@ impl Editor {
             if dropped > 0 {
                 // Named rather than discovered. Unlike the flip's, this one is
                 // reachable by anybody who resizes a document holding text.
-                self.notice = Some(Notice {
-                    title: "Text on this document is paint now".to_string(),
-                    lines: vec![format!(
+                // Added to a notice already up (the marks one, above) rather
+                // than replacing it, so both sentences reach the artist.
+                add_notice_line(
+                    &mut self.notice,
+                    "Text on this document is paint now",
+                    &format!(
                         "The canvas changed size, so Umber no longer knows where the text \
                          on {} goes. Every pixel is still there. What is lost is that it \
                          can be set again.",
                         text_layers(dropped)
-                    )],
-                });
+                    ),
+                );
             }
             // **A vector layer's paths move with the picture instead.** Unlike
             // a text placement they are exact under a translation, and the
@@ -4965,6 +4968,25 @@ mod tests {
             notice.lines,
             vec!["The new canvas size cannot hold registration marks, so they were switched off."]
         );
+    }
+
+    /// The text branch used to assign the notice rather than add to it, so a
+    /// document with marks and a caption lost the marks sentence.
+    #[test]
+    fn a_resize_that_drops_marks_and_text_says_both() {
+        use umber_core::Anchor;
+        let mut ed = Editor {
+            doc: marked(1748, 2480, 300.0),
+            ..Editor::default()
+        };
+        assert!(ed.layers.set_text(0, a_record("A caption")));
+        assert!(ed.apply_canvas(marked(300, 300, 300.0), Anchor::Centre));
+        assert!(!ed.doc.marks);
+        assert!(ed.layers.text_at(0).is_none());
+        let notice = ed.notice.as_ref().expect("said so");
+        let all = notice.lines.join("\n");
+        assert!(all.contains("cannot hold registration marks"), "{all}");
+        assert!(all.contains("one text layer"), "{all}");
     }
 
     /// 300 pixels square at 300 dpi is 25 mm, which has no room for a 60 mm
