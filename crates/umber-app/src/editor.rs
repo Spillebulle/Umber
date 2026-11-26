@@ -2339,6 +2339,15 @@ impl Editor {
         }
     }
 
+    /// Hand every queued new layer's slice to `wipe`, once, and empty the
+    /// queue. The renderer's half is `App::drain_path_layers`, which says why
+    /// it runs where it does.
+    pub fn take_path_layers(&mut self, mut wipe: impl FnMut(DocId, u32)) {
+        for (id, slot) in self.path_layers_made.drain(..) {
+            wipe(id, slot);
+        }
+    }
+
     /// The press the Path tool was holding ended without a release: another
     /// gesture took `Interaction` over, a second finger landed, or the window
     /// lost focus. Every place that takes `Pathing` away calls this, so the
@@ -5954,6 +5963,28 @@ mod tests {
             ed.path_layers_made,
             vec![(ed.session.tabs()[0].id, vector_slots[0])]
         );
+    }
+
+    /// The queue the renderer drains is handed over once and emptied, so a
+    /// second drain in the same pump wipes nothing twice. This is the Editor
+    /// half only: that `App` drains at the end of every event is a call site no
+    /// test without a device can reach.
+    #[test]
+    fn a_landed_layer_is_handed_to_the_wipe_once() {
+        let mut ed = path_editor();
+        draw_closed_triangle(&mut ed, 100.0);
+        let slot = ed.layers.active_slot().expect("a slot");
+        let mut seen = Vec::new();
+        ed.take_path_layers(|id, slot| seen.push((id, slot)));
+        assert_eq!(seen, vec![(ed.session.tabs()[0].id, slot)]);
+        ed.take_path_layers(|id, slot| seen.push((id, slot)));
+        assert_eq!(seen.len(), 1, "nothing is wiped twice");
+        // An append makes no layer and queues nothing.
+        path_tap(&mut ed, Vec2::new(400.0, 400.0));
+        path_tap(&mut ed, Vec2::new(500.0, 400.0));
+        assert!(ed.path_key(PathKey::Finish));
+        ed.take_path_layers(|id, slot| seen.push((id, slot)));
+        assert_eq!(seen.len(), 1);
     }
 
     // --- round one: interrupted presses, closing, flips, the menu ------------

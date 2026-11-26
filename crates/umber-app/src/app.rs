@@ -4345,11 +4345,7 @@ impl UmberApp {
         // so this is after it and before anything reads a slice: the autosave
         // and the composite below. By document, because a tab switch can land
         // a path in the document it is leaving.
-        for (id, slot) in self.editor.path_layers_made.drain(..) {
-            if let Some(canvas) = gfx.canvases.get_mut(&id) {
-                canvas.clear_layer(&gfx.gpu.queue, slot);
-            }
-        }
+        wipe_new_layers(&mut self.editor, gfx);
 
         // Tessellation and egui's texture uploads happen *before* the surface
         // is acquired, because every path below this can decide not to draw the
@@ -5900,341 +5896,36 @@ impl UmberApp {
     }
 }
 
-impl ApplicationHandler<Wake> for UmberApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gfx.is_some() {
-            return;
-        }
-
-        // The window appears early and then sits unpainted until the rest of
-        // this function has finished, so this is the number that decides
-        // whether Umber needs a real loading screen. Logged rather than
-        // measured once and written down, because it is a property of the
-        // driver and the machine rather than of this code.
-        let started = std::time::Instant::now();
-
-        let attrs = Window::default_attributes()
-            .with_title("Umber")
-            // Per-platform, and quietly so: Windows uses it for the title bar,
-            // X11 for the window list. Wayland ignores it entirely and takes
-            // its icon from the `.desktop` file matching the app id, and on
-            // macOS `set_window_icon` is documented as a no-op — there the icon
-            // comes from the `.app` bundle's `Info.plist`. The executable
-            // resource in `crates/umber-desktop/build.rs` is what gives
-            // Explorer and the Start Menu an icon before the process starts.
-            .with_window_icon(logo::window_icon())
-            .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0));
-
-        // Windows keeps a *second* icon per window, `ICON_BIG`, and that is the
-        // one the taskbar and Alt-Tab draw. `with_window_icon` sets only
-        // `ICON_SMALL`; winit's window class carries no icon either, so without
-        // this the taskbar has nothing and Windows substitutes its generic
-        // application icon. See `logo::taskbar_icon`.
-        #[cfg(target_os = "windows")]
-        let attrs = {
-            use winit::platform::windows::WindowAttributesExtWindows;
-            attrs.with_taskbar_icon(logo::taskbar_icon())
-        };
-
-        // Linux takes its icon from an installed `.desktop` file rather than
-        // from the window, and finds that file by name — so a window with no
-        // application id has no icon to be found, which is what Umber shipped
-        // with. Wayland matches its app id against the entry's basename, which
-        // is why this is the reverse-DNS `taskbar::APP_ID` and not "Umber".
-        //
-        // X11 matches the entry's `StartupWMClass` against the window's class
-        // instead, and that file says `umber`, so the two platforms genuinely
-        // want different strings here. `taskbar`'s tests pin both against the
-        // packaging so a rename cannot quietly break either.
-        //
-        // Both traits spell it `with_name`, so both calls name their trait
-        // explicitly. Written as a chain, the second one is ambiguous and does
-        // not compile — and the tempting repair, dropping one `use`, would
-        // silently set the same platform's name twice.
-        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
-        let attrs = {
-            use winit::platform::wayland::WindowAttributesExtWayland;
-            use winit::platform::x11::WindowAttributesExtX11;
-            let attrs = WindowAttributesExtWayland::with_name(attrs, taskbar::APP_ID, "");
-            WindowAttributesExtX11::with_name(attrs, "umber", "umber")
-        };
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("failed to create window"),
-        );
-
-        let window_ready = started.elapsed();
-
-        // From here to the end of this function the window is on screen with
-        // nothing in it, and most of the wait is the graphics driver's. The
-        // splash paints it from the CPU — the only way to reach a window that
-        // has no GPU surface yet. Each stage is shown *before* the work it
-        // names, so the bar never claims progress that has not happened.
-        let mut splash = Splash::new(window.clone(), self.editor.palette());
-        splash.show(splash::Stage::Adapter);
-
-        let instance = Gpu::create_instance();
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("failed to create surface");
-        let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))
-            .expect("failed to initialise GPU");
-
-        // wgpu's default for an error nobody asked it to hand back is one log
-        // line and a panic from inside `wgpu_core`. Routed here it keeps the
-        // log line, gains Umber's own wording, and travels down the same path
-        // as every other crash — which is what turns "wgpu error: Validation
-        // Error" in a terminal into a box that names the file the artist's work
-        // is in. It stays fatal; see `crash::device_error`.
-        gpu.device
-            .on_uncaptured_error(std::sync::Arc::new(crash::device_error));
-
-        // What the crash report says the picture was drawn on. Recorded as soon
-        // as there is a device, because "no device had been created" is itself
-        // one of the more useful things a report can say.
-        crash::note_adapter(&gpu.adapter.get_info());
-
-        splash.adapter(&gpu.adapter.get_info());
-        splash.show(splash::Stage::Surface);
-
-        let size = window.inner_size();
-        let config = gpu.surface_config(&surface, size.width, size.height);
-        surface.configure(&gpu.device, &config);
-
-        splash.show(splash::Stage::Shaders);
-        // Compiled once here; every further document clones the pipeline
-        // handles out of this one. See `Graphics::add_canvas`.
-        // At start-up the slot count is one and the speculative floor decides.
-        // It matters on the Android path, where `resumed` runs again with a
-        // session already open: the live document can have any number of
-        // layers, and its slots have to exist before the first stroke commits
-        // into one. Stated to the constructor rather than grown into
-        // afterwards, for the reason `CanvasRenderer::for_document` gives.
-        let mut canvas = CanvasRenderer::new(
-            &gpu.device,
-            &gpu.queue,
-            UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
-            config.format,
-            self.editor.layers.slot_capacity_needed(),
-        );
-        // This one renderer is built here rather than by `add_canvas`, so it
-        // needs the same call: a renderer starts on transparency until it is
-        // told what its document is on, and a new document is white.
-        canvas.set_background(self.editor.doc.background);
-
-        // Start blank rather than showing whatever the allocation held.
-        let mut enc = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("init"),
-            });
-        canvas.clear_all_layers(&gpu.queue);
-        canvas.clear_stroke(&gpu.device, &mut enc);
-        gpu.queue.submit(Some(enc.finish()));
-
-        splash.show(splash::Stage::Fonts);
-        let egui_ctx = egui::Context::default();
-        // egui scales its own interface on Ctrl+= / Ctrl+- / Ctrl+0 by default.
-        // Here those are the canvas's zoom and Fit to view, and interface scale
-        // is a slider in Settings — so egui would silently take a second action
-        // on every one of them, growing the panels while the artist zoomed.
-        // Turned off at the context rather than swallowed per key: key presses
-        // are read off the winit event before egui is asked, so there is no
-        // point in the dispatch where the press could be withheld from it.
-        egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        theme::install_fonts(&egui_ctx);
-        let egui_state = egui_winit::State::new(
-            egui_ctx.clone(),
-            egui_ctx.viewport_id(),
-            &window,
-            Some(window.scale_factor() as f32),
-            None,
-            None,
-        );
-        let egui_renderer = egui_wgpu::Renderer::new(
-            &gpu.device,
-            config.format,
-            egui_wgpu::RendererOptions::default(),
-        );
-
-        // Everything is ready, so the splash goes now — not when its bar
-        // finishes. A progress bar that held the first frame back to complete
-        // its own animation would be a lie about latency in an application that
-        // exists for latency.
-        splash.show(splash::Stage::Ready);
-        drop(splash);
-
-        // What the canvas dialogs may offer. `max_texture_dimension_2d` is the
-        // number that decides whether a canvas can exist at all — past it,
-        // creating the layer array is a validation error, which is fatal — and
-        // `Limits::downlevel_defaults` guarantees only 2048 while
-        // `using_resolution` raises exactly that limit from the adapter, so it
-        // has to be read from the device rather than assumed. Read once here,
-        // because it describes the machine and not any document; the import
-        // path asks the same question of the same limit a few hundred lines up.
-        self.editor
-            .canvas_form
-            .set_device_limit(gpu.device.limits().max_texture_dimension_2d);
-
-        // Provisional: the real canvas region is not known until the first
-        // frame has laid the panels out, which corrects both of these.
-        self.editor.canvas_size = Vec2::new(config.width as f32, config.height as f32);
-        self.editor.canvas_pivot = self.editor.canvas_size * 0.5;
-        self.editor.fit_view();
-
-        let documents = self.editor.open_documents();
-        let active = self.editor.session.active_id();
-        let mut canvases = HashMap::new();
-        canvases.insert(active, canvas);
-
-        self.gfx = Some(Graphics {
-            window,
-            surface,
-            config,
-            gpu,
-            canvases,
-            egui_ctx,
-            egui_state,
-            egui_renderer,
-            // The surface was configured a few lines above, with the size the
-            // window reported, so nothing is owed.
-            reconfigure_pending: false,
-        });
-
-        // Normally there is exactly one document here, this being start-up.
-        // The loop is for the Android path, where the surface is destroyed on
-        // suspend and rebuilt on resume with the session still open: every
-        // document needs its storage back. Their pixels do not survive that —
-        // they never have — but a document without a renderer would be a blank
-        // window with no way out.
-        if documents.len() > 1 {
-            log::warn!(
-                "rebuilding storage for {} documents after the surface was lost; \
-                 their contents are gone",
-                documents.len(),
-            );
-        }
-        if let Some(gfx) = self.gfx.as_mut() {
-            for (id, doc, slots) in documents {
-                if id != active {
-                    gfx.add_canvas(id, &doc, slots);
-                }
-            }
-        }
-
-        // A document from the command line, which is what a file association
-        // amounts to once the shell has done its half. Here rather than where
-        // the arguments were read, because `open_path` asks the device whether
-        // the canvas can exist and there was no device until a few lines ago.
-        //
-        // A failure is already a notice on screen — `open_import` says why in
-        // the importer's own words — so nothing is checked first and nothing is
-        // reported twice. Umber still starts, with the blank document it would
-        // have had, which is the same rule `parse_args` follows for a stray
-        // argument: a painting application that refuses to open over a bad path
-        // is a worse failure than one that opens.
-        if let Some(path) = self.opening.take() {
-            self.open_path(&path);
-        }
-
-        // Ask for the first frame explicitly. The platform usually sends one
-        // unprompted as the window is shown, but "usually" is not a thing to
-        // rest a blank window on — and nothing else here would ever wake the
-        // loop, now that painting a frame no longer asks for another.
-        self.request_redraw();
-
-        // Split, because the two halves have very different characters and only
-        // one of them is ours to improve: window creation is fast and constant,
-        // while adapter enumeration and device creation are the graphics
-        // driver's own start-up and dominate the total. `splash.rs` explains
-        // what these numbers mean for the overlay it draws.
-        log::info!(
-            "window in {:.0} ms, GPU and fonts {:.0} ms more",
-            window_ready.as_secs_f64() * 1000.0,
-            (started.elapsed() - window_ready).as_secs_f64() * 1000.0
-        );
-    }
-
-    /// Decide how long to sleep for.
+impl UmberApp {
+    /// Wipe the slices of the layers the Path tool made, now.
     ///
-    /// [`ControlFlow::Wait`] unless egui asked for a frame at a particular
-    /// time — a hover fading, a caret blinking. Without this the only thing
-    /// keeping those animations moving would be a redraw loop that never idles,
-    /// which is what this replaced.
-    /// A background job has reported. [`Self::render`] is what collects it; all
-    /// this has to do is make a frame happen.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
-        self.request_redraw();
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // How an update ends. The Windows installer cannot replace a program
-        // that is running, so handing it the package is only half of the update
-        // — the other half is getting out of its way. A portable or AppImage
-        // copy has already been replaced, and the new build is started here on
-        // the way out.
-        match self.editor.updates.take_exit_request() {
-            Some(update::Exit::Restart) => match update::relaunch() {
-                Ok(()) => {
-                    event_loop.exit();
-                    return;
-                }
-                // A restart that could not start anything must leave the copy
-                // that is running running. The new build is in place either
-                // way; it simply waits for the next start.
-                Err(message) => self.editor.updates.restart_failed(message),
-            },
-            Some(update::Exit::Quit) => {
-                event_loop.exit();
-                return;
-            }
-            None => {}
-        }
-        // The quit prompt's answer. It is drawn from `ui::draw`, which has no
-        // `ActiveEventLoop` — so it sets a flag and this is where the loop
-        // actually stops, exactly as the update's own quit request does.
-        if self.editor.quit_requested {
-            event_loop.exit();
-            return;
-        }
-        match self.repaint_at {
-            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+    /// A recycled slice holds whatever the last layer in it left until it is
+    /// cleared, and the clear is the renderer's: `Editor` makes the layer and
+    /// has no `CanvasRenderer` to clear it with, so it can only queue the slot
+    /// (`Editor::path_layers_made`). The question is then who drains the queue
+    /// before anything reads that slice, and the readers are many: a save, an
+    /// export, a copy or cut, an undo or redo, the autosave, the composite.
+    /// Asking each of them to drain first is a rule enforced at every reader,
+    /// the one that is forgotten at the next.
+    ///
+    /// So it runs at the end of every `window_event`, after the event was
+    /// dispatched, and in `render` once the interface (which can land a path
+    /// from the rail) has run and before anything there reads a slice. A
+    /// landing can only come from an event or from a frame, and a reader
+    /// sitting in a later event of the same pump finds the queue already
+    /// drained, so "no reader sees an unwiped slice" is a property of these
+    /// two calls rather than of each reader. `user_event` only asks for a
+    /// frame, `about_to_wait` and `new_events` run no action that lands a
+    /// path, and the actions the interface returns are carried out inside
+    /// `render`, after its drain. With no device there is nothing to read a
+    /// slice either, and the queue waits for one.
+    fn drain_path_layers(&mut self) {
+        if let Some(gfx) = self.gfx.as_mut() {
+            wipe_new_layers(&mut self.editor, gfx);
         }
     }
 
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
-        // The deadline set above has come round: egui wants the frame it asked
-        // for. Nothing else wakes the loop on a timer.
-        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
-            self.repaint_at = None;
-            self.request_redraw();
-        }
-    }
-
-    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        // Drop the surface but keep editor state; Android tears the window
-        // down when backgrounded.
-        //
-        // A floating transform does not survive it, and cannot: its pixels are
-        // in textures that go with the renderers. Dropped rather than
-        // committed, because committing needs the GPU that is being taken
-        // away — the same bargain the pixels themselves have always struck on
-        // this path.
-        //
-        // **A layer the float made for itself goes with it**, and this is the
-        // third of the three sites `Floating::made` claims cannot be missed —
-        // taking the float and dropping it is exactly how one is missed, and
-        // this line is what makes that claim true rather than hopeful. The
-        // pixels are lost either way, so a layer left behind would be an empty
-        // one named after words the artist never got to put down.
-        let float = self.editor.float.take();
-        self.editor.unmake_layer(float.and_then(|f| f.made));
-        self.gfx = None;
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn dispatch_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         let Some(gfx) = self.gfx.as_mut() else { return };
 
         let response = gfx.egui_state.on_window_event(&gfx.window, &event);
@@ -6688,6 +6379,358 @@ impl ApplicationHandler<Wake> for UmberApp {
             _ => {}
         }
     }
+}
+
+impl ApplicationHandler<Wake> for UmberApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            return;
+        }
+
+        // The window appears early and then sits unpainted until the rest of
+        // this function has finished, so this is the number that decides
+        // whether Umber needs a real loading screen. Logged rather than
+        // measured once and written down, because it is a property of the
+        // driver and the machine rather than of this code.
+        let started = std::time::Instant::now();
+
+        let attrs = Window::default_attributes()
+            .with_title("Umber")
+            // Per-platform, and quietly so: Windows uses it for the title bar,
+            // X11 for the window list. Wayland ignores it entirely and takes
+            // its icon from the `.desktop` file matching the app id, and on
+            // macOS `set_window_icon` is documented as a no-op — there the icon
+            // comes from the `.app` bundle's `Info.plist`. The executable
+            // resource in `crates/umber-desktop/build.rs` is what gives
+            // Explorer and the Start Menu an icon before the process starts.
+            .with_window_icon(logo::window_icon())
+            .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0));
+
+        // Windows keeps a *second* icon per window, `ICON_BIG`, and that is the
+        // one the taskbar and Alt-Tab draw. `with_window_icon` sets only
+        // `ICON_SMALL`; winit's window class carries no icon either, so without
+        // this the taskbar has nothing and Windows substitutes its generic
+        // application icon. See `logo::taskbar_icon`.
+        #[cfg(target_os = "windows")]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_taskbar_icon(logo::taskbar_icon())
+        };
+
+        // Linux takes its icon from an installed `.desktop` file rather than
+        // from the window, and finds that file by name — so a window with no
+        // application id has no icon to be found, which is what Umber shipped
+        // with. Wayland matches its app id against the entry's basename, which
+        // is why this is the reverse-DNS `taskbar::APP_ID` and not "Umber".
+        //
+        // X11 matches the entry's `StartupWMClass` against the window's class
+        // instead, and that file says `umber`, so the two platforms genuinely
+        // want different strings here. `taskbar`'s tests pin both against the
+        // packaging so a rename cannot quietly break either.
+        //
+        // Both traits spell it `with_name`, so both calls name their trait
+        // explicitly. Written as a chain, the second one is ambiguous and does
+        // not compile — and the tempting repair, dropping one `use`, would
+        // silently set the same platform's name twice.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            let attrs = WindowAttributesExtWayland::with_name(attrs, taskbar::APP_ID, "");
+            WindowAttributesExtX11::with_name(attrs, "umber", "umber")
+        };
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("failed to create window"),
+        );
+
+        let window_ready = started.elapsed();
+
+        // From here to the end of this function the window is on screen with
+        // nothing in it, and most of the wait is the graphics driver's. The
+        // splash paints it from the CPU — the only way to reach a window that
+        // has no GPU surface yet. Each stage is shown *before* the work it
+        // names, so the bar never claims progress that has not happened.
+        let mut splash = Splash::new(window.clone(), self.editor.palette());
+        splash.show(splash::Stage::Adapter);
+
+        let instance = Gpu::create_instance();
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("failed to create surface");
+        let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))
+            .expect("failed to initialise GPU");
+
+        // wgpu's default for an error nobody asked it to hand back is one log
+        // line and a panic from inside `wgpu_core`. Routed here it keeps the
+        // log line, gains Umber's own wording, and travels down the same path
+        // as every other crash — which is what turns "wgpu error: Validation
+        // Error" in a terminal into a box that names the file the artist's work
+        // is in. It stays fatal; see `crash::device_error`.
+        gpu.device
+            .on_uncaptured_error(std::sync::Arc::new(crash::device_error));
+
+        // What the crash report says the picture was drawn on. Recorded as soon
+        // as there is a device, because "no device had been created" is itself
+        // one of the more useful things a report can say.
+        crash::note_adapter(&gpu.adapter.get_info());
+
+        splash.adapter(&gpu.adapter.get_info());
+        splash.show(splash::Stage::Surface);
+
+        let size = window.inner_size();
+        let config = gpu.surface_config(&surface, size.width, size.height);
+        surface.configure(&gpu.device, &config);
+
+        splash.show(splash::Stage::Shaders);
+        // Compiled once here; every further document clones the pipeline
+        // handles out of this one. See `Graphics::add_canvas`.
+        // At start-up the slot count is one and the speculative floor decides.
+        // It matters on the Android path, where `resumed` runs again with a
+        // session already open: the live document can have any number of
+        // layers, and its slots have to exist before the first stroke commits
+        // into one. Stated to the constructor rather than grown into
+        // afterwards, for the reason `CanvasRenderer::for_document` gives.
+        let mut canvas = CanvasRenderer::new(
+            &gpu.device,
+            &gpu.queue,
+            UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
+            config.format,
+            self.editor.layers.slot_capacity_needed(),
+        );
+        // This one renderer is built here rather than by `add_canvas`, so it
+        // needs the same call: a renderer starts on transparency until it is
+        // told what its document is on, and a new document is white.
+        canvas.set_background(self.editor.doc.background);
+
+        // Start blank rather than showing whatever the allocation held.
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("init"),
+            });
+        canvas.clear_all_layers(&gpu.queue);
+        canvas.clear_stroke(&gpu.device, &mut enc);
+        gpu.queue.submit(Some(enc.finish()));
+
+        splash.show(splash::Stage::Fonts);
+        let egui_ctx = egui::Context::default();
+        // egui scales its own interface on Ctrl+= / Ctrl+- / Ctrl+0 by default.
+        // Here those are the canvas's zoom and Fit to view, and interface scale
+        // is a slider in Settings — so egui would silently take a second action
+        // on every one of them, growing the panels while the artist zoomed.
+        // Turned off at the context rather than swallowed per key: key presses
+        // are read off the winit event before egui is asked, so there is no
+        // point in the dispatch where the press could be withheld from it.
+        egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        theme::install_fonts(&egui_ctx);
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui_ctx.viewport_id(),
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &gpu.device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
+        // Everything is ready, so the splash goes now — not when its bar
+        // finishes. A progress bar that held the first frame back to complete
+        // its own animation would be a lie about latency in an application that
+        // exists for latency.
+        splash.show(splash::Stage::Ready);
+        drop(splash);
+
+        // What the canvas dialogs may offer. `max_texture_dimension_2d` is the
+        // number that decides whether a canvas can exist at all — past it,
+        // creating the layer array is a validation error, which is fatal — and
+        // `Limits::downlevel_defaults` guarantees only 2048 while
+        // `using_resolution` raises exactly that limit from the adapter, so it
+        // has to be read from the device rather than assumed. Read once here,
+        // because it describes the machine and not any document; the import
+        // path asks the same question of the same limit a few hundred lines up.
+        self.editor
+            .canvas_form
+            .set_device_limit(gpu.device.limits().max_texture_dimension_2d);
+
+        // Provisional: the real canvas region is not known until the first
+        // frame has laid the panels out, which corrects both of these.
+        self.editor.canvas_size = Vec2::new(config.width as f32, config.height as f32);
+        self.editor.canvas_pivot = self.editor.canvas_size * 0.5;
+        self.editor.fit_view();
+
+        let documents = self.editor.open_documents();
+        let active = self.editor.session.active_id();
+        let mut canvases = HashMap::new();
+        canvases.insert(active, canvas);
+
+        self.gfx = Some(Graphics {
+            window,
+            surface,
+            config,
+            gpu,
+            canvases,
+            egui_ctx,
+            egui_state,
+            egui_renderer,
+            // The surface was configured a few lines above, with the size the
+            // window reported, so nothing is owed.
+            reconfigure_pending: false,
+        });
+
+        // Normally there is exactly one document here, this being start-up.
+        // The loop is for the Android path, where the surface is destroyed on
+        // suspend and rebuilt on resume with the session still open: every
+        // document needs its storage back. Their pixels do not survive that —
+        // they never have — but a document without a renderer would be a blank
+        // window with no way out.
+        if documents.len() > 1 {
+            log::warn!(
+                "rebuilding storage for {} documents after the surface was lost; \
+                 their contents are gone",
+                documents.len(),
+            );
+        }
+        if let Some(gfx) = self.gfx.as_mut() {
+            for (id, doc, slots) in documents {
+                if id != active {
+                    gfx.add_canvas(id, &doc, slots);
+                }
+            }
+        }
+
+        // A document from the command line, which is what a file association
+        // amounts to once the shell has done its half. Here rather than where
+        // the arguments were read, because `open_path` asks the device whether
+        // the canvas can exist and there was no device until a few lines ago.
+        //
+        // A failure is already a notice on screen — `open_import` says why in
+        // the importer's own words — so nothing is checked first and nothing is
+        // reported twice. Umber still starts, with the blank document it would
+        // have had, which is the same rule `parse_args` follows for a stray
+        // argument: a painting application that refuses to open over a bad path
+        // is a worse failure than one that opens.
+        if let Some(path) = self.opening.take() {
+            self.open_path(&path);
+        }
+
+        // Ask for the first frame explicitly. The platform usually sends one
+        // unprompted as the window is shown, but "usually" is not a thing to
+        // rest a blank window on — and nothing else here would ever wake the
+        // loop, now that painting a frame no longer asks for another.
+        self.request_redraw();
+
+        // Split, because the two halves have very different characters and only
+        // one of them is ours to improve: window creation is fast and constant,
+        // while adapter enumeration and device creation are the graphics
+        // driver's own start-up and dominate the total. `splash.rs` explains
+        // what these numbers mean for the overlay it draws.
+        log::info!(
+            "window in {:.0} ms, GPU and fonts {:.0} ms more",
+            window_ready.as_secs_f64() * 1000.0,
+            (started.elapsed() - window_ready).as_secs_f64() * 1000.0
+        );
+    }
+
+    /// Decide how long to sleep for.
+    ///
+    /// [`ControlFlow::Wait`] unless egui asked for a frame at a particular
+    /// time — a hover fading, a caret blinking. Without this the only thing
+    /// keeping those animations moving would be a redraw loop that never idles,
+    /// which is what this replaced.
+    /// A background job has reported. [`Self::render`] is what collects it; all
+    /// this has to do is make a frame happen.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
+        self.request_redraw();
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // How an update ends. The Windows installer cannot replace a program
+        // that is running, so handing it the package is only half of the update
+        // — the other half is getting out of its way. A portable or AppImage
+        // copy has already been replaced, and the new build is started here on
+        // the way out.
+        match self.editor.updates.take_exit_request() {
+            Some(update::Exit::Restart) => match update::relaunch() {
+                Ok(()) => {
+                    event_loop.exit();
+                    return;
+                }
+                // A restart that could not start anything must leave the copy
+                // that is running running. The new build is in place either
+                // way; it simply waits for the next start.
+                Err(message) => self.editor.updates.restart_failed(message),
+            },
+            Some(update::Exit::Quit) => {
+                event_loop.exit();
+                return;
+            }
+            None => {}
+        }
+        // The quit prompt's answer. It is drawn from `ui::draw`, which has no
+        // `ActiveEventLoop` — so it sets a flag and this is where the loop
+        // actually stops, exactly as the update's own quit request does.
+        if self.editor.quit_requested {
+            event_loop.exit();
+            return;
+        }
+        match self.repaint_at {
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        // The deadline set above has come round: egui wants the frame it asked
+        // for. Nothing else wakes the loop on a timer.
+        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
+            self.repaint_at = None;
+            self.request_redraw();
+        }
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // Drop the surface but keep editor state; Android tears the window
+        // down when backgrounded.
+        //
+        // A floating transform does not survive it, and cannot: its pixels are
+        // in textures that go with the renderers. Dropped rather than
+        // committed, because committing needs the GPU that is being taken
+        // away — the same bargain the pixels themselves have always struck on
+        // this path.
+        //
+        // **A layer the float made for itself goes with it**, and this is the
+        // third of the three sites `Floating::made` claims cannot be missed —
+        // taking the float and dropping it is exactly how one is missed, and
+        // this line is what makes that claim true rather than hopeful. The
+        // pixels are lost either way, so a layer left behind would be an empty
+        // one named after words the artist never got to put down.
+        let float = self.editor.float.take();
+        self.editor.unmake_layer(float.and_then(|f| f.made));
+        self.gfx = None;
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.dispatch_window_event(event_loop, event);
+        // After the event, whatever it did and wherever its arm returned: see
+        // `drain_path_layers`.
+        self.drain_path_layers();
+    }
+}
+
+/// The one statement of the wipe `UmberApp::drain_path_layers` argues for,
+/// shared with `render`, which holds `gfx` borrowed where it drains.
+fn wipe_new_layers(editor: &mut Editor, gfx: &mut Graphics) {
+    editor.take_path_layers(|id, slot| {
+        if let Some(canvas) = gfx.canvases.get_mut(&id) {
+            canvas.clear_layer(&gfx.gpu.queue, slot);
+        }
+    });
 }
 
 /// The file's own name, for a message written to the user.
