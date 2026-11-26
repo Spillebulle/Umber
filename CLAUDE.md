@@ -2316,9 +2316,17 @@ conversation is a rule about a scripted fake until somebody has.
     That was a critical review finding: every marked sheet died after block 0.
   - **A machine saying Moving is alive**, so `Timing::REAL.ready` is 45 minutes
     rather than two; a machine that stops answering is a `Timeout` after
-    `reply`, which is the other failure. Stop is read after every Moving inside
-    the wait as well as between blocks, so it takes effect while a block cuts.
-    After a stop or an error the end block is not sent.
+    `reply`, which is the other failure.
+  - **A stop does not end the job until the machine has.** It holds up to a
+    kilobyte of moves when Stop is pressed and goes on cutting, so a stop that
+    returned at once told the artist it had finished while the blade was still
+    on the sheet, and sent no end block, so the tool could be left down. Once
+    the stop is seen (between blocks, or after any Moving inside a wait, which
+    is when `Stage::Stopping` is said) nothing is written but status queries
+    and the end block: the machine is waited for until Ready, the end block
+    (a tool-up move home) goes once, it is waited for again, and only then is
+    the job `Stopped`. A failure on the way is that failure. After an *error*
+    the end block is still not sent, because the link may be what failed.
   - **A failure says how far the job got.** `Failure::blocks_sent` counts a
     block before its write, and the sentence adds that the sheet may be part
     cut. A failure in the last wait, after the end block went, is
@@ -2360,8 +2368,8 @@ conversation is a rule about a scripted fake until somebody has.
     driver, and how long it costs;
   - whether `ESC EOT` answers at all;
   - how many replies the marks search actually sends;
-  - whether the tool is left down on the sheet after a stop or an error, since
-    the end block is not sent then;
+  - whether the tool is left down on the sheet after an error, since the end
+    block is not sent then;
   - the non-Windows build of `cutter.rs`, which nobody here can compile and CI
     checks;
   - and quitting Umber mid-job, which the close prompt does not yet know about.

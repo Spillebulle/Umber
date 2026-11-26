@@ -41,9 +41,10 @@ pub const MAX_LOG_LINES: usize = 2000;
 const SUPPORTED: bool = cfg!(windows);
 
 const FIRST_TEST: &str = "For a first test, put a pen in the holder and use plain paper.";
-const WINDOWS_ONLY: &str = "Sending to a cutter works on Windows only for now.";
+pub(crate) const WINDOWS_ONLY: &str = "Sending to a cutter works on Windows only for now.";
 const NO_MARKS: &str = "This document has no registration marks. Switch them on in the File menu.";
 const MARKS_DO_NOT_FIT: &str = "This page cannot hold registration marks.";
+const STOPPING: &str = "Stopping. The cutter is finishing the part it was already sent.";
 
 /// What the dialog has asked `App` to do, spent once after the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,7 +275,15 @@ impl CutterForm {
                     // A stop is said until the worker answers it.
                     CutterPhase::Stopping | CutterPhase::Checking => {}
                     CutterPhase::Idle | CutterPhase::Sending(_) => {
-                        self.phase = CutterPhase::Sending(stage);
+                        self.phase = match stage {
+                            // The worker saw the stop itself: there is
+                            // nothing left to press.
+                            Stage::Stopping => CutterPhase::Stopping,
+                            Stage::Connecting
+                            | Stage::FindingMarks
+                            | Stage::Cutting { .. }
+                            | Stage::Finishing => CutterPhase::Sending(stage),
+                        };
                     }
                 },
                 Event::Checked(outcome) | Event::Sent(outcome) => {
@@ -341,7 +350,7 @@ fn stage_line(phase: CutterPhase) -> Option<String> {
             Some(format!("Cutting, block {} of {of}", block + 1))
         }
         CutterPhase::Sending(Stage::Finishing) => Some("Finishing".to_string()),
-        CutterPhase::Stopping => Some("Stopping".to_string()),
+        CutterPhase::Sending(Stage::Stopping) | CutterPhase::Stopping => Some(STOPPING.to_string()),
     }
 }
 
@@ -900,7 +909,7 @@ mod tests {
             assert!(shot.buttons.is_empty(), "{phase:?}: {:?}", shot.words());
             assert!(shot.bars.is_empty());
         }
-        assert!(h.settled(&mut ed).has("Stopping"));
+        assert!(h.settled(&mut ed).has(STOPPING));
         ed.cutter.phase = CutterPhase::Checking;
         assert!(h.settled(&mut ed).has("Looking for the cutter"));
     }

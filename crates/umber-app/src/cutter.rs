@@ -117,6 +117,9 @@ pub enum Stage {
         of: usize,
     },
     Finishing,
+    /// A stop was seen: nothing more is cut, and the machine is waited for
+    /// and sent home.
+    Stopping,
 }
 
 /// Why a job ended before the machine was sent home.
@@ -127,11 +130,14 @@ pub enum SendError {
     NoMedia,
     /// The marks search ended in anything but the found reply, which is kept.
     MarksNotFound(Vec<u8>),
+    /// The marks search got no reply at all within [`Timing::marks`].
+    MarksTimedOut,
     /// A status Umber does not recognise, as it arrived.
     Unknown(Vec<u8>),
     /// The machine stayed busy past [`Timing::ready`].
     NeverReady,
-    /// The stop flag was raised.
+    /// The stop flag was raised, and the machine finished what it held and
+    /// was sent home.
     Stopped,
     /// Everything was written, the end block included, and then the last wait
     /// did not end in Ready. The raw reply where there was one that was not a
@@ -163,6 +169,7 @@ impl Failure {
             SendError::Link(_)
             | SendError::NoMedia
             | SendError::MarksNotFound(_)
+            | SendError::MarksTimedOut
             | SendError::Unknown(_)
             | SendError::NeverReady
             | SendError::Stopped => false,
@@ -194,26 +201,29 @@ impl SendError {
                 LinkError::Timeout => "The cutter did not respond in time.".to_string(),
                 LinkError::Io(why) => format!("The connection to the cutter failed: {why}."),
                 LinkError::Unsupported => {
-                    "Sending to a cutter only works on Windows so far.".to_string()
+                    "Sending to a cutter works on Windows only for now.".to_string()
                 }
             },
             SendError::NoMedia => {
                 "There is no mat or sheet in the cutter. Load one and try again.".to_string()
             }
             SendError::MarksNotFound(raw) => format!(
-                "The cutter could not find the registration marks (it answered {}). Check that \
-                 the sheet was printed with marks and is loaded straight.",
+                "The cutter did not report finding the registration marks, so nothing was \
+                 cut. It answered: {}.",
                 escaped(raw)
             ),
+            SendError::MarksTimedOut => "The cutter did not answer while looking for the \
+                                         registration marks. Nothing was cut."
+                .to_string(),
             SendError::Unknown(raw) => format!(
                 "The cutter gave an answer Umber does not understand ({}), so nothing more was \
                  sent.",
                 escaped(raw)
             ),
             SendError::NeverReady => "The cutter stayed busy and never became ready.".to_string(),
-            SendError::Stopped => {
-                "Stopped. The cutter finished the part it had already been sent.".to_string()
-            }
+            SendError::Stopped => "Stopped. The cutter finished the part it had already been \
+                                   sent, and nothing more was sent."
+                .to_string(),
             SendError::Unconfirmed(_) => "The whole job was sent, but the cutter did not \
                                           confirm it had finished. Check the sheet before \
                                           sending again."
@@ -257,20 +267,32 @@ impl Timing {
 /// Send a whole job. `Ok` carries the firmware string the machine gave; a
 /// [`Failure`] says how many path blocks had been written when it ended.
 ///
-/// `stop` is read before each path block, before the end block, and after
-/// every Moving while the machine is being waited for, so a stop takes effect
-/// while a block is cutting. Once it is raised nothing more is written.
+/// `stop` is read before the setup, the search and each path block, and after
+/// every Moving while the machine is being waited for, which is when
+/// [`Stage::Stopping`] is said.
 ///
-/// **After a stop or an error part way through, the end block is deliberately
-/// not sent.** The link may be what failed, and the end block is a move like
-/// any other, so sending it would be writing into a conversation Umber has
-/// already lost track of. What that leaves the machine doing is not known:
-/// whether the tool is left down on the sheet, and whether the carriage stays
-/// where the last block left it, has to be checked on a real Portrait 3.
+/// **A stop does not end the job at once, because the machine has not
+/// stopped.** It holds up to a kilobyte of moves when the stop is pressed and
+/// goes on cutting them, so ending there would tell the artist it had
+/// finished while it had not, and would leave the tool wherever the last move
+/// put it, which may be down on the sheet. So once the stop is seen nothing is
+/// written but status queries and the end block: the machine is waited for,
+/// as it is between blocks, until it says Ready; then the end block, which is
+/// a move with the tool up to the origin, goes once; then the machine is
+/// waited for again, and only then is the job [`SendError::Stopped`]. A stop
+/// seen before any path block went still sends the machine home, which costs
+/// a move and nothing else.
 ///
-/// A failure in the very last wait, after the end block went, is
-/// [`SendError::Unconfirmed`]: the whole job is on the machine, and reading
-/// that as a failed job is how a sheet gets cut twice.
+/// **After an error part way through, the end block is deliberately not
+/// sent**, stop or no stop. The link may be what failed, and the end block is
+/// a move like any other, so sending it would be writing into a conversation
+/// Umber has already lost track of. What that leaves the machine doing is not
+/// known, and has to be checked on a real Portrait 3.
+///
+/// A failure in the very last wait of a job that was not stopped, after the
+/// end block went, is [`SendError::Unconfirmed`]: the whole job is on the
+/// machine, and reading that as a failed job is how a sheet gets cut twice.
+/// A stop raised during that wait changes nothing; the job is all sent.
 pub fn send(
     link: &mut dyn Link,
     job: &Job,
@@ -298,59 +320,120 @@ fn conversation(
     progress: &mut dyn FnMut(Stage),
     sent: &mut usize,
 ) -> Result<String, SendError> {
+    let mut stop = Stopper {
+        flag: stop,
+        said: false,
+    };
     progress(Stage::Connecting);
     let firmware = hello(link, timing)?;
-    wait_ready(link, timing, stop)?;
+    wait_ready(link, timing, &mut stop, progress)?;
+    if stop.seen(progress) {
+        return go_home(link, job, timing, progress);
+    }
     link.write(&job.setup_block())?;
-    wait_ready(link, timing, stop)?;
+    wait_ready(link, timing, &mut stop, progress)?;
 
     if let Some(marks) = job.marks_block() {
+        if stop.seen(progress) {
+            return go_home(link, job, timing, progress);
+        }
         progress(Stage::FindingMarks);
         link.write(&marks)?;
         // The first reply is the verdict. A search that succeeded answers
         // more than once (three times, the reference implementation says),
         // and the rest are settled away rather than left to be read as the
         // status of the first block.
-        let reply = link.read_reply(timing.marks)?;
+        let reply = match link.read_reply(timing.marks) {
+            Ok(reply) => reply,
+            Err(LinkError::Timeout) => return Err(SendError::MarksTimedOut),
+            Err(e) => return Err(e.into()),
+        };
         if !marks_found(&reply) {
             return Err(SendError::MarksNotFound(reply));
         }
         link.discard(timing.settle)?;
         // The search moved the carriage; nothing is cut until it is done.
-        wait_ready(link, timing, stop)?;
+        wait_ready(link, timing, &mut stop, progress)?;
     }
 
     let of = blocks.len();
     for (block, bytes) in blocks.iter().enumerate() {
-        if stop.load(Ordering::SeqCst) {
-            return Err(SendError::Stopped);
+        if stop.seen(progress) {
+            return go_home(link, job, timing, progress);
         }
         progress(Stage::Cutting { block, of });
         // Counted before the write: one that fails may have gone in part.
         *sent += 1;
         link.write(bytes)?;
-        wait_ready(link, timing, stop)?;
+        wait_ready(link, timing, &mut stop, progress)?;
     }
 
-    if stop.load(Ordering::SeqCst) {
-        return Err(SendError::Stopped);
+    if stop.seen(progress) {
+        return go_home(link, job, timing, progress);
     }
     progress(Stage::Finishing);
     link.write(&job.end_block())?;
     // Everything is on the machine now, so however this wait ends it is not
-    // a failed job. A stop here changes nothing the machine does either.
-    wait_ready(link, timing, stop).map_err(|e| {
+    // a failed job, and a stop raised now changes nothing the machine does.
+    // It is not watched for here, so it is not said either.
+    let mut ignored = Stopper {
+        flag: &AtomicBool::new(false),
+        said: true,
+    };
+    wait_ready(link, timing, &mut ignored, progress).map_err(|e| {
         SendError::Unconfirmed(match e {
             SendError::Unknown(raw) => raw,
             SendError::Link(_)
             | SendError::NoMedia
             | SendError::MarksNotFound(_)
+            | SendError::MarksTimedOut
             | SendError::NeverReady
             | SendError::Stopped
             | SendError::Unconfirmed(_) => Vec::new(),
         })
     })?;
     Ok(firmware)
+}
+
+/// Whether the stop has been raised, said once as [`Stage::Stopping`] the
+/// first time it is seen.
+struct Stopper<'a> {
+    flag: &'a AtomicBool,
+    said: bool,
+}
+
+impl Stopper<'_> {
+    fn seen(&mut self, progress: &mut dyn FnMut(Stage)) -> bool {
+        if self.said {
+            return true;
+        }
+        if self.flag.load(Ordering::SeqCst) {
+            self.said = true;
+            progress(Stage::Stopping);
+            return true;
+        }
+        false
+    }
+}
+
+/// The end of a stopped job: let the machine finish what it holds, send it
+/// home with the tool up, and wait for that too. Any failure on the way is
+/// that failure, and is reported in place of the stop.
+fn go_home(
+    link: &mut dyn Link,
+    job: &Job,
+    timing: &Timing,
+    progress: &mut dyn FnMut(Stage),
+) -> Result<String, SendError> {
+    // Already stopped and already said, so the waits watch for nothing.
+    let mut stopped = Stopper {
+        flag: &AtomicBool::new(true),
+        said: true,
+    };
+    wait_ready(link, timing, &mut stopped, progress)?;
+    link.write(&job.end_block())?;
+    wait_ready(link, timing, &mut stopped, progress)?;
+    Err(SendError::Stopped)
 }
 
 /// The three harmless commands and nothing else: initialise, the firmware
@@ -387,11 +470,17 @@ fn ask_status(link: &mut dyn Link, timing: &Timing) -> Result<Vec<u8>, LinkError
 }
 
 /// Ask until the machine is ready. Moving is asked again after
-/// [`Timing::poll`] until [`Timing::ready`] has passed, and the stop flag is
-/// read after every Moving, so a stop takes effect while a block is cutting.
-/// A query that gets no reply at all is a timeout at once, and anything that
-/// is not a status ends the job rather than being asked again.
-fn wait_ready(link: &mut dyn Link, timing: &Timing, stop: &AtomicBool) -> Result<(), SendError> {
+/// [`Timing::poll`] until [`Timing::ready`] has passed. The stop is looked at
+/// after every Moving, so that it is said while a block is still cutting, and
+/// the wait goes on regardless: a stopped machine is still a moving one. A
+/// query that gets no reply at all is a timeout at once, and anything that is
+/// not a status ends the job rather than being asked again.
+fn wait_ready(
+    link: &mut dyn Link,
+    timing: &Timing,
+    stop: &mut Stopper,
+    progress: &mut dyn FnMut(Stage),
+) -> Result<(), SendError> {
     let started = Instant::now();
     loop {
         let reply = ask_status(link, timing)?;
@@ -399,9 +488,7 @@ fn wait_ready(link: &mut dyn Link, timing: &Timing, stop: &AtomicBool) -> Result
             Ok(Status::Ready) => return Ok(()),
             Ok(Status::NoMedia) => return Err(SendError::NoMedia),
             Ok(Status::Moving) => {
-                if stop.load(Ordering::SeqCst) {
-                    return Err(SendError::Stopped);
-                }
+                stop.seen(progress);
                 if started.elapsed() >= timing.ready {
                     return Err(SendError::NeverReady);
                 }
@@ -1313,6 +1400,15 @@ mod tests {
         replies: VecDeque<Vec<u8>>,
         /// How many times `discard` was asked.
         discards: usize,
+        /// Every write and every reply read, in the order they happened, so
+        /// a test can say what the machine had answered before a write.
+        trace: Vec<Trace>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Trace {
+        Wrote(Vec<u8>),
+        Read(Vec<u8>),
     }
 
     impl FakeLink {
@@ -1329,6 +1425,7 @@ mod tests {
                 after: Vec::new(),
                 replies: VecDeque::new(),
                 discards: 0,
+                trace: Vec::new(),
             }
         }
 
@@ -1348,6 +1445,7 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
             let index = self.writes.len();
             self.writes.push(bytes.to_vec());
+            self.trace.push(Trace::Wrote(bytes.to_vec()));
             if self.fail_on.as_deref() == Some(bytes) {
                 self.fail_on = None;
                 return Err(LinkError::Io("scripted".into()));
@@ -1377,7 +1475,9 @@ mod tests {
         }
 
         fn read_reply(&mut self, _timeout: Duration) -> Result<Vec<u8>, LinkError> {
-            self.replies.pop_front().ok_or(LinkError::Timeout)
+            let reply = self.replies.pop_front().ok_or(LinkError::Timeout)?;
+            self.trace.push(Trace::Read(reply.clone()));
+            Ok(reply)
         }
 
         fn discard(&mut self, _quiet: Duration) -> Result<Vec<u8>, LinkError> {
@@ -1545,47 +1645,121 @@ mod tests {
         }
     }
 
+    /// After a stop the end block is written exactly once, only once the
+    /// machine has answered Ready to the query just before it, and nothing
+    /// follows it but the wait for it to finish.
+    fn sent_home_once_after_ready(link: &FakeLink, job: &Job) {
+        let end = job.end_block();
+        assert_eq!(count(&link.writes, &end), 1, "{:?}", link.writes);
+        let at = link
+            .trace
+            .iter()
+            .position(|t| *t == Trace::Wrote(end.clone()))
+            .unwrap();
+        assert!(at >= 2, "{:?}", link.trace);
+        assert_eq!(link.trace[at - 2], Trace::Wrote(STATUS.to_vec()));
+        assert_eq!(link.trace[at - 1], Trace::Read(b"0\x03".to_vec()));
+        assert_eq!(
+            &link.trace[at + 1..],
+            &[
+                Trace::Wrote(STATUS.to_vec()),
+                Trace::Read(b"0\x03".to_vec())
+            ]
+        );
+    }
+
+    /// A stop seen while the machine is still cutting a block lets it finish
+    /// that block, however long it says Moving, and then sends it home.
     #[test]
-    fn stop_during_a_wait_ends_the_job_and_writes_nothing_more() {
+    fn stop_during_a_wait_lets_the_block_finish_and_then_sends_the_machine_home() {
         let job = job(true);
         let blocks = job.path_blocks();
-        let timing = Timing {
-            ready: Duration::from_secs(10),
-            ..fast()
-        };
-        // Ready until the first block, then Moving for ever. The stop has to
-        // come from inside the wait, so a thread raises it once the first
-        // block has begun and the conversation is polling.
-        let mut link = FakeLink::new().statuses(&[&b"0\x03"[..]; 3]);
-        link.idle = b"1\x03".to_vec();
+        // Ready before setup, after setup and after the search; then Moving
+        // five times after the first block, then Ready from there on.
+        let mut statuses: Vec<&[u8]> = vec![b"0\x03"; 3];
+        statuses.extend(std::iter::repeat_n(&b"1\x03"[..], 5));
+        let mut link = FakeLink::new().statuses(&statuses);
         let stop = AtomicBool::new(false);
-        let cutting = AtomicBool::new(false);
-        let started = Instant::now();
-        let out = std::thread::scope(|s| {
-            s.spawn(|| {
-                while !cutting.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                std::thread::sleep(Duration::from_millis(20));
+        let mut stages = Vec::new();
+        let out = send(&mut link, &job, &fast(), &stop, &mut |s| {
+            stages.push(s);
+            if matches!(s, Stage::Cutting { block: 0, .. }) {
                 stop.store(true, Ordering::SeqCst);
-            });
-            send(&mut link, &job, &timing, &stop, &mut |s| {
-                if matches!(s, Stage::Cutting { block: 0, .. }) {
-                    cutting.store(true, Ordering::SeqCst);
-                }
-            })
+            }
         });
-        // Well short of `ready`: the stop ended the wait, not the deadline.
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let out = out.map_err(|f| f.error);
-        assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
+        let failure = out.unwrap_err();
+        assert!(matches!(failure.error, SendError::Stopped), "{failure:?}");
+        assert_eq!(failure.blocks_sent, 1);
         assert_eq!(count(&link.writes, &blocks[0]), 1);
         for b in &blocks[1..] {
             assert_eq!(count(&link.writes, b), 0);
         }
+        // Every Moving was waited through: none of them was taken for the
+        // end of the job.
+        assert!(link.statuses.is_empty(), "{:?}", link.statuses);
+        sent_home_once_after_ready(&link, &job);
+        // Said once, after the block that was cut.
+        assert_eq!(
+            stages.iter().filter(|s| **s == Stage::Stopping).count(),
+            1,
+            "{stages:?}"
+        );
+        let cut = stages
+            .iter()
+            .position(|s| matches!(s, Stage::Cutting { block: 0, .. }))
+            .unwrap();
+        assert_eq!(stages[cut + 1], Stage::Stopping, "{stages:?}");
+        assert!(!stages.contains(&Stage::Finishing), "{stages:?}");
+    }
+
+    /// Whatever goes wrong while a stopped job is waited for is reported as
+    /// it is, with the blocks already sent.
+    #[test]
+    fn a_failure_while_stopping_is_that_failure() {
+        let job = job(true);
+        let mut link = FakeLink::new().statuses(&[&b"0\x03"[..], b"0\x03", b"0\x03", b"3\x03"]);
+        let stop = AtomicBool::new(false);
+        let failure = send(&mut link, &job, &fast(), &stop, &mut |s| {
+            if matches!(s, Stage::Cutting { block: 0, .. }) {
+                stop.store(true, Ordering::SeqCst);
+            }
+        })
+        .unwrap_err();
+        match &failure.error {
+            SendError::Unknown(raw) => assert_eq!(raw, b"3\x03"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(failure.blocks_sent, 1);
         assert_eq!(count(&link.writes, &job.end_block()), 0);
-        let at = link.writes.iter().position(|w| *w == blocks[0]).unwrap();
-        assert!(link.writes[at + 1..].iter().all(|w| w == STATUS));
+
+        // Moving for ever after a stop is NeverReady, not Stopped.
+        let mut link = FakeLink::new().statuses(&[&b"0\x03"[..]; 3]);
+        link.idle = b"1\x03".to_vec();
+        let stop = AtomicBool::new(false);
+        let failure = send(&mut link, &job, &fast(), &stop, &mut |s| {
+            if matches!(s, Stage::Cutting { block: 0, .. }) {
+                stop.store(true, Ordering::SeqCst);
+            }
+        })
+        .unwrap_err();
+        assert!(
+            matches!(failure.error, SendError::NeverReady),
+            "{failure:?}"
+        );
+        assert_eq!(failure.blocks_sent, 1);
+        assert_eq!(count(&link.writes, &job.end_block()), 0);
+
+        // The end block's own write failing is that failure too.
+        let mut link = FakeLink::new();
+        link.fail_on = Some(job.end_block());
+        let stop = AtomicBool::new(true);
+        let failure = send(&mut link, &job, &fast(), &stop, &mut |_| {}).unwrap_err();
+        assert!(
+            matches!(failure.error, SendError::Link(LinkError::Io(_))),
+            "{failure:?}"
+        );
+        assert_eq!(failure.blocks_sent, 0);
+        assert_eq!(link.writes.last(), Some(&job.end_block()));
     }
 
     const PART_CUT: &str = " Part of the sheet may already be cut. Check it before sending again.";
@@ -1621,8 +1795,8 @@ mod tests {
             failure.sentence()
         );
 
-        // Stopped after the last block: the end block was not sent, and that
-        // is a stop, not an unconfirmed whole job.
+        // Stopped after the last block: the end block is still sent once,
+        // and that is a stop, not a whole job.
         let mut link = FakeLink::new();
         let stop = AtomicBool::new(false);
         let failure = send(&mut link, &job, &fast(), &stop, &mut |s| {
@@ -1636,7 +1810,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(failure.error, SendError::Stopped), "{failure:?}");
         assert_eq!(failure.blocks_sent, n);
-        assert_eq!(count(&link.writes, &job.end_block()), 0);
+        sent_home_once_after_ready(&link, &job);
         assert!(failure.sentence().ends_with(PART_CUT));
     }
 
@@ -1951,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_ends_the_job_between_blocks_and_writes_nothing_more() {
+    fn stop_writes_no_further_path_block_and_sends_the_machine_home() {
         let job = job(true);
         let blocks = job.path_blocks();
         let mut link = FakeLink::new();
@@ -1970,22 +2144,29 @@ mod tests {
         for b in &blocks[1..] {
             assert_eq!(count(&link.writes, b), 0);
         }
-        assert_eq!(count(&link.writes, &job.end_block()), 0);
-        // The block that was sent is waited for, and that is the last thing.
-        assert_eq!(link.writes.last(), Some(&STATUS.to_vec()));
+        sent_home_once_after_ready(&link, &job);
+        // After the block that was sent, nothing but status queries and the
+        // end block.
         let at = link.writes.iter().position(|w| *w == blocks[0]).unwrap();
-        assert_eq!(at + 2, link.writes.len());
+        assert!(
+            link.writes[at + 1..]
+                .iter()
+                .all(|w| w == STATUS || *w == job.end_block()),
+            "{:?}",
+            &link.writes[at + 1..]
+        );
 
-        // Raised before the job begins: setup and marks go, no path block does.
+        // Raised before the job begins: nothing is set up, searched or cut,
+        // and the machine is still sent home once it is ready.
         let mut link = FakeLink::new();
         let stop = AtomicBool::new(true);
         let out = send(&mut link, &job, &fast(), &stop, &mut |_| {});
         let out = out.map_err(|f| f.error);
         assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
-        assert_eq!(count(&link.writes, &job.setup_block()), 1);
-        assert_eq!(count(&link.writes, &job.marks_block().unwrap()), 1);
+        assert_eq!(count(&link.writes, &job.setup_block()), 0);
+        assert_eq!(count(&link.writes, &job.marks_block().unwrap()), 0);
         assert!(blocks.iter().all(|b| count(&link.writes, b) == 0));
-        assert_eq!(count(&link.writes, &job.end_block()), 0);
+        sent_home_once_after_ready(&link, &job);
     }
 
     #[test]
@@ -2011,6 +2192,7 @@ mod tests {
             for e in [
                 SendError::NoMedia,
                 SendError::MarksNotFound(b"    1\x03".to_vec()),
+                SendError::MarksTimedOut,
                 SendError::Unknown(b"3\x03".to_vec()),
                 SendError::NeverReady,
                 SendError::Stopped,
@@ -2020,6 +2202,7 @@ mod tests {
                     SendError::Link(_)
                     | SendError::NoMedia
                     | SendError::MarksNotFound(_)
+                    | SendError::MarksTimedOut
                     | SendError::Unknown(_)
                     | SendError::NeverReady
                     | SendError::Stopped
@@ -2029,7 +2212,7 @@ mod tests {
             all
         }
         let sentences: Vec<String> = every().iter().map(SendError::sentence).collect();
-        assert_eq!(sentences.len(), 11);
+        assert_eq!(sentences.len(), 12);
         // A timeout can be a write as well as a read, so it may not say the
         // cutter stopped answering.
         assert_eq!(sentences[2], "The cutter did not respond in time.");
@@ -2041,8 +2224,70 @@ mod tests {
                 assert_ne!(s, t);
             }
         }
-        assert!(sentences[6].contains("    1\\x03"), "{}", sentences[6]);
-        assert!(sentences[7].contains("3\\x03"), "{}", sentences[7]);
+        assert_eq!(
+            sentences[6],
+            "The cutter did not report finding the registration marks, so nothing was cut. \
+             It answered:     1\\x03."
+        );
+        assert_eq!(
+            sentences[7],
+            "The cutter did not answer while looking for the registration marks. Nothing \
+             was cut."
+        );
+        assert!(sentences[8].contains("3\\x03"), "{}", sentences[8]);
+        assert_eq!(
+            sentences[10],
+            "Stopped. The cutter finished the part it had already been sent, and nothing \
+             more was sent."
+        );
+        // One wording for the platform limit, here and in the dialog.
+        assert_eq!(sentences[4], crate::cutterdlg::WINDOWS_ONLY);
+    }
+
+    /// A search that gets no reply is said as such, not as a generic timeout,
+    /// and nothing is cut after it.
+    #[test]
+    fn a_marks_search_with_no_reply_says_so() {
+        let job = job(true);
+        let mut link = FakeLink::new();
+        // A reply the search never gets: the queue is emptied by the discard
+        // before the search's own read, so nothing comes.
+        link.marks = Vec::new();
+        link.after.clear();
+        let marks = job.marks_block().unwrap();
+        let mut silent = SilentSearch(link, marks.clone());
+        let stop = AtomicBool::new(false);
+        let failure = send(&mut silent, &job, &fast(), &stop, &mut |_| {}).unwrap_err();
+        assert!(
+            matches!(failure.error, SendError::MarksTimedOut),
+            "{failure:?}"
+        );
+        assert_eq!(failure.blocks_sent, 0);
+        assert!(
+            job.path_blocks()
+                .iter()
+                .all(|b| count(&silent.0.writes, b) == 0)
+        );
+        assert_eq!(silent.0.writes.last(), Some(&marks));
+    }
+
+    /// The scripted machine, except that the marks search is never answered.
+    struct SilentSearch(FakeLink, Vec<u8>);
+
+    impl Link for SilentSearch {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+            self.0.write(bytes)?;
+            if bytes == self.1.as_slice() {
+                self.0.replies.clear();
+            }
+            Ok(())
+        }
+        fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+            self.0.read_reply(timeout)
+        }
+        fn discard(&mut self, quiet: Duration) -> Result<Vec<u8>, LinkError> {
+            self.0.discard(quiet)
+        }
     }
 
     #[test]
@@ -2365,12 +2610,12 @@ mod tests {
         }
 
         #[test]
-        fn stop_ends_the_job_between_blocks_and_writes_nothing_more() {
+        fn stop_lets_the_machine_finish_and_then_sends_it_home() {
             let job = job(true);
             let blocks = job.path_blocks();
-            let end = job.end_block();
-            // Ready until the first block, then busy for ever: the job sits in
-            // the wait after block 0 until the stop arrives.
+            // Ready until the first block, then busy until the test says
+            // otherwise: the job sits in the wait after block 0 until the stop
+            // arrives, and goes on waiting after it.
             let mut fake = FakeLink::new().statuses(&[&b"0\x03"[..]; 3]);
             fake.idle = b"1\x03".to_vec();
             let (open, link) = opener(fake);
@@ -2390,6 +2635,19 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             w.stop();
+            // The worker says it is stopping while the machine is still busy,
+            // and does not end the job while it is.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !events
+                .iter()
+                .any(|e| matches!(e, Event::Stage(Stage::Stopping)))
+            {
+                assert!(Instant::now() < deadline, "the stop was never said");
+                events.extend(w.poll());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!w.finished(), "the job ended while the cutter was busy");
+            link.lock().unwrap().idle = b"0\x03".to_vec();
             events.extend(to_the_end(&mut w));
             let stopped = Failure {
                 error: SendError::Stopped,
@@ -2398,12 +2656,12 @@ mod tests {
             }
             .sentence();
             assert_eq!(last(&events), &Event::Sent(Err(stopped)));
-            let writes = link.lock().unwrap().writes.clone();
-            assert_eq!(count(&writes, &blocks[0]), 1);
+            let link = link.lock().unwrap();
+            assert_eq!(count(&link.writes, &blocks[0]), 1);
             for b in &blocks[1..] {
-                assert_eq!(count(&writes, b), 0);
+                assert_eq!(count(&link.writes, b), 0);
             }
-            assert_eq!(count(&writes, &end), 0);
+            sent_home_once_after_ready(&link, &super::job(true));
         }
 
         #[test]
