@@ -3525,6 +3525,8 @@ const PATH_SWITCH_WIDTH: f32 = 96.0;
 const PATH_HINT_ZOOM: &str = "Zoom in to edit this path's nodes.";
 const PATH_HINT_DRAFT: &str = "Click to add a point, drag to curve it. Click the first point to \
      close, Enter to finish, Backspace to step back, Escape to throw it away.";
+const PATH_HINT_DRAFT_EDIT: &str =
+    "Switch to Draw to carry this path on, or press Enter to finish it.";
 const PATH_HINT_DRAW: &str = "Click to place points, drag to pull a curve. Click the end of an \
      open path to carry it on. Hold Ctrl to edit.";
 const PATH_HINT_EDIT_PICKED: &str = "Drag a point or a handle. Click the line to add a point, \
@@ -3542,9 +3544,10 @@ const PATH_SMOOTH_ENDS_TIP: &str = "An end of an open path has no curve to smoot
 /// Every sentence the strip draws that is not one of [`path_hint`]'s refusals,
 /// for the guard that reads them all.
 #[cfg(test)]
-const PATH_STRIP_SENTENCES: [&str; 11] = [
+const PATH_STRIP_SENTENCES: [&str; 12] = [
     PATH_HINT_ZOOM,
     PATH_HINT_DRAFT,
+    PATH_HINT_DRAFT_EDIT,
     PATH_HINT_DRAW,
     PATH_HINT_EDIT_PICKED,
     PATH_HINT_EDIT,
@@ -3581,7 +3584,12 @@ pub(crate) fn path_hint(ed: &Editor) -> &'static str {
         return PATH_HINT_ZOOM;
     }
     if ed.path_tool.draft().is_some() {
-        return PATH_HINT_DRAFT;
+        // In Edit a click picks rather than places, so the Draw hint would
+        // tell somebody to do what the mode in hand will not.
+        return match mode {
+            PathMode::Draw => PATH_HINT_DRAFT,
+            PathMode::Edit => PATH_HINT_DRAFT_EDIT,
+        };
     }
     match mode {
         PathMode::Draw => PATH_HINT_DRAW,
@@ -9046,6 +9054,12 @@ mod tests {
             path_hint(&ed),
             "Click to add a point, drag to curve it. Click the first point to close, \
              Enter to finish, Backspace to step back, Escape to throw it away."
+        );
+        // 4b. The same draft in Edit, where "click to add a point" is false.
+        ed.path_tool.mode = PathMode::Edit;
+        assert_eq!(
+            path_hint(&ed),
+            "Switch to Draw to carry this path on, or press Enter to finish it."
         );
 
         // 5. Draw, with a pick left over from Edit: the pick is no reason to
