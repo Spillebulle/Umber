@@ -26,22 +26,22 @@ Layers and History modules](docs/images/window.png)
 
 ## Install
 
-**Umber 0.1.7.** Take the file for your system, or browse the
+**Umber 0.1.8.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/umber/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-setup-0.1.7-x64.exe) | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-setup-0.1.7-arm64.exe) |
-| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber_0.1.7_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber_0.1.7_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-1.aarch64.rpm) |
-| Arch, CachyOS | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-bin-0.1.7-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.7/Umber-0.1.7-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.7/Umber-0.1.7-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x64.msi) | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.7/umber-0.1.7-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-setup-0.1.8-x64.exe) | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-setup-0.1.8-arm64.exe) |
+| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber_0.1.8_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber_0.1.8_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-1.aarch64.rpm) |
+| Arch, CachyOS | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-bin-0.1.8-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.8/Umber-0.1.8-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.8/Umber-0.1.8-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x64.msi) | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-aarch64-unknown-linux-gnu.tar.gz) |
 
 The `.deb`, the `.rpm` and the Arch package add the
 [Spillebulle archive](https://spillebulle.github.io/packages/) as they install,
@@ -217,6 +217,22 @@ everything you have painted, standing off by a margin you set in pixels or read
 in millimetres. Each piece of artwork gets a line of its own.
 
 <br clear="right">
+
+## Print and cut
+
+Umber can make stickers with a **Silhouette Portrait 3**. Draw the cut lines on
+a vector layer with the Path tool or Trace outline, then switch on
+**File → Registration marks**. Keep artwork out of the three outlined corners,
+because that is where the cutter looks.
+
+**File → Export print sheet…** writes a PDF of the picture at its real size,
+with the marks on it. Print it at 100%, with no fit to page, or the cuts will not
+line up.
+
+Load the printed sheet and choose **File → Send to cutter…**. Pick Cut or Plot,
+the pressure, the speed and the number of passes, and send. **Check connection**
+asks the cutter who it is without moving anything. Close Silhouette Studio while
+Umber uses the machine.
 
 ## Colour
 
@@ -411,9 +427,13 @@ a speed-derived approximation, and a mouse always paints at full pressure.
   layers change what is below them, which Umber cannot do yet. Both are named
   when the document opens.
 - **Vector layers are only half there.** You can draw paths and reshape them,
-  but you cannot yet draw freehand and have it fitted to a curve, select
-  several points at once, or send anything to a cutter, plotter or printer.
-  Lines that look like brush strokes and stay editable are further off still.
+  but you cannot yet draw freehand and have it fitted to a curve, or select
+  several points at once. Lines that look like brush strokes and stay editable
+  are further off still.
+- **Sending to a cutter is new and has not been tried on a real machine yet.**
+  It works on Windows only, and with a Silhouette Portrait 3 and nothing else.
+  Start with Check connection, then a pen on plain paper. Printing is done by
+  exporting the PDF and printing that, not from inside Umber.
 - **Picking a colour from outside the window is Windows only.** Inside the
   window the eyedropper works everywhere. On macOS and Linux the tool options
   strip says so, rather than the drag quietly doing nothing. There is no
