@@ -2158,7 +2158,13 @@ undo entry.
   back ties an explicit command to the effect cache's working set and budget,
   cannot be tested without a device, and still leaves the contouring and the
   fitting to do on the CPU. The exact Euclidean transform gives round offsets
-  and the whole of it is tested with no device at all.
+  and the whole of it is tested with no device at all. **What makes it exact
+  is that the envelope is worked in `f64`**: a parabola intersection is a
+  difference of two squared cell indices, which `f32` stops holding at cell
+  4097, and in `f32` a block 12000 cells along a 12200-wide grid broke into ten
+  rings at margin 1. That is any strip wider than 4096 at one pixel a cell.
+  The stored field stays `f32`, exact for every squared distance a ring can be
+  at. `a_grown_outline_is_the_same_far_along_a_wide_grid_as_near_its_start`.
 - **The background is left out of the composite pass by a parameter**, the
   `[f32; 4]` `composite_over` takes, set to transparent's all-zeroes identity
   for that one draw. Subtracting it afterwards cannot work: a white-backed
@@ -2176,14 +2182,27 @@ undo entry.
   removed**, so a stray pixel does not become a sticker of its own.
 - **A margin is measured from the ink's pixel edge, and any cell at or above
   the threshold counts as wholly inside.** The field is `margin + 0.5 -
-  distance` between cell centres, so a straight edge lands exactly `margin`
-  beyond the artwork and a corner is a circle about the corner cell's centre,
+  distance` between cell centres, so the ring's straight edge lands exactly
+  `margin` beyond the artwork (the fitted line is within the tolerance of the
+  ring; see the next point) and a corner is a circle about the corner cell's centre,
   which falls about 0.21 of a cell short of a true offset on the diagonal
   (`sqrt(2)/2 - 1/2`; the test pins it). On a grid `region` has averaged down
   to stay under `MAX_CELLS` the same rule makes a grown outline the offset of a
   staircase, so it is faceted and costs nodes: a margin-10 disc is 2 nodes at
   one pixel a cell and 14 at two. The repair is a sub-cell distance in `rings`,
   never a looser fitter.
+- **With a margin, Smoothing is capped at half of it, because the fitter's
+  tolerance is symmetric.** Uncapped, the line could sit `smoothing` inside the
+  ring: a block with a 5 px wavy edge at margin 3 and smoothing 8 put the cut
+  line through solid ink, which on a cutter is material spoilt. Capped, the
+  line stands off at least half the margin, less the fifth of a cell the ring
+  itself falls short round a curve (measured: 1.63 there). The quarter-cell
+  floor still wins where the two conflict, a margin under half a cell, and at
+  margin zero the tolerance is as asked, since there is no stand-off to keep.
+  The Smoothing hover text says so. `smoothing_never_pulls_a_grown_line_into_
+  the_ink` and `a_grown_line_stands_off_at_least_half_the_margin`.
+- **A selection is ignored.** The trace reads the whole composite of what the
+  source names, whatever is selected.
 - **Holes are decided on the grown shape**, not on the artwork. A gap the
   margin closes is not a hole any more; one it does not close is filled unless
   Keep holes is on, because a sticker with its middle cut out is rarely what
@@ -2196,11 +2215,13 @@ undo entry.
 - **`trace::fit` is the fitter freehand drawing will use**, which is why
   `fit_open` exists with nothing calling it. Corners first, then Schneider's
   algorithm between them. One consequence worth knowing before a report of
-  "the circle came out square": at margin zero a circle under about 7.6 cells
-  of radius turns by more than `CORNER_DEGREES` across the eight cells of arc
-  `CORNER_REACH` looks over, so its vertices read as corners and it fits as a
-  polygon. A margin of that size or more rounds it, since a grown corner's
-  radius is at least the margin.
+  "the circle came out square": `corners` measures the turn between the chords
+  `CORNER_REACH` either side of a vertex, about `4/r` radians on a circle of
+  radius `r`, which passes `CORNER_DEGREES` near a radius of 4 cells. Measured
+  at margin zero, a circle of radius 4.5 cells or less fits as four kinked
+  nodes and one of 5 or more as two smooth ones. A grown corner is a circle of
+  `margin + 0.5` about the corner cell's centre, so a block grown by 4 cells
+  has smooth corners and one grown by 3 still has four kinks.
 - **An empty `trace` after a non-empty `region` is "nothing to trace"**, the
   same notice as `region` answering `None`. Thin faint content can survive the
   crop and vanish in the averaging, and treating the two as one is what stops
