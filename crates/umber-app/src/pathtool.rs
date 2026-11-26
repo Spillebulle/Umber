@@ -551,6 +551,14 @@ impl PathTool {
     /// Enter.
     pub fn finish(&mut self) -> Commit {
         self.cancel_hold();
+        // A path taken up and given nothing is put back as it was: there is
+        // nothing to land, and the draft would otherwise sit there waiting.
+        if self.untouched_continuation() {
+            self.draft = None;
+            self.draft_role = None;
+            self.base_len = 0;
+            return Commit::Nothing;
+        }
         // Enter ends an open path; only the closing press lands one closed.
         self.land(false)
     }
@@ -797,13 +805,32 @@ impl PathTool {
         }
     }
 
-    /// The draft as a landing, where it is long enough to be a path. The draft
-    /// itself stays put until `landed`.
+    /// A draft that continues a path and has had nothing added to it.
+    ///
+    /// The count is the whole test because the base cannot change inside the
+    /// draft: a press only ever pushes a node, a drag pulls the handles of the
+    /// node it placed, `pop` gives the draft up rather than eat into the base,
+    /// and a mirror mirrors the record under it in the same breath.
+    fn untouched_continuation(&self) -> bool {
+        self.draft
+            .as_ref()
+            .is_some_and(|d| d.continues.is_some() && d.nodes.len() == self.base_len)
+    }
+
+    /// The draft as a landing, where it is long enough to be a path and is
+    /// more than a path taken up and put back. The draft itself stays put
+    /// until `landed`.
+    ///
+    /// **An open landing of an untouched continuation is `Nothing`.** It would
+    /// write the path back as it was, which is an undo entry that does
+    /// nothing, a tab marked modified, a redo stack drained, and, where the
+    /// first node was the one pressed, the path silently reversed. The closing
+    /// press is the exception and is not refused: closing a path is an edit.
     fn land(&self, closed: bool) -> Commit {
         let Some(draft) = self.draft.as_ref() else {
             return Commit::Nothing;
         };
-        if draft.nodes.len() < 2 {
+        if draft.nodes.len() < 2 || (!closed && self.untouched_continuation()) {
             return Commit::Nothing;
         }
         Commit::Land {
@@ -1831,6 +1858,52 @@ mod tests {
         t.press(v(500.0, 500.0), true, on(&rec));
         t.applied(Err("late"));
         assert_eq!(t.pick(), None);
+    }
+
+    /// A path taken up and given nothing lands nothing, from either end,
+    /// by Enter or by a settle, and Enter puts the draft away.
+    #[test]
+    fn a_continuation_with_nothing_added_lands_nothing() {
+        let rec = record();
+        for end in [v(51.0, 0.0), v(0.0, 0.0)] {
+            let mut t = PathTool::default();
+            t.press(end, false, on(&rec));
+            t.release(end, on(&rec));
+            assert!(t.draft().is_some_and(|d| d.continues == Some(0)));
+            assert_eq!(t.finish(), Commit::Nothing);
+            assert!(t.draft().is_none(), "Enter puts it back");
+
+            let mut t = PathTool::default();
+            t.press(end, false, on(&rec));
+            t.release(end, on(&rec));
+            assert_eq!(t.settle(), Commit::Nothing);
+            assert!(t.draft().is_none());
+        }
+        // One node added is a real edit.
+        let mut t = PathTool::default();
+        t.press(v(51.0, 0.0), false, on(&rec));
+        t.release(v(51.0, 0.0), on(&rec));
+        tap(&mut t, v(50.0, 40.0), on(&rec));
+        let (_, replaces) = land_of(t.finish());
+        assert_eq!(replaces, Some(0));
+    }
+
+    /// Closing a continued path with no node added still lands: the close is
+    /// the edit.
+    #[test]
+    fn closing_a_continued_path_with_nothing_added_still_lands() {
+        let rec = VectorObject::Paths(vec![open(
+            PathRole::Cut,
+            &[(0.0, 0.0), (50.0, 0.0), (50.0, 50.0)],
+            false,
+        )]);
+        let mut t = PathTool::default();
+        t.press(v(50.0, 50.0), false, on(&rec));
+        t.release(v(50.0, 50.0), on(&rec));
+        let (paths, replaces) = land_of(tap(&mut t, v(0.0, 0.0), on(&rec)));
+        assert_eq!(replaces, Some(0));
+        assert!(paths[0].closed);
+        assert_eq!(paths[0].nodes.len(), 3);
     }
 
     #[test]

@@ -2055,6 +2055,12 @@ impl Editor {
         match plan {
             PathPlan::Append { slot, after } => {
                 let index = self.layers.active_index();
+                // The rule `apply_path_edit` keeps: an entry that undoes to
+                // itself is a row in the history that does nothing, and it
+                // would mark the tab modified and drain the redo stack.
+                if self.layers.vector_at(index) == Some(&*after) {
+                    return Ok(());
+                }
                 match self.layers.set_vector(index, *after.clone()) {
                     Ok(was) => {
                         self.history.record(umber_core::Edit::vector(
@@ -6450,6 +6456,68 @@ mod tests {
             Some(1),
             "the draft is on no layer and stays"
         );
+    }
+
+    /// **Taking a path up and putting it down again is not an edit.** Enter
+    /// and a settle, from either end: the history, the redo stack, the tab's
+    /// dot and the record's bytes are all as they were. The redo stack is made
+    /// non-empty first, or "nothing drained" would hold of an empty one.
+    #[test]
+    fn a_path_taken_up_and_given_nothing_records_nothing() {
+        for (end, by_enter) in [
+            (Vec2::new(100.0, 0.0), true),
+            (Vec2::new(0.0, 0.0), true),
+            (Vec2::new(100.0, 0.0), false),
+            (Vec2::new(0.0, 0.0), false),
+        ] {
+            let mut ed = with_paths(vec![
+                line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)),
+                line(Vec2::new(0.0, 300.0), Vec2::new(100.0, 300.0)),
+            ]);
+            let other = record_of(&ed)
+                .with_path(1, line(Vec2::new(0.0, 400.0), Vec2::new(100.0, 400.0)))
+                .expect("a record");
+            ed.apply_path_edit(other).expect("an edit");
+            let undone = ed.history.take_undo().expect("the edit");
+            ed.history.push_redo(undone);
+            ed.session.active_tab_mut().modified = false;
+            ed.follow_path_ground();
+            let before = record_of(&ed);
+            let (position, len) = (ed.history.position(), ed.history.len());
+            assert!(len > position, "the fixture has something to redo");
+
+            path_tap(&mut ed, end);
+            assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+            if by_enter {
+                assert!(ed.path_key(PathKey::Finish), "Enter is still the draft's");
+            } else {
+                assert!(ed.settle_path_tool().is_none());
+            }
+
+            assert!(ed.path_tool.draft().is_none());
+            assert_eq!(record_of(&ed), before, "from {end:?}");
+            assert_eq!((ed.history.position(), ed.history.len()), (position, len));
+            assert!(!ed.session.active_tab().modified);
+        }
+    }
+
+    /// An append plan that would leave the record as it is records nothing,
+    /// whoever made it: the Path tool's guard and this one are two doors.
+    #[test]
+    fn an_append_plan_that_changes_nothing_records_nothing() {
+        let mut ed = with_vector_paths(1);
+        ed.session.active_tab_mut().modified = false;
+        let slot = ed.layers.active_slot().expect("a slot");
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        let plan = PathPlan::Append {
+            slot,
+            after: Box::new(record_of(&ed)),
+        };
+        ed.apply_path_plan(plan).expect("nothing to do");
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(ed.layers.vector_revision(), revision);
+        assert!(!ed.session.active_tab().modified);
     }
 
     /// A draft carrying a path on must not replace a path on another layer.
