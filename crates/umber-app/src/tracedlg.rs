@@ -288,7 +288,12 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| show(ui, &self.palette, ed),
+                // In `ui::draw`'s order: the notice is drawn after this
+                // dialog, so it is the modal on top.
+                |ui| {
+                    show(ui, &self.palette, ed);
+                    tabs::notice(ui, &self.palette, ed);
+                },
             );
             let mut shot = Shot {
                 texts: Vec::new(),
@@ -437,16 +442,7 @@ mod tests {
         // Escape is Cancel too, and so must not ask either.
         ed.open_trace();
         h.settled(&mut ed);
-        h.frame(
-            &mut ed,
-            vec![egui::Event::Key {
-                key: egui::Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::default(),
-            }],
-        );
+        h.frame(&mut ed, vec![escape()]);
         assert!(!ed.ui.trace.open, "Escape left the dialog open");
         assert!(!ed.trace_requested, "Escape asked for a trace");
         assert_eq!(ed.ui.trace.settings, before.settings);
@@ -471,6 +467,68 @@ mod tests {
         ed.trace_requested = false;
         h.settled(&mut ed);
         assert!(!ed.trace_requested, "a frame with no press asked again");
+    }
+
+    fn escape() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn refusal() -> Option<tabs::Notice> {
+        Some(tabs::Notice {
+            title: "Nothing to trace".to_owned(),
+            lines: vec!["The layers in view are empty.".to_owned()],
+        })
+    }
+
+    /// **The first dialog that stays open behind a notice**: a refused trace
+    /// leaves the form up and raises one over it. Dismissing the notice must
+    /// not cancel the form under it, which holds only because this dialog's
+    /// Escape and click-outside go through `Modal::should_close`, egui's
+    /// top-modal rule, rather than a key read of its own.
+    #[test]
+    fn dismissing_a_notice_over_the_dialog_leaves_the_dialog_up() {
+        let mut h = Harness::new();
+        let mut ed = opened();
+        h.settled(&mut ed);
+        ed.notice = refusal();
+        let shot = h.settled(&mut ed);
+        assert!(shot.has("Nothing to trace") && shot.has("Trace outline"));
+
+        h.frame(&mut ed, vec![escape()]);
+        assert!(ed.notice.is_none(), "the first Escape left the notice up");
+        assert!(
+            ed.ui.trace.open,
+            "the Escape meant for the notice cancelled the dialog"
+        );
+
+        h.settled(&mut ed);
+        h.frame(&mut ed, vec![escape()]);
+        assert!(!ed.ui.trace.open, "the second Escape left the dialog open");
+        assert!(!ed.trace_requested);
+
+        // The same for a click outside both.
+        ed.open_trace();
+        h.settled(&mut ed);
+        ed.notice = refusal();
+        h.settled(&mut ed);
+        h.click(&mut ed, pos2(5.0, 5.0));
+        assert!(ed.notice.is_none(), "a click outside left the notice up");
+        assert!(
+            ed.ui.trace.open,
+            "the click meant for the notice cancelled the dialog"
+        );
+        h.settled(&mut ed);
+        h.click(&mut ed, pos2(5.0, 5.0));
+        assert!(
+            !ed.ui.trace.open,
+            "the second click outside left the dialog open"
+        );
     }
 
     #[test]
