@@ -339,6 +339,18 @@ pub const NO_SLICE_LINE: &str = "Umber has no texture slice left for one. Save a
                                  document to pack them back down, though deleted layers cannot \
                                  be brought back afterwards.";
 
+/// What the Path tool says when a new layer for its path found no slice.
+///
+/// Its own sentence and not [`NO_SLICE_LINE`], which is written to sit under a
+/// title naming the layer and reads "no texture slice left for one", a "one"
+/// that dangles on the strip and under [`PATH_NOT_KEPT_TITLE`]. The remedy is
+/// that sentence's: by the time this is said `Editor::free_a_slot` has already
+/// given the undo history up, so the history is not what holds the space and
+/// saving and reopening is what packs the slices back down.
+pub const PATH_NO_SLICE_LINE: &str = "There is no room for another layer. Save and reopen the \
+                                      document to free the space, though deleted layers cannot \
+                                      be brought back afterwards.";
+
 /// What leaving the Path tool says when the path being drawn could not be put
 /// on a layer. The reason goes under it.
 pub const PATH_NOT_KEPT_TITLE: &str = "The path being drawn was not kept";
@@ -2505,7 +2517,7 @@ impl Editor {
                 }
                 Ok(())
             }
-            Err(PathApplyRefusal::NoSlice(_)) => Err(NO_SLICE_LINE),
+            Err(PathApplyRefusal::NoSlice(_)) => Err(PATH_NO_SLICE_LINE),
             Err(PathApplyRefusal::Declined(why)) => Err(why),
         }
     }
@@ -7244,10 +7256,26 @@ mod tests {
 
     /// None of the four sentences has a run of spaces, a stray edge space or an
     /// em-dash.
+    /// The path route's no-slice sentence stands on its own, with no "one"
+    /// left over from the notice it was borrowed from.
+    #[test]
+    fn the_path_tools_no_slice_sentence_stands_alone() {
+        assert_eq!(
+            PATH_NO_SLICE_LINE,
+            "There is no room for another layer. Save and reopen the document to free the \
+             space, though deleted layers cannot be brought back afterwards."
+        );
+        assert!(!PATH_NO_SLICE_LINE.contains(" one."));
+    }
+
     #[test]
     fn no_path_edit_sentence_has_a_run_of_spaces() {
-        for why in PathEditRefusal::ALL {
-            let text = why.sentence();
+        let others = [PATH_NO_SLICE_LINE, PATH_NOT_KEPT_TITLE, NO_SLICE_LINE];
+        for text in PathEditRefusal::ALL
+            .iter()
+            .map(|why| why.sentence())
+            .chain(others)
+        {
             assert!(!text.contains("  "), "a run of spaces in {text:?}");
             assert_eq!(text.trim(), text);
             assert!(!text.contains('\u{2014}'), "an em-dash in {text:?}");
