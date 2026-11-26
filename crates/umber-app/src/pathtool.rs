@@ -31,7 +31,8 @@
 //!   node as it was then, so a handle dragged through zero cannot change which
 //!   rule applies half way.
 
-use glam::Vec2;
+use glam::{UVec2, Vec2};
+use umber_core::FlipAxis;
 use umber_core::pathedit::{self, Side};
 use umber_core::vector::{Node, Path, PathRole, VectorObject, VectorRefusal};
 
@@ -215,6 +216,12 @@ impl PathTool {
         self.hover
     }
 
+    /// Put a sentence on the strip, for a refusal the editor found before the
+    /// tool was asked.
+    pub fn say(&mut self, sentence: &'static str) {
+        self.said = Some(sentence);
+    }
+
     /// The sentence to show until the next press, if any.
     pub fn said(&self) -> Option<&'static str> {
         self.said
@@ -268,6 +275,57 @@ impl PathTool {
     fn cancel_hold(&mut self) {
         self.held = Held::Nothing;
         self.dragged = None;
+    }
+
+    /// The press ended without a release: another gesture took the pointer
+    /// over (a middle-button pan, a second finger) or the window lost focus.
+    ///
+    /// Nothing is committed, and a node the press was *placing* is taken back
+    /// off, since the release that would have settled it as a corner or a
+    /// curve is never coming, and a node pulled half into a curve by a gesture
+    /// that was then taken away is not something anybody drew. It ends the
+    /// draft where it was the only node. A closing press reopens the draft,
+    /// since closing happens on the release. A drag is dropped and the record
+    /// is untouched, which is what an unreleased drag always was.
+    pub fn interrupt(&mut self) {
+        let held = std::mem::replace(&mut self.held, Held::Nothing);
+        self.dragged = None;
+        match held {
+            Held::Placing { .. } => {
+                if let Some(draft) = self.draft.as_mut() {
+                    draft.nodes.pop();
+                    if draft.nodes.is_empty() {
+                        self.draft = None;
+                        self.draft_role = None;
+                        self.base_len = 0;
+                    }
+                }
+            }
+            Held::Closing => {
+                if let Some(draft) = self.draft.as_mut() {
+                    draft.closed = false;
+                }
+            }
+            Held::Nothing
+            | Held::Continuing
+            | Held::Picked
+            | Held::Handle { .. }
+            | Held::Node { .. }
+            | Held::Segment { .. } => {}
+        }
+    }
+
+    /// The canvas was mirrored. A draft is drawn over the artwork, so it is
+    /// mirrored with it, by the arithmetic the paths on the layers use. A held
+    /// press is ended first, because its press point is in the old orientation.
+    pub fn mirror(&mut self, axis: FlipAxis, canvas: UVec2) {
+        self.interrupt();
+        if let Some(draft) = self.draft.as_mut() {
+            for node in &mut draft.nodes {
+                *node = node.flipped(axis, canvas);
+            }
+        }
+        self.hover = None;
     }
 
     /// Drop the pick (active layer changed, foreign revision, tab switch).

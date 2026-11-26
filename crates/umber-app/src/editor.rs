@@ -346,6 +346,40 @@ pub const PATH_NOT_KEPT_TITLE: &str = "The path being drawn was not kept";
 /// How close a press must be to a node or a line, in screen points.
 const PATH_HIT_POINTS: f32 = 8.0;
 
+/// Whether no more than `cap` of `nodes` lie inside `lo..=hi`, stopping as
+/// soon as the answer is known either way: past the cap, or with too few
+/// nodes left to reach it.
+fn nodes_in_view_within(nodes: &[umber_core::Node], lo: Vec2, hi: Vec2, cap: usize) -> bool {
+    let mut inside = 0;
+    for (i, node) in nodes.iter().enumerate() {
+        if node.at.cmpge(lo).all() && node.at.cmple(hi).all() {
+            inside += 1;
+            if inside > cap {
+                return false;
+            }
+        }
+        if inside + (nodes.len() - i - 1) <= cap {
+            return true;
+        }
+    }
+    true
+}
+
+/// What [`Editor::path_nodes_shown`] is a function of. Equal keys are equal
+/// answers, so the cache is exact rather than a frame's worth of staleness:
+/// the record is named by document and revision, the path by the pick, and the
+/// view by the camera and the canvas region.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NodesShownKey {
+    document: DocId,
+    revision: u64,
+    path: usize,
+    center: Vec2,
+    zoom: f32,
+    pivot: Vec2,
+    size: Vec2,
+}
+
 /// The keys the Path tool may claim. Each is offered to it first while it is in
 /// hand and falls through to whatever the key did before when it answers no.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1256,6 +1290,12 @@ pub struct Editor {
     /// drains it before anything composites. Empty except for the frame a
     /// layer is made in, so it allocates once and then never.
     pub path_layers_made: Vec<(DocId, u32)>,
+    /// [`Editor::path_nodes_shown`]'s last answer and everything it was a
+    /// function of. The painter asks every frame and the hit test at every
+    /// press, so a long path is scanned once per change of view, pick or
+    /// record rather than once per asking. A `Cell` because the answer is read
+    /// through `&self`, as the painter borrows the editor.
+    path_nodes_seen: std::cell::Cell<Option<(NodesShownKey, bool)>>,
     /// What the Path tool paints with: the preview's buffers, the paths built
     /// from the draft and the marks. Above the `--- documents ---` line because
     /// it is a cache of what is drawn. See `ui::path_tool_marks`.
@@ -1437,6 +1477,7 @@ impl Default for Editor {
             path_watch: PathWatch::default(),
             path_layers_made: Vec::new(),
             path_paint: crate::ui::PathPaint::default(),
+            path_nodes_seen: std::cell::Cell::new(None),
             selection_outline: Vec::new(),
             selection_screen: Vec::new(),
             selection_dashes: Vec::new(),
@@ -2136,10 +2177,18 @@ impl Editor {
 
     /// Whether the picked path's nodes may be marked and hit: false where more
     /// than [`crate::pathtool::NODE_MARK_CAP`] of them fall inside the canvas
-    /// region. **One bounded count**, stopping at the first node past the cap,
-    /// so a traced path of tens of thousands of nodes costs a scan and never a
-    /// mark per node. The marks and the hit test both read this, so a node is
-    /// never hittable where it is not drawn.
+    /// region. The marks and the hit test both read this, so a node is never
+    /// hittable where it is not drawn.
+    ///
+    /// **The bound is one pass over the picked path's nodes, at most, per
+    /// change of what it depends on**: the answer is cached against the
+    /// document, the record's revision, the pick and the view, so the painter
+    /// asking every frame and the hit test asking at every press scan nothing
+    /// while those stand still. The pass itself stops as soon as the answer is
+    /// known either way: a path of no more than the cap nodes is answered with
+    /// no scan at all, a count past the cap stops at the first node over it,
+    /// and a count that the nodes left could no longer carry past the cap
+    /// stops there. Never a mark per node.
     pub fn path_nodes_shown(&self) -> bool {
         let cap = crate::pathtool::NODE_MARK_CAP;
         let Some(pick) = self.path_tool.pick() else {
@@ -2151,6 +2200,24 @@ impl Editor {
         else {
             return true;
         };
+        let total = path.nodes.len();
+        if total <= cap {
+            return true;
+        }
+        let key = NodesShownKey {
+            document: self.session.active_id(),
+            revision: self.layers.vector_revision(),
+            path: pick.path,
+            center: self.camera.center,
+            zoom: self.camera.zoom,
+            pivot: self.canvas_pivot,
+            size: self.canvas_size,
+        };
+        if let Some((seen, shown)) = self.path_nodes_seen.get()
+            && seen == key
+        {
+            return shown;
+        }
         // The canvas region, recorded each frame in physical pixels, taken into
         // the document. The camera neither rotates nor shears, so two corners
         // say it all.
@@ -2158,12 +2225,9 @@ impl Editor {
         let a = self.screen_to_doc(self.canvas_pivot - half);
         let b = self.screen_to_doc(self.canvas_pivot + half);
         let (lo, hi) = (a.min(b), a.max(b));
-        path.nodes
-            .iter()
-            .filter(|n| n.at.cmpge(lo).all() && n.at.cmple(hi).all())
-            .take(cap + 1)
-            .count()
-            <= cap
+        let shown = nodes_in_view_within(&path.nodes, lo, hi, cap);
+        self.path_nodes_seen.set(Some((key, shown)));
+        shown
     }
 
     /// A press with the Path tool. `ctrl` borrows Edit for this one gesture.
@@ -2219,6 +2283,16 @@ impl Editor {
                 if self.path_tool.pick().is_none() {
                     return false;
                 }
+                // A pick on a layer that has since been locked or hidden: the
+                // key was aimed at that path, so it is the tool's and says why,
+                // rather than falling through to whatever else Backspace or
+                // Delete is bound to. Nothing is bound to either by default,
+                // but somebody who bound Delete to deleting the layer would
+                // otherwise lose the layer they were aiming at a path on.
+                if let Some(why) = self.path_edit_refusal() {
+                    self.path_tool.say(why.sentence());
+                    return true;
+                }
                 let commit = self.with_path_tool(|tool, ground| tool.remove(ground));
                 self.carry_out(commit);
                 true
@@ -2257,12 +2331,48 @@ impl Editor {
     /// [`Editor::settle_path_tool`], with its notice raised beside whatever is
     /// already up rather than over it. For the settle sites that have nowhere
     /// else to put it.
-    fn settle_path_tool_noting(&mut self) {
+    pub fn settle_path_tool_noting(&mut self) {
         if let Some(notice) = self.settle_path_tool() {
             for line in &notice.lines {
                 add_notice_line(&mut self.notice, &notice.title, line);
             }
         }
+    }
+
+    /// The press the Path tool was holding ended without a release: another
+    /// gesture took `Interaction` over, a second finger landed, or the window
+    /// lost focus. Every place that takes `Pathing` away calls this, so the
+    /// tool is never left holding a press only a release could end.
+    pub fn interrupt_path_gesture(&mut self) {
+        match self.interaction {
+            Interaction::Pathing => {
+                self.path_tool.interrupt();
+                self.interaction = Interaction::Idle;
+            }
+            Interaction::Idle
+            | Interaction::Drawing
+            | Interaction::Selecting
+            | Interaction::Panning
+            | Interaction::Zooming
+            | Interaction::Picking => {}
+        }
+    }
+
+    /// Closing the tab at `index` was asked for. The path being drawn is on
+    /// the document in front, so where that is the one closing it is put on a
+    /// layer **before** anybody asks whether the tab holds unsaved work: a kept
+    /// path marks it modified, and the ordinary prompt then asks about it
+    /// rather than the close dropping it in silence.
+    pub fn settle_before_closing(&mut self, index: usize) {
+        if index == self.session.active_index() {
+            self.settle_path_tool_noting();
+        }
+    }
+
+    /// The window is closing. The same, for the document in front, before the
+    /// list of unsaved documents is made.
+    pub fn settle_before_quitting(&mut self) {
+        self.settle_path_tool_noting();
     }
 
     /// Carry out what the Path tool asked for, and tell it how that went.
@@ -2834,6 +2944,14 @@ impl Editor {
         // record may reach, which is taken out and said, after the text notice
         // below so that one cannot replace it.
         let lost_paths = self.layers.flip_vectors(axis, doc);
+        // The path being drawn is over the artwork, so it rides the flip with
+        // it, by the arithmetic the paths above use. Here rather than settled
+        // first, because this is also the route an undo of a flip takes and a
+        // landing recorded in the middle of a step would land in the history
+        // being walked. The pick names a path by index and the flip may have
+        // taken one out, so it goes.
+        self.path_tool.mirror(axis, doc);
+        self.path_tool.let_go();
         let dropped = self.layers.flip_text(axis, doc);
         if dropped > 0 {
             // Rare rather than unreachable, and the difference is worth stating.

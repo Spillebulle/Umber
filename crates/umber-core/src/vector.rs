@@ -124,6 +124,31 @@ impl Node {
             pressure: 1.0,
         }
     }
+
+    /// This node mirrored across the middle of a `canvas`-sized document.
+    ///
+    /// The one statement of the arithmetic, which [`VectorObject::flipped`]
+    /// and a path still being drawn both use, so a draft carried over a flip
+    /// lands exactly where the paths beside it went. The handles are offsets,
+    /// so only their mirrored component changes sign, and in stays in.
+    pub fn flipped(&self, axis: FlipAxis, canvas: UVec2) -> Self {
+        let (at, turn) = match axis {
+            FlipAxis::Horizontal => (
+                Vec2::new(canvas.x as f32 - self.at.x, self.at.y),
+                Vec2::new(-1.0, 1.0),
+            ),
+            FlipAxis::Vertical => (
+                Vec2::new(self.at.x, canvas.y as f32 - self.at.y),
+                Vec2::new(1.0, -1.0),
+            ),
+        };
+        Self {
+            at,
+            handle_in: self.handle_in * turn,
+            handle_out: self.handle_out * turn,
+            pressure: self.pressure,
+        }
+    }
 }
 
 /// How an ink path would be drawn. Reserved.
@@ -461,28 +486,11 @@ impl VectorObject {
             VectorObject::Paths(p) => p,
             VectorObject::Opaque(_) => return self.clone(),
         };
-        let mirror = |p: Vec2| match axis {
-            FlipAxis::Horizontal => Vec2::new(canvas.x as f32 - p.x, p.y),
-            FlipAxis::Vertical => Vec2::new(p.x, canvas.y as f32 - p.y),
-        };
-        let turn = |h: Vec2| match axis {
-            FlipAxis::Horizontal => Vec2::new(-h.x, h.y),
-            FlipAxis::Vertical => Vec2::new(h.x, -h.y),
-        };
         VectorObject::Paths(
             paths
                 .iter()
                 .map(|p| Path {
-                    nodes: p
-                        .nodes
-                        .iter()
-                        .map(|n| Node {
-                            at: mirror(n.at),
-                            handle_in: turn(n.handle_in),
-                            handle_out: turn(n.handle_out),
-                            pressure: n.pressure,
-                        })
-                        .collect(),
+                    nodes: p.nodes.iter().map(|n| n.flipped(axis, canvas)).collect(),
                     ..p.clone()
                 })
                 .collect(),

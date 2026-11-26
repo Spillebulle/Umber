@@ -311,6 +311,9 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     actions.pick_tab = tab_actions.pick;
     actions.new_document |= tab_actions.new_document;
     if let Some(index) = tab_actions.close {
+        // Before `modified` is read, so a path being drawn on this document is
+        // kept and asked about rather than dropped.
+        ed.settle_before_closing(index);
         if ed.session.tabs().get(index).is_some_and(|tab| tab.modified) {
             // Show the document before asking about it: a prompt that offers to
             // export a canvas you cannot see is asking about the wrong one.
@@ -2397,6 +2400,7 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         .clicked()
     {
         let index = ed.session.active_index();
+        ed.settle_before_closing(index);
         if ed.session.active_tab().modified {
             ed.ui.close_prompt = Some(index);
         } else {
@@ -2475,8 +2479,8 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // menu from a speculative `finish_transform` would mean predicting an edit
     // in order to describe it.
     let undo_gate = ed.undo_gate();
-    let undo_locked = undo_gate.refuses();
-    if menu_item(ui, Action::Undo, ed.history.can_undo() && !undo_locked)
+    let rows = step_rows(ed);
+    if menu_item_labelled(ui, Action::Undo, rows.undo_label, rows.undo)
         .on_disabled_hover_text(match undo_gate {
             editor::StepGate::FlipRefused(why) => step_refused_tip("back", why),
             editor::StepGate::Clear | editor::StepGate::SettleForFlip => {
@@ -2489,10 +2493,12 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         ui.close();
     }
     let redo_gate = ed.redo_gate();
-    let redo_locked = redo_gate.refuses();
-    if menu_item(ui, Action::Redo, ed.history.can_redo() && !redo_locked)
+    if menu_item(ui, Action::Redo, rows.redo)
         .on_disabled_hover_text(match redo_gate {
             editor::StepGate::FlipRefused(why) => step_refused_tip("forward", why),
+            editor::StepGate::Clear | editor::StepGate::SettleForFlip if rows.drafting => {
+                "Finish or abandon the path being drawn first.".to_owned()
+            }
             editor::StepGate::Clear | editor::StepGate::SettleForFlip => {
                 "Nothing undone to put back.".to_owned()
             }
@@ -2743,15 +2749,53 @@ fn step_refused_tip(way: &str, why: editor::FlipRefusal) -> String {
 /// bare buttons for exactly that reason, which left `Ctrl+Z` named nowhere in
 /// the interface outside the Shortcuts page.
 fn menu_item(ui: &mut egui::Ui, action: shortcuts::Action, enabled: bool) -> egui::Response {
+    menu_item_labelled(ui, action, action.label(), enabled)
+}
+
+/// [`menu_item`] with a label of its own, for the one row whose meaning shifts
+/// with the state: Undo with a path being drawn takes a point off it. The key
+/// still comes from `shortcuts`, because it is still the key that does it.
+fn menu_item_labelled(
+    ui: &mut egui::Ui,
+    action: shortcuts::Action,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
     let chord = shortcuts::published()
         .iter()
         .find(|b| b.action == action)
         .map(|b| b.chord().display())
         .unwrap_or_default();
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(action.label()).shortcut_text(chord),
-    )
+    ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(chord))
+}
+
+/// What the Edit menu's Undo and Redo rows offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepRows {
+    pub undo: bool,
+    pub undo_label: &'static str,
+    pub redo: bool,
+    pub drafting: bool,
+}
+
+/// What the Edit menu's step rows offer. **With a path being drawn they are
+/// the draft's**, exactly as Ctrl+Z and Ctrl+Shift+Z are (`Editor::path_key`):
+/// Undo is live whatever the history holds, named for what it does, and goes
+/// through the same `App::undo_command`, and Redo is dead because it does
+/// nothing to a draft and must not reach the history behind it. Otherwise the
+/// history and its gates decide, as before.
+pub(crate) fn step_rows(ed: &Editor) -> StepRows {
+    let drafting = ed.path_tool.draft().is_some();
+    StepRows {
+        undo: drafting || (ed.history.can_undo() && !ed.undo_gate().refuses()),
+        undo_label: if drafting {
+            "Undo point"
+        } else {
+            shortcuts::Action::Undo.label()
+        },
+        redo: !drafting && ed.history.can_redo() && !ed.redo_gate().refuses(),
+        drafting,
+    }
 }
 
 /// What each optional group on the tool options strip costs, in points.

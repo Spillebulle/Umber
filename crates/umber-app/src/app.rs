@@ -1122,14 +1122,6 @@ impl UmberApp {
             self.editor.notice = Some(flip_refusal_notice(why));
             return;
         }
-        // The path being drawn is on no layer, so it would not be mirrored with
-        // the paths that are. Put on its layer first, here and not inside
-        // `mirror_document`: that is also the undo's route, and a landing
-        // recorded in the middle of a step would land in the history the step
-        // is walking.
-        if let Some(notice) = self.editor.settle_path_tool() {
-            self.editor.notice = Some(notice);
-        }
         if !self.mirror_document(axis) {
             return;
         }
@@ -5615,6 +5607,13 @@ impl UmberApp {
         if gesture::supersedes_stroke(decision) && self.editor.stroke.is_active() {
             self.finish_stroke();
         }
+        // And a press the Path tool is holding, for the same reason: a middle
+        // press taking `Interaction` over as a pan means the release the tool
+        // is waiting for is dispatched as the pan's. A Path press is the tool's
+        // own and replaces its hold itself.
+        if decision != gesture::Press::Path {
+            self.editor.interrupt_path_gesture();
+        }
 
         // Every press ends the brush-size drag except the one that is carrying
         // it on. A mouse press is never a contact, so without "press to
@@ -6265,6 +6264,9 @@ impl ApplicationHandler<Wake> for UmberApp {
             // until each one with unsaved work has been accounted for — and the
             // question has to be answerable with "actually, no".
             WindowEvent::CloseRequested => {
+                // A path being drawn becomes a layer first, so a kept path is
+                // unsaved work the prompt below asks about.
+                self.editor.settle_before_quitting();
                 if self.editor.unsaved_documents().is_empty() {
                     event_loop.exit();
                 } else {
@@ -6332,6 +6334,8 @@ impl ApplicationHandler<Wake> for UmberApp {
                 // `gesture::supersedes_stroke` gives: the artist drew a visible
                 // mark.
                 self.finish_stroke();
+                // A press the Path tool held, which no release will now end.
+                self.editor.interrupt_path_gesture();
                 // And the gestures that carry no stroke behind them. `quiet`
                 // reads `Interaction` as well, so a pan or a zoom abandoned by
                 // an Alt-Tab stalls the autosave exactly as a stroke does —
@@ -6593,6 +6597,9 @@ impl ApplicationHandler<Wake> for UmberApp {
                         self.put_down_at = None;
                         self.editor.transform_release();
                         self.editor.drawing_touch = None;
+                        // A node the first finger was placing goes with it: a
+                        // pinch is not a node.
+                        self.editor.interrupt_path_gesture();
                         // A pan or a zoom the first contact had begun goes with
                         // the rest of it. `cancel_stroke` resets this only where
                         // there was a stroke to cancel, and now that the Pan and
