@@ -2469,6 +2469,13 @@ impl Editor {
                 let outcome = self.apply_path_edit(after);
                 if outcome.is_ok() {
                     self.path_watch.own_edit(self.path_ground_now());
+                    // A Ctrl edit of the very path a draft is carrying on: the
+                    // landing would put the draft's old copy of it back over
+                    // the edit, so the draft lands as a new path instead.
+                    let record = self.layers.vector_at(self.layers.active_index());
+                    if !self.path_tool.still_continues(record) {
+                        self.path_tool.detach();
+                    }
                 }
                 self.path_tool.applied(outcome);
             }
@@ -6586,6 +6593,40 @@ mod tests {
         ed.layers.set_vector(index, moved).expect("set");
         ed.follow_path_ground();
         assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+    }
+
+    /// **The tool's own edit of the path a draft continues detaches it.** A
+    /// Ctrl drag moves the continued path's first node; the landing that
+    /// follows must not put the old node back, so it lands as a new path and
+    /// the edit stands.
+    #[test]
+    fn a_ctrl_edit_of_the_continued_path_is_not_undone_by_the_landing() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(100.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+
+        path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+        ed.path_press(Vec2::new(0.0, 0.0), true);
+        ed.path_moved(Vec2::new(0.0, 50.0), false);
+        ed.path_release(Vec2::new(0.0, 50.0));
+        assert_eq!(record_of(&ed).paths()[0].nodes[0].at, Vec2::new(0.0, 50.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), None);
+
+        path_tap(&mut ed, Vec2::new(150.0, 50.0));
+        assert!(ed.path_key(PathKey::Finish));
+        let paths = record_of(&ed).paths().to_vec();
+        assert_eq!(paths.len(), 2, "a new path beside the edited one");
+        assert_eq!(paths[0].nodes[0].at, Vec2::new(0.0, 50.0), "the edit stands");
+        let at: Vec<Vec2> = paths[1].nodes.iter().map(|n| n.at).collect();
+        assert_eq!(
+            at,
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(100.0, 0.0),
+                Vec2::new(150.0, 50.0)
+            ]
+        );
     }
 
     #[test]
