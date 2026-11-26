@@ -275,6 +275,18 @@ pub fn screen_mapping(
     }
 }
 
+/// The canvas region `view` as a box of document pixels, `(low, high)`: the
+/// inverse of [`screen_mapping`] at two corners, which is enough because the
+/// camera neither rotates nor shears. For culling a point in the document
+/// before it is mapped at all.
+pub fn view_in_document(camera: &Camera, view: Rect, ppp: f32) -> (Vec2, Vec2) {
+    let ppp = ppp.max(1e-3);
+    let pivot = Vec2::new(view.center().x, view.center().y) * ppp;
+    let a = camera.screen_to_doc(Vec2::new(view.min.x, view.min.y) * ppp, pivot);
+    let b = camera.screen_to_doc(Vec2::new(view.max.x, view.max.y) * ppp, pivot);
+    (a.min(b), a.max(b))
+}
+
 /// What tracing one path did, for the caller to total.
 struct Traced {
     /// The point budget ran out; the build ends here.
