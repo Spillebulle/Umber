@@ -14,6 +14,12 @@ mod colorpicker;
 mod controls;
 mod cputext;
 mod crash;
+/// Talking to a cutter over USB.
+///
+/// Public because `examples/probe-cutter.rs` is how somebody with the machine
+/// finds out what it actually answers, and an example sees only what the crate
+/// exposes.
+pub mod cutter;
 mod dock;
 /// Redrawing the pictures in `docs/images/` from the interface itself.
 ///

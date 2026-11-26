@@ -1,0 +1,800 @@
+//! Talking to a cutter: the conversation a job is, and the link it travels on.
+//!
+//! `umber_core::cutjob` builds the bytes; this module decides when each block
+//! is written and what the machine has to say before the next one goes. It is
+//! in `umber-app` because the link is the platform's, and it holds no egui and
+//! no winit, because the worker that drives it and the dialog that watches it
+//! are separate things built on top of it.
+//!
+//! **Nobody has run this against a machine.** Everything below is pinned
+//! against [`Link`] implementations the tests script themselves, which proves
+//! what Umber writes and how it reads what comes back, and proves nothing about
+//! what a Silhouette actually answers.
+//!
+//! Three rules the conversation keeps, each of which is a cut in the wrong
+//! place if it is broken:
+//!
+//! - **Nothing is ever written twice.** A write that failed, or that may have
+//!   reached the machine only in part, ends the job. Resending a block the
+//!   machine already holds half of is the blade going round a second time from
+//!   wherever the first copy stopped.
+//! - **An answer Umber does not recognise is never taken for ready.** A status
+//!   is exactly one of three byte strings; anything else, a `3` or a `4`
+//!   included, ends the job and is reported as it arrived.
+//! - **The marks reply is compared byte for byte, spaces and all.** The machine
+//!   pads its number; `"    0"` is found and `"0"` is not something it says.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use umber_core::cutjob::{ETX, Job};
+
+/// Silhouette's USB vendor id.
+pub const VENDOR: u16 = 0x0b4d;
+/// The Portrait 3's product id.
+pub const PORTRAIT_3: u16 = 0x113a;
+
+/// Initialise: the machine forgets any half-received command.
+const INIT: &[u8] = b"\x1b\x04";
+/// Ask for the firmware version.
+const FIRMWARE: &[u8] = b"FG\x03";
+/// Ask for the status.
+const STATUS: &[u8] = b"\x1b\x05";
+/// The one reply that means the marks were found.
+const MARKS_FOUND: &[u8] = b"    0\x03";
+
+/// Why the link could not carry a write or a reply.
+#[derive(Debug)]
+pub enum LinkError {
+    /// No machine of that kind is plugged in.
+    NotFound,
+    /// Another program holds the machine.
+    Busy,
+    /// Nothing arrived in time.
+    Timeout,
+    /// The operating system refused, or a write went only part of the way.
+    Io(String),
+    /// This platform has no link.
+    Unsupported,
+}
+
+/// The wire to the machine.
+///
+/// A reply is everything up to and including one ETX; whatever arrived after
+/// it belongs to the next reply.
+pub trait Link {
+    /// Write all of `bytes`, or fail. A failure may have delivered part of
+    /// them, so a caller never retries one.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError>;
+    /// The next reply, ETX included.
+    fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError>;
+}
+
+/// What the machine says when asked how it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Ready,
+    Moving,
+    NoMedia,
+}
+
+/// A status reply, or the reply itself when it is not one of the three.
+pub fn status_of(reply: &[u8]) -> Result<Status, Vec<u8>> {
+    match reply {
+        b"0\x03" => Ok(Status::Ready),
+        b"1\x03" => Ok(Status::Moving),
+        b"2\x03" => Ok(Status::NoMedia),
+        other => Err(other.to_vec()),
+    }
+}
+
+/// Whether the reply to the marks search says they were found.
+pub fn marks_found(reply: &[u8]) -> bool {
+    reply == MARKS_FOUND
+}
+
+/// How far a job has got, reported as each part begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Connecting,
+    FindingMarks,
+    /// `block` counts from zero.
+    Cutting {
+        block: usize,
+        of: usize,
+    },
+    Finishing,
+}
+
+/// Why a job ended before the machine was sent home.
+#[derive(Debug)]
+pub enum SendError {
+    Link(LinkError),
+    /// No mat or sheet is loaded.
+    NoMedia,
+    /// The marks search ended in anything but the found reply, which is kept.
+    MarksNotFound(Vec<u8>),
+    /// A status Umber does not recognise, as it arrived.
+    Unknown(Vec<u8>),
+    /// The machine stayed busy past [`Timing::ready`].
+    NeverReady,
+    /// The stop flag was raised.
+    Stopped,
+}
+
+impl From<LinkError> for SendError {
+    fn from(e: LinkError) -> Self {
+        SendError::Link(e)
+    }
+}
+
+impl SendError {
+    /// What to tell the artist.
+    pub fn sentence(&self) -> String {
+        match self {
+            SendError::Link(e) => match e {
+                LinkError::NotFound => "No cutter was found. Check that it is plugged in and \
+                                        switched on."
+                    .to_string(),
+                LinkError::Busy => "The cutter is in use by another program. Close Silhouette \
+                                    Studio and try again."
+                    .to_string(),
+                LinkError::Timeout => "The cutter stopped answering.".to_string(),
+                LinkError::Io(why) => format!("The connection to the cutter failed: {why}."),
+                LinkError::Unsupported => {
+                    "Sending to a cutter only works on Windows so far.".to_string()
+                }
+            },
+            SendError::NoMedia => {
+                "There is no mat or sheet in the cutter. Load one and try again.".to_string()
+            }
+            SendError::MarksNotFound(raw) => format!(
+                "The cutter could not find the registration marks (it answered {}). Check that \
+                 the sheet was printed with marks and is loaded straight.",
+                escaped(raw)
+            ),
+            SendError::Unknown(raw) => format!(
+                "The cutter gave an answer Umber does not understand ({}), so nothing more was \
+                 sent.",
+                escaped(raw)
+            ),
+            SendError::NeverReady => "The cutter stayed busy and never became ready.".to_string(),
+            SendError::Stopped => {
+                "Stopped. The cutter finished the part it had already been sent.".to_string()
+            }
+        }
+    }
+}
+
+/// How long the conversation waits for each thing.
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    /// Between status queries while the machine is moving.
+    pub poll: Duration,
+    /// How long the machine may stay busy before the job gives up.
+    pub ready: Duration,
+    /// How long the marks search may take to answer.
+    pub marks: Duration,
+    /// How long any other reply may take.
+    pub reply: Duration,
+}
+
+impl Timing {
+    pub const REAL: Timing = Timing {
+        poll: Duration::from_millis(250),
+        ready: Duration::from_secs(120),
+        marks: Duration::from_secs(40),
+        reply: Duration::from_secs(5),
+    };
+}
+
+/// Send a whole job. `Ok` carries the firmware string the machine gave.
+///
+/// `stop` is read before each path block and before the end block; once it is
+/// raised nothing more is written, not even the end block, because the machine
+/// finishes what it holds whatever Umber does next.
+pub fn send(
+    link: &mut dyn Link,
+    job: &Job,
+    timing: &Timing,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(Stage),
+) -> Result<String, SendError> {
+    progress(Stage::Connecting);
+    let firmware = hello(link, timing)?;
+    wait_ready(link, timing)?;
+    link.write(&job.setup_block())?;
+    wait_ready(link, timing)?;
+
+    if let Some(marks) = job.marks_block() {
+        progress(Stage::FindingMarks);
+        link.write(&marks)?;
+        let reply = link.read_reply(timing.marks)?;
+        if !marks_found(&reply) {
+            return Err(SendError::MarksNotFound(reply));
+        }
+    }
+
+    let blocks = job.path_blocks();
+    let of = blocks.len();
+    for (block, bytes) in blocks.iter().enumerate() {
+        if stop.load(Ordering::SeqCst) {
+            return Err(SendError::Stopped);
+        }
+        progress(Stage::Cutting { block, of });
+        link.write(bytes)?;
+        wait_ready(link, timing)?;
+    }
+
+    if stop.load(Ordering::SeqCst) {
+        return Err(SendError::Stopped);
+    }
+    progress(Stage::Finishing);
+    link.write(&job.end_block())?;
+    wait_ready(link, timing)?;
+    Ok(firmware)
+}
+
+/// The three harmless commands and nothing else: initialise, the firmware
+/// string and one status. Nothing moves.
+pub fn probe(
+    link: &mut dyn Link,
+    timing: &Timing,
+) -> Result<(String, Result<Status, Vec<u8>>), LinkError> {
+    let firmware = hello(link, timing)?;
+    link.write(STATUS)?;
+    let reply = link.read_reply(timing.reply)?;
+    Ok((firmware, status_of(&reply)))
+}
+
+/// Initialise and ask for the firmware string: what comes before the ETX, as
+/// text, trimmed.
+fn hello(link: &mut dyn Link, timing: &Timing) -> Result<String, LinkError> {
+    link.write(INIT)?;
+    link.write(FIRMWARE)?;
+    let reply = link.read_reply(timing.reply)?;
+    let text = reply.split(|&b| b == ETX).next().unwrap_or(&[]);
+    Ok(String::from_utf8_lossy(text).trim().to_string())
+}
+
+/// Ask until the machine is ready. Moving is asked again after
+/// [`Timing::poll`] until [`Timing::ready`] has passed; anything that is not a
+/// status ends the job at once rather than being asked again.
+fn wait_ready(link: &mut dyn Link, timing: &Timing) -> Result<(), SendError> {
+    let started = Instant::now();
+    loop {
+        link.write(STATUS)?;
+        let reply = link.read_reply(timing.reply)?;
+        match status_of(&reply) {
+            Ok(Status::Ready) => return Ok(()),
+            Ok(Status::NoMedia) => return Err(SendError::NoMedia),
+            Ok(Status::Moving) => {
+                if started.elapsed() >= timing.ready {
+                    return Err(SendError::NeverReady);
+                }
+                std::thread::sleep(timing.poll);
+            }
+            Err(raw) => return Err(SendError::Unknown(raw)),
+        }
+    }
+}
+
+/// Bytes as a line of text: printable ASCII as itself, a backslash doubled,
+/// everything else as `\xNN`.
+pub fn escaped(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(char::from(b)),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out
+}
+
+/// One log line: direction, count, and the bytes, a long run cut short.
+fn log_line(direction: char, bytes: &[u8]) -> String {
+    if bytes.len() > LOG_BYTES {
+        format!(
+            "{direction} {} {} ... ({} bytes)",
+            bytes.len(),
+            escaped(&bytes[..LOG_BYTES]),
+            bytes.len()
+        )
+    } else {
+        format!("{direction} {} {}", bytes.len(), escaped(bytes))
+    }
+}
+
+/// The most bytes of one write a log line shows.
+const LOG_BYTES: usize = 96;
+
+/// A link that hands one line per transfer to a sink, and otherwise is the
+/// link it wraps.
+pub struct Logged<L: Link, F: FnMut(String)> {
+    link: L,
+    sink: F,
+}
+
+impl<L: Link, F: FnMut(String)> Logged<L, F> {
+    pub fn new(link: L, sink: F) -> Self {
+        Logged { link, sink }
+    }
+}
+
+impl<L: Link, F: FnMut(String)> Link for Logged<L, F> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+        let out = self.link.write(bytes);
+        let line = log_line('>', bytes);
+        match &out {
+            Ok(()) => (self.sink)(line),
+            Err(e) => (self.sink)(format!("{line} failed: {e:?}")),
+        }
+        out
+    }
+
+    fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+        let out = self.link.read_reply(timeout);
+        match &out {
+            Ok(reply) => (self.sink)(log_line('<', reply)),
+            Err(e) => (self.sink)(format!("< failed: {e:?}")),
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    use glam::Vec2;
+    use umber_core::cutjob::{self, JobSettings, Page};
+    use umber_core::document::Document;
+    use umber_core::vector::{Node, Path, PathRole};
+
+    /// A machine that answers from a script. It replies to what was last
+    /// written, the way the real one does: a firmware string to `FG`, the next
+    /// queued status to a status query, the marks reply to a marks search.
+    struct FakeLink {
+        writes: Vec<Vec<u8>>,
+        firmware: Vec<u8>,
+        statuses: VecDeque<Vec<u8>>,
+        /// What every status query answers once the queue is empty.
+        idle: Vec<u8>,
+        marks: Vec<u8>,
+        /// The first write equal to this fails, after being recorded.
+        fail_on: Option<Vec<u8>>,
+        pending: Option<Vec<u8>>,
+    }
+
+    impl FakeLink {
+        fn new() -> Self {
+            FakeLink {
+                writes: Vec::new(),
+                firmware: b"CAMEO V1.10    \x03".to_vec(),
+                statuses: VecDeque::new(),
+                idle: b"0\x03".to_vec(),
+                marks: MARKS_FOUND.to_vec(),
+                fail_on: None,
+                pending: None,
+            }
+        }
+
+        fn statuses(mut self, s: &[&[u8]]) -> Self {
+            self.statuses = s.iter().map(|b| b.to_vec()).collect();
+            self
+        }
+    }
+
+    impl Link for FakeLink {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+            self.writes.push(bytes.to_vec());
+            if self.fail_on.as_deref() == Some(bytes) {
+                self.fail_on = None;
+                return Err(LinkError::Io("scripted".into()));
+            }
+            self.pending = if bytes == FIRMWARE {
+                Some(self.firmware.clone())
+            } else if bytes == STATUS {
+                Some(
+                    self.statuses
+                        .pop_front()
+                        .unwrap_or_else(|| self.idle.clone()),
+                )
+            } else if bytes.starts_with(b"TB99") {
+                Some(self.marks.clone())
+            } else {
+                None
+            };
+            Ok(())
+        }
+
+        fn read_reply(&mut self, _timeout: Duration) -> Result<Vec<u8>, LinkError> {
+            self.pending.take().ok_or(LinkError::Timeout)
+        }
+    }
+
+    fn fast() -> Timing {
+        Timing {
+            poll: Duration::from_millis(1),
+            ready: Duration::from_millis(30),
+            marks: Duration::from_millis(5),
+            reply: Duration::from_millis(5),
+        }
+    }
+
+    /// A zigzag long enough to need several path blocks, on A4 at one pixel
+    /// to the millimetre.
+    fn job(use_marks: bool) -> Job {
+        let mut doc = Document::new(210, 297).with_marks(true);
+        doc.dpi = 25.4;
+        let page = Page::of(&doc);
+        let zigzag = Path {
+            role: PathRole::Cut,
+            closed: false,
+            nodes: (0..400)
+                .map(|i| {
+                    let y = if i % 2 == 0 { 20.0 } else { 30.0 };
+                    Node::corner(Vec2::new(20.0 + i as f32 * 0.25, y))
+                })
+                .collect(),
+            ink: None,
+        };
+        let settings = JobSettings {
+            use_marks,
+            ..JobSettings::new(PathRole::Cut)
+        };
+        let job = cutjob::plan(&[&zigzag], &settings, &page).unwrap();
+        assert!(job.path_blocks().len() >= 3, "{}", job.path_blocks().len());
+        job
+    }
+
+    fn run(link: &mut FakeLink, job: &Job) -> (Result<String, SendError>, Vec<Stage>) {
+        let stop = AtomicBool::new(false);
+        let mut stages = Vec::new();
+        let out = send(link, job, &fast(), &stop, &mut |s| stages.push(s));
+        (out, stages)
+    }
+
+    fn count(writes: &[Vec<u8>], block: &[u8]) -> usize {
+        writes.iter().filter(|w| w.as_slice() == block).count()
+    }
+
+    #[test]
+    fn a_job_with_marks_is_written_in_order_and_once() {
+        let job = job(true);
+        let mut link = FakeLink::new();
+        let (out, _) = run(&mut link, &job);
+        assert_eq!(out.unwrap(), "CAMEO V1.10");
+
+        let mut expected = vec![
+            INIT.to_vec(),
+            FIRMWARE.to_vec(),
+            STATUS.to_vec(),
+            job.setup_block(),
+            STATUS.to_vec(),
+            job.marks_block().unwrap(),
+        ];
+        for b in job.path_blocks() {
+            expected.push(b);
+            expected.push(STATUS.to_vec());
+        }
+        expected.push(job.end_block());
+        expected.push(STATUS.to_vec());
+        assert_eq!(link.writes, expected);
+
+        assert_eq!(count(&link.writes, &job.setup_block()), 1);
+        assert_eq!(count(&link.writes, &job.marks_block().unwrap()), 1);
+        for b in job.path_blocks() {
+            assert_eq!(count(&link.writes, &b), 1);
+        }
+        assert_eq!(count(&link.writes, &job.end_block()), 1);
+    }
+
+    #[test]
+    fn marks_not_found_ends_the_job_before_any_cut() {
+        let job = job(true);
+        let mut link = FakeLink::new();
+        link.marks = b"    1\x03".to_vec();
+        let (out, _) = run(&mut link, &job);
+        match out {
+            Err(SendError::MarksNotFound(raw)) => assert_eq!(raw, b"    1\x03"),
+            other => panic!("{other:?}"),
+        }
+        let at = link
+            .writes
+            .iter()
+            .position(|w| *w == job.marks_block().unwrap())
+            .unwrap();
+        assert!(
+            link.writes[at + 1..].iter().all(|w| !w.contains(&b'D')),
+            "{:?}",
+            &link.writes[at + 1..]
+        );
+        assert_eq!(at, link.writes.len() - 1);
+    }
+
+    #[test]
+    fn a_marks_reply_with_other_spacing_is_not_found() {
+        assert!(marks_found(b"    0\x03"));
+        for reply in [&b"0\x03"[..], b"   0\x03", b"     0\x03", b"    0"] {
+            assert!(!marks_found(reply), "{reply:?}");
+            let job = job(true);
+            let mut link = FakeLink::new();
+            link.marks = reply.to_vec();
+            let (out, _) = run(&mut link, &job);
+            match out {
+                Err(SendError::MarksNotFound(raw)) => assert_eq!(raw, reply),
+                other => panic!("{reply:?}: {other:?}"),
+            }
+            assert!(
+                job.path_blocks()
+                    .iter()
+                    .all(|b| count(&link.writes, b) == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn no_media_is_said_before_anything_is_set_up() {
+        let job = job(true);
+        let mut link = FakeLink::new().statuses(&[b"2\x03"]);
+        let (out, _) = run(&mut link, &job);
+        assert!(matches!(out, Err(SendError::NoMedia)), "{out:?}");
+        assert_eq!(
+            link.writes,
+            vec![INIT.to_vec(), FIRMWARE.to_vec(), STATUS.to_vec()]
+        );
+    }
+
+    #[test]
+    fn an_unknown_status_is_reported_raw_and_never_ready() {
+        for raw in [&b"3\x03"[..], b"4\x03", b"\x03", b"", b" 0\x03", b"0"] {
+            assert!(status_of(raw).is_err(), "{raw:?}");
+            let job = job(true);
+            let mut link = FakeLink::new().statuses(&[raw]);
+            let (out, _) = run(&mut link, &job);
+            match out {
+                Err(SendError::Unknown(got)) => assert_eq!(got, raw),
+                other => panic!("{raw:?}: {other:?}"),
+            }
+            assert_eq!(
+                link.writes,
+                vec![INIT.to_vec(), FIRMWARE.to_vec(), STATUS.to_vec()]
+            );
+        }
+        assert_eq!(status_of(b"0\x03"), Ok(Status::Ready));
+        assert_eq!(status_of(b"1\x03"), Ok(Status::Moving));
+        assert_eq!(status_of(b"2\x03"), Ok(Status::NoMedia));
+    }
+
+    #[test]
+    fn moving_keeps_polling_and_then_gives_up() {
+        let job = job(true);
+
+        // Moving for a while and then ready: the job goes on.
+        let mut link = FakeLink::new().statuses(&[b"1\x03", b"1\x03", b"1\x03"]);
+        let (out, _) = run(&mut link, &job);
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(&link.writes[2..6], vec![STATUS.to_vec(); 4].as_slice());
+        assert_eq!(link.writes[6], job.setup_block());
+
+        // Moving for ever: polled more than once, then given up, nothing set up.
+        let mut link = FakeLink::new();
+        link.idle = b"1\x03".to_vec();
+        let started = Instant::now();
+        let (out, _) = run(&mut link, &job);
+        assert!(matches!(out, Err(SendError::NeverReady)), "{out:?}");
+        assert!(started.elapsed() >= fast().ready);
+        assert!(count(&link.writes, STATUS) > 1);
+        assert_eq!(count(&link.writes, &job.setup_block()), 0);
+    }
+
+    #[test]
+    fn a_failed_write_is_never_retried() {
+        let job = job(true);
+        let second = job.path_blocks()[1].clone();
+        let mut link = FakeLink::new();
+        link.fail_on = Some(second.clone());
+        let (out, _) = run(&mut link, &job);
+        assert!(
+            matches!(out, Err(SendError::Link(LinkError::Io(_)))),
+            "{out:?}"
+        );
+        assert_eq!(count(&link.writes, &second), 1);
+        assert_eq!(link.writes.last(), Some(&second));
+    }
+
+    #[test]
+    fn a_job_without_marks_sends_no_search() {
+        let job = job(false);
+        assert_eq!(job.marks_block(), None);
+        let mut link = FakeLink::new();
+        let (out, stages) = run(&mut link, &job);
+        assert!(out.is_ok(), "{out:?}");
+        assert!(link.writes.iter().all(|w| !w.starts_with(b"TB99")));
+        assert!(
+            link.writes
+                .iter()
+                .all(|w| !w.windows(5).any(|x| x == b"TB123"))
+        );
+        assert!(!stages.contains(&Stage::FindingMarks));
+        assert_eq!(link.writes[4], STATUS.to_vec());
+        assert_eq!(link.writes[5], job.path_blocks()[0]);
+    }
+
+    #[test]
+    fn progress_reports_each_stage_in_order() {
+        let job = job(true);
+        let n = job.path_blocks().len();
+        let mut link = FakeLink::new();
+        let (out, stages) = run(&mut link, &job);
+        assert!(out.is_ok(), "{out:?}");
+        let mut expected = vec![Stage::Connecting, Stage::FindingMarks];
+        expected.extend((0..n).map(|block| Stage::Cutting { block, of: n }));
+        expected.push(Stage::Finishing);
+        assert_eq!(stages, expected);
+    }
+
+    #[test]
+    fn stop_ends_the_job_between_blocks_and_writes_nothing_more() {
+        let job = job(true);
+        let blocks = job.path_blocks();
+        let mut link = FakeLink::new();
+        let stop = AtomicBool::new(false);
+        let out = send(&mut link, &job, &fast(), &stop, &mut |s| {
+            if s == (Stage::Cutting {
+                block: 0,
+                of: blocks.len(),
+            }) {
+                stop.store(true, Ordering::SeqCst);
+            }
+        });
+        assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
+        assert_eq!(count(&link.writes, &blocks[0]), 1);
+        for b in &blocks[1..] {
+            assert_eq!(count(&link.writes, b), 0);
+        }
+        assert_eq!(count(&link.writes, &job.end_block()), 0);
+        // The block that was sent is waited for, and that is the last thing.
+        assert_eq!(link.writes.last(), Some(&STATUS.to_vec()));
+        let at = link.writes.iter().position(|w| *w == blocks[0]).unwrap();
+        assert_eq!(at + 2, link.writes.len());
+
+        // Raised before the job begins: setup and marks go, no path block does.
+        let mut link = FakeLink::new();
+        let stop = AtomicBool::new(true);
+        let out = send(&mut link, &job, &fast(), &stop, &mut |_| {});
+        assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
+        assert!(blocks.iter().all(|b| count(&link.writes, b) == 0));
+        assert_eq!(count(&link.writes, &job.end_block()), 0);
+    }
+
+    #[test]
+    fn every_send_error_has_its_own_sentence_and_no_dash() {
+        // Exhaustive on purpose: a new variant must be added here to compile.
+        fn every() -> Vec<SendError> {
+            let link = |e: &LinkError| match e {
+                LinkError::NotFound
+                | LinkError::Busy
+                | LinkError::Timeout
+                | LinkError::Io(_)
+                | LinkError::Unsupported => (),
+            };
+            let errors = vec![
+                LinkError::NotFound,
+                LinkError::Busy,
+                LinkError::Timeout,
+                LinkError::Io("the device was removed".into()),
+                LinkError::Unsupported,
+            ];
+            errors.iter().for_each(link);
+            let mut all: Vec<SendError> = errors.into_iter().map(SendError::Link).collect();
+            for e in [
+                SendError::NoMedia,
+                SendError::MarksNotFound(b"    1\x03".to_vec()),
+                SendError::Unknown(b"3\x03".to_vec()),
+                SendError::NeverReady,
+                SendError::Stopped,
+            ] {
+                match e {
+                    SendError::Link(_)
+                    | SendError::NoMedia
+                    | SendError::MarksNotFound(_)
+                    | SendError::Unknown(_)
+                    | SendError::NeverReady
+                    | SendError::Stopped => all.push(e),
+                }
+            }
+            all
+        }
+        let sentences: Vec<String> = every().iter().map(SendError::sentence).collect();
+        assert_eq!(sentences.len(), 10);
+        for (i, s) in sentences.iter().enumerate() {
+            assert!(!s.is_empty());
+            assert!(s.ends_with('.'), "{s}");
+            assert!(!s.contains(['-', '\u{2013}', '\u{2014}']), "{s}");
+            for t in &sentences[i + 1..] {
+                assert_ne!(s, t);
+            }
+        }
+        assert!(sentences[6].contains("    1\\x03"), "{}", sentences[6]);
+        assert!(sentences[7].contains("3\\x03"), "{}", sentences[7]);
+    }
+
+    #[test]
+    fn probe_sends_only_the_three_harmless_commands() {
+        let mut link = FakeLink::new().statuses(&[b"1\x03"]);
+        let (firmware, status) = probe(&mut link, &fast()).unwrap();
+        assert_eq!(firmware, "CAMEO V1.10");
+        assert_eq!(status, Ok(Status::Moving));
+        assert_eq!(
+            link.writes,
+            vec![INIT.to_vec(), FIRMWARE.to_vec(), STATUS.to_vec()]
+        );
+
+        let mut link = FakeLink::new().statuses(&[b"7\x03"]);
+        let (_, status) = probe(&mut link, &fast()).unwrap();
+        assert_eq!(status, Err(b"7\x03".to_vec()));
+    }
+
+    #[test]
+    fn the_log_shows_each_transfer_once_with_its_direction() {
+        let mut lines = Vec::new();
+        let mut link = Logged::new(FakeLink::new(), |l| lines.push(l));
+        link.write(b"FG\x03").unwrap();
+        let reply = link.read_reply(Duration::from_millis(1)).unwrap();
+        assert_eq!(reply, b"CAMEO V1.10    \x03");
+        assert!(link.read_reply(Duration::from_millis(1)).is_err());
+        drop(link);
+        assert_eq!(
+            lines,
+            vec![
+                "> 3 FG\\x03".to_string(),
+                "< 16 CAMEO V1.10    \\x03".to_string(),
+                "< failed: Timeout".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_write_is_logged_cut_short_with_its_length() {
+        let mut lines = Vec::new();
+        let bytes = vec![b'D'; 200];
+        let mut link = Logged::new(FakeLink::new(), |l| lines.push(l));
+        link.write(&bytes).unwrap();
+        drop(link);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            format!("> 200 {} ... (200 bytes)", "D".repeat(96))
+        );
+    }
+
+    #[test]
+    fn control_bytes_are_escaped() {
+        assert_eq!(escaped(b"\x1b\x04"), "\\x1b\\x04");
+        assert_eq!(escaped(b"\\0,0\x03"), "\\\\0,0\\x03");
+        assert_eq!(escaped(b"a b~\x7f\xff\x00"), "a b~\\x7f\\xff\\x00");
+
+        let mut lines = Vec::new();
+        let mut link = Logged::new(FakeLink::new(), |l| lines.push(l));
+        link.write(b"\x1b\x05").unwrap();
+        drop(link);
+        assert_eq!(lines, vec!["> 2 \\x1b\\x05".to_string()]);
+
+        // A failed write is still one line, and says it failed.
+        let mut lines = Vec::new();
+        let mut fake = FakeLink::new();
+        fake.fail_on = Some(b"M0,0\x03".to_vec());
+        let mut link = Logged::new(fake, |l| lines.push(l));
+        assert!(link.write(b"M0,0\x03").is_err());
+        drop(link);
+        assert_eq!(
+            lines,
+            vec!["> 5 M0,0\\x03 failed: Io(\"scripted\")".to_string()]
+        );
+    }
+}
