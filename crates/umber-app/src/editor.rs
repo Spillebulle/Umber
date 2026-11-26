@@ -2244,6 +2244,12 @@ impl Editor {
                 crate::pathtool::PathMode::Draw => false,
             };
         self.with_path_tool(|tool, ground| tool.press(doc, edit, ground));
+        // An edit press on a layer that cannot be edited is nobody's, and
+        // used to say nothing either: a Ctrl press in Draw on a locked layer
+        // looked like a press that had missed.
+        if edit && let Some(why) = self.path_edit_refusal() {
+            self.path_tool.say(why.sentence());
+        }
     }
 
     /// The pointer moved, held or hovering. `shift` moves one handle alone.
@@ -6627,6 +6633,28 @@ mod tests {
                 Vec2::new(150.0, 50.0)
             ]
         );
+    }
+
+    /// A Ctrl press in Draw on a layer that cannot be edited says why, for a
+    /// lock and for a hidden eye, and picks nothing.
+    #[test]
+    fn a_ctrl_press_on_a_layer_that_cannot_be_edited_says_why() {
+        for why in [PathEditRefusal::Locked, PathEditRefusal::Hidden] {
+            let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+            match why {
+                PathEditRefusal::Locked => ed.layers.active_mut().locked = true,
+                PathEditRefusal::Hidden => ed.layers.active_mut().visible = false,
+                PathEditRefusal::NotVector | PathEditRefusal::Newer => unreachable!(),
+            }
+            path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+            assert_eq!(ed.path_tool.pick(), None);
+            assert_eq!(ed.path_tool.said(), Some(why.sentence()), "{why:?}");
+        }
+        // The same press on an editable layer says nothing and picks.
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+        assert!(ed.path_tool.pick().is_some());
+        assert_eq!(ed.path_tool.said(), None);
     }
 
     #[test]
