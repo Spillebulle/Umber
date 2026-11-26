@@ -395,7 +395,7 @@ fn matte_over(rgba: &[u8], matte: [u8; 3]) -> Vec<u8> {
 }
 
 /// `[alpha][value] -> byte` for one channel over one matte component.
-fn matte_table(matte: u8) -> Vec<u8> {
+pub(crate) fn matte_table(matte: u8) -> Vec<u8> {
     let back = srgb_to_linear(matte as f32 / 255.0);
     let mut t = vec![0u8; 256 * 256];
     for a in 0..256usize {
@@ -416,6 +416,13 @@ fn matte_table(matte: u8) -> Vec<u8> {
 /// extension Umber reads or writes is dropped; anything else is left alone,
 /// because a document deliberately called `study.v2` is not a `.v2` file.
 pub fn default_file_name(title: &str, format: ExportFormat) -> String {
+    format!("{}.{}", title_stem(title), format.extension())
+}
+
+/// A document's title with any extension Umber knows taken off, and
+/// "untitled" for a title with nothing left in it. The print sheet's suggested
+/// name is built from the same stem, so the two cannot disagree.
+pub(crate) fn title_stem(title: &str) -> &str {
     let stem = title.rsplit_once('.').map_or(title, |(stem, ext)| {
         if !stem.is_empty() && KNOWN_EXTENSIONS.iter().any(|k| ext.eq_ignore_ascii_case(k)) {
             stem
@@ -424,8 +431,7 @@ pub fn default_file_name(title: &str, format: ExportFormat) -> String {
         }
     });
     let stem = stem.trim();
-    let stem = if stem.is_empty() { "untitled" } else { stem };
-    format!("{stem}.{}", format.extension())
+    if stem.is_empty() { "untitled" } else { stem }
 }
 
 /// Extensions `default_file_name` will take off a document's title: everything

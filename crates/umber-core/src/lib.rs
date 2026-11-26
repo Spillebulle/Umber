@@ -34,6 +34,7 @@ pub mod pathedit;
 mod pattern_table;
 pub mod preset;
 pub mod preview;
+pub mod printsheet;
 pub mod selection;
 pub mod sheet;
 // **Public for `examples/survey-clip-schema.rs` and for nothing else.** Nothing
