@@ -1230,6 +1230,15 @@ pub struct Editor {
     /// `quit_requested` is one: the dialog is drawn from `ui::draw`, and the
     /// trace needs the device. `App` spends it once, after the frame.
     pub trace_requested: bool,
+    /// The Send to cutter dialog, and the check or job it has running. Above
+    /// the `--- documents ---` line because it describes the machine on the
+    /// desk rather than a document: a running job owns its own copy of what
+    /// it sends and reads nothing from whichever tab is in front.
+    pub cutter: crate::cutterdlg::CutterForm,
+    /// What the Send to cutter dialog asked for. Spent by `App` after the
+    /// frame, as `trace_requested` is, because a job has to settle the stroke,
+    /// the float and a Path tool draft before the paths are read.
+    pub cutter_request: Option<crate::cutterdlg::CutterRequest>,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -1543,6 +1552,8 @@ impl Default for Editor {
             recovery: crate::recoverdlg::Recovery::default(),
             quit_requested: false,
             trace_requested: false,
+            cutter: crate::cutterdlg::CutterForm::default(),
+            cutter_request: None,
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),
@@ -1986,6 +1997,12 @@ impl Editor {
             }
         }
         self.plan_paths(paths, None).map_err(path_refusal)
+    }
+
+    /// Put the Send to cutter dialog up. Its settings are the session's, so
+    /// they are as the artist last left them.
+    pub fn open_cutter(&mut self) {
+        self.cutter.open = true;
     }
 
     /// Put the trace outline dialog up. The first time in a session the

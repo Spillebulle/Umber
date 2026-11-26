@@ -20,6 +20,7 @@ mod crash;
 /// finds out what it actually answers, and an example sees only what the crate
 /// exposes.
 pub mod cutter;
+mod cutterdlg;
 mod dock;
 /// Redrawing the pictures in `docs/images/` from the interface itself.
 ///

@@ -433,6 +433,11 @@ impl Job {
     pub fn length_mm(&self) -> f32 {
         self.length_mm
     }
+
+    /// The settings the job was planned with, inside what the machine takes.
+    pub fn settings(&self) -> JobSettings {
+        self.settings
+    }
 }
 
 #[cfg(test)]

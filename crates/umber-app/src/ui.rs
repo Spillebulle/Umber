@@ -364,6 +364,10 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     // `Editor::trace_requested`, because the alpha it traces is the GPU's.
     crate::tracedlg::show(root, &p, ed);
 
+    // And again: it answers by raising `Editor::cutter_request`, because a
+    // job has to settle the stroke, the float and a Path tool draft first.
+    crate::cutterdlg::show(root, &p, ed);
+
     // Before the close prompt, and above it: this one is the answer to "the
     // window is closing", which supersedes any question about a single tab.
     match tabs::quit_prompt(root, &p, ed) {
