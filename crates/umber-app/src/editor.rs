@@ -359,6 +359,11 @@ impl TraceSource {
     }
 }
 
+/// Why a trace past the bounds of a fresh vector record was refused. Not the
+/// record's own sentence, which says to use another vector layer: a new layer
+/// would hold no more, so what helps is fewer, larger pieces.
+pub const TOO_MANY_PIECES_LINE: &str = "The artwork traces to more paths than one layer can hold. Raise the margin so that pieces join, or trace one layer at a time.";
+
 /// The trace outline dialog's state: whether it is up, and what it will ask
 /// for. Per session rather than per document, like the rest of [`UiState`]:
 /// a margin chosen for one sticker sheet is the margin wanted on the next.
@@ -1963,6 +1968,22 @@ impl Editor {
         let paths = umber_core::trace::trace(&region, settings);
         if paths.is_empty() {
             return Err(nothing());
+        }
+        // Judged against a fresh record first, through the record's own
+        // bounds: past them, `plan_paths` would say to use another vector
+        // layer, and no layer holds more than a fresh one does.
+        let too_many = || Notice {
+            title: "Too many pieces to trace".to_string(),
+            lines: vec![TOO_MANY_PIECES_LINE.to_string()],
+        };
+        if let Err(why) = umber_core::VectorObject::empty().appended(paths.clone()) {
+            match why {
+                umber_core::vector::VectorRefusal::TooManyPaths
+                | umber_core::vector::VectorRefusal::TooManyNodes => return Err(too_many()),
+                // Left to `plan_paths`, which words them already.
+                umber_core::vector::VectorRefusal::Impossible
+                | umber_core::vector::VectorRefusal::Opaque => {}
+            }
         }
         self.plan_paths(paths, None).map_err(path_refusal)
     }
@@ -7539,11 +7560,17 @@ mod tests {
     /// an em-dash.
     #[test]
     fn no_path_edit_sentence_has_a_run_of_spaces() {
-        let others = [PATH_NO_SLICE_LINE, PATH_NOT_KEPT_TITLE, NO_SLICE_LINE];
+        let others = [
+            PATH_NO_SLICE_LINE,
+            PATH_NOT_KEPT_TITLE,
+            NO_SLICE_LINE,
+            TOO_MANY_PIECES_LINE,
+        ];
         for text in PathEditRefusal::ALL
             .iter()
             .map(|why| why.sentence())
             .chain(others)
+            .chain(TraceSource::ALL.map(TraceSource::nothing_line))
         {
             assert!(!text.contains("  "), "a run of spaces in {text:?}");
             assert_eq!(text.trim(), text);
@@ -7657,6 +7684,68 @@ mod tests {
                 assert!(!ed.session.active_tab().modified);
             }
         }
+    }
+
+    /// More pieces than any one layer holds is its own refusal, and it says
+    /// what would help: a new layer would hold no more than the one active,
+    /// so "use another vector layer" is advice that cannot work. Changes
+    /// nothing, like every refusal.
+    #[test]
+    fn a_trace_of_more_pieces_than_a_layer_holds_says_how_to_join_them() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        // 70 by 70 dots of three pixels, six apart, is 4900 pieces.
+        let mut ed = Editor::default();
+        ed.doc.size = glam::UVec2::new(420, 420);
+        let alpha: Vec<u8> = (0..420u32)
+            .flat_map(|y| (0..420u32).map(move |x| (x, y)))
+            .map(|(x, y)| if x % 6 < 3 && y % 6 < 3 { 255 } else { 0 })
+            .collect();
+        assert!(
+            umber_core::trace::trace(
+                &umber_core::trace::region(ed.doc.size, &alpha, 0.0, umber_core::trace::MAX_CELLS)
+                    .expect("dots"),
+                &settings
+            )
+            .len()
+                > umber_core::vector::MAX_PATHS
+        );
+        ed.session.active_tab_mut().modified = false;
+        let before = (stack_ids(&ed), ed.history.len());
+        let notice = ed
+            .plan_trace(&alpha, TraceSource::Everything, &settings)
+            .expect_err("too many pieces");
+        assert_eq!(notice.title, "Too many pieces to trace");
+        assert_eq!(notice.lines, vec![TOO_MANY_PIECES_LINE.to_string()]);
+        assert_eq!((stack_ids(&ed), ed.history.len()), before);
+        assert!(!ed.session.active_tab().modified);
+    }
+
+    /// Where the trace would fit a layer of its own but not the vector layer
+    /// that is active, the active layer is what is full, and `plan_paths`'
+    /// own sentence is the right one.
+    #[test]
+    fn a_trace_onto_a_full_layer_says_the_layer_is_full() {
+        let full: Vec<umber_core::Path> = (0..umber_core::vector::MAX_PATHS)
+            .map(|i| {
+                let y = i as f32 * 0.01;
+                line(Vec2::new(0.0, y), Vec2::new(5.0, y))
+            })
+            .collect();
+        let mut ed = with_paths(full);
+        ed.doc.size = glam::UVec2::new(64, 64);
+        let alpha = a_disc(&ed);
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        let notice = ed
+            .plan_trace(&alpha, TraceSource::ThisLayer, &settings)
+            .expect_err("the layer is full");
+        assert_eq!(
+            notice.lines,
+            vec![
+                umber_core::vector::VectorRefusal::TooManyPaths
+                    .sentence()
+                    .to_string()
+            ]
+        );
     }
 
     /// A trace refused while another notice is up lands under that notice's
