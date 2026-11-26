@@ -5741,7 +5741,19 @@ mod tests {
     #[test]
     fn the_marks_switch_shows_a_chord_bound_to_it() {
         let _serial = crate::prefs::prefs_lock();
-        let before = shortcuts::published();
+        /// Puts the table back when it goes, so a failing assertion below
+        /// cannot leave the rest of the process reading this test's chord.
+        /// Declared after the lock, so it drops first and the table is restored
+        /// while the lock is still held.
+        struct Restore(Option<Vec<shortcuts::Binding>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(before) = self.0.take() {
+                    shortcuts::publish(before);
+                }
+            }
+        }
+        let _restore = Restore(Some(shortcuts::published()));
         let bound = shortcuts::Binding {
             action: Action::ToggleSheetMarks,
             key: winit::keyboard::KeyCode::F9,
@@ -5759,7 +5771,6 @@ mod tests {
         shortcuts::publish(table);
         let mut ed = Editor::default();
         let drawn = menu_strings(Menu::File, &mut ed);
-        shortcuts::publish(before);
 
         let label = drawn
             .iter()

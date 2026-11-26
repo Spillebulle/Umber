@@ -4314,10 +4314,19 @@ impl UmberApp {
                         .to_string(),
                 ];
                 if marks.is_none() {
-                    lines.push(
+                    // Two different situations and two different remedies. The
+                    // second should be unreachable through the interface, since
+                    // the File menu's switch refuses a page too small for the
+                    // marks; a file, or a resize after the switch, can still
+                    // leave the flag set against such a page, and saying "switch them on" to somebody whose
+                    // marks are already on would send them round in a circle.
+                    lines.push(if doc.marks {
+                        "This page cannot hold registration marks, so none were printed."
+                            .to_string()
+                    } else {
                         "This document has no registration marks. Switch them on in the File menu to print and cut."
-                            .to_string(),
-                    );
+                            .to_string()
+                    });
                 }
                 self.editor.notice = Some(Notice {
                     title: "Print sheet exported".to_string(),
