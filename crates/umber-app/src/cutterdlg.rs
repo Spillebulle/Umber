@@ -46,6 +46,7 @@ const NO_MARKS: &str = "This document has no registration marks. Switch them on 
 const MARKS_DO_NOT_FIT: &str = "This page cannot hold registration marks.";
 const STOPPING: &str = "Stopping. The cutter is finishing the part it was already sent.";
 const BLADE_DEPTH: &str = "For the AutoBlade. Off leaves the blade as it was last set.";
+const MAT: &str = "On when the sheet is stuck to the cutting mat. Off when it is fed in bare.";
 /// The depth the rail starts at the first time it is switched on.
 const FIRST_DEPTH: u8 = 3;
 
@@ -368,13 +369,14 @@ fn send_header(job: &Job) -> String {
         None => "blade depth not set".to_string(),
     };
     format!(
-        "Send: {}, pressure {}, speed {}, passes {}, {depth}, registration marks {}, {} paths, \
-         {:.1} mm",
+        "Send: {}, pressure {}, speed {}, passes {}, {depth}, registration marks {}, cutting mat \
+         {}, {} paths, {:.1} mm",
         offered(s.role).unwrap_or("Cut"),
         s.pressure,
         s.speed,
         s.passes,
         if s.use_marks { "on" } else { "off" },
+        if s.mat { "on" } else { "off" },
         job.path_count(),
         job.length_mm()
     )
@@ -495,6 +497,10 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                         },
                     );
                 }
+                ui.add_space(8.0);
+                widgets::toggle_row(ui, p, "Cutting mat", &mut form.settings_mut().mat);
+                ui.add_space(4.0);
+                caption(ui, p, MAT);
                 ui.add_space(12.0);
 
                 let s = form.settings_mut();
@@ -948,6 +954,49 @@ mod tests {
     }
 
     #[test]
+    fn the_cutting_mat_is_a_switch_of_its_own_for_each_role() {
+        let mut h = Harness::new();
+        let mut ed = opened();
+        let shot = h.settled(&mut ed);
+        assert!(shot.has("Cutting mat"), "{:?}", shot.words());
+        assert!(shot.has(MAT), "{:?}", shot.words());
+        assert!(ed.cutter.settings().mat);
+        // Marks first, the mat second.
+        assert!(shot.toggles.len() >= 2, "{:?}", shot.toggles);
+        assert!(shot.at("Cutting mat").y > shot.at("Use registration marks").y);
+        h.click(&mut ed, shot.toggles[1].center());
+        assert!(!ed.cutter.settings().mat, "the mat switch did nothing");
+        assert!(ed.cutter.settings().use_marks, "the wrong switch moved");
+        let job = ed.cutter.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(job.setup_block().starts_with(b"TG0\x03"));
+
+        // The pen's own setting was not touched.
+        h.press(&mut ed, "Plot");
+        assert!(ed.cutter.settings().mat);
+        let job = ed.cutter.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(job.setup_block().starts_with(b"TG3\x03"));
+    }
+
+    #[test]
+    fn the_log_header_says_the_cutting_mat() {
+        let ed = opened();
+        let mut form = CutterForm::default();
+        let job = form.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(
+            send_header(&job).contains(", cutting mat on, "),
+            "{}",
+            send_header(&job)
+        );
+        form.cut.mat = false;
+        let job = form.plan_job(&ed.layers, &ed.doc).unwrap();
+        assert!(
+            send_header(&job).contains(", cutting mat off, "),
+            "{}",
+            send_header(&job)
+        );
+    }
+
+    #[test]
     fn the_log_header_says_the_blade_depth() {
         let ed = opened();
         let mut form = CutterForm::default();
@@ -1051,8 +1100,8 @@ mod tests {
             shot.words()
         );
         // The pill is drawn and pressing it changes nothing. The marks are
-        // the first pill; the blade depth's is below it.
-        assert_eq!(shot.toggles.len(), 2, "{:?}", shot.toggles);
+        // the first pill; the mat's and the blade depth's are below it.
+        assert_eq!(shot.toggles.len(), 3, "{:?}", shot.toggles);
         let pill = shot.toggles[0].center();
         h.click(&mut ed, pill);
         assert!(ed.cutter.settings().use_marks);

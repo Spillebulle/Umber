@@ -67,6 +67,10 @@ pub struct JobSettings {
     pub speed: u8,
     /// How many times every path is followed, `1..=5`.
     pub passes: u8,
+    /// Whether the sheet is stuck to the Portrait's 8 by 12 inch cutting mat
+    /// rather than fed in bare. Sent as the mat number the reference
+    /// implementation uses for it, `TG3`, or `TG0` for no mat.
+    pub mat: bool,
     /// The AutoBlade's depth, `0..=10`, or `None` to leave the blade as it
     /// was last set. Sent only for a cut: a pen has no blade.
     pub depth: Option<u8>,
@@ -87,6 +91,7 @@ impl JobSettings {
             pressure,
             speed,
             passes: 1,
+            mat: true,
             depth: None,
         }
     }
@@ -371,9 +376,12 @@ impl Job {
             PathRole::Cut => "FC18,1,1",
             PathRole::Plot | PathRole::Ink => "FC0,1,1",
         };
+        // The mat is the one thing here the reference sends differently with
+        // and without one; what follows it is the same either way.
+        let mat = if s.mat { "TG3" } else { "TG0" };
         let mut out = Vec::new();
         for c in [
-            "TG0".to_string(),
+            mat.to_string(),
             "FN0".to_string(),
             "TB50,0".to_string(),
             "\\0,0".to_string(),
@@ -530,7 +538,7 @@ mod tests {
         let job = plan(&[&sq], &JobSettings::new(PathRole::Cut), &a4(true)).unwrap();
         assert_eq!(
             job.setup_block(),
-            etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX10,1·!5,1·FC18,1,1·FE0,1·")
+            etx("TG3·FN0·TB50,0·\\0,0·Z5940,4060·FX10,1·!5,1·FC18,1,1·FE0,1·")
         );
         assert_eq!(
             job.marks_block(),
@@ -565,9 +573,40 @@ mod tests {
         let setup = job.setup_block();
         assert_eq!(
             setup,
-            etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX5,1·!8,1·FC0,1,1·FE0,1·")
+            etx("TG3·FN0·TB50,0·\\0,0·Z5940,4060·FX5,1·!8,1·FC0,1,1·FE0,1·")
         );
         assert!(!setup.windows(4).any(|w| w == b"FC18"));
+    }
+
+    #[test]
+    fn a_job_on_a_mat_says_so() {
+        let sq = square(PathRole::Cut, 20.0, 30.0);
+        let on = JobSettings::new(PathRole::Cut);
+        assert!(
+            on.mat,
+            "a sheet is stuck to the mat unless the artist says not"
+        );
+        let job = plan(&[&sq], &on, &a4(true)).unwrap();
+        // The reference's command for the Portrait's 8 by 12 inch mat.
+        assert_eq!(
+            job.setup_block(),
+            etx("TG3·FN0·TB50,0·\\0,0·Z5940,4060·FX10,1·!5,1·FC18,1,1·FE0,1·")
+        );
+        let bare = JobSettings { mat: false, ..on };
+        let job = plan(&[&sq], &bare, &a4(true)).unwrap();
+        assert_eq!(
+            job.setup_block(),
+            etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX10,1·!5,1·FC18,1,1·FE0,1·")
+        );
+        // A pen on bare paper is the same command.
+        let sq = square(PathRole::Plot, 20.0, 30.0);
+        let pen = JobSettings {
+            mat: false,
+            ..JobSettings::new(PathRole::Plot)
+        };
+        let job = plan(&[&sq], &pen, &a4(true)).unwrap();
+        assert!(job.setup_block().starts_with(b"TG0\x03FN0\x03"));
+        assert!(JobSettings::new(PathRole::Plot).mat);
     }
 
     #[test]
@@ -582,7 +621,7 @@ mod tests {
         // the speed, the blade offset and the lift.
         assert_eq!(
             job.setup_block(),
-            etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX10,1·!5,1·FC18,1,1·FE0,1·TF3,1·")
+            etx("TG3·FN0·TB50,0·\\0,0·Z5940,4060·FX10,1·!5,1·FC18,1,1·FE0,1·TF3,1·")
         );
         // Zero is a depth, not "unset".
         let zero = JobSettings {
@@ -612,7 +651,7 @@ mod tests {
             let job = plan(&[&sq], &settings, &a4(true)).unwrap();
             assert_eq!(
                 job.setup_block(),
-                etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX5,1·!8,1·FC0,1,1·FE0,1·"),
+                etx("TG3·FN0·TB50,0·\\0,0·Z5940,4060·FX5,1·!8,1·FC0,1,1·FE0,1·"),
                 "{depth:?}"
             );
             assert!(!job.setup_block().windows(2).any(|w| w == b"TF"));
@@ -774,7 +813,7 @@ mod tests {
         let job = plan(&[&near], &cut(false), &wide).unwrap();
         assert_eq!(
             job.setup_block(),
-            etx("TG0·FN0·TB50,0·\\0,0·Z6000,4060·FX10,1·!5,1·FC18,1,1·FE0,1·")
+            etx("TG3·FN0·TB50,0·\\0,0·Z6000,4060·FX10,1·!5,1·FC18,1,1·FE0,1·")
         );
         let far = path(PathRole::Cut, false, &[(20.0, 20.0), (250.0, 20.0)]);
         assert_eq!(
@@ -931,7 +970,7 @@ mod tests {
         let job = plan(&[&line], &low, &a4(false)).unwrap();
         assert_eq!(
             job.setup_block(),
-            etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX1,1·!1,1·FC18,1,1·FE0,1·")
+            etx("TG3·FN0·TB50,0·\\0,0·Z5940,4060·FX1,1·!1,1·FC18,1,1·FE0,1·")
         );
         assert_eq!(joined(&job), etx("M600,200·D600,1000·"));
         let high = JobSettings {
@@ -943,7 +982,7 @@ mod tests {
         let job = plan(&[&line], &high, &a4(false)).unwrap();
         assert_eq!(
             job.setup_block(),
-            etx("TG0·FN0·TB50,0·\\0,0·Z5940,4060·FX33,1·!10,1·FC18,1,1·FE0,1·")
+            etx("TG3·FN0·TB50,0·\\0,0·Z5940,4060·FX33,1·!10,1·FC18,1,1·FE0,1·")
         );
         assert_eq!(joined(&job), etx(&"M600,200·D600,1000·".repeat(5)));
     }

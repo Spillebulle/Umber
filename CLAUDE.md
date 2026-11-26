@@ -2298,6 +2298,14 @@ conversation is a rule about a scripted fake until somebody has.
   on the half-unit edge tolerance rounded to 4061 after `Z5940,4060`. `SO0` is
   deliberately not sent: it moves the origin for the next job, which a roll
   feed wants and a print-and-cut sheet does not. Do not "tidy" a command.
+- **The cutting mat is `TG3`, and no mat is `TG0`.** `JobSettings::mat`
+  defaults to on, because a sticker sheet is normally stuck to the Portrait's
+  8 by 12 inch mat, and the reference implementation's number for that mat is
+  3; it is per role, and the log header records it. It is the only thing the
+  reference sends differently for the two: `FN0` and `TB50,0` follow either way.
+  Its boundary differs too (`Z6096,4064`, the mat's 12 by 8 inches, where Umber
+  sends the page clamped to 203 mm), and that was deliberately not copied: the
+  page is the smaller, and a blade is not sent past the sheet it is cutting.
 - **The blade depth is `TF<d>,1`, last in the setup, and only for a cut.**
   `JobSettings::depth` is `None` by default and then the setup block is byte
   for byte what it was before the field existed; `Some(d)` is clamped to
@@ -2382,6 +2390,7 @@ conversation is a rule about a scripted fake until somebody has.
     and a 0.5 mm stroke;
   - whether the machine corrects for a print that came out slightly scaled;
   - the pressure and speed that suit sticker paper;
+  - what the machine does with `TG3` and with `TG0`, on the mat and off it;
   - whether one read left outstanding across every poll behaves on the real
     driver, and whether its cancel on close completes;
   - whether `ESC EOT` answers at all;
