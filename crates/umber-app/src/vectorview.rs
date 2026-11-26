@@ -372,17 +372,22 @@ fn shrink_scratch(scratch: &mut Vec<Vec2>) {
 /// its rubber band, the dragged path, the picked path. Rebuilt on every call,
 /// into buffers it keeps, so a warm frame allocates nothing here.
 ///
-/// **Not cached, deliberately.** A draft moves with the pointer and the paths
-/// are a few nodes; a key like [`VectorView`]'s would be a different number on
-/// every frame this is used. The runs come from [`trace_path`], the overlay's
-/// own body, so a path is clipped and culled exactly as it will be once it is
-/// on a layer.
+/// **Not cached here; its caller decides when to call.** The paths are not
+/// always a few nodes: a picked path can be a lasso's tens of thousands, so a
+/// trace is work that scales with the pick. `ui::path_tool_marks` keys the
+/// whole picture on what it depends on and calls this only when that key
+/// moves, which a still frame never does. The runs come from [`trace_path`],
+/// the overlay's own body, so a path is clipped and culled exactly as it will
+/// be once it is on a layer.
 #[derive(Default)]
 pub struct PathPreview {
     lines: Vec<ScreenLine>,
     points: Vec<Pos2>,
     scratch: Vec<Vec2>,
     generation: u64,
+    /// Cubics flattened over every call, for the still-frame guard.
+    #[cfg(test)]
+    pub(crate) flattened: usize,
 }
 
 impl PathPreview {
@@ -405,6 +410,8 @@ impl PathPreview {
             lines,
             points,
             scratch,
+            #[cfg(test)]
+            flattened,
             ..
         } = self;
         let mut runs = Runs {
@@ -419,7 +426,12 @@ impl PathPreview {
                 PathRole::Cut | PathRole::Plot => {}
                 PathRole::Ink => continue,
             }
-            if trace_path(path, &mut runs, scratch, &to_screen, keep, tolerance).capped {
+            let traced = trace_path(path, &mut runs, scratch, &to_screen, keep, tolerance);
+            #[cfg(test)]
+            {
+                *flattened += traced.flattened;
+            }
+            if traced.capped {
                 break;
             }
         }

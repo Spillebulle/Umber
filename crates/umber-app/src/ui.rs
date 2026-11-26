@@ -739,31 +739,65 @@ pub(crate) enum PathMark {
 
 /// What the Path tool paints with, kept on `Editor` so a warm frame allocates
 /// nothing of its own: the preview's buffers, the two paths built from the
-/// draft, and the marks.
+/// draft, the marks, and the mesh.
 #[derive(Default)]
 pub struct PathPaint {
     preview: crate::vectorview::PathPreview,
     draft: Vec<umber_core::Node>,
     band: Vec<umber_core::Node>,
     marks: Vec<PathMark>,
-    /// The lines the mesh was tessellated from, compared by value. **The key
-    /// is the content and not a list of what it depends on**: a draft, a drag,
-    /// a hover, a pick, the camera and the record all reach the lines, and a
-    /// key naming them is one that goes stale the day a seventh is added. The
-    /// lines are a few dozen points and are rebuilt allocation-free anyway, so
-    /// comparing them is cheaper than the tessellation it saves and cannot
-    /// disagree with it.
-    built_lines: Vec<crate::vectorview::ScreenLine>,
-    built_points: Vec<egui::Pos2>,
-    /// What the mesh also depends on: the scale and the two colours.
-    built_for: Option<(u32, [egui::Color32; 2])>,
+    /// What the lines, the mesh and the marks were last built for. **A frame
+    /// whose key is equal does no work that scales with a path**: no trace, no
+    /// walk of the nodes, no tessellation. That matters because the picked
+    /// path can be a lasso's tens of thousands of nodes, and comparing the
+    /// traced lines by value, which this used to do, was itself a pass over
+    /// all of them on every frame.
+    built: Option<PaintKey>,
+    /// Whether the last build had any lines to hand egui.
+    lines_drawn: bool,
     mesh: std::sync::Arc<egui::epaint::Mesh>,
     /// Meshes tessellated, for the guard that a still frame builds none.
     #[cfg(test)]
     builds: usize,
+    /// Nodes `path_marks` walked, for the same guard.
+    #[cfg(test)]
+    walked: usize,
+}
+
+/// Everything the Path tool's picture is a function of. Equal keys are equal
+/// pictures, which is what lets a still frame reuse the last one whole.
+///
+/// The record is named by document, active slot and revision, and by whether
+/// it may be edited at all (a lock or an eye changes that without moving the
+/// revision). The tool's own state is one number, [`PathTool::generation`],
+/// which every method that changes what is drawn moves from inside itself, so
+/// the key does not need a field per thing the tool holds; `role` is beside it
+/// because it is a plain field the strip writes. Then the view: the camera,
+/// the region, both scales, the two colours, whether the band's hover is still
+/// over the canvas, and the cached node gate.
+///
+/// [`PathTool::generation`]: crate::pathtool::PathTool::generation
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PaintKey {
+    document: crate::session::DocId,
+    slot: Option<u32>,
+    revision: u64,
+    editable: bool,
+    tool: u64,
+    role: umber_core::PathRole,
+    nodes_shown: bool,
+    band: bool,
+    center: [u32; 2],
+    zoom: u32,
+    view: [u32; 4],
+    ppp: u32,
+    device: u32,
+    colours: [egui::Color32; 2],
 }
 
 /// Where the marks on the path in hand are, in screen points, culled to `view`.
+/// Answers how many nodes it walked, which is what the still-frame guard
+/// counts.
 ///
 /// **The one statement the painter and the tests read.** The picked path's
 /// nodes are marked only where [`Editor::path_nodes_shown`] says so, which is
@@ -772,8 +806,14 @@ pub struct PathPaint {
 /// is only ever grabbed on the picked node. The draft's nodes are marked too,
 /// with the handles of its last node, which is the one a press-and-drag is
 /// pulling out. Mapped by [`crate::vectorview::screen_mapping`], the line's own.
-pub(crate) fn path_marks(ed: &Editor, view: Rect, out: &mut Vec<PathMark>) {
+///
+/// **A draft past [`crate::pathtool::NODE_MARK_CAP`] nodes still marks its last
+/// node and that node's handles**, and its first (which is where a press would
+/// close it), and caps only the rest: a path taken up to be carried on can be
+/// that long, and the end being drawn from is the one mark it cannot lose.
+pub(crate) fn path_marks(ed: &Editor, view: Rect, out: &mut Vec<PathMark>) -> usize {
     out.clear();
+    let mut walked = 0;
     let ppp = ed.pixels_per_point;
     let to_screen = crate::vectorview::screen_mapping(&ed.camera, view, ppp);
     // Nodes are culled in the document, against the view as a box of document
@@ -795,6 +835,7 @@ pub(crate) fn path_marks(ed: &Editor, view: Rect, out: &mut Vec<PathMark>) {
             .or_else(|| ed.editable_paths()?.paths().get(pick.path));
         if let Some(path) = path {
             for (i, node) in path.nodes.iter().enumerate() {
+                walked += 1;
                 let picked = pick.node == Some(i);
                 if in_view(node.at) {
                     out.push(PathMark::Node {
@@ -809,14 +850,16 @@ pub(crate) fn path_marks(ed: &Editor, view: Rect, out: &mut Vec<PathMark>) {
         }
     }
     if let Some(draft) = tool.draft() {
-        let closes = draft.nodes.len() >= 3;
-        let last = draft.nodes.len().saturating_sub(1);
-        for (i, node) in draft
-            .nodes
-            .iter()
-            .enumerate()
-            .take(crate::pathtool::NODE_MARK_CAP)
-        {
+        let len = draft.nodes.len();
+        let closes = len >= 3;
+        let last = len.saturating_sub(1);
+        let cap = crate::pathtool::NODE_MARK_CAP;
+        // The first `cap` nodes, which take in the first, and the last where
+        // the cap stopped short of it.
+        let tail = (len > cap).then_some(last);
+        for i in (0..len.min(cap)).chain(tail) {
+            walked += 1;
+            let node = &draft.nodes[i];
             if in_view(node.at) {
                 out.push(PathMark::Node {
                     at: to_screen(node.at),
@@ -828,6 +871,7 @@ pub(crate) fn path_marks(ed: &Editor, view: Rect, out: &mut Vec<PathMark>) {
             }
         }
     }
+    walked
 }
 
 /// `node`'s two handles as marks, where either end is in view.
@@ -854,8 +898,8 @@ fn on_device_pixel(x: f32, ppp: f32) -> f32 {
     (x * ppp).round() / ppp
 }
 
-/// The path in hand: the picked path or the one being dragged, the draft and
-/// its rubber band, and then the nodes and handles marked on them.
+/// The path in hand: the draft and its rubber band, the picked path or the one
+/// being dragged, and then the nodes and handles marked on them.
 ///
 /// Drawn only with the Path tool in hand. **The paths are the overlay's own
 /// two-tone pair, in the accent**, through [`machine_line_mesh`] at its widths,
@@ -864,8 +908,13 @@ fn on_device_pixel(x: f32, ppp: f32) -> f32 {
 /// pair, dark under light, with every stroke a whole number of device pixels
 /// wide ([`ant_width`]) for the reason the marquee's is.
 ///
+/// **The draft and its band are traced before the picked path.** The preview
+/// stops at a point budget, and a picked path long enough to meet it would
+/// otherwise hide the very lines the artist is drawing.
+///
 /// Requests no repaint of its own: a draft moves with the pointer, which is
-/// already a frame.
+/// already a frame. A frame whose [`PaintKey`] is unchanged hands egui last
+/// frame's mesh and marks and does nothing else.
 fn path_tool_marks(painter: &egui::Painter, p: &Palette, ed: &mut Editor, view: Rect) {
     if ed.ui.tool != Tool::Path {
         return;
@@ -881,106 +930,55 @@ fn path_tool_marks(painter: &egui::Painter, p: &Palette, ed: &mut Editor, view: 
     let accent = p.accent;
     let painter = painter.with_clip_rect(view);
 
-    // The paths. At most three: picked or dragged, the draft, its band.
     let tool = &ed.path_tool;
-    let picked = tool.dragged().or_else(|| {
-        let pick = tool.pick()?;
-        ed.editable_paths()?.paths().get(pick.path)
-    });
-    let mut draft_path = None;
-    let mut band_path = None;
-    if let Some(draft) = tool.draft() {
-        paint.draft.clear();
-        paint.draft.extend_from_slice(&draft.nodes);
-        draft_path = Some(umber_core::Path {
-            role: tool.role,
-            closed: draft.closed,
-            nodes: std::mem::take(&mut paint.draft),
-            ink: None,
-        });
-        // The hover is the last place the pointer reported and is not cleared
-        // when it leaves the canvas or goes over a panel, so the band is drawn
-        // only while that place is still the canvas's, read the way a press
-        // is. The place is the hover's own and not `Editor::cursor`, which a
-        // pen never writes.
-        let over_canvas = |hover: glam::Vec2| {
+    // The hover is the last place the pointer reported and is not cleared
+    // when it leaves the canvas or goes over a panel, so the band is drawn
+    // only while that place is still the canvas's, read the way a press is.
+    // The place is the hover's own and not `Editor::cursor`, which a pen
+    // never writes.
+    let band = tool.draft().is_some_and(|d| !d.nodes.is_empty())
+        && !tool.is_held()
+        && tool.hover().is_some_and(|hover| {
             ed.pointer_over_canvas(ed.camera.doc_to_screen(hover, ed.canvas_pivot))
-        };
-        if let (Some(last), Some(hover), false) = (
-            draft.nodes.last(),
-            tool.hover().filter(|h| over_canvas(*h)),
-            tool.is_held(),
-        ) {
-            paint.band.clear();
-            paint.band.push(umber_core::Node {
-                handle_in: glam::Vec2::ZERO,
-                ..*last
-            });
-            paint.band.push(umber_core::Node::corner(hover));
-            band_path = Some(umber_core::Path {
-                role: tool.role,
-                closed: false,
-                nodes: std::mem::take(&mut paint.band),
-                ink: None,
-            });
-        }
+        });
+    let key = PaintKey {
+        document: ed.session.active_id(),
+        slot: ed.layers.active_slot(),
+        revision: ed.layers.vector_revision(),
+        editable: ed.editable_paths().is_some(),
+        tool: tool.generation(),
+        role: tool.role,
+        nodes_shown: ed.path_nodes_shown(),
+        band,
+        center: [ed.camera.center.x.to_bits(), ed.camera.center.y.to_bits()],
+        zoom: ed.camera.zoom.to_bits(),
+        view: [
+            view.min.x.to_bits(),
+            view.min.y.to_bits(),
+            view.max.x.to_bits(),
+            view.max.y.to_bits(),
+        ],
+        ppp: ppp.to_bits(),
+        device: device.to_bits(),
+        colours: [under, accent],
+    };
+    if paint.built != Some(key) {
+        rebuild_path_paint(
+            &mut paint,
+            ed,
+            view,
+            ppp,
+            band,
+            ctx,
+            device,
+            [under, accent],
+        );
+        paint.built = Some(key);
     }
-    let mut refs: [&umber_core::Path; 3] = [&EMPTY_PATH; 3];
-    let mut count = 0;
-    for path in [picked, draft_path.as_ref(), band_path.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        refs[count] = path;
-        count += 1;
-    }
-    {
-        let PathPaint {
-            preview,
-            built_lines,
-            built_points,
-            built_for,
-            mesh,
-            #[cfg(test)]
-            builds,
-            ..
-        } = &mut paint;
-        let drawn = preview.lines(&refs[..count], &ed.camera, view, ppp);
-        if !drawn.lines.is_empty() {
-            // A frame where nothing moved hands egui last frame's mesh.
-            let want = Some((device.to_bits(), [under, accent]));
-            if *built_for != want
-                || built_lines.as_slice() != drawn.lines
-                || built_points.as_slice() != drawn.points
-            {
-                *mesh = std::sync::Arc::new(machine_line_mesh(
-                    ctx,
-                    drawn,
-                    device,
-                    [under, accent, accent],
-                ));
-                built_lines.clear();
-                built_lines.extend_from_slice(drawn.lines);
-                built_points.clear();
-                built_points.extend_from_slice(drawn.points);
-                *built_for = want;
-                #[cfg(test)]
-                {
-                    *builds += 1;
-                }
-            }
-            painter.add(egui::Shape::Mesh(std::sync::Arc::clone(mesh)));
-        }
-    }
-    // Give the node buffers back to be reused.
-    if let Some(path) = draft_path {
-        paint.draft = path.nodes;
-    }
-    if let Some(path) = band_path {
-        paint.band = path.nodes;
+    if paint.lines_drawn {
+        painter.add(egui::Shape::Mesh(std::sync::Arc::clone(&paint.mesh)));
     }
 
-    path_marks(ed, view, &mut paint.marks);
     let w = ant_width(device);
     let dark = Stroke::new(w, under);
     let light = Stroke::new(w, accent);
@@ -1013,6 +1011,89 @@ fn path_tool_marks(painter: &egui::Painter, p: &Palette, ed: &mut Editor, view: 
         }
     }
     ed.path_paint = paint;
+}
+
+/// The work a changed [`PaintKey`] pays for: the lines traced, the mesh
+/// tessellated, and the marks placed.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_path_paint(
+    paint: &mut PathPaint,
+    ed: &Editor,
+    view: Rect,
+    ppp: f32,
+    band: bool,
+    ctx: &egui::Context,
+    device: f32,
+    [under, accent]: [egui::Color32; 2],
+) {
+    let tool = &ed.path_tool;
+    let picked = tool.dragged().or_else(|| {
+        let pick = tool.pick()?;
+        ed.editable_paths()?.paths().get(pick.path)
+    });
+    let mut draft_path = None;
+    let mut band_path = None;
+    if let Some(draft) = tool.draft() {
+        paint.draft.clear();
+        paint.draft.extend_from_slice(&draft.nodes);
+        draft_path = Some(umber_core::Path {
+            role: tool.role,
+            closed: draft.closed,
+            nodes: std::mem::take(&mut paint.draft),
+            ink: None,
+        });
+        if let (true, Some(last), Some(hover)) = (band, draft.nodes.last(), tool.hover()) {
+            paint.band.clear();
+            paint.band.push(umber_core::Node {
+                handle_in: glam::Vec2::ZERO,
+                ..*last
+            });
+            paint.band.push(umber_core::Node::corner(hover));
+            band_path = Some(umber_core::Path {
+                role: tool.role,
+                closed: false,
+                nodes: std::mem::take(&mut paint.band),
+                ink: None,
+            });
+        }
+    }
+    // At most three, the draft and its band first: see `path_tool_marks`.
+    let mut refs: [&umber_core::Path; 3] = [&EMPTY_PATH; 3];
+    let mut count = 0;
+    for path in [draft_path.as_ref(), band_path.as_ref(), picked]
+        .into_iter()
+        .flatten()
+    {
+        refs[count] = path;
+        count += 1;
+    }
+    let drawn = paint.preview.lines(&refs[..count], &ed.camera, view, ppp);
+    paint.lines_drawn = !drawn.lines.is_empty();
+    if paint.lines_drawn {
+        paint.mesh = std::sync::Arc::new(machine_line_mesh(
+            ctx,
+            drawn,
+            device,
+            [under, accent, accent],
+        ));
+        #[cfg(test)]
+        {
+            paint.builds += 1;
+        }
+    }
+    // Give the node buffers back to be reused.
+    if let Some(path) = draft_path {
+        paint.draft = path.nodes;
+    }
+    if let Some(path) = band_path {
+        paint.band = path.nodes;
+    }
+    #[cfg_attr(not(test), allow(unused_variables))]
+    let walked = path_marks(ed, view, &mut paint.marks);
+    #[cfg(test)]
+    {
+        paint.walked += walked;
+    }
 }
 
 /// What an unused slot of [`path_tool_marks`]' fixed array points at.
@@ -8513,6 +8594,184 @@ mod tests {
         ed.path_release(glam::Vec2::new(200.0, 60.0));
         assert_eq!(frame(&mut ed), 4, "a new node kept the old mesh");
         assert_eq!(frame(&mut ed), 4);
+    }
+
+    /// **A frame where nothing changed does no work that scales with the
+    /// picked path**: the second of two identical frames flattens no cubic and
+    /// walks no node. A hover, a camera move and a pick change each rebuild,
+    /// read off the same counters, so the guard is not satisfied by a painter
+    /// that simply never rebuilds.
+    #[test]
+    fn a_still_frame_traces_nothing_and_walks_no_node() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let mut ed = picked_node(curvy(), 1);
+        let frame = |ed: &mut Editor| {
+            frame_shapes(&palette, vec2(320.0, 220.0), 1.0, |ui| {
+                let rect = ui.max_rect();
+                super::path_tool_marks(ui.painter(), &palette, ed, rect);
+            });
+            (ed.path_paint.preview.flattened, ed.path_paint.walked)
+        };
+        let first = frame(&mut ed);
+        assert!(first.0 > 0 && first.1 > 0, "the fixture draws: {first:?}");
+        assert_eq!(frame(&mut ed), first, "a still frame did work");
+
+        ed.path_moved(glam::Vec2::new(250.0, 160.0), false);
+        let hovered = frame(&mut ed);
+        assert!(
+            hovered.0 > first.0 && hovered.1 > first.1,
+            "a hover kept it"
+        );
+        assert_eq!(frame(&mut ed), hovered);
+
+        ed.camera.center.x += 5.0;
+        let panned = frame(&mut ed);
+        assert!(
+            panned.0 > hovered.0 && panned.1 > hovered.1,
+            "a pan kept it"
+        );
+        assert_eq!(frame(&mut ed), panned);
+
+        tap_at(&mut ed, glam::Vec2::new(210.0, 100.0));
+        assert_eq!(ed.path_tool.pick().and_then(|p| p.node), Some(2));
+        let repicked = frame(&mut ed);
+        assert!(
+            repicked.0 > panned.0 && repicked.1 > panned.1,
+            "a pick kept it"
+        );
+        assert_eq!(frame(&mut ed), repicked);
+
+        // A lock moves no revision and no generation, and still changes what
+        // may be drawn: the picked path is not the tool's to show any more.
+        ed.layers.active_mut().locked = true;
+        assert!(!ed.path_paint.marks.is_empty() && ed.path_paint.lines_drawn);
+        frame(&mut ed);
+        assert!(ed.path_paint.marks.is_empty(), "a lock kept the node marks");
+        assert!(!ed.path_paint.lines_drawn, "a lock kept the picked line");
+    }
+
+    /// A zig-zag of curves that fills the view many times over, long enough to
+    /// meet the preview's point budget on its own.
+    fn budget_filling_path() -> umber_core::Path {
+        let nodes = (0..20_000)
+            .map(|i| {
+                let x = if i % 2 == 0 { 20.0 } else { 300.0 };
+                let mut node =
+                    umber_core::Node::corner(glam::Vec2::new(x, 20.0 + (i % 160) as f32));
+                node.handle_in = glam::Vec2::new(0.0, -100.0);
+                node.handle_out = glam::Vec2::new(0.0, 100.0);
+                node
+            })
+            .collect();
+        umber_core::Path {
+            role: umber_core::PathRole::Cut,
+            closed: false,
+            nodes,
+            ink: None,
+        }
+    }
+
+    /// **The draft and its band are drawn before the picked path spends the
+    /// budget.** The pick on its own meets the cap, which the fixture checks,
+    /// so a painter tracing it first would have nothing left for the lines
+    /// the artist is drawing.
+    #[test]
+    fn a_picked_path_that_meets_the_cap_does_not_hide_the_draft() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let path = budget_filling_path();
+        let mut alone = crate::vectorview::PathPreview::default();
+        let ed = editor_in_the_path_tool(path.clone(), 1.0);
+        let met = alone
+            .lines(&[&path], &ed.camera, view_of(vec2(320.0, 220.0)), 1.0)
+            .points
+            .len();
+        assert!(
+            met >= crate::vectorview::MAX_POINTS,
+            "the fixture does not meet the cap: {met}"
+        );
+
+        let mut ed = editor_in_the_path_tool(path, 1.0);
+        ed.path_tool.mode = PathMode::Draw;
+        tap_at(&mut ed, glam::Vec2::new(160.0, 205.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), None);
+        ed.path_press(glam::Vec2::new(300.0, 21.0), true);
+        ed.path_release(glam::Vec2::new(300.0, 21.0));
+        assert!(
+            ed.path_tool.pick().is_some(),
+            "the fixture picks the long path"
+        );
+        ed.path_moved(glam::Vec2::new(60.0, 210.0), false);
+
+        let shapes = frame_shapes(&palette, vec2(320.0, 220.0), 1.0, |ui| {
+            let rect = ui.max_rect();
+            super::path_tool_marks(ui.painter(), &palette, &mut ed, rect);
+        });
+        // The band runs from the draft's node to the hover, along y = 205 to
+        // 210, where nothing of the long path is (it stops at y = 180 plus its
+        // curves' swing, which the mesh is checked against by its end).
+        let reaches = |target: egui::Pos2| {
+            shapes.iter().any(|s| match &s.shape {
+                egui::Shape::Mesh(mesh) => mesh
+                    .vertices
+                    .iter()
+                    .any(|v| (v.pos - target).length() < 2.0),
+                _ => false,
+            })
+        };
+        assert!(
+            reaches(pos2(60.0, 210.0)),
+            "the band to the pointer is gone"
+        );
+    }
+
+    /// **A continued draft past the cap still marks the end it is drawn from**,
+    /// with the handles being pulled out of it, and its first node.
+    #[test]
+    fn a_long_continued_draft_marks_its_last_node_and_its_handles() {
+        let cap = crate::pathtool::NODE_MARK_CAP;
+        let mut ed = editor_in_the_path_tool(row_of_corners(3000, 0.1), 1.0);
+        ed.path_tool.mode = PathMode::Draw;
+        let end = glam::Vec2::new(10.0 + 0.1 * 2999.0, 100.0);
+        tap_at(&mut ed, end);
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+        ed.path_press(glam::Vec2::new(250.0, 40.0), false);
+        ed.path_moved(glam::Vec2::new(280.0, 20.0), false);
+        assert!(ed.path_tool.draft().unwrap().nodes.len() > cap + 1);
+
+        let view = view_of(vec2(320.0, 220.0));
+        let mut marks = Vec::new();
+        path_marks(&ed, view, &mut marks);
+        let to_screen = crate::vectorview::screen_mapping(&ed.camera, view, 1.0);
+        let last = to_screen(glam::Vec2::new(250.0, 40.0));
+        let first = to_screen(glam::Vec2::new(10.0, 100.0));
+        assert!(
+            marks.contains(&PathMark::Node {
+                at: last,
+                picked: false
+            }),
+            "the last node is not marked"
+        );
+        assert!(
+            marks.contains(&PathMark::Node {
+                at: first,
+                picked: true
+            }),
+            "the first node is not marked as the closing one"
+        );
+        let handle_of_last = |m: &PathMark| match *m {
+            PathMark::Handle { node, .. } => node == last,
+            PathMark::Node { .. } => false,
+        };
+        assert!(
+            marks.iter().any(handle_of_last),
+            "the node being placed has no handle marks"
+        );
+        let is_node = |m: &&PathMark| match **m {
+            PathMark::Node { .. } => true,
+            PathMark::Handle { .. } => false,
+        };
+        let nodes = marks.iter().filter(is_node).count();
+        assert!(nodes <= cap + 1, "{nodes} node marks past the cap");
     }
 
     /// The hover is not cleared when the pointer goes over a panel, so the

@@ -168,6 +168,9 @@ pub struct PathTool {
     dragged: Option<Path>,
     /// Shift on the last move, so the release shapes the path as the drag did.
     alone: bool,
+    /// Moves whenever something the painter draws may have changed. See
+    /// [`PathTool::generation`].
+    generation: u64,
 }
 
 impl Default for PathTool {
@@ -186,6 +189,7 @@ impl Default for PathTool {
             before: None,
             dragged: None,
             alone: false,
+            generation: 0,
         }
     }
 }
@@ -240,6 +244,27 @@ impl PathTool {
         self.dragged.as_ref()
     }
 
+    /// A number that moves whenever what the painter draws of the tool may
+    /// have changed: the draft, the drag, the hover, the pick, or whether a
+    /// press is held (which hides the rubber band).
+    ///
+    /// **Bumped inside the methods that change those, never beside their call
+    /// sites**, so the painter can skip a frame on an equal number without a
+    /// list of call sites to keep in step. Every `&mut self` method bumps it
+    /// except [`PathTool::say`], whose sentence is on the strip and not the
+    /// canvas. A bump that changed nothing costs one rebuild on a frame that
+    /// already had an event; a missing one would leave a stale picture, so the
+    /// rule errs the cheap way. `mode` and `role` are plain fields and are not
+    /// covered: the painter reads `role` into its own key, and nothing it draws
+    /// reads `mode`.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
     pub fn is_held(&self) -> bool {
         match self.held {
             Held::Nothing => false,
@@ -257,9 +282,12 @@ impl PathTool {
     /// which are tool settings. For the document going away under the tool,
     /// where there is nothing left to land a path on.
     pub fn reset(&mut self) {
+        // The generation carries on rather than starting again at zero, or a
+        // reset could land back on a number a painter has already cached.
         *self = Self {
             mode: self.mode,
             role: self.role,
+            generation: self.generation.wrapping_add(1),
             ..Self::default()
         };
     }
@@ -267,6 +295,7 @@ impl PathTool {
     /// The active layer changed under a draft that continues one of its
     /// paths. The draft now lands as a new path and the old one is untouched.
     pub fn detach(&mut self) {
+        self.touch();
         if let Some(draft) = self.draft.as_mut() {
             draft.continues = None;
             self.base_len = 0;
@@ -336,6 +365,7 @@ impl PathTool {
     /// since closing happens on the release. A drag is dropped and the record
     /// is untouched, which is what an unreleased drag always was.
     pub fn interrupt(&mut self) {
+        self.touch();
         let held = std::mem::replace(&mut self.held, Held::Nothing);
         self.dragged = None;
         match held {
@@ -367,6 +397,7 @@ impl PathTool {
     /// mirrored with it, by the arithmetic the paths on the layers use. A held
     /// press is ended first, because its press point is in the old orientation.
     pub fn mirror(&mut self, axis: FlipAxis, canvas: UVec2) {
+        self.touch();
         self.interrupt();
         if let Some(draft) = self.draft.as_mut() {
             for node in &mut draft.nodes {
@@ -378,6 +409,7 @@ impl PathTool {
 
     /// Drop the pick (active layer changed, foreign revision, tab switch).
     pub fn let_go(&mut self) {
+        self.touch();
         self.pick = None;
         self.before = None;
         self.dragged = None;
@@ -391,6 +423,7 @@ impl PathTool {
 
     /// A press. `edit` is `mode == Edit || ctrl`.
     pub fn press(&mut self, at: Vec2, edit: bool, ground: Ground<'_>) {
+        self.touch();
         // A press while one is held replaces it, leaving no stale drag behind.
         self.cancel_hold();
         if edit {
@@ -511,25 +544,42 @@ impl PathTool {
     }
 
     /// The pointer moved, held or not. `alone` is Shift.
+    ///
+    /// **A drag clones the path once, on its first move, and every move after
+    /// writes into that copy**: a node drag or a handle drag rewrites the one
+    /// node it moves, a whole-path drag rewrites every node in place. A path
+    /// traced from a lasso can hold tens of thousands of nodes, and a clone per
+    /// pointer event was an allocation of all of them a hundred times a
+    /// second. Still absolute against the press, because each write is from
+    /// the press-time copy and the pointer, never from the last move.
     pub fn moved(&mut self, at: Vec2, alone: bool) {
+        self.touch();
         self.hover = Some(at);
         self.alone = alone;
-        match &self.held {
+        let Self {
+            held,
+            dragged,
+            draft,
+            ..
+        } = self;
+        match &*held {
             Held::Placing { .. } => {
-                if let Some(node) = self.draft.as_mut().and_then(|d| d.nodes.last_mut()) {
+                if let Some(node) = draft.as_mut().and_then(|d| d.nodes.last_mut()) {
                     let out = at - node.at;
                     node.handle_out = out;
                     node.handle_in = -out;
                 }
             }
-            Held::Handle { .. } | Held::Node { .. } | Held::Segment { .. } => {
-                self.dragged = shaped(&self.held, at, alone);
+            Held::Handle { start, .. } | Held::Node { start, .. } | Held::Segment { start, .. } => {
+                let out = dragged.get_or_insert_with(|| start.clone());
+                shape_into(held, at, alone, out);
             }
             Held::Nothing | Held::Closing | Held::Continuing | Held::Picked => {}
         }
     }
 
     pub fn release(&mut self, at: Vec2, ground: Ground<'_>) -> Commit {
+        self.touch();
         self.sanitize(ground);
         let held = std::mem::replace(&mut self.held, Held::Nothing);
         self.dragged = None;
@@ -599,6 +649,7 @@ impl PathTool {
 
     /// Enter.
     pub fn finish(&mut self) -> Commit {
+        self.touch();
         self.cancel_hold();
         // A path taken up and given nothing is put back as it was: there is
         // nothing to land, and the draft would otherwise sit there waiting.
@@ -614,6 +665,7 @@ impl PathTool {
 
     /// Backspace, Delete or Undo with a draft up. True when it took something.
     pub fn pop(&mut self) -> bool {
+        self.touch();
         self.cancel_hold();
         let Some(draft) = self.draft.as_mut() else {
             return false;
@@ -636,6 +688,7 @@ impl PathTool {
     /// Escape. True when it consumed the key. A draft goes first, then the
     /// node picked, then the path, one for each press of the key.
     pub fn abandon(&mut self) -> bool {
+        self.touch();
         self.said = None;
         match self.held {
             Held::Nothing
@@ -666,6 +719,7 @@ impl PathTool {
 
     /// Tool change, tab switch, close, resize, flip.
     pub fn settle(&mut self) -> Commit {
+        self.touch();
         self.held = Held::Nothing;
         self.dragged = None;
         let commit = self.land(false);
@@ -678,6 +732,7 @@ impl PathTool {
     /// The outcome of the last `Commit::Land`. Ok clears the draft; Err keeps
     /// it up and says why.
     pub fn landed(&mut self, outcome: Result<(), &'static str>) {
+        self.touch();
         match outcome {
             Ok(()) => {
                 self.draft = None;
@@ -690,6 +745,7 @@ impl PathTool {
     /// The outcome of the last `Commit::Set`. Err says why and puts the pick
     /// back where it was before the edit asked to move it.
     pub fn applied(&mut self, outcome: Result<(), &'static str>) {
+        self.touch();
         match outcome {
             Ok(()) => self.before = None,
             Err(why) => {
@@ -704,6 +760,7 @@ impl PathTool {
 
     /// Delete or Backspace with no draft: the node picked, or else the path.
     pub fn remove(&mut self, ground: Ground<'_>) -> Commit {
+        self.touch();
         self.cancel_hold();
         self.sanitize(ground);
         let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
@@ -726,6 +783,7 @@ impl PathTool {
     /// The Cut / Plot switch. With a pick it changes that path alone and never
     /// the role for new paths; without one it sets the role for new paths.
     pub fn set_role(&mut self, role: PathRole, ground: Ground<'_>) -> Commit {
+        self.touch();
         self.cancel_hold();
         self.sanitize(ground);
         let Some(pick) = self.pick else {
@@ -755,6 +813,7 @@ impl PathTool {
     /// to close, and with fewer nothing happens and nothing is said: the
     /// button is not the place to teach geometry.
     pub fn toggle_closed(&mut self, ground: Ground<'_>) -> Commit {
+        self.touch();
         self.cancel_hold();
         self.sanitize(ground);
         let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
@@ -790,6 +849,8 @@ impl PathTool {
         ground: Ground<'_>,
         make: impl Fn(&Path, usize) -> Option<Node>,
     ) -> Commit {
+        // For `corner` and `smooth`, the two public doors in.
+        self.touch();
         self.cancel_hold();
         self.sanitize(ground);
         let (Some(record), Some(pick)) = (ground.paths, self.pick) else {
@@ -895,33 +956,62 @@ impl PathTool {
 }
 
 /// The dragged path for a hold with the pointer at `at`, recomputed from the
-/// press state. `None` for a hold that drags nothing, and for a drag on a line
-/// that has not yet left the tap slop.
+/// press state, as a fresh copy for the release. `None` for a hold that drags
+/// nothing, and for a drag on a line that has not yet left the tap slop.
 fn shaped(held: &Held, at: Vec2, alone: bool) -> Option<Path> {
+    let start = match held {
+        Held::Handle { start, .. } | Held::Node { start, .. } => start,
+        Held::Segment {
+            press, tap, start, ..
+        } => {
+            if at.distance(*press) <= *tap {
+                return None;
+            }
+            start
+        }
+        Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing | Held::Picked => {
+            return None;
+        }
+    };
+    let mut out = start.clone();
+    shape_into(held, at, alone, &mut out);
+    Some(out)
+}
+
+/// Write the drag at `at` into `out`, which holds a copy of the press-time
+/// path. Only what the drag moves is written, each from the press-time copy,
+/// so `out` is never reallocated and a drag back to the press is the path it
+/// began as. A line drag still inside the tap slop writes the path where it
+/// was: on the release that press is a split, not a move.
+fn shape_into(held: &Held, at: Vec2, alone: bool, out: &mut Path) {
     match held {
         Held::Handle {
             node, side, start, ..
         } => {
             let from = start.nodes[*node];
-            let mut out = start.clone();
             // Smoothness is judged on the node as it was at the press, and
             // Shift is read now, so pressing it mid-drag takes effect.
             out.nodes[*node] = pathedit::with_handle(from, *side, at - from.at, !alone);
-            Some(out)
         }
         Held::Node {
             node, press, start, ..
         } => {
-            let mut out = start.clone();
             out.nodes[*node].at = start.nodes[*node].at + (at - *press);
-            Some(out)
         }
         Held::Segment {
             press, tap, start, ..
-        } => (at.distance(*press) > *tap).then(|| pathedit::moved(start, at - *press)),
-        Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing | Held::Picked => {
-            None
+        } => {
+            // `pathedit::moved`, in place.
+            let by = if at.distance(*press) > *tap {
+                at - *press
+            } else {
+                Vec2::ZERO
+            };
+            for (moved, was) in out.nodes.iter_mut().zip(&start.nodes) {
+                moved.at = was.at + by;
+            }
         }
+        Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing | Held::Picked => {}
     }
 }
 
@@ -1967,6 +2057,172 @@ mod tests {
         let (paths, replaces) = land_of(t.finish());
         assert_eq!(replaces, None);
         assert_eq!(paths[0].nodes.len(), 3);
+    }
+
+    /// What the painter draws of the tool, as a value to compare: the draft,
+    /// the drag, the hover, the pick and whether a press is held.
+    fn drawn(t: &PathTool) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {}",
+            t.draft().map(|d| (&d.nodes, d.closed)),
+            t.dragged(),
+            t.hover(),
+            t.pick(),
+            t.is_held()
+        )
+    }
+
+    /// **Every public method that changes what is drawn moves the generation**,
+    /// each from a state where it does change something, and `say` (the one
+    /// that changes only the strip) does not. A hand-kept list: a new `&mut
+    /// self` method has to be added here, which is what the doc comment on
+    /// `generation` says it bumps.
+    #[test]
+    fn every_change_to_what_is_drawn_moves_the_generation() {
+        let rec = edit_record();
+        let check = |name: &str, t: &mut PathTool, f: &mut dyn FnMut(&mut PathTool)| {
+            let (was_drawn, was) = (drawn(t), t.generation());
+            f(t);
+            assert_ne!(
+                drawn(t),
+                was_drawn,
+                "{name}: the fixture changes nothing drawn"
+            );
+            assert_ne!(
+                t.generation(),
+                was,
+                "{name} changed the picture and kept the number"
+            );
+        };
+        let drafting = || {
+            let mut t = PathTool::default();
+            tap(&mut t, v(0.0, 0.0), bare());
+            tap(&mut t, v(50.0, 0.0), bare());
+            t
+        };
+
+        check("press", &mut drafting(), &mut |t| {
+            t.press(v(90.0, 0.0), false, bare())
+        });
+        check("moved", &mut drafting(), &mut |t| {
+            t.moved(v(9.0, 9.0), false)
+        });
+        let mut t = drafting();
+        t.press(v(90.0, 0.0), false, bare());
+        check("release", &mut t, &mut |t| {
+            t.release(v(90.0, 0.0), bare());
+        });
+        let mut t = drafting();
+        t.press(v(90.0, 0.0), false, bare());
+        check("interrupt", &mut t, &mut |t| t.interrupt());
+        check("mirror", &mut drafting(), &mut |t| {
+            t.mirror(FlipAxis::Horizontal, UVec2::new(100, 100))
+        });
+        check("pop", &mut drafting(), &mut |t| {
+            t.pop();
+        });
+        check("abandon", &mut drafting(), &mut |t| {
+            t.abandon();
+        });
+        check("reset", &mut drafting(), &mut |t| t.reset());
+        let mut t = drafting();
+        let _ = t.finish();
+        check("landed", &mut t, &mut |t| t.landed(Ok(())));
+        let mut t = PathTool::default();
+        tap(&mut t, v(0.0, 0.0), bare());
+        // A press held: Enter ends the press.
+        t.press(v(40.0, 0.0), false, bare());
+        check("finish", &mut t, &mut |t| {
+            let _ = t.finish();
+        });
+        let mut t = PathTool::default();
+        tap(&mut t, v(0.0, 0.0), bare());
+        check("settle", &mut t, &mut |t| {
+            let _ = t.settle();
+        });
+
+        let picked = || {
+            let mut t = PathTool::default();
+            edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+            t
+        };
+        check("let_go", &mut picked(), &mut |t| t.let_go());
+        check("remove", &mut picked(), &mut |t| {
+            let _ = t.remove(on(&rec));
+        });
+        let mut t = picked();
+        let _ = set_of(edit_tap(&mut t, v(50.0, 0.0), on(&rec)));
+        check("applied", &mut t, &mut |t| t.applied(Err("no")));
+        let mut t = picked();
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(120.0, 0.0), false);
+        check("set_role", &mut t, &mut |t| {
+            let _ = t.set_role(PathRole::Plot, on(&rec));
+        });
+        let mut t = picked();
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(120.0, 0.0), false);
+        check("toggle_closed", &mut t, &mut |t| {
+            let _ = t.toggle_closed(on(&rec));
+        });
+        let mut t = with_node_picked(&rec);
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(120.0, 0.0), false);
+        check("corner", &mut t, &mut |t| {
+            let _ = t.corner(on(&rec));
+        });
+        let mut t = with_node_picked(&rec);
+        t.press(v(100.0, 0.0), true, on(&rec));
+        t.moved(v(120.0, 0.0), false);
+        check("smooth", &mut t, &mut |t| {
+            let _ = t.smooth(on(&rec));
+        });
+
+        // `detach` changes nothing drawn, and still moves the number: the rule
+        // errs towards a rebuild. `say` changes only the strip and must not.
+        let mut t = drafting();
+        let was = t.generation();
+        t.detach();
+        assert_ne!(t.generation(), was, "detach");
+        let was = t.generation();
+        t.say("Said.");
+        assert_eq!(t.generation(), was, "say is not drawn on the canvas");
+    }
+
+    /// **A drag writes into one copy and never reallocates it**, for a node, a
+    /// handle and a whole-path drag: the buffer the first move made is the
+    /// buffer every later move writes, at the same address and capacity.
+    #[test]
+    fn a_drag_move_writes_into_one_copy_of_the_path() {
+        let rec = smooth_record();
+        // A node drag, a handle drag, and a drag on the line.
+        let mut presses: Vec<(PathTool, Vec2)> = Vec::new();
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&rec));
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        presses.push((t, v(50.0, 0.0)));
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&rec));
+        edit_tap(&mut t, v(50.0, 0.0), on(&rec));
+        presses.push((t, v(60.0, 0.0)));
+        let mut t = PathTool::default();
+        edit_tap(&mut t, v(25.0, 0.0), on(&rec));
+        presses.push((t, v(75.0, 0.0)));
+        for (mut t, at) in presses {
+            t.press(at, true, on(&rec));
+            t.moved(at + v(20.0, 20.0), false);
+            let first = t.dragged().expect("a drag").nodes.as_ptr();
+            let capacity = t.dragged().unwrap().nodes.capacity();
+            for step in 0..20 {
+                t.moved(at + v(30.0 + step as f32, -10.0), step % 2 == 0);
+                let now = &t.dragged().expect("still a drag").nodes;
+                assert_eq!(now.as_ptr(), first, "reallocated at {at:?}");
+                assert_eq!(now.capacity(), capacity);
+            }
+            // And the copy is still absolute: back at the press it is the path.
+            t.moved(at, false);
+            assert_eq!(t.dragged().unwrap(), &rec.paths()[0], "at {at:?}");
+        }
     }
 
     #[test]

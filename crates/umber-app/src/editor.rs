@@ -6635,7 +6635,11 @@ mod tests {
         assert!(ed.path_key(PathKey::Finish));
         let paths = record_of(&ed).paths().to_vec();
         assert_eq!(paths.len(), 2, "a new path beside the edited one");
-        assert_eq!(paths[0].nodes[0].at, Vec2::new(0.0, 50.0), "the edit stands");
+        assert_eq!(
+            paths[0].nodes[0].at,
+            Vec2::new(0.0, 50.0),
+            "the edit stands"
+        );
         let at: Vec<Vec2> = paths[1].nodes.iter().map(|n| n.at).collect();
         assert_eq!(
             at,
