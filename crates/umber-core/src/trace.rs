@@ -25,9 +25,13 @@
 //! - **The grid is padded before contouring**, so artwork touching its edge
 //!   still closes, and the padding is subtracted again on the way out.
 
+mod fit;
+
 use std::collections::VecDeque;
 
 use glam::{UVec2, Vec2};
+
+pub use fit::{CORNER_DEGREES, fit_closed, fit_open};
 
 /// Alpha at or above this is inside. About 10%.
 pub const THRESHOLD: u8 = 26;
