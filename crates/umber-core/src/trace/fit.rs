@@ -105,8 +105,9 @@ pub fn fit_closed(ring: &[Vec2], tolerance: f32) -> Vec<Node> {
     match corners.len() {
         0 | 1 => {
             // One seam, at the corner if there is one and otherwise at vertex 0,
-            // and a forced split halfway round so a closed run is never one
-            // cubic from a point back to itself.
+            // and a split halfway round. The handle bound would refuse one cubic
+            // from a point back to itself anyway, since its chord is zero, but
+            // then the split would land wherever the worst point was.
             let start = corners.first().copied().unwrap_or(0);
             let run: Vec<Vec2> = (0..=n).map(|k| pts[(start + k) % n]).collect();
             let arc = arcs(&run);
@@ -634,22 +635,24 @@ mod tests {
 
     #[test]
     fn no_handle_is_longer_than_the_chord_it_spans() {
-        // A tall narrow U: up one arm, round the top, down the other. Its
-        // ends are close and its tangents parallel, so least squares asks
-        // for handles several times the chord, which is a loop an artist
-        // would have to untie.
+        // A narrow U: up one arm, round the top, down the other. Its ends
+        // are close and its tangents parallel, so least squares asks for
+        // handles several times the chord, which is a loop an artist would
+        // have to untie.
         let mut pts = Vec::new();
-        for i in 0..=100 {
-            pts.push(Vec2::new(0.0, 100.0 - i as f32));
+        for i in 0..=20 {
+            pts.push(Vec2::new(0.0, 20.0 - i as f32));
         }
         for i in 1..20 {
             let t = i as f32 / 20.0 * std::f32::consts::PI;
             pts.push(Vec2::new(5.0 - 5.0 * t.cos(), -5.0 * t.sin()));
         }
-        for i in 0..=100 {
+        for i in 0..=20 {
             pts.push(Vec2::new(10.0, i as f32));
         }
-        let nodes = fit_open(&pts, 8.0);
+        // Unbounded, this fits within 4 as one cubic with handles nearly
+        // three times the chord.
+        let nodes = fit_open(&pts, 4.0);
         assert!(all_finite(&nodes));
         for w in nodes.windows(2) {
             let chord = w[0].at.distance(w[1].at);
