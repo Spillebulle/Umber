@@ -141,7 +141,7 @@ impl JobRefusal {
                     .to_string()
             }
             JobRefusal::OutsidePage => {
-                "A path goes off the edge of the page. Move it onto the page and send again."
+                "A path goes past the edge of the page or further than the machine can feed. Move it inside and send again."
                     .to_string()
             }
             JobRefusal::PageTooWide => {
@@ -193,7 +193,10 @@ pub fn paths_of(stack: &LayerStack, role: PathRole) -> Vec<&Path> {
         .filter(|&(i, _)| stack.effective_visible(i))
         .filter_map(|(_, layer)| layer.vector())
         .flat_map(|v| v.paths())
-        .filter(|p| p.role == role)
+        .filter(|p| match role {
+            PathRole::Cut | PathRole::Plot => p.role == role,
+            PathRole::Ink => false,
+        })
         .collect()
 }
 
@@ -232,7 +235,7 @@ pub fn plan(paths: &[&Path], settings: &JobSettings, page: &Page) -> Result<Job,
     // they reach, all in millimetres.
     let (origin, extent) = match &marks {
         Some(m) => (m.origin(), m.span),
-        None => (Vec2::ZERO, Vec2::new(page.size_mm.x, media_length_mm)),
+        None => (Vec2::ZERO, Vec2::new(width_mm, media_length_mm)),
     };
     let max_units = (
         (extent.y * UNITS_PER_MM).round() as i64,
@@ -708,6 +711,47 @@ mod tests {
     }
 
     #[test]
+    fn a_point_on_the_width_limit_never_passes_the_declared_width() {
+        let line = path(PathRole::Cut, false, &[(10.0, 10.0), (203.025, 10.0)]);
+        let job = plan(&[&line], &cut(false), &a4(false)).unwrap();
+        let setup = String::from_utf8(job.setup_block()).unwrap();
+        assert!(setup.contains("Z5940,4060"), "{setup}");
+        assert_eq!(joined(&job), etx("M200,200·D200,4060·"));
+    }
+
+    #[test]
+    fn exactly_the_point_limit_is_admitted() {
+        // A zigzag of corner nodes two millimetres apart, so none merge.
+        let zigzag = |n: usize| {
+            let pts: Vec<(f32, f32)> = (0..n)
+                .map(|i| (10.0 + (i % 2) as f32 * 2.0, 10.0 + (i / 2) as f32 * 0.1))
+                .collect();
+            path(PathRole::Cut, false, &pts)
+        };
+        let page = page_mm(100, 30000, false);
+        let ok = zigzag(MAX_POINTS);
+        let job = plan(&[&ok], &cut(false), &page).unwrap();
+        assert_eq!(points(&joined(&job)).len(), MAX_POINTS);
+        let over = zigzag(MAX_POINTS + 1);
+        assert_eq!(
+            plan(&[&over], &cut(false), &page).unwrap_err(),
+            JobRefusal::TooManyPoints
+        );
+    }
+
+    #[test]
+    fn a_path_a_tenth_of_a_millimetre_outside_the_cut_area_is_refused() {
+        let at = |x: f32| path(PathRole::Cut, false, &[(100.0, 100.0), (x, 100.0)]);
+        let edge = at(200.0);
+        assert!(plan(&[&edge], &cut(true), &a4(true)).is_ok());
+        let past = at(200.1);
+        assert_eq!(
+            plan(&[&past], &cut(true), &a4(true)).unwrap_err(),
+            JobRefusal::OutsideCutArea
+        );
+    }
+
+    #[test]
     fn marks_asked_for_on_a_document_without_them_is_refused() {
         let sq = square(PathRole::Cut, 20.0, 30.0);
         assert_eq!(
@@ -898,8 +942,9 @@ mod tests {
         let b = square(PathRole::Plot, 20.0, 30.0);
         let c = square(PathRole::Cut, 40.0, 50.0);
         let d = square(PathRole::Cut, 60.0, 70.0);
+        let ink = square(PathRole::Ink, 80.0, 90.0);
         stack
-            .add_vector_layer("one", VectorObject::Paths(vec![a.clone(), b.clone()]))
+            .add_vector_layer("one", VectorObject::Paths(vec![a.clone(), b.clone(), ink]))
             .unwrap();
         let hidden = stack
             .add_vector_layer("two", VectorObject::Paths(vec![d.clone()]))
@@ -911,6 +956,25 @@ mod tests {
         assert_eq!(paths_of(&stack, PathRole::Cut), vec![&a, &c]);
         assert_eq!(paths_of(&stack, PathRole::Plot), vec![&b]);
         assert!(paths_of(&stack, PathRole::Ink).is_empty());
+    }
+
+    #[test]
+    fn paths_inside_a_hidden_folder_are_not_returned() {
+        let mut stack = LayerStack::new();
+        let a = square(PathRole::Cut, 20.0, 30.0);
+        let inside = square(PathRole::Cut, 40.0, 50.0);
+        stack
+            .add_vector_layer("shown", VectorObject::Paths(vec![a.clone()]))
+            .unwrap();
+        let kept = stack
+            .add_vector_layer("kept", VectorObject::Paths(vec![inside.clone()]))
+            .unwrap();
+        assert_eq!(paths_of(&stack, PathRole::Cut), vec![&a, &inside]);
+        let folder = stack.group(&[kept]).unwrap();
+        // The layer's own eye stays on; only the folder's goes off.
+        stack.get_mut(folder).unwrap().visible = false;
+        assert!(stack.get_mut(kept).unwrap().visible);
+        assert_eq!(paths_of(&stack, PathRole::Cut), vec![&a]);
     }
 
     #[test]
