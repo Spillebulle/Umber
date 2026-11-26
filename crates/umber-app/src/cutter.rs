@@ -3,8 +3,9 @@
 //! `umber_core::cutjob` builds the bytes; this module decides when each block
 //! is written and what the machine has to say before the next one goes. It is
 //! in `umber-app` because the link is the platform's, and it holds no egui and
-//! no winit, because the worker that drives it and the dialog that watches it
-//! are separate things built on top of it.
+//! no winit: the [`Worker`] here runs a job on its own thread and wakes the
+//! loop through a plain closure, and the dialog that watches it is
+//! `cutterdlg`.
 //!
 //! **Nobody has run this against a machine.** Everything below is pinned
 //! against [`Link`] implementations the tests script themselves, which proves
@@ -487,6 +488,260 @@ impl<L: Link, F: FnMut(String)> Link for Logged<L, F> {
         }
         out
     }
+}
+
+/// A boxed link is the link it holds, which is what lets the worker wrap
+/// whatever its opener produced in [`Logged`].
+impl<L: Link + ?Sized> Link for Box<L> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+        (**self).write(bytes)
+    }
+    fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+        (**self).read_reply(timeout)
+    }
+    fn discard(&mut self, quiet: Duration) -> Result<Vec<u8>, LinkError> {
+        (**self).discard(quiet)
+    }
+}
+
+// ------------------------------------------------------------------ the worker
+
+/// What a worker says, in the order it happens.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Event {
+    /// One line for the log: a transfer, or something the opener found.
+    Line(String),
+    /// A job has reached a new part.
+    Stage(Stage),
+    /// A connection check ended: the sentence to show, or why it failed.
+    Checked(Result<String, String>),
+    /// A job ended: the sentence to show, or why it failed.
+    Sent(Result<String, String>),
+}
+
+impl Event {
+    /// Whether nothing follows this one.
+    fn is_final(&self) -> bool {
+        match self {
+            Event::Line(_) | Event::Stage(_) => false,
+            Event::Checked(_) | Event::Sent(_) => true,
+        }
+    }
+}
+
+/// One piece of work for a worker.
+pub enum Work {
+    /// Ask the machine who it is and how it is. Nothing moves.
+    Check,
+    /// Send this job. The worker owns it, so nothing it does afterwards reads
+    /// the document, which may have been closed or switched by then.
+    Send(Job),
+}
+
+/// How a worker reaches the machine. It is handed a sink for log lines, so
+/// the real opener can say which machines it found before it opens one, and a
+/// test's opener says nothing platform specific.
+pub type Opener =
+    Box<dyn FnOnce(&mut dyn FnMut(String)) -> Result<Box<dyn Link + Send>, LinkError> + Send>;
+
+/// What the real opener logs before it opens: every Silhouette interface it
+/// found, or that it found none.
+pub fn found_lines(paths: &[String]) -> Vec<String> {
+    if paths.is_empty() {
+        return vec!["No Silhouette cutter found on USB.".to_string()];
+    }
+    paths
+        .iter()
+        .map(|p| format!("Found a Silhouette at {p}"))
+        .collect()
+}
+
+/// The sentence a worker that died before answering is reported with.
+const SEND_DIED: &str =
+    "The connection to the cutter stopped unexpectedly. Check the sheet before sending again.";
+const CHECK_DIED: &str = "The connection to the cutter stopped unexpectedly.";
+
+/// The worker's end of the channel, and the wake that must follow every
+/// event and the end of the thread.
+///
+/// **It owns the sender, and the wake in `drop` comes after the sender has
+/// gone.** On a panic nothing final was sent, so the frame the wake asks for
+/// has to find the channel disconnected; waking first would let it read
+/// `Empty` and sleep with no second wake coming. `loading::Finish` is the same
+/// shape for the same reason, and CLAUDE.md's "try_recv has three readings"
+/// is the bug it closes. Everything that logs or reports progress borrows
+/// this rather than cloning the sender, so there is exactly one sender and the
+/// borrow checker drops everything that borrowed it first.
+struct Finish {
+    /// `Option` only so `drop` can let it go before the wake.
+    tx: Option<std::sync::mpsc::Sender<Event>>,
+    wake: Box<dyn Fn() + Send>,
+}
+
+impl Finish {
+    fn send(&self, event: Event) {
+        if let Some(tx) = self.tx.as_ref() {
+            // Failing means the worker handle was dropped, which is nobody
+            // left to tell.
+            let _ = tx.send(event);
+        }
+        (self.wake)();
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        // Nothing here may panic: a panic in a destructor while unwinding
+        // aborts the process.
+        (self.wake)();
+    }
+}
+
+/// A connection check or a job running on its own thread.
+pub struct Worker {
+    rx: std::sync::mpsc::Receiver<Event>,
+    stop: std::sync::Arc<AtomicBool>,
+    /// Which final event a death is reported as.
+    checking: bool,
+    /// A final event has been handed out, so nothing more will be.
+    done: bool,
+}
+
+impl Worker {
+    /// Start `work` on a thread of its own. `wake` is called after every event
+    /// and once more when the thread ends, however it ends.
+    pub fn start(
+        work: Work,
+        open: Opener,
+        timing: Timing,
+        wake: impl Fn() + Send + 'static,
+    ) -> Worker {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let checking = match &work {
+            Work::Check => true,
+            Work::Send(_) => false,
+        };
+        let finish = Finish {
+            tx: Some(tx),
+            wake: Box::new(wake),
+        };
+        let flag = std::sync::Arc::clone(&stop);
+        let started = std::thread::Builder::new()
+            .name("umber-cutter".to_owned())
+            .spawn(move || {
+                let finish = finish;
+                run(work, open, &timing, &flag, &finish);
+            });
+        if let Err(e) = started {
+            // The closure went with the failure and took `Finish` with it, so
+            // the channel is already disconnected and `poll` reports the death.
+            log::error!("could not start the cutter worker: {e}");
+        }
+        Worker {
+            rx,
+            stop,
+            checking,
+            done: false,
+        }
+    }
+
+    /// Ask the job to stop. The worker answers, with the final event, once it
+    /// has: the conversation reads the flag before each block and inside each
+    /// wait, and never abandons a write half way.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Everything said since the last poll. A worker that ended without a
+    /// final event yields one error event in its place, once, and after the
+    /// final event nothing more is ever handed out.
+    pub fn poll(&mut self) -> Vec<Event> {
+        let mut out = Vec::new();
+        while !self.done {
+            match self.rx.try_recv() {
+                Ok(event) => {
+                    self.done = event.is_final();
+                    out.push(event);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // Every sender gone without a final event: the thread died.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.done = true;
+                    out.push(if self.checking {
+                        Event::Checked(Err(CHECK_DIED.to_string()))
+                    } else {
+                        Event::Sent(Err(SEND_DIED.to_string()))
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the final event has been handed out.
+    pub fn finished(&self) -> bool {
+        self.done
+    }
+}
+
+/// The worker's whole body. The link is dropped, closing the handle, before
+/// the final event is sent, so a second job started on that event cannot find
+/// the machine still held by this one.
+fn run(work: Work, open: Opener, timing: &Timing, stop: &AtomicBool, finish: &Finish) {
+    let opened = open(&mut |line| finish.send(Event::Line(line)));
+    match work {
+        Work::Check => {
+            let out = opened.and_then(|link| {
+                let mut link = Logged::new(link, |line| finish.send(Event::Line(line)));
+                probe(&mut link, timing)
+            });
+            finish.send(Event::Checked(match out {
+                Ok((firmware, status)) => Ok(checked(&firmware, status)),
+                Err(e) => Err(SendError::Link(e).sentence()),
+            }));
+        }
+        Work::Send(job) => {
+            let out = match opened {
+                Err(e) => Err(Failure {
+                    error: SendError::Link(e),
+                    blocks_sent: 0,
+                    blocks: job.path_blocks().len(),
+                }),
+                Ok(link) => {
+                    let mut link = Logged::new(link, |line| finish.send(Event::Line(line)));
+                    send(&mut link, &job, timing, stop, &mut |stage| {
+                        finish.send(Event::Stage(stage))
+                    })
+                }
+            };
+            finish.send(Event::Sent(match out {
+                Ok(_) => Ok("Sent.".to_string()),
+                Err(failure) => Err(failure.sentence()),
+            }));
+        }
+    }
+}
+
+/// What a connection check found, as one sentence. An answer Umber does not
+/// recognise is said as it arrived, and is never called ready.
+fn checked(firmware: &str, status: Result<Status, Vec<u8>>) -> String {
+    let who = if firmware.is_empty() {
+        "Connected. The cutter gave no firmware string.".to_string()
+    } else {
+        format!("Connected. Firmware {firmware}.")
+    };
+    let how = match status {
+        Ok(Status::Ready) => "The cutter is ready.".to_string(),
+        Ok(Status::Moving) => "The cutter is busy.".to_string(),
+        Ok(Status::NoMedia) => "No sheet is loaded.".to_string(),
+        Err(raw) => format!(
+            "The cutter answered with a status Umber does not know: {}.",
+            escaped(&raw)
+        ),
+    };
+    format!("{who} {how}")
 }
 
 /// Whether a device interface path names a Silhouette, and the product
@@ -1926,5 +2181,289 @@ mod tests {
         fn send_able<T: Send>() {}
         send_able::<UsbPrint>();
         send_able::<Box<dyn Link + Send>>();
+    }
+
+    /// The worker the dialog drives, against the same scripted machine.
+    mod worker {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+
+        /// A scripted machine the test can still read once the worker has
+        /// taken it to its own thread.
+        struct Shared(Arc<Mutex<FakeLink>>);
+
+        impl Link for Shared {
+            fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+                self.0.lock().unwrap().read_reply(timeout)
+            }
+            fn discard(&mut self, quiet: Duration) -> Result<Vec<u8>, LinkError> {
+                self.0.lock().unwrap().discard(quiet)
+            }
+        }
+
+        fn opener(link: FakeLink) -> (Opener, Arc<Mutex<FakeLink>>) {
+            let shared = Arc::new(Mutex::new(link));
+            let held = Arc::clone(&shared);
+            let open: Opener =
+                Box::new(move |_log| Ok(Box::new(Shared(held)) as Box<dyn Link + Send>));
+            (open, shared)
+        }
+
+        fn failing(error: fn() -> LinkError) -> Opener {
+            Box::new(move |_log| Err(error()))
+        }
+
+        /// Poll until the worker has said its last, and answer everything it
+        /// said. Bounded, so a worker that never finishes fails the test
+        /// rather than hanging it.
+        fn to_the_end(w: &mut Worker) -> Vec<Event> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut events = Vec::new();
+            while !w.finished() {
+                assert!(Instant::now() < deadline, "the worker never finished");
+                events.extend(w.poll());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            events.extend(w.poll());
+            events
+        }
+
+        fn last(events: &[Event]) -> &Event {
+            events.last().expect("the worker said nothing")
+        }
+
+        #[test]
+        fn a_check_reports_the_firmware_and_status() {
+            for (status, said) in [
+                (
+                    &b"0\x03"[..],
+                    "Connected. Firmware CAMEO V1.10. The cutter is ready.",
+                ),
+                (
+                    b"1\x03",
+                    "Connected. Firmware CAMEO V1.10. The cutter is busy.",
+                ),
+                (
+                    b"2\x03",
+                    "Connected. Firmware CAMEO V1.10. No sheet is loaded.",
+                ),
+                (
+                    b"7\x03",
+                    "Connected. Firmware CAMEO V1.10. The cutter answered with a status \
+                     Umber does not know: 7\\x03.",
+                ),
+            ] {
+                let (open, link) = opener(FakeLink::new().statuses(&[status]));
+                let mut w = Worker::start(Work::Check, open, fast(), || {});
+                let events = to_the_end(&mut w);
+                assert_eq!(last(&events), &Event::Checked(Ok(said.to_string())));
+                // Only the three harmless commands went to the machine.
+                assert_eq!(
+                    link.lock().unwrap().writes,
+                    vec![INIT.to_vec(), FIRMWARE.to_vec(), STATUS.to_vec()]
+                );
+            }
+        }
+
+        #[test]
+        fn a_send_reports_each_stage_then_the_outcome() {
+            let job = job(true);
+            let n = job.path_blocks().len();
+            let (open, _link) = opener(FakeLink::new());
+            let mut w = Worker::start(Work::Send(job), open, fast(), || {});
+            let events = to_the_end(&mut w);
+            let stages: Vec<Stage> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Stage(s) => Some(*s),
+                    Event::Line(_) | Event::Checked(_) | Event::Sent(_) => None,
+                })
+                .collect();
+            let mut expected = vec![Stage::Connecting, Stage::FindingMarks];
+            expected.extend((0..n).map(|block| Stage::Cutting { block, of: n }));
+            expected.push(Stage::Finishing);
+            assert_eq!(stages, expected);
+            assert_eq!(last(&events), &Event::Sent(Ok("Sent.".to_string())));
+            // Exactly one final event, and it is the last thing said.
+            let finals = events
+                .iter()
+                .filter(|e| matches!(e, Event::Sent(_) | Event::Checked(_)))
+                .count();
+            assert_eq!(finals, 1);
+        }
+
+        #[test]
+        fn every_transfer_reaches_the_log() {
+            let job = job(true);
+            let (open, link) = opener(FakeLink::new());
+            let mut w = Worker::start(Work::Send(job), open, fast(), || {});
+            let events = to_the_end(&mut w);
+            let lines: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Line(l) => Some(l.as_str()),
+                    Event::Stage(_) | Event::Checked(_) | Event::Sent(_) => None,
+                })
+                .collect();
+            let writes = link.lock().unwrap().writes.clone();
+            let written: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|l| l.starts_with("> "))
+                .collect();
+            assert_eq!(written.len(), writes.len(), "{lines:?}");
+            for (line, bytes) in written.iter().zip(&writes) {
+                assert_eq!(*line, log_line('>', bytes));
+            }
+            // A reply was read for every status query and the firmware, and
+            // each of those is a line too.
+            let read = lines.iter().filter(|l| l.starts_with("< ")).count();
+            assert!(read > count(&writes, STATUS), "{lines:?}");
+            assert_eq!(lines[0], "> 2 \\x1b\\x04");
+        }
+
+        #[test]
+        fn a_worker_that_dies_is_noticed_once_and_wakes_the_loop() {
+            for (work, said) in [
+                (
+                    Work::Send(job(false)),
+                    Event::Sent(Err("The connection to the cutter stopped unexpectedly. \
+                                     Check the sheet before sending again."
+                        .to_string())),
+                ),
+                (
+                    Work::Check,
+                    Event::Checked(Err(
+                        "The connection to the cutter stopped unexpectedly.".to_string()
+                    )),
+                ),
+            ] {
+                let wakes = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&wakes);
+                let open: Opener = Box::new(|_log| panic!("an opener panicked"));
+                let mut w = Worker::start(work, open, fast(), move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while wakes.load(Ordering::SeqCst) == 0 {
+                    assert!(Instant::now() < deadline, "a dead worker woke nothing");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // The frame the wake asked for already sees the death: the
+                // wake came after the channel went quiet.
+                assert_eq!(w.poll(), vec![said]);
+                assert!(w.finished());
+                for _ in 0..5 {
+                    assert_eq!(w.poll(), Vec::new(), "the death was reported twice");
+                }
+                assert_eq!(wakes.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[test]
+        fn stop_ends_the_job_between_blocks_and_writes_nothing_more() {
+            let job = job(true);
+            let blocks = job.path_blocks();
+            let end = job.end_block();
+            // Ready until the first block, then busy for ever: the job sits in
+            // the wait after block 0 until the stop arrives.
+            let mut fake = FakeLink::new().statuses(&[&b"0\x03"[..]; 3]);
+            fake.idle = b"1\x03".to_vec();
+            let (open, link) = opener(fake);
+            let timing = Timing {
+                ready: Duration::from_secs(10),
+                ..fast()
+            };
+            let mut w = Worker::start(Work::Send(job), open, timing, || {});
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut events = Vec::new();
+            while !events
+                .iter()
+                .any(|e| matches!(e, Event::Stage(Stage::Cutting { block: 0, .. })))
+            {
+                assert!(Instant::now() < deadline, "the first block never began");
+                events.extend(w.poll());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            w.stop();
+            events.extend(to_the_end(&mut w));
+            let stopped = Failure {
+                error: SendError::Stopped,
+                blocks_sent: 1,
+                blocks: blocks.len(),
+            }
+            .sentence();
+            assert_eq!(last(&events), &Event::Sent(Err(stopped)));
+            let writes = link.lock().unwrap().writes.clone();
+            assert_eq!(count(&writes, &blocks[0]), 1);
+            for b in &blocks[1..] {
+                assert_eq!(count(&writes, b), 0);
+            }
+            assert_eq!(count(&writes, &end), 0);
+        }
+
+        #[test]
+        fn an_opener_that_fails_is_a_sentence() {
+            let errors: [fn() -> LinkError; 3] = [
+                || LinkError::NotFound,
+                || LinkError::Busy,
+                || LinkError::Unsupported,
+            ];
+            for checking in [false, true] {
+                let mut said = Vec::new();
+                for error in errors {
+                    let work = if checking {
+                        Work::Check
+                    } else {
+                        Work::Send(job(false))
+                    };
+                    let mut w = Worker::start(work, failing(error), fast(), || {});
+                    let events = to_the_end(&mut w);
+                    let sentence = match last(&events) {
+                        Event::Sent(Err(s)) if !checking => s.clone(),
+                        Event::Checked(Err(s)) if checking => s.clone(),
+                        other => panic!("{other:?}"),
+                    };
+                    assert_eq!(sentence, SendError::Link(error()).sentence());
+                    assert!(
+                        !sentence.contains(['-', '\u{2013}', '\u{2014}']),
+                        "{sentence}"
+                    );
+                    said.push(sentence);
+                }
+                for (i, s) in said.iter().enumerate() {
+                    for t in &said[i + 1..] {
+                        assert_ne!(s, t);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn the_paths_found_are_logged_before_the_open() {
+            assert_eq!(
+                found_lines(&[]),
+                vec!["No Silhouette cutter found on USB.".to_string()]
+            );
+            assert_eq!(
+                found_lines(&["a".to_string(), "b".to_string()]),
+                vec![
+                    "Found a Silhouette at a".to_string(),
+                    "Found a Silhouette at b".to_string()
+                ]
+            );
+            // Whatever the opener logs reaches the log, ahead of any transfer.
+            let open: Opener = Box::new(|log| {
+                log("from the opener".to_string());
+                Err(LinkError::NotFound)
+            });
+            let mut w = Worker::start(Work::Check, open, fast(), || {});
+            let events = to_the_end(&mut w);
+            assert_eq!(events[0], Event::Line("from the opener".to_string()));
+        }
     }
 }
