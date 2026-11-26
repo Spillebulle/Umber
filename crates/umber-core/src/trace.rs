@@ -342,16 +342,24 @@ fn without_specks(alpha: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-/// Felzenszwalb and Huttenlocher's squared Euclidean distance, exact to `f32`
-/// precision, in place,
-/// in time linear in the number of cells. `grid` holds 0 for a source and
+/// Felzenszwalb and Huttenlocher's squared Euclidean distance, in place, in
+/// time linear in the number of cells. `grid` holds 0 for a source and
 /// [`FAR`] elsewhere.
+///
+/// The field is stored as `f32` and the envelope is worked in `f64`. A cell
+/// index squared passes 2^24 at cell 4097, where `f32` stops holding every
+/// integer, and the intersection of two parabolas is a difference of two such
+/// squares: worked in `f32`, a block 12000 cells along a row came out a whole
+/// cell short at margin 3 and broke into ten rings at margin 1. In `f64` every
+/// term is exact for any grid [`MAX_CELLS`] admits. What is left is the store
+/// back to `f32`, which is exact below 2^24 and so for every squared distance
+/// within `MAX_MARGIN` of the artwork, which is everywhere a ring can be.
 fn distance_squared(grid: &mut [f32], w: usize, h: usize) {
     let n = w.max(h);
     let mut line = vec![0.0f32; n];
     let mut out = vec![0.0f32; n];
     let mut v = vec![0usize; n];
-    let mut z = vec![0.0f32; n + 1];
+    let mut z = vec![0.0f64; n + 1];
     for x in 0..w {
         for y in 0..h {
             line[y] = grid[y * w + x];
@@ -368,18 +376,21 @@ fn distance_squared(grid: &mut [f32], w: usize, h: usize) {
     }
 }
 
-/// The one-dimensional lower envelope of parabolas.
-fn transform_line(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]) {
+/// The one-dimensional lower envelope of parabolas, worked in `f64`; see
+/// [`distance_squared`].
+fn transform_line(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f64]) {
     let n = f.len();
-    let at = |q: usize| q as f32;
+    let at = |q: usize| q as f64;
+    let height = |q: usize| f64::from(f[q]);
     let mut k = 0usize;
     v[0] = 0;
-    z[0] = f32::NEG_INFINITY;
-    z[1] = f32::INFINITY;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
     for q in 1..n {
         loop {
             let p = v[k];
-            let s = ((f[q] + at(q) * at(q)) - (f[p] + at(p) * at(p))) / (2.0 * at(q) - 2.0 * at(p));
+            let s = ((height(q) + at(q) * at(q)) - (height(p) + at(p) * at(p)))
+                / (2.0 * at(q) - 2.0 * at(p));
             if s <= z[k] {
                 if k > 0 {
                     k -= 1;
@@ -387,13 +398,13 @@ fn transform_line(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]) {
                 }
                 // The new parabola beats the first everywhere; replace it.
                 v[0] = q;
-                z[0] = f32::NEG_INFINITY;
-                z[1] = f32::INFINITY;
+                z[0] = f64::NEG_INFINITY;
+                z[1] = f64::INFINITY;
             } else {
                 k += 1;
                 v[k] = q;
                 z[k] = s;
-                z[k + 1] = f32::INFINITY;
+                z[k + 1] = f64::INFINITY;
             }
             break;
         }
@@ -404,7 +415,7 @@ fn transform_line(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]) {
             k += 1;
         }
         let dq = at(q) - at(v[k]);
-        *out = dq * dq + f[v[k]];
+        *out = (dq * dq + height(v[k])) as f32;
     }
 }
 
@@ -778,6 +789,38 @@ mod tests {
     fn a_grid_of_the_wrong_length_has_no_rings() {
         let a = vec![255u8; 99];
         assert!(outline(UVec2::new(10, 10), &a, 0.0, false).is_empty());
+    }
+
+    #[test]
+    fn a_grown_outline_is_the_same_far_along_a_wide_grid_as_near_its_start() {
+        // `q * q` in `f32` drops bits past 2^24, which is cell 4096: the same
+        // block traced near the far end of a 12200-cell row used to come out
+        // short, and at margin 1 broke into separate rings.
+        let at = |x0: u32| {
+            grid(12_200, 120, move |x, y| {
+                if (x0..x0 + 40).contains(&x) && (40..80).contains(&y) {
+                    255
+                } else {
+                    0
+                }
+            })
+        };
+        for margin in [1.0, 3.0] {
+            let mut seen = Vec::new();
+            for x0 in [100u32, 12_000] {
+                let (s, a) = at(x0);
+                let r = outline(s, &a, margin, false);
+                assert_eq!(r.len(), 1, "margin {margin} at {x0}: {} rings", r.len());
+                let (lo, hi) = bounds(&r[0]);
+                let shift = Vec2::new(x0 as f32, 0.0);
+                seen.push((lo - shift, hi - shift));
+            }
+            let ((lo0, hi0), (lo1, hi1)) = (seen[0], seen[1]);
+            assert!(
+                (lo0 - lo1).abs().max_element() < 0.01 && (hi0 - hi1).abs().max_element() < 0.01,
+                "margin {margin}: {lo0} {hi0} against {lo1} {hi1}"
+            );
+        }
     }
 
     #[test]
