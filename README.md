@@ -201,6 +201,21 @@ or delete them all at once.
 Drag a layer sideways as well as up and down to nest it. A dashed outline shows
 where it lands, and at what depth, before you let go.
 
+**Vector layers** hold lines rather than paint, for a sticker cut or a plot.
+Select something, choose Cut path from selection or Plot path from selection on
+the Edit menu, and its outline becomes a closed line on a vector layer. The line
+is drawn over the canvas and is never part of the picture, so it stays out of
+your exports. It saves with the document and undoes like anything else.
+
+The **Path tool** (`P`) draws those lines by hand. Click for a corner, drag for
+a curve, and click the first point to close the path. Switch to Edit to move
+points and handles, add a point on a line, or make a point a corner or smooth.
+Each path is either Cut or Plot, and you can switch it at any time.
+
+**Trace outline**, on the Edit menu, draws a smooth cut or plot line round
+everything you have painted, standing off by a margin you set in pixels or read
+in millimetres. Each piece of artwork gets a line of its own.
+
 <br clear="right">
 
 ## Colour
@@ -360,6 +375,7 @@ wrong.
 |---|---|
 | Left drag | Use the selected tool |
 | `B` / `E` / `S` / `T` / `I` / `H` / `Z` | Brush / eraser / select / transform / eyedropper / pan / zoom |
+| `P` | Path tool |
 | `Ctrl` + `D` | Deselect |
 | `Ctrl` + `C` / `X` / `V` | Copy / cut / paste |
 | `Shift` / `Ctrl` / both + drag with Select | Add to the selection / take away / keep the overlap |
@@ -394,6 +410,10 @@ a speed-derived approximation, and a mouse always paints at full pressure.
   vector renderer; rasterise it before saving and it comes across. Adjustment
   layers change what is below them, which Umber cannot do yet. Both are named
   when the document opens.
+- **Vector layers are only half there.** You can draw paths and reshape them,
+  but you cannot yet draw freehand and have it fitted to a curve, select
+  several points at once, or send anything to a cutter, plotter or printer.
+  Lines that look like brush strokes and stay editable are further off still.
 - **Picking a colour from outside the window is Windows only.** Inside the
   window the eyedropper works everywhere. On macOS and Linux the tool options
   strip says so, rather than the drag quietly doing nothing. There is no

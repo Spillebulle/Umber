@@ -1810,6 +1810,11 @@ struct Landing {
     /// reachable with `own_layer` off: with it on the new layer goes *inside*
     /// the folder, which is where every application puts one.
     folder: bool,
+    /// The selected layer is a vector layer and the text would have to land on
+    /// it. Only reachable with `own_layer` off, as `folder` is: a vector layer
+    /// refuses a paste, and placing text onto the selected layer is a paste, so
+    /// the button was live and then refused in a paste's words.
+    vector: bool,
     /// Why a new layer cannot be had, where it cannot. Only ever `Some` with
     /// `own_layer` on.
     ///
@@ -1834,6 +1839,12 @@ impl Landing {
                 ed.layers.active_is_locked()
             },
             folder: !own_layer && ed.layers.active_slot().is_none(),
+            // The stack's own answer, the one `begin_float` refuses the paste
+            // with, so the button and the gate cannot disagree about which
+            // layer is a vector layer.
+            vector: !own_layer
+                && ed.layers.active_refusal(umber_core::EditTarget::Layer)
+                    == Some(umber_core::EditRefusal::Vector),
             // **`LayerStack::add_refusal`'s answer, and the answer *whole*
             // rather than whether there was one.** The button has to be dead
             // exactly where `App::add_text_layer` will refuse and to say the
@@ -1844,6 +1855,10 @@ impl Landing {
         }
     }
 }
+
+/// What a dead Place says over a vector layer with "On its own layer" off.
+pub(crate) const PLACE_VECTOR_TIP: &str = "This is a vector layer. Select an ordinary layer, \
+     or switch on \"On its own layer\".";
 
 /// Whether Place may be pressed, and what to say about it.
 ///
@@ -1874,6 +1889,7 @@ fn place_state(landing: Landing, empty: bool, refused: Option<TextError>) -> Pla
         own_layer,
         locked,
         folder,
+        vector,
         no_room,
     } = landing;
     if locked {
@@ -1898,6 +1914,12 @@ fn place_state(landing: Landing, empty: bool, refused: Option<TextError>) -> Pla
             tooltip: "A folder is selected. A folder holds no pixels, so select a layer, \
                       or switch on \"On its own layer\"."
                 .into(),
+        };
+    }
+    if vector {
+        return Place {
+            enabled: false,
+            tooltip: PLACE_VECTOR_TIP.into(),
         };
     }
     if let Some(why) = no_room {
@@ -2295,6 +2317,7 @@ mod tests {
                 own_layer,
                 locked: false,
                 folder: false,
+                vector: false,
                 no_room: None,
             };
             for (landing, why) in [
@@ -2311,6 +2334,13 @@ mod tests {
                         ..clear
                     },
                     "a folder",
+                ),
+                (
+                    Landing {
+                        vector: true,
+                        ..clear
+                    },
+                    "a vector layer",
                 ),
                 (
                     Landing {
@@ -2364,6 +2394,28 @@ mod tests {
         }
     }
 
+    /// **Over a vector layer Place is dead with "On its own layer" off and live
+    /// with it on**, read off a real stack through `Landing::of`, so the two
+    /// readings start out disagreeing: the same selected layer, two answers.
+    #[test]
+    fn place_over_a_vector_layer_is_dead_unless_the_text_gets_its_own_layer() {
+        let mut ed = Editor::default();
+        ed.layers
+            .add_vector_layer("Paths", umber_core::VectorObject::empty())
+            .expect("room");
+        ed.ui.text_own_layer = true;
+        assert!(
+            place_state(Landing::of(&ed), false, None).enabled,
+            "a layer of its own does not land on the vector layer"
+        );
+        ed.ui.text_own_layer = false;
+        let state = place_state(Landing::of(&ed), false, None);
+        assert!(!state.enabled, "Place was live over a vector layer");
+        assert_eq!(state.tooltip, PLACE_VECTOR_TIP);
+        assert!(!PLACE_VECTOR_TIP.contains("  "));
+        assert!(!PLACE_VECTOR_TIP.contains('\u{2014}'));
+    }
+
     /// The button says where the text will go, and the two answers differ.
     ///
     /// A tooltip that read the same either way would be a control whose outcome
@@ -2376,6 +2428,7 @@ mod tests {
             own_layer: true,
             locked: false,
             folder: false,
+            vector: false,
             no_room: None,
         };
         let here = Landing {
@@ -2433,6 +2486,7 @@ mod tests {
             own_layer: true,
             locked: false,
             folder: false,
+            vector: false,
             no_room: None,
         };
         let full = place_state(

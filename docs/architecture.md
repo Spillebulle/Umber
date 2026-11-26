@@ -260,6 +260,7 @@ Next, roughly in order:
   to, and offering it on the next start. The copies are written; nothing reads
   them back automatically, so today a recovery means opening one out of the
   folder by hand.
+- **Vector layers, the rest of it.** Stage one is built: a layer that holds Cut and Plot paths, drawn as an overlay and never rasterised, made from a selection's outline. `docs/superpowers/specs/2026-11-25-vector-layers-design.md` is the design. Three projects are left, in order. **Drawing and editing paths** by hand: freehand, point by point and node editing, which is where hit testing and per-path undo arrive. **Tracing** a cut contour from artwork, with an offset, which is also where a combined selection's stair-stepped outline gets smoothed. **The machine**: registration marks and sending to a cutter or plotter. Brush-look **Ink** strokes that stay editable are reserved in the record and have no control and no renderer yet.
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop

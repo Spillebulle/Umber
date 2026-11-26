@@ -53,6 +53,12 @@ pub enum Interaction {
     /// with any other tool: both resolve to `gesture::Press::Eyedropper`, and
     /// this is where that one answer lands.
     Picking,
+    /// The Path tool has the pointer: a node being placed or dragged, a handle,
+    /// or a whole path. Busy for the autosave's quiet test, like `Selecting`,
+    /// although nothing here is in any layer until the release: the record is
+    /// swapped once, at the release, so a capture could not see a half-dragged
+    /// path anyway. Counting it busy keeps the rule simple rather than clever.
+    Pathing,
 }
 
 impl Interaction {
@@ -73,7 +79,9 @@ impl Interaction {
     pub fn allows_aim(self) -> bool {
         match self {
             Self::Idle | Self::Picking => true,
-            Self::Drawing | Self::Selecting | Self::Panning | Self::Zooming => false,
+            Self::Drawing | Self::Selecting | Self::Panning | Self::Zooming | Self::Pathing => {
+                false
+            }
         }
     }
 }
@@ -189,6 +197,10 @@ pub enum Tool {
     Eyedropper,
     Pan,
     Zoom,
+    /// Draw cut and plot paths point by point, and pick them up and reshape
+    /// them. The model is [`crate::pathtool`]; nothing on the rail reaches it
+    /// yet, so it is reachable only from tests until the rail button lands.
+    Path,
 }
 
 impl Tool {
@@ -204,7 +216,12 @@ impl Tool {
     pub fn paints(self) -> bool {
         match self {
             Self::Brush | Self::Eraser => true,
-            Self::Select | Self::Transform | Self::Eyedropper | Self::Pan | Self::Zoom => false,
+            Self::Select
+            | Self::Transform
+            | Self::Eyedropper
+            | Self::Pan
+            | Self::Zoom
+            | Self::Path => false,
         }
     }
 }
@@ -249,6 +266,343 @@ pub struct Floating {
     /// ends a gesture already takes the float out of the `Option`, and the two
     /// that merely read one now borrow it.
     pub made: Option<MadeLayer>,
+}
+
+/// The names a layer made from the selection's outline is given.
+///
+/// Said by the command rather than by the artist, which is what lets a layer
+/// holding cut lines be told from one holding plot lines in a list of
+/// thirty. `Ink` has no command that makes it, but the match that picks a name
+/// is exhaustive over the role so a fourth cannot arrive unnamed.
+pub const CUT_LAYER_NAME: &str = "Cut lines";
+pub const PLOT_LAYER_NAME: &str = "Plot lines";
+pub const INK_LAYER_NAME: &str = "Ink lines";
+/// What the Layers panel's mark names an empty one.
+pub const VECTOR_LAYER_NAME: &str = "Vector layer";
+
+/// What turning the selection's outline into paths will do. See
+/// [`Editor::plan_path_from_selection`].
+#[derive(Clone, Debug)]
+pub enum PathPlan {
+    /// Paths added to the active vector layer. Carries the whole record the
+    /// layer will hold, already checked, and the slot an undo names it by.
+    Append {
+        slot: u32,
+        after: Box<umber_core::VectorObject>,
+    },
+    /// A layer of its own, above the active entry.
+    NewLayer {
+        name: &'static str,
+        record: Box<umber_core::VectorObject>,
+    },
+}
+
+/// Why [`Editor::apply_path_plan`] did not carry a plan out.
+///
+/// Two answers because they want opposite things of the caller. A new layer
+/// that found no slice is handed back to be tried again once a parked slice has
+/// been given up; an append takes no slice, so giving one up would mend nothing
+/// and the refusal it met is what to say.
+#[derive(Debug)]
+pub enum PathApplyRefusal {
+    /// A [`PathPlan::NewLayer`] that found the pool dry, handed back to retry.
+    NoSlice(PathPlan),
+    /// A [`PathPlan::Append`] the layer declined, as the sentence for why. A
+    /// sentence and not a notice, because the Path tool says it on its strip
+    /// where the selection commands raise it in a box.
+    Declined(&'static str),
+}
+
+impl PathPlan {
+    /// Does carrying this out take a slice? Exhaustive, so a third way of
+    /// making paths has to say.
+    pub fn adds_a_layer(&self) -> bool {
+        match self {
+            PathPlan::Append { .. } => false,
+            PathPlan::NewLayer { .. } => true,
+        }
+    }
+}
+
+/// What a trace outline reads: the whole picture, or the active entry alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceSource {
+    /// Every layer in view, as an export flattens them.
+    Everything,
+    /// The active layer, or a folder's contents, with the rest hidden.
+    ThisLayer,
+}
+
+impl TraceSource {
+    /// Both, in the order the dialog offers them.
+    pub const ALL: [TraceSource; 2] = [TraceSource::Everything, TraceSource::ThisLayer];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TraceSource::Everything => "Everything",
+            TraceSource::ThisLayer => "This layer",
+        }
+    }
+
+    /// What a trace that found nothing says. Exhaustive, so a third source
+    /// has to say what "nothing" means for it.
+    ///
+    /// **Each line says it on its own, without the title.** `add_notice` puts
+    /// a line under a notice already up, whose title is somebody else's, and
+    /// "The layers in view are empty." under that reads as a fact rather than
+    /// as why nothing was traced.
+    fn nothing_line(self) -> &'static str {
+        match self {
+            TraceSource::Everything => "There is nothing to trace. The layers in view are empty.",
+            TraceSource::ThisLayer => "There is nothing to trace on this layer.",
+        }
+    }
+}
+
+/// Why a trace past the bounds of a fresh vector record was refused. Not the
+/// record's own sentence, which says to use another vector layer: a new layer
+/// would hold no more, so what helps is fewer, larger pieces.
+pub const TOO_MANY_PIECES_LINE: &str = "The artwork traces to more paths than one layer can hold. Raise the margin so that pieces join, or trace one layer at a time.";
+
+/// The trace outline dialog's state: whether it is up, and what it will ask
+/// for. Per session rather than per document, like the rest of [`UiState`]:
+/// a margin chosen for one sticker sheet is the margin wanted on the next.
+///
+/// `Copy` because `UiState` is.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceForm {
+    pub open: bool,
+    pub source: TraceSource,
+    pub settings: umber_core::trace::TraceSettings,
+    /// True once the margin has been set from a document's resolution, after
+    /// which it is the artist's and [`Editor::open_trace`] leaves it alone.
+    pub seeded: bool,
+}
+
+impl Default for TraceForm {
+    fn default() -> Self {
+        Self {
+            open: false,
+            source: TraceSource::Everything,
+            settings: umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut),
+            seeded: false,
+        }
+    }
+}
+
+/// The one statement of what a full stack says, written as a literal so it can
+/// sit inside `concat!`. A test pins the figure to `LayerStack::MAX`.
+macro_rules! stack_full_line {
+    () => {
+        "This document already has 64 entries, which is all Umber holds."
+    };
+}
+pub(crate) use stack_full_line;
+
+/// What a new layer that found no texture slice says, as one sentence, so the
+/// Path tool can carry it on its strip and the commands can put it in a box.
+pub const NO_SLICE_LINE: &str = "Umber has no texture slice left for one. Save and reopen the \
+                                 document to pack them back down, though deleted layers cannot \
+                                 be brought back afterwards.";
+
+/// What the Path tool says when a new layer for its path found no slice.
+///
+/// Its own sentence and not [`NO_SLICE_LINE`], which is written to sit under a
+/// title naming the layer and reads "no texture slice left for one", a "one"
+/// that dangles on the strip and under [`PATH_NOT_KEPT_TITLE`]. The remedy is
+/// that sentence's: by the time this is said `Editor::free_a_slot` has already
+/// given the undo history up, so the history is not what holds the space and
+/// saving and reopening is what packs the slices back down.
+pub const PATH_NO_SLICE_LINE: &str = "There is no room for another layer. Save and reopen the \
+                                      document to free the space, though deleted layers cannot \
+                                      be brought back afterwards.";
+
+/// What leaving the Path tool says when the path being drawn could not be put
+/// on a layer. The reason goes under it.
+pub const PATH_NOT_KEPT_TITLE: &str = "The path being drawn was not kept";
+
+/// How close a press must be to a node or a line, in screen points.
+const PATH_HIT_POINTS: f32 = 8.0;
+
+/// Whether no more than `cap` of `nodes` lie inside `lo..=hi`, stopping as
+/// soon as the answer is known either way: past the cap, or with too few
+/// nodes left to reach it.
+fn nodes_in_view_within(nodes: &[umber_core::Node], lo: Vec2, hi: Vec2, cap: usize) -> bool {
+    let mut inside = 0;
+    for (i, node) in nodes.iter().enumerate() {
+        if node.at.cmpge(lo).all() && node.at.cmple(hi).all() {
+            inside += 1;
+            if inside > cap {
+                return false;
+            }
+        }
+        if inside + (nodes.len() - i - 1) <= cap {
+            return true;
+        }
+    }
+    true
+}
+
+/// What [`Editor::path_nodes_shown`] is a function of. Equal keys are equal
+/// answers, so the cache is exact rather than a frame's worth of staleness:
+/// the record is named by document and revision, the path by the pick, and the
+/// view by the camera and the canvas region.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NodesShownKey {
+    document: DocId,
+    revision: u64,
+    path: usize,
+    center: Vec2,
+    zoom: f32,
+    pivot: Vec2,
+    size: Vec2,
+}
+
+/// The keys the Path tool may claim. Each is offered to it first while it is in
+/// hand and falls through to whatever the key did before when it answers no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathKey {
+    /// Enter.
+    Finish,
+    /// Escape.
+    Abandon,
+    /// Backspace or Delete.
+    Remove,
+    /// Undo, with a draft up.
+    Undo,
+    /// Redo, with a draft up.
+    Redo,
+}
+
+/// What the Path tool sees of the ground under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathGround {
+    pub document: DocId,
+    /// The active layer's slot, `None` for a folder.
+    pub slot: Option<u32>,
+    /// [`LayerStack::vector_revision`].
+    pub revision: u64,
+}
+
+/// What a change of ground asks of the tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Follow {
+    /// Drop the pick: it names a path by index, and the index may now name
+    /// another path or none.
+    pub let_go: bool,
+    /// Make a draft that continues a path land as a new one instead, whatever
+    /// the record now holds: the document or the active layer changed.
+    pub detach: bool,
+}
+
+/// **Whether the pick and the continuation still mean what they meant.**
+///
+/// A pick names a path by index, and so does a draft that carries an existing
+/// path on. Both go stale when the record moves under them in a way the tool did
+/// not cause: an undo, a redo, a layer deleted, a tab switched. The pick is let
+/// go of on any of those, since a fresh one is a click away. The draft is only
+/// detached, never dropped, because it is what the artist has drawn: it then
+/// lands as a new path and the old one stays as it was, which can cost a
+/// duplicate and can never cost a path.
+///
+/// The draft is detached on a change of document or active layer outright. On
+/// any other foreign revision it is detached unless the path it names is still
+/// the path it took up, which is `PathTool::still_continues`'s reading of the
+/// record and not this model's: **a count is not enough**, because an undo or a
+/// History jump can leave the count where it was while the index names another
+/// path. A structural edit elsewhere in the stack moves the revision without
+/// touching this layer's paths, so the content check keeps the draft attached
+/// there and the continued path is not doubled for nothing.
+///
+/// The tool's own edits move the revision too, and must not let go of the pick
+/// they just set, so [`PathWatch::own_edit`] takes them in without a follow.
+/// A model with no editor in it, the shape `app::LiftNotice` keeps, so the rule
+/// is a test rather than a sentence.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PathWatch {
+    seen: Option<PathGround>,
+}
+
+impl PathWatch {
+    /// The ground as it stands now. Answers what the tool has to give up.
+    pub fn observe(&mut self, now: PathGround) -> Follow {
+        let follow = match self.seen {
+            None => Follow::default(),
+            Some(was) => {
+                let moved = was.document != now.document || was.slot != now.slot;
+                Follow {
+                    let_go: moved || was.revision != now.revision,
+                    detach: moved,
+                }
+            }
+        };
+        self.seen = Some(now);
+        follow
+    }
+
+    /// The tool changed the record itself. The revision it left is taken in;
+    /// the document and the slot are not, so an edit that made a new layer
+    /// still lets go of a pick on the old one at the next look.
+    pub fn own_edit(&mut self, now: PathGround) {
+        if let Some(seen) = self.seen.as_mut() {
+            seen.revision = now.revision;
+        }
+    }
+}
+
+/// Why the active layer's paths cannot be edited, in the order the tests are
+/// made. One enum so the tool's hint, its refusals and `plan_paths` read one
+/// answer rather than restating it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathEditRefusal {
+    /// The active entry is not a vector layer.
+    NotVector,
+    /// Its record is from a newer Umber and is held as bytes.
+    Newer,
+    /// It, or a folder around it, is locked.
+    Locked,
+    /// It, or a folder around it, is hidden.
+    Hidden,
+}
+
+impl PathEditRefusal {
+    /// Every refusal, in the order they are tested.
+    pub const ALL: [PathEditRefusal; 4] = [
+        PathEditRefusal::NotVector,
+        PathEditRefusal::Newer,
+        PathEditRefusal::Locked,
+        PathEditRefusal::Hidden,
+    ];
+
+    /// What the interface says. Exhaustive, so a fifth reason is worded.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            PathEditRefusal::NotVector => "Select a vector layer to edit its paths.",
+            PathEditRefusal::Newer => {
+                "These paths are from a newer Umber and cannot be changed here."
+            }
+            PathEditRefusal::Locked => "This layer is locked.",
+            PathEditRefusal::Hidden => "This layer is hidden. Show it to edit its paths.",
+        }
+    }
+}
+
+pub(crate) fn path_refusal(sentence: &str) -> Notice {
+    Notice {
+        title: "No path was made".to_string(),
+        lines: vec![sentence.to_string()],
+    }
+}
+
+/// The sentence for a vector layer declining a record. Exhaustive, so a new
+/// reason has to be worded rather than falling to a shrug.
+fn set_refusal_sentence(why: umber_core::VectorSetRefusal) -> &'static str {
+    match why {
+        umber_core::VectorSetRefusal::Missing => "There is no layer to put the path on.",
+        umber_core::VectorSetRefusal::NotVector => "That layer does not hold paths.",
+        umber_core::VectorSetRefusal::Locked => "Unlock the layer to add paths to it.",
+        umber_core::VectorSetRefusal::Record(why) => why.sentence(),
+    }
 }
 
 /// A layer a float created for itself, what was selected before it did, and the
@@ -297,6 +651,65 @@ pub struct MadeLayer {
     /// for as long as nothing else moved the stack — a discipline claim, where a
     /// snapshot is a fact.
     pub before: Box<umber_core::StackShape>,
+}
+
+/// What a resize says when it takes the Ink off a vector layer's paths.
+///
+/// A const so a test can read the sentence that was shown.
+pub const VECTOR_INK_LINE: &str =
+    "Strokes on vector layers became ordinary paint, because the canvas changed size.";
+
+/// The line a resize adds when it took a vector path out of bounds.
+///
+/// A path is not clamped when the picture moves, because clamping deforms it,
+/// so one lying far off the canvas can be carried past the furthest a record
+/// may reach. It is taken out rather than left to make the next save refuse
+/// every path on that layer.
+pub const VECTOR_LOST_ON_RESIZE_LINE: &str = "A vector path was moved too far off the \
+     canvas when it changed size, so it was removed. The other paths are kept.";
+
+/// The flip's twin of [`VECTOR_LOST_ON_RESIZE_LINE`]. Undoing the flip does not
+/// bring the path back, which is why it says so.
+pub const VECTOR_LOST_ON_FLIP_LINE: &str = "A vector path was mirrored too far off the \
+     canvas, so it was removed. The other paths are kept.";
+
+/// Add `line` to the notice already up, or raise one with `title`.
+///
+/// Appended rather than replacing, so a document holding several kinds of
+/// layer hears about each of them.
+fn add_notice_line(notice: &mut Option<Notice>, title: &str, line: &str) {
+    match notice.as_mut() {
+        Some(up) => up.lines.push(line.to_string()),
+        None => {
+            *notice = Some(Notice {
+                title: title.to_string(),
+                lines: vec![line.to_string()],
+            })
+        }
+    }
+}
+
+/// The sentence on a disabled "Clear layer" over a vector layer.
+pub const CLEAR_VECTOR_TIP: &str =
+    "A vector layer has no paint to clear. Delete the layer to remove its paths.";
+
+/// Why the active layer cannot be cleared, or `None` where it can.
+///
+/// **The one statement**, read by the menu item's enabled state and its
+/// tooltip and by `App::clear_active_layer`'s own gate, so a control cannot be
+/// lit for something the command then declines. Lock first: unlocking is the
+/// remedy that costs nothing, and a vector layer's remedy is to delete it.
+pub fn clear_layer_refusal(layers: &umber_core::LayerStack) -> Option<&'static str> {
+    if layers.active_is_locked() {
+        return Some("Unlock the layer to clear it.");
+    }
+    if layers
+        .get(layers.active_index())
+        .is_some_and(umber_core::Layer::is_vector)
+    {
+        return Some(CLEAR_VECTOR_TIP);
+    }
+    None
 }
 
 /// "one text layer" or "3 text layers", for a notice that has to count them.
@@ -496,6 +909,8 @@ pub struct UiState {
     /// distance to the centre, `Brush::size_from_rim`, so the brush is exactly
     /// as big as the circle you left on the screen.
     pub resize_from_edge: bool,
+    /// The trace outline dialog. See [`TraceForm`].
+    pub trace: TraceForm,
 }
 
 /// Tabs of the brush editor dialog.
@@ -534,7 +949,8 @@ pub enum BrushTab {
 /// refuse every flip or quiet the document for a refusal it is about to make.
 ///
 /// **Every reader today matches exhaustively, and a test is what keeps it that
-/// way.** The two menu rows read `gate == StepGate::FlipLocked`, which is
+/// way.** The two menu rows read `gate == StepGate::FlipLocked` (as the
+/// refusing arm was then called), which is
 /// `matches!` wearing an operator: a fourth answer would have been a compile
 /// error in `App::settle_step` and a silent `false` in both rows — the menu
 /// going on offering a command the model had just learned to decline, in a
@@ -560,24 +976,45 @@ pub enum StepGate {
     /// first — `flip_canvas` does both before it mirrors and stepping over one
     /// has to do the same.
     SettleForFlip,
-    /// A canvas flip a locked layer refuses. The entry stays where it is, and
-    /// the artist is told: a flip that half happened cannot be undone by
-    /// flipping again.
-    FlipLocked,
+    /// A canvas flip the document refuses, for the reason carried. The entry
+    /// stays where it is, and the artist is told: a flip that half happened
+    /// cannot be undone by flipping again.
+    FlipRefused(FlipRefusal),
 }
+
+/// Why a canvas flip is refused. [`Editor::flip_refusal`] is the one reading.
+///
+/// Two reasons with two remedies, so the sentence has to say which: a lock is
+/// something the artist can take off, a record from a newer Umber is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlipRefusal {
+    /// Some layer is locked, and a flip cannot skip one.
+    Locked,
+    /// Some vector layer holds paths from a newer Umber, which this build
+    /// cannot mirror. See `LayerStack::has_opaque_vector`.
+    NewerPaths,
+}
+
+/// What a flip refused for paths from a newer Umber says, wherever it is said.
+pub const FLIP_NEWER_PATHS: &str = "This document has vector paths from a newer Umber. \
+     Flipping the canvas would leave them behind, so it is not done.";
+
+/// The resize's twin of [`FLIP_NEWER_PATHS`].
+pub const RESIZE_NEWER_PATHS: &str = "This document has vector paths from a newer Umber. \
+     Resizing the canvas would leave them behind, so it is not done.";
 
 impl StepGate {
     /// Does this answer refuse the step outright?
     ///
     /// **Exhaustive, and that is the whole reason it exists** rather than the
-    /// two call sites comparing against [`StepGate::FlipLocked`]. A control asks
+    /// two call sites comparing against one refusing variant. A control asks
     /// "may I offer this", which is a question about the *set* of refusing
     /// answers, and an equality test answers it only for as long as that set has
     /// one member. See the type's own docs.
     pub fn refuses(self) -> bool {
         match self {
             Self::Clear | Self::SettleForFlip => false,
-            Self::FlipLocked => true,
+            Self::FlipRefused(_) => true,
         }
     }
 }
@@ -587,7 +1024,7 @@ impl StepGate {
 /// **Three controls have to say this**: the Image menu's two flip rows, the Edit
 /// menu's Undo and Redo rows, and the notice a refused keystroke raises. They
 /// were three hand-written near-copies, which is the drift
-/// [`Editor::flip_refused_by_lock`] was introduced two commits earlier to stop
+/// [`Editor::flip_refusal`] (then a lock-only `bool`) was introduced to stop
 /// for the *reading* — the sentence deserves the same treatment and a critic
 /// pointed out that it had not had it.
 ///
@@ -638,6 +1075,7 @@ impl Default for UiState {
             // preferences file that names neither changes nothing.
             resize_needs_press: false,
             resize_from_edge: false,
+            trace: TraceForm::default(),
         }
     }
 }
@@ -707,6 +1145,18 @@ pub struct Editor {
     /// is a cache of GPU state rather than part of the document. See
     /// [`crate::thumbs`].
     pub thumbs: crate::thumbs::Thumbs,
+    /// Where the vector layers' cut and plot paths land on screen, and the
+    /// mesh they were tessellated into.
+    ///
+    /// Above the `--- documents ---` line for the reason [`Editor::thumbs`]
+    /// is: it is a cache of what is drawn rather than part of the document,
+    /// and it is keyed by document id, so a tab switch is a key that moved
+    /// rather than a field that leaked. See [`crate::vectorview`].
+    pub vector_view: crate::vectorview::VectorView,
+    /// Those lines tessellated, so a still frame hands egui an `Arc` rather
+    /// than a copy of every point. A field of its own beside `vector_view`
+    /// because it is built *from* that one's borrowed lines.
+    pub vector_mesh: crate::vectorview::Tessellated,
     /// Where the live document lets an edit land, or `None` for all of it.
     ///
     /// An `Arc` because the renderer compares it by identity to decide whether
@@ -776,6 +1226,10 @@ pub struct Editor {
     /// is drawn from `ui::draw`, which has no `ActiveEventLoop` — the same
     /// arrangement `Updates::take_quit_request` uses for the Windows installer.
     pub quit_requested: bool,
+    /// The trace outline dialog's Trace was pressed. A flag for the reason
+    /// `quit_requested` is one: the dialog is drawn from `ui::draw`, and the
+    /// trace needs the device. `App` spends it once, after the frame.
+    pub trace_requested: bool,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -902,6 +1356,35 @@ pub struct Editor {
     /// [`Editor::stroke`], and abandoned rather than carried across a tab
     /// switch — half a lasso belongs to the gesture, not to the document.
     pub selection_draft: Option<SelectionDraft>,
+    /// The Path tool: its mode and role, the path being drawn, and what is
+    /// picked on the active layer.
+    ///
+    /// Not part of [`DocumentState`], for the reason [`Editor::float`] is not:
+    /// every path that leaves the document settles it first (`take_document`,
+    /// `set_tool`, a resize and a flip), so the draft never has to travel, and
+    /// the pick is let go of whenever the document, the active layer or the
+    /// record moves under it ([`Editor::follow_path_ground`]). The mode and the
+    /// role are tool settings, so they stay put across a tab switch.
+    pub path_tool: crate::pathtool::PathTool,
+    /// What the Path tool last saw of the ground under it. See [`PathWatch`].
+    pub path_watch: PathWatch,
+    /// Layers the Path tool made, by document, whose slices the renderer has
+    /// yet to wipe. A recycled slot still holds the last layer's tiles, and the
+    /// tool can land a path from places that have no device in reach: the rail
+    /// calls [`Editor::set_tool`] straight from the panel. `App::render`
+    /// drains it before anything composites. Empty except for the frame a
+    /// layer is made in, so it allocates once and then never.
+    pub path_layers_made: Vec<(DocId, u32)>,
+    /// [`Editor::path_nodes_shown`]'s last answer and everything it was a
+    /// function of. The painter asks every frame and the hit test at every
+    /// press, so a long path is scanned once per change of view, pick or
+    /// record rather than once per asking. A `Cell` because the answer is read
+    /// through `&self`, as the painter borrows the editor.
+    path_nodes_seen: std::cell::Cell<Option<(NodesShownKey, bool)>>,
+    /// What the Path tool paints with: the preview's buffers, the paths built
+    /// from the draft and the marks. Above the `--- documents ---` line because
+    /// it is a cache of what is drawn. See `ui::path_tool_marks`.
+    pub path_paint: crate::ui::PathPaint,
     /// Scratch for the outline being painted this frame.
     ///
     /// Held rather than built per frame for the reason
@@ -1046,6 +1529,8 @@ impl Default for Editor {
             papers: BTreeMap::new(),
             layers: LayerStack::new(),
             thumbs: crate::thumbs::Thumbs::default(),
+            vector_view: crate::vectorview::VectorView::default(),
+            vector_mesh: crate::vectorview::Tessellated::default(),
             session: Session::default(),
             notice: None,
             loading: None,
@@ -1057,6 +1542,7 @@ impl Default for Editor {
             autosave: crate::autosave::Autosave::default(),
             recovery: crate::recoverdlg::Recovery::default(),
             quit_requested: false,
+            trace_requested: false,
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),
@@ -1073,6 +1559,11 @@ impl Default for Editor {
             float_text: None,
             clipboard: None,
             selection_draft: None,
+            path_tool: crate::pathtool::PathTool::default(),
+            path_watch: PathWatch::default(),
+            path_layers_made: Vec::new(),
+            path_paint: crate::ui::PathPaint::default(),
+            path_nodes_seen: std::cell::Cell::new(None),
             selection_outline: Vec::new(),
             selection_screen: Vec::new(),
             selection_dashes: Vec::new(),
@@ -1290,6 +1781,14 @@ impl Editor {
 
     /// Select a tool, keeping the brush's paint/erase mode in step.
     pub fn set_tool(&mut self, tool: Tool) {
+        // The path being drawn belongs to the tool too, but it is *kept* rather
+        // than abandoned: two nodes are a path somebody meant. Before the tool
+        // changes, so the settle lands it on the layer it was drawn against.
+        // The one dialog the Path tool can raise is here, and this is reached
+        // by the rail and the shortcuts, never by a press on the canvas.
+        if self.ui.tool == Tool::Path && tool != Tool::Path {
+            self.settle_path_tool_noting();
+        }
         self.ui.tool = tool;
         // A half-drawn outline belongs to the tool that was drawing it. Through
         // `cancel_selection_draft` rather than by clearing the field, because
@@ -1304,7 +1803,12 @@ impl Editor {
         match tool {
             Tool::Brush => self.brush.mode = BrushMode::Paint,
             Tool::Eraser => self.brush.mode = BrushMode::Erase,
-            Tool::Select | Tool::Transform | Tool::Eyedropper | Tool::Pan | Tool::Zoom => {}
+            Tool::Select
+            | Tool::Transform
+            | Tool::Eyedropper
+            | Tool::Pan
+            | Tool::Zoom
+            | Tool::Path => {}
         }
     }
 
@@ -1389,6 +1893,789 @@ impl Editor {
             *made.before,
         ));
         self.mark_modified();
+    }
+
+    /// What the Edit menu's two path commands would do with the selection as it
+    /// stands, or the sentence for why not. `Ok(None)` is "no selection", which
+    /// the menu rows are disabled for and a keystroke simply ignores.
+    ///
+    /// **The whole decision, with nothing changed.** Append to the active vector
+    /// layer, or make a layer of its own, or refuse: all three are settled here
+    /// from the model alone so a guard can drive them with no window, and
+    /// `App::path_from_selection` is left to put the picture down, reserve the
+    /// slice and carry the plan out. A refusal therefore changes nothing at all,
+    /// which is structural: nothing here takes `&mut self`.
+    ///
+    /// A locked or opaque vector layer is not a refusal: the paths go on a layer
+    /// of their own beside it, which is what the artist would have had to do by
+    /// hand. What *is* refused is a layer that is full, because the remedy there
+    /// is theirs to choose.
+    pub fn plan_path_from_selection(
+        &self,
+        role: umber_core::PathRole,
+    ) -> Result<Option<PathPlan>, Notice> {
+        let Some(selection) = self.selection.as_ref() else {
+            return Ok(None);
+        };
+        self.plan_path_from_rings(selection.rings(), role).map(Some)
+    }
+
+    /// [`Editor::plan_path_from_selection`] over the rings it was handed.
+    ///
+    /// Apart so a guard can reach the refusal for rings that collapse to
+    /// nothing: a `Selection` with coverage always has rings that enclose
+    /// something, so the public constructors cannot build that case, and the
+    /// arm would otherwise be untested.
+    fn plan_path_from_rings(
+        &self,
+        rings: &[Vec<Vec2>],
+        role: umber_core::PathRole,
+    ) -> Result<PathPlan, Notice> {
+        let paths = umber_core::VectorObject::from_rings(rings, role);
+        self.plan_paths(paths, None).map_err(path_refusal)
+    }
+
+    /// What tracing `alpha` would do: the paths `umber_core::trace` finds,
+    /// planned through [`Editor::plan_paths`] exactly as the selection
+    /// commands plan theirs, or the sentence for why not.
+    ///
+    /// `alpha` is one byte per document pixel, as
+    /// `CanvasRenderer::export_coverage` reads it from
+    /// [`Editor::trace_draws`]. `source` only decides what "nothing" is called.
+    ///
+    /// **Nothing found is one answer however it was reached.** `region` finds
+    /// nothing over the threshold, or `trace` finds nothing worth a path once a
+    /// large region has been averaged down and faint thin work has gone with
+    /// it; both are the same sentence. Changes nothing: `&self`.
+    pub fn plan_trace(
+        &self,
+        alpha: &[u8],
+        source: TraceSource,
+        settings: &umber_core::trace::TraceSettings,
+    ) -> Result<PathPlan, Notice> {
+        let nothing = || Notice {
+            title: "Nothing to trace".to_string(),
+            lines: vec![source.nothing_line().to_string()],
+        };
+        let Some(region) = umber_core::trace::region(
+            self.doc.size,
+            alpha,
+            settings.margin,
+            umber_core::trace::MAX_CELLS,
+        ) else {
+            return Err(nothing());
+        };
+        let paths = umber_core::trace::trace(&region, settings);
+        if paths.is_empty() {
+            return Err(nothing());
+        }
+        // Judged against a fresh record first, through the record's own
+        // bounds: past them, `plan_paths` would say to use another vector
+        // layer, and no layer holds more than a fresh one does.
+        let too_many = || Notice {
+            title: "Too many pieces to trace".to_string(),
+            lines: vec![TOO_MANY_PIECES_LINE.to_string()],
+        };
+        if let Err(why) = umber_core::VectorObject::empty().appended(paths.clone()) {
+            match why {
+                umber_core::vector::VectorRefusal::TooManyPaths
+                | umber_core::vector::VectorRefusal::TooManyNodes => return Err(too_many()),
+                // Left to `plan_paths`, which words them already.
+                umber_core::vector::VectorRefusal::Impossible
+                | umber_core::vector::VectorRefusal::Opaque => {}
+            }
+        }
+        self.plan_paths(paths, None).map_err(path_refusal)
+    }
+
+    /// Put the trace outline dialog up. The first time in a session the
+    /// margin is seeded to 3 mm at this document's resolution, clamped to what
+    /// the trace honours; after that it is left as the artist set it.
+    pub fn open_trace(&mut self) {
+        let dpi = self.doc.dpi;
+        let form = &mut self.ui.trace;
+        form.open = true;
+        // A resolution that is not a positive number says nothing about how
+        // big 3 mm is, so the margin is left alone and not marked seeded: the
+        // next document with a real resolution still gets the seed.
+        if !form.seeded && dpi.is_finite() && dpi > 0.0 {
+            form.settings.margin = (dpi * 3.0 / 25.4)
+                .round()
+                .min(umber_core::trace::MAX_MARGIN);
+            form.seeded = true;
+        }
+    }
+
+    /// Why the active layer's paths cannot be edited, or `None` when they can.
+    ///
+    /// **Visibility is the stack's effective reading**, the one
+    /// `vectorview::shown` draws by, so a layer inside a hidden folder is
+    /// hidden here too. An edit to a layer nobody can see would land blind.
+    pub fn path_edit_refusal(&self) -> Option<PathEditRefusal> {
+        let active = self.layers.active_index();
+        let Some(record) = self.layers.vector_at(active) else {
+            return Some(PathEditRefusal::NotVector);
+        };
+        if record.is_opaque() {
+            return Some(PathEditRefusal::Newer);
+        }
+        if self.layers.effective_locked(active) {
+            return Some(PathEditRefusal::Locked);
+        }
+        if !self.layers.effective_visible(active) {
+            return Some(PathEditRefusal::Hidden);
+        }
+        None
+    }
+
+    /// The active layer's record, where it may be edited.
+    pub fn editable_paths(&self) -> Option<&umber_core::VectorObject> {
+        match self.path_edit_refusal() {
+            Some(_) => None,
+            None => self.layers.vector_at(self.layers.active_index()),
+        }
+    }
+
+    /// Where finished paths go: onto the active layer where it may be edited,
+    /// otherwise a layer of their own. `replaces` names a path of the active
+    /// layer the first of `paths` takes the place of, and is refused outright
+    /// where the layer cannot be edited, because a new layer has nothing to
+    /// replace.
+    ///
+    /// The one door every way of making paths goes through, so the selection
+    /// commands and the Path tool cannot come to judge a layer differently.
+    /// Nothing here takes `&mut self`: a refusal changes nothing.
+    pub fn plan_paths(
+        &self,
+        mut paths: Vec<umber_core::vector::Path>,
+        replaces: Option<usize>,
+    ) -> Result<PathPlan, &'static str> {
+        let impossible = umber_core::vector::VectorRefusal::sentence;
+        let Some(first_role) = paths.first().map(|p| p.role) else {
+            return Err(impossible(umber_core::vector::VectorRefusal::Impossible));
+        };
+        let active = self.layers.active_index();
+        match (self.path_edit_refusal(), replaces) {
+            (Some(why), Some(_)) => Err(why.sentence()),
+            (Some(_), None) => {
+                let record = umber_core::VectorObject::empty()
+                    .appended(paths)
+                    .map_err(impossible)?;
+                if let Some((_, sentence)) = self.new_layer_refusal() {
+                    return Err(sentence);
+                }
+                let name = match first_role {
+                    umber_core::PathRole::Cut => CUT_LAYER_NAME,
+                    umber_core::PathRole::Plot => PLOT_LAYER_NAME,
+                    umber_core::PathRole::Ink => INK_LAYER_NAME,
+                };
+                Ok(PathPlan::NewLayer {
+                    name,
+                    record: Box::new(record),
+                })
+            }
+            (None, replaces) => {
+                let (Some(existing), Some(slot)) =
+                    (self.layers.vector_at(active), self.layers.active_slot())
+                else {
+                    return Err(PathEditRefusal::NotVector.sentence());
+                };
+                let after = match replaces {
+                    Some(index) => {
+                        // `paths` is not empty, so the first is there to take.
+                        let first = paths.remove(0);
+                        existing
+                            .with_path(index, first)
+                            .and_then(|swapped| swapped.appended(paths))
+                            .map_err(impossible)?
+                    }
+                    None => existing.appended(paths).map_err(impossible)?,
+                };
+                match self.layers.can_set_vector(active, &after) {
+                    Ok(()) => Ok(PathPlan::Append {
+                        slot,
+                        after: Box::new(after),
+                    }),
+                    Err(why) => Err(set_refusal_sentence(why)),
+                }
+            }
+        }
+    }
+
+    /// Swap the active layer's record for `after` as one "Edit paths" entry.
+    ///
+    /// A record equal to the one there records nothing and answers `Ok`: an
+    /// entry that undoes to itself is a row in the history that does nothing.
+    /// A refusal, from the layer's state or from the record, changes nothing.
+    pub fn apply_path_edit(&mut self, after: umber_core::VectorObject) -> Result<(), &'static str> {
+        if let Some(why) = self.path_edit_refusal() {
+            return Err(why.sentence());
+        }
+        let index = self.layers.active_index();
+        if self.layers.vector_at(index) == Some(&after) {
+            return Ok(());
+        }
+        let Some(slot) = self.layers.active_slot() else {
+            return Err(PathEditRefusal::NotVector.sentence());
+        };
+        match self.layers.set_vector(index, after) {
+            Ok(was) => {
+                self.history.record(umber_core::Edit::vector(
+                    slot,
+                    was,
+                    Some(umber_core::Timestamp::now()),
+                ));
+                self.mark_modified();
+                Ok(())
+            }
+            Err(why) => Err(set_refusal_sentence(why)),
+        }
+    }
+
+    /// The refusals a new layer has, in the order the stack states them, as a
+    /// title and one sentence. **Static text**, so `plan_paths` can answer with
+    /// the sentence alone while the notice is built from the same pair: the two
+    /// ways in cannot come to word one refusal differently.
+    ///
+    /// The stack's limits come first, one sentence per reason because the
+    /// remedies differ. A layer born inside a locked folder would be locked at
+    /// once, holding paths nobody could then change.
+    fn new_layer_refusal(&self) -> Option<(&'static str, &'static str)> {
+        match self.layers.add_refusal() {
+            Some(umber_core::AddRefusal::StackFull) => {
+                return Some((
+                    "There is no room for another layer",
+                    concat!(stack_full_line!(), " Delete a layer to make room."),
+                ));
+            }
+            Some(umber_core::AddRefusal::TooDeep) => {
+                return Some((
+                    "That folder is nested as deep as it goes",
+                    "A layer inside it would be one level too deep. Select a layer \
+                     outside it.",
+                ));
+            }
+            None => {}
+        }
+        if self.layers.new_layer_would_be_locked() {
+            return Some((
+                "That folder is locked",
+                "A new layer inside it would be locked too. Unlock the folder, or \
+                 select a layer outside it.",
+            ));
+        }
+        None
+    }
+
+    /// An empty vector layer above the active entry, for the Layers panel's
+    /// mark. The same gate as a layer made from the selection.
+    pub fn plan_new_vector_layer(&self) -> Result<PathPlan, Notice> {
+        self.plan_new_layer(VECTOR_LAYER_NAME, umber_core::VectorObject::empty())
+    }
+
+    /// The refusals a new layer has, in the order the stack states them, and the
+    /// plan where there are none. **One function for both ways in**, so the
+    /// two commands cannot come to refuse different things.
+    fn plan_new_layer(
+        &self,
+        name: &'static str,
+        record: umber_core::VectorObject,
+    ) -> Result<PathPlan, Notice> {
+        if let Some((title, sentence)) = self.new_layer_refusal() {
+            return Err(Notice {
+                title: title.to_string(),
+                lines: vec![sentence.to_string()],
+            });
+        }
+        Ok(PathPlan::NewLayer {
+            name,
+            record: Box::new(record),
+        })
+    }
+
+    /// Carry a plan out and record its one undo entry.
+    ///
+    /// A new layer that finds the pool dry hands the plan back
+    /// ([`PathApplyRefusal::NoSlice`]), so the caller can give a parked slice up
+    /// and ask again, exactly as `App::add_layer` does. An append takes no
+    /// slice, so the one way it can fail, a stack that changed since the plan
+    /// judged it, comes back worded ([`PathApplyRefusal::Declined`]) with the
+    /// layer's own refusal rather than a sentence about slices.
+    ///
+    /// **Recording is here and not at the call site**, for the reason
+    /// [`Editor::commit_made_layer`] is: a recording inside `App` is one no
+    /// guard in this crate can drive without a device. A new layer is the
+    /// ordinary structural `EditKind::AddLayer` entry, which carries the layer
+    /// and its record whole, so one Ctrl+Z takes both back; an append is a
+    /// `Paths` entry holding what was there before.
+    pub fn apply_path_plan(&mut self, plan: PathPlan) -> Result<(), PathApplyRefusal> {
+        match plan {
+            PathPlan::Append { slot, after } => {
+                let index = self.layers.active_index();
+                // The rule `apply_path_edit` keeps: an entry that undoes to
+                // itself is a row in the history that does nothing, and it
+                // would mark the tab modified and drain the redo stack.
+                if self.layers.vector_at(index) == Some(&*after) {
+                    return Ok(());
+                }
+                match self.layers.set_vector(index, *after.clone()) {
+                    Ok(was) => {
+                        self.history.record(umber_core::Edit::vector(
+                            slot,
+                            was,
+                            Some(umber_core::Timestamp::now()),
+                        ));
+                        self.mark_modified();
+                        Ok(())
+                    }
+                    // Judged a moment ago by the plan, so this is a stack that
+                    // changed between the two. Nothing was written.
+                    Err(why) => Err(PathApplyRefusal::Declined(set_refusal_sentence(why))),
+                }
+            }
+            PathPlan::NewLayer { name, record } => {
+                // Before the add, so restoring the shape takes the layer out.
+                let before = self.layers.shape(self.doc.layer_bytes());
+                match self.layers.add_vector_layer(name, (*record).clone()) {
+                    Some(_) => {
+                        self.history.record(umber_core::Edit::new(
+                            umber_core::EditKind::AddLayer,
+                            before,
+                        ));
+                        self.mark_modified();
+                        Ok(())
+                    }
+                    None => Err(PathApplyRefusal::NoSlice(PathPlan::NewLayer {
+                        name,
+                        record,
+                    })),
+                }
+            }
+        }
+    }
+
+    /// Give the oldest undo entries up until a parked slice comes free, or the
+    /// history runs out. The rule `App::add_layer` and the path commands follow
+    /// on a dry pool, here so the Path tool can follow it with no device.
+    ///
+    /// **Called after a refusal, never before**: `free_until` gives nothing up
+    /// while there is already room, and freeing first would throw an artist's
+    /// edits away for a layer that was refused for some other reason.
+    pub fn free_a_slot(&mut self) -> bool {
+        let room = self.layers.room();
+        self.history.free_until(move || room.has_room())
+    }
+
+    /// What the Path tool sees of the document now.
+    fn path_ground_now(&self) -> PathGround {
+        PathGround {
+            document: self.session.active_id(),
+            slot: self.layers.active_slot(),
+            revision: self.layers.vector_revision(),
+        }
+    }
+
+    /// Let go of what the Path tool picked, and detach what it is carrying on,
+    /// where the ground has moved under it. Once a frame from `App::render`,
+    /// before the interface is built, and again at the top of every press,
+    /// release and key the tool is handed, so an undo landing between two
+    /// frames cannot hand the next press a pick that names another path.
+    ///
+    /// A handful of reads and a comparison while nothing moves, and it
+    /// allocates nothing. A foreign revision under a continued draft also
+    /// compares the continued path's nodes, once, against the draft's base.
+    pub fn follow_path_ground(&mut self) {
+        let follow = self.path_watch.observe(self.path_ground_now());
+        if follow.let_go {
+            self.path_tool.let_go();
+        }
+        let record = self.layers.vector_at(self.layers.active_index());
+        if follow.detach || (follow.let_go && !self.path_tool.still_continues(record)) {
+            self.path_tool.detach();
+        }
+    }
+
+    /// Document-space distances for a press, from the camera. The hit radius
+    /// is screen points; the tap slop is physical pixels, `gesture`'s unit.
+    fn path_reach(&self) -> crate::pathtool::Reach {
+        let zoom = self.camera.zoom.max(1e-6);
+        crate::pathtool::Reach {
+            hit: PATH_HIT_POINTS * self.pixels_per_point.max(1e-3) / zoom,
+            tap: crate::gesture::TAP_SLOP / zoom,
+        }
+    }
+
+    /// What the Path tool may touch on this event.
+    pub fn path_ground(&self) -> crate::pathtool::Ground<'_> {
+        crate::pathtool::Ground {
+            paths: self.editable_paths(),
+            reach: self.path_reach(),
+            nodes_shown: self.path_nodes_shown(),
+        }
+    }
+
+    /// Hand the tool and its ground to `f`. The tool is taken out for the call
+    /// because the ground borrows the stack while the tool is changed; both
+    /// readings that need the tool are made first, so the ground is the one
+    /// [`Editor::path_ground`] would answer.
+    fn with_path_tool<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::pathtool::PathTool, crate::pathtool::Ground<'_>) -> R,
+    ) -> R {
+        let reach = self.path_reach();
+        let nodes_shown = self.path_nodes_shown();
+        let mut tool = std::mem::take(&mut self.path_tool);
+        let out = f(
+            &mut tool,
+            crate::pathtool::Ground {
+                paths: self.editable_paths(),
+                reach,
+                nodes_shown,
+            },
+        );
+        self.path_tool = tool;
+        out
+    }
+
+    /// Whether the picked path's nodes may be marked and hit: false where more
+    /// than [`crate::pathtool::NODE_MARK_CAP`] of them fall inside the canvas
+    /// region. The marks and the hit test both read this, so a node is never
+    /// hittable where it is not drawn.
+    ///
+    /// **The bound is one pass over the picked path's nodes, at most, per
+    /// change of what it depends on**: the answer is cached against the
+    /// document, the record's revision, the pick and the view, so the painter
+    /// asking every frame and the hit test asking at every press scan nothing
+    /// while those stand still. The pass itself stops as soon as the answer is
+    /// known either way: a path of no more than the cap nodes is answered with
+    /// no scan at all, a count past the cap stops at the first node over it,
+    /// and a count that the nodes left could no longer carry past the cap
+    /// stops there. Never a mark per node.
+    pub fn path_nodes_shown(&self) -> bool {
+        let cap = crate::pathtool::NODE_MARK_CAP;
+        let Some(pick) = self.path_tool.pick() else {
+            return true;
+        };
+        let Some(path) = self
+            .editable_paths()
+            .and_then(|record| record.paths().get(pick.path))
+        else {
+            return true;
+        };
+        let total = path.nodes.len();
+        if total <= cap {
+            return true;
+        }
+        let key = NodesShownKey {
+            document: self.session.active_id(),
+            revision: self.layers.vector_revision(),
+            path: pick.path,
+            center: self.camera.center,
+            zoom: self.camera.zoom,
+            pivot: self.canvas_pivot,
+            size: self.canvas_size,
+        };
+        if let Some((seen, shown)) = self.path_nodes_seen.get()
+            && seen == key
+        {
+            return shown;
+        }
+        // The canvas region, recorded each frame in physical pixels, taken into
+        // the document. The camera neither rotates nor shears, so two corners
+        // say it all.
+        let half = self.canvas_size * 0.5;
+        let a = self.screen_to_doc(self.canvas_pivot - half);
+        let b = self.screen_to_doc(self.canvas_pivot + half);
+        let (lo, hi) = (a.min(b), a.max(b));
+        let shown = nodes_in_view_within(&path.nodes, lo, hi, cap);
+        self.path_nodes_seen.set(Some((key, shown)));
+        shown
+    }
+
+    /// A press with the Path tool. `ctrl` borrows Edit for this one gesture.
+    pub fn path_press(&mut self, doc: Vec2, ctrl: bool) {
+        self.follow_path_ground();
+        let edit = ctrl
+            || match self.path_tool.mode {
+                crate::pathtool::PathMode::Edit => true,
+                crate::pathtool::PathMode::Draw => false,
+            };
+        self.with_path_tool(|tool, ground| tool.press(doc, edit, ground));
+        // An edit press on a layer that cannot be edited is nobody's, and
+        // used to say nothing either: a Ctrl press in Draw on a locked layer
+        // looked like a press that had missed.
+        if edit && let Some(why) = self.path_edit_refusal() {
+            self.path_tool.say(why.sentence());
+        }
+    }
+
+    /// The pointer moved, held or hovering. `shift` moves one handle alone.
+    pub fn path_moved(&mut self, doc: Vec2, shift: bool) {
+        self.path_tool.moved(doc, shift);
+    }
+
+    /// The press was let go of. A finished drag, a closing press or an insert
+    /// is carried out here, as one undo entry.
+    pub fn path_release(&mut self, doc: Vec2) {
+        self.follow_path_ground();
+        let commit = self.with_path_tool(|tool, ground| tool.release(doc, ground));
+        self.carry_out(commit);
+    }
+
+    /// A key offered to the Path tool. True when it took it; false and the key
+    /// does what it did before.
+    ///
+    /// **Undo and redo with a draft up belong to the draft**: undo takes its
+    /// last node off and redo does nothing, and neither touches the history,
+    /// so nothing is committed and no redo stack is lost. With no draft both
+    /// answer false and are the ordinary commands.
+    pub fn path_key(&mut self, key: PathKey) -> bool {
+        self.follow_path_ground();
+        let drafting = self.path_tool.draft().is_some();
+        match key {
+            PathKey::Finish => {
+                if !drafting {
+                    return false;
+                }
+                // One node is not a path yet, but Enter is still the draft's,
+                // so it does not fall through to whatever else is bound to it.
+                let commit = self.path_tool.finish();
+                self.carry_out(commit);
+                true
+            }
+            PathKey::Abandon => self.path_tool.abandon(),
+            PathKey::Remove => {
+                if drafting {
+                    return self.path_tool.pop();
+                }
+                if self.path_tool.pick().is_none() {
+                    return false;
+                }
+                // A pick on a layer that has since been locked or hidden: the
+                // key was aimed at that path, so it is the tool's and says why,
+                // rather than falling through to whatever else Backspace or
+                // Delete is bound to. Nothing is bound to either by default,
+                // but somebody who bound Delete to deleting the layer would
+                // otherwise lose the layer they were aiming at a path on.
+                if let Some(why) = self.path_edit_refusal() {
+                    self.path_tool.say(why.sentence());
+                    return true;
+                }
+                let commit = self.with_path_tool(|tool, ground| tool.remove(ground));
+                self.carry_out(commit);
+                true
+            }
+            PathKey::Undo => drafting && self.path_tool.pop(),
+            PathKey::Redo => drafting,
+        }
+    }
+
+    /// A command from the options strip, carried out by the route a pointer
+    /// release takes: the tool answers a [`crate::pathtool::Commit`] and
+    /// [`Editor::carry_out`] is the one thing that lands it. The strip collects
+    /// its press while it draws and calls one of these after the row, so the
+    /// record has one writer per frame.
+    fn path_command(
+        &mut self,
+        command: impl FnOnce(
+            &mut crate::pathtool::PathTool,
+            crate::pathtool::Ground<'_>,
+        ) -> crate::pathtool::Commit,
+    ) {
+        self.follow_path_ground();
+        let commit = self.with_path_tool(command);
+        self.carry_out(commit);
+    }
+
+    /// The strip's Cut / Plot switch: the picked path's role, or with no pick
+    /// the role for new paths.
+    pub fn path_set_role(&mut self, role: umber_core::PathRole) {
+        self.path_command(|tool, ground| tool.set_role(role, ground));
+    }
+
+    /// The strip's Close path / Open path button.
+    pub fn path_toggle_closed(&mut self) {
+        self.path_command(|tool, ground| tool.toggle_closed(ground));
+    }
+
+    /// The strip's Corner button.
+    pub fn path_corner(&mut self) {
+        self.path_command(|tool, ground| tool.corner(ground));
+    }
+
+    /// The strip's Smooth button.
+    pub fn path_smooth(&mut self) {
+        self.path_command(|tool, ground| tool.smooth(ground));
+    }
+
+    /// Settle the Path tool before it, or the document under it, goes away: a
+    /// draft of two or more nodes is put on a layer, a shorter one is dropped,
+    /// and the pick is let go of. A draft that could not land is dropped too,
+    /// and the notice saying so is answered for the caller to raise. Never from
+    /// a press on the canvas.
+    pub fn settle_path_tool(&mut self) -> Option<Notice> {
+        self.follow_path_ground();
+        let commit = self.path_tool.settle();
+        self.carry_out(commit);
+        let mut notice = None;
+        if self.path_tool.draft().is_some() {
+            // `landed` left the reason in `said`, and a refusal always gives one.
+            let reason = self
+                .path_tool
+                .said()
+                .unwrap_or(umber_core::vector::VectorRefusal::Impossible.sentence());
+            notice = Some(Notice {
+                title: PATH_NOT_KEPT_TITLE.to_string(),
+                lines: vec![reason.to_string()],
+            });
+            self.path_tool.abandon();
+        }
+        self.path_tool.let_go();
+        notice
+    }
+
+    /// [`Editor::settle_path_tool`], with its notice raised beside whatever is
+    /// already up rather than over it. For the settle sites that have nowhere
+    /// else to put it.
+    pub fn settle_path_tool_noting(&mut self) {
+        if let Some(notice) = self.settle_path_tool() {
+            self.add_notice(notice);
+        }
+    }
+
+    /// Raise `notice` beside whatever is already up rather than over it: its
+    /// lines go under the standing notice's title, or it becomes the notice
+    /// where none is up. For a command that can raise two in one call, so the
+    /// first is not lost to the second.
+    pub fn add_notice(&mut self, notice: Notice) {
+        for line in &notice.lines {
+            add_notice_line(&mut self.notice, &notice.title, line);
+        }
+    }
+
+    /// Hand every queued new layer's slice to `wipe`, once, and empty the
+    /// queue. The renderer's half is `App::drain_path_layers`, which says why
+    /// it runs where it does.
+    pub fn take_path_layers(&mut self, mut wipe: impl FnMut(DocId, u32)) {
+        for (id, slot) in self.path_layers_made.drain(..) {
+            wipe(id, slot);
+        }
+    }
+
+    /// The press the Path tool was holding ended without a release: another
+    /// gesture took `Interaction` over, a second finger landed, or the window
+    /// lost focus. Every place that takes `Pathing` away calls this, so the
+    /// tool is never left holding a press only a release could end.
+    pub fn interrupt_path_gesture(&mut self) {
+        match self.interaction {
+            Interaction::Pathing => {
+                self.path_tool.interrupt();
+                self.interaction = Interaction::Idle;
+            }
+            Interaction::Idle
+            | Interaction::Drawing
+            | Interaction::Selecting
+            | Interaction::Panning
+            | Interaction::Zooming
+            | Interaction::Picking => {}
+        }
+    }
+
+    /// Closing the tab at `index` was asked for. The path being drawn is on
+    /// the document in front, so where that is the one closing it is put on a
+    /// layer **before** anybody asks whether the tab holds unsaved work: a kept
+    /// path marks it modified, and the ordinary prompt then asks about it
+    /// rather than the close dropping it in silence.
+    pub fn settle_before_closing(&mut self, index: usize) {
+        if index == self.session.active_index() {
+            self.settle_path_tool_noting();
+        }
+    }
+
+    /// The window is closing. The same, for the document in front, before the
+    /// list of unsaved documents is made.
+    pub fn settle_before_quitting(&mut self) {
+        self.settle_path_tool_noting();
+    }
+
+    /// Carry out what the Path tool asked for, and tell it how that went.
+    ///
+    /// A landing goes through [`Editor::plan_paths`] and
+    /// [`Editor::apply_path_plan`], the one door every way of making paths
+    /// uses; a dry pool gives a parked slice up and tries once more, as every
+    /// other way of adding a layer does. An edit goes through
+    /// [`Editor::apply_path_edit`]. Either way the tool hears the outcome, so a
+    /// refusal keeps the draft up and says why on the strip.
+    ///
+    /// **No float can be up under a commit that writes, and that is what lets
+    /// this record.** A float exists only with the transform tool in hand, and
+    /// every way a float begins settles the Path tool before it: a lift needs
+    /// the transform tool already in hand, and a paste or a text placement
+    /// (`App::float_a_clip`) settles first, because the tool change at its end
+    /// would otherwise settle with the float up. So there is no draft and no
+    /// pick for a `Land` or a `Set` to come from while one stands.
+    /// `Nothing` is a different matter: the window's close, the tab's close
+    /// mark and File > Close document settle the tool with a float still up,
+    /// and an empty hand settles to `Nothing`, so the assertion sits in the two
+    /// arms that write and not above the match.
+    pub fn carry_out(&mut self, commit: crate::pathtool::Commit) {
+        match commit {
+            crate::pathtool::Commit::Nothing => {}
+            crate::pathtool::Commit::Land { paths, replaces } => {
+                debug_assert!(
+                    self.float.is_none(),
+                    "the Path tool landed a path while a float was up"
+                );
+                let outcome = match self.plan_paths(paths, replaces) {
+                    Err(why) => Err(why),
+                    Ok(plan) => self.land_path_plan(plan),
+                };
+                if outcome.is_ok() {
+                    self.path_watch.own_edit(self.path_ground_now());
+                }
+                self.path_tool.landed(outcome);
+            }
+            crate::pathtool::Commit::Set(after) => {
+                debug_assert!(
+                    self.float.is_none(),
+                    "the Path tool edited a path while a float was up"
+                );
+                let outcome = self.apply_path_edit(after);
+                if outcome.is_ok() {
+                    self.path_watch.own_edit(self.path_ground_now());
+                    // A Ctrl edit of the very path a draft is carrying on: the
+                    // landing would put the draft's old copy of it back over
+                    // the edit, so the draft lands as a new path instead.
+                    let record = self.layers.vector_at(self.layers.active_index());
+                    if !self.path_tool.still_continues(record) {
+                        self.path_tool.detach();
+                    }
+                }
+                self.path_tool.applied(outcome);
+            }
+        }
+    }
+
+    /// Apply a planned landing, giving a parked slice up once on a dry pool, and
+    /// queue a new layer's slice for the renderer to wipe.
+    fn land_path_plan(&mut self, plan: PathPlan) -> Result<(), &'static str> {
+        let adds_a_layer = plan.adds_a_layer();
+        let applied = match self.apply_path_plan(plan) {
+            Err(PathApplyRefusal::NoSlice(plan)) if self.free_a_slot() => {
+                self.apply_path_plan(plan)
+            }
+            other => other,
+        };
+        match applied {
+            Ok(()) => {
+                if adds_a_layer && let Some(slot) = self.layers.active_slot() {
+                    self.path_layers_made.push((self.session.active_id(), slot));
+                }
+                Ok(())
+            }
+            Err(PathApplyRefusal::NoSlice(_)) => Err(PATH_NO_SLICE_LINE),
+            Err(PathApplyRefusal::Declined(why)) => Err(why),
+        }
     }
 
     /// Take back a layer a text placement made.
@@ -1571,6 +2858,11 @@ impl Editor {
     /// document in the same breath. It exists because these fields are read by
     /// name all over the interface, so they cannot be an `Option`.
     fn take_document(&mut self) -> DocumentState {
+        // The path being drawn is settled into the document it was drawn on,
+        // while that is still the one here. Here rather than at each of the
+        // callers, because every tab switch and every open parks the document
+        // in front through this one function.
+        self.settle_path_tool_noting();
         DocumentState {
             doc: std::mem::take(&mut self.doc),
             layers: std::mem::replace(&mut self.layers, LayerStack::new()),
@@ -1591,6 +2883,11 @@ impl Editor {
         // The gesture, unlike the selection, does not travel: it belonged to
         // the pointer, and the pointer is now over a different document.
         self.selection_draft = None;
+        // The Path tool's draft and pick belonged to the outgoing document.
+        // `take_document` settles them on every swap that parks it; what is
+        // left to reach here is closing the document in front, where there is
+        // nothing to land a path on any more.
+        self.path_tool.reset();
         // Belt and braces. Every caller owes this a document with nothing
         // floating — the pixels live in the *outgoing* document's renderer, so
         // carrying the record across would leave a preview standing in front of
@@ -1674,8 +2971,16 @@ impl Editor {
     ///
     /// The history is cleared here rather than left to the caller so it cannot
     /// be forgotten by one of two call sites.
-    pub fn apply_canvas(&mut self, doc: Document) -> bool {
+    pub fn apply_canvas(&mut self, doc: Document, anchor: umber_core::Anchor) -> bool {
         let resized = doc.size != self.doc.size;
+        // The path being drawn is a statement about the canvas as it is, so it
+        // goes onto a layer first and is carried by the resize like any other.
+        if resized {
+            self.settle_path_tool_noting();
+        }
+        // Read before `self.doc` is replaced: the plan is a statement about the
+        // old canvas and the new one together.
+        let moved = umber_core::CanvasCopy::plan(self.doc.size, doc.size, anchor);
         // Only a real change is a change: pressing Apply on a dialog nobody
         // touched must not put a dot on the tab and start asking about
         // unsaved work.
@@ -1714,6 +3019,28 @@ impl Editor {
                     )],
                 });
             }
+            // **A vector layer's paths move with the picture instead.** Unlike
+            // a text placement they are exact under a translation, and the
+            // offset is the one the pixels move by: `CanvasCopy::plan`'s
+            // destination minus its source, which is the same plan
+            // `CanvasRenderer::resize` copies by, so the paths cannot disagree
+            // with the pixels about where the picture went. A shrink may carry
+            // a path off the canvas, which is legal: a path is geometry, and
+            // the part that is gone was never going to be drawn.
+            let by = moved.to.as_vec2() - moved.from.as_vec2();
+            let carried = self.layers.translate_vectors(by);
+            if carried.stripped_ink > 0 {
+                // Appended to a notice already up rather than replacing it, so
+                // a document holding both kinds of layer hears about both.
+                add_notice_line(&mut self.notice, "Strokes are paint now", VECTOR_INK_LINE);
+            }
+            if carried.lost_paths > 0 {
+                add_notice_line(
+                    &mut self.notice,
+                    "A vector path was removed",
+                    VECTOR_LOST_ON_RESIZE_LINE,
+                );
+            }
             // Keep the zoom, but not the ability to be looking at a part of the
             // canvas that no longer exists.
             self.camera.center = self.camera.center.clamp(Vec2::ZERO, doc.size_vec2());
@@ -1730,8 +3057,28 @@ impl Editor {
     /// Redo rows, and the keystroke behind each. One statement here rather than
     /// three `layers.any_locked()` calls that happen to be spelled the same, so
     /// a change to what refuses a flip cannot leave one control offering it.
-    pub fn flip_refused_by_lock(&self) -> bool {
-        self.layers.any_locked()
+    ///
+    /// **A record from a newer Umber refuses it too**, and for the same shape of
+    /// reason: this build cannot read those paths, so it cannot mirror them,
+    /// and a flip that moved every pixel and left them where they were is a
+    /// document the newer build would open wrong. The lock is asked first,
+    /// because it is the one the artist can do something about.
+    pub fn flip_refusal(&self) -> Option<FlipRefusal> {
+        if self.layers.any_locked() {
+            Some(FlipRefusal::Locked)
+        } else if self.layers.has_opaque_vector() {
+            Some(FlipRefusal::NewerPaths)
+        } else {
+            None
+        }
+    }
+
+    /// Would a change of canvas *size* be refused? A record from a newer Umber
+    /// is the one reason, for [`Editor::flip_refusal`]'s: its paths cannot be
+    /// moved with the picture. A change to the resolution or the background
+    /// alone moves nothing and is never refused.
+    pub fn resize_refused(&self, size: glam::UVec2) -> bool {
+        size != self.doc.size && self.layers.has_opaque_vector()
     }
 
     /// What carrying the entry at the top of the undo stack backwards needs of
@@ -1780,8 +3127,10 @@ impl Editor {
         // be a second copy of a number that has exactly one source.
         match next.and_then(umber_core::EditKind::flip_axis) {
             None => StepGate::Clear,
-            Some(_) if self.flip_refused_by_lock() => StepGate::FlipLocked,
-            Some(_) => StepGate::SettleForFlip,
+            Some(_) => match self.flip_refusal() {
+                Some(why) => StepGate::FlipRefused(why),
+                None => StepGate::SettleForFlip,
+            },
         }
     }
 
@@ -1829,6 +3178,21 @@ impl Editor {
         // `Placement::flipped` — which is why a flip does not cost a text layer
         // its record the way a resize does, and it has to be, because undoing a
         // flip is another flip.
+        // And a vector layer's paths, which a mirror carries within one
+        // rounding (Ink included, since the pixels it describes are mirrored by
+        // this same flip), so its undo, which is another flip, puts every node
+        // back. The one exception is a path the mirror pushes past the bound a
+        // record may reach, which is taken out and said, after the text notice
+        // below so that one cannot replace it.
+        let lost_paths = self.layers.flip_vectors(axis, doc);
+        // The path being drawn is over the artwork, so it rides the flip with
+        // it, by the arithmetic the paths above use. Here rather than settled
+        // first, because this is also the route an undo of a flip takes and a
+        // landing recorded in the middle of a step would land in the history
+        // being walked. The pick names a path by index and the flip may have
+        // taken one out, so it goes.
+        self.path_tool.mirror(axis, doc);
+        self.path_tool.let_go();
         let dropped = self.layers.flip_text(axis, doc);
         if dropped > 0 {
             // Rare rather than unreachable, and the difference is worth stating.
@@ -1849,6 +3213,13 @@ impl Editor {
                     text_layers(dropped)
                 )],
             });
+        }
+        if lost_paths > 0 {
+            add_notice_line(
+                &mut self.notice,
+                "A vector path was removed",
+                VECTOR_LOST_ON_FLIP_LINE,
+            );
         }
         // The gesture belongs to the pointer and was drawn on the picture as it
         // was. Abandoned rather than mirrored, exactly as a tab switch does —
@@ -2435,32 +3806,83 @@ impl Editor {
     ///
     /// A folder carries no effects: `LayerStack::set_effect` refuses one, because
     /// a folder holds no coverage to derive from until group compositing lands.
-    /// So the `filter_map` below drops folders exactly as it always did and never
-    /// has to ask.
+    /// So the `filter_map` in `Editor::indexed_draws` drops folders exactly as
+    /// it always did and never has to ask.
     pub fn effected_draws(&self, float: Option<(u32, u32)>) -> Vec<LayerEffects<'_>> {
+        self.indexed_draws(float)
+            .into_iter()
+            .map(|(_, draw)| draw)
+            .collect()
+    }
+
+    /// The draws a trace outline reads: [`Editor::layer_draws`] for
+    /// Everything, and for This layer the same list with every draw outside
+    /// the active entry's subtree made invisible. For a folder that is its
+    /// contents. A draw already invisible stays so, so a layer hidden by its
+    /// own eye or a folder's traces nothing.
+    pub fn trace_draws(&self, source: TraceSource) -> Vec<LayerDraw> {
+        self.trace_effected_draws(source)
+            .into_iter()
+            .map(|e| e.draw)
+            .collect()
+    }
+
+    /// [`Editor::trace_draws`] with each layer's effects beside its draw, for
+    /// `App::trace_outline` to bake. An effect's draw takes its visibility from
+    /// its layer, so hiding the layer hides what it casts.
+    ///
+    /// **Everything outside the subtree is hidden, clip bases included.** A
+    /// clipped layer whose base is outside it therefore shows nothing and
+    /// traces nothing, which is what the composite does with a clipped layer
+    /// at the bottom of a stack. Keeping the base's alpha for the clip while
+    /// hiding its colour is not something a draw can say, and tracing the
+    /// clipped layer unclipped would trace pixels nobody can see.
+    pub fn trace_effected_draws(&self, source: TraceSource) -> Vec<LayerEffects<'_>> {
+        let mut draws = self.indexed_draws(None);
+        match source {
+            TraceSource::Everything => {}
+            TraceSource::ThisLayer => {
+                let keep = self.layers.subtree(self.layers.active_index());
+                for (index, effected) in &mut draws {
+                    if !keep.contains(index) {
+                        effected.draw.visible = false;
+                    }
+                }
+            }
+        }
+        draws.into_iter().map(|(_, draw)| draw).collect()
+    }
+
+    /// The flattening itself, each draw beside the stack position it came
+    /// from. A draw's position is not a stack position once there are folders,
+    /// so anything that has to ask the stack about a draw asks with this.
+    fn indexed_draws(&self, float: Option<(u32, u32)>) -> Vec<(usize, LayerEffects<'_>)> {
         self.layers
             .layers()
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
-                Some(LayerEffects {
-                    draw: LayerDraw {
-                        slot: match (l.slot()?, float) {
-                            (slot, Some((from, to))) if from == slot => to,
-                            (slot, _) => slot,
+                Some((
+                    i,
+                    LayerEffects {
+                        draw: LayerDraw {
+                            slot: match (l.slot()?, float) {
+                                (slot, Some((from, to))) if from == slot => to,
+                                (slot, _) => slot,
+                            },
+                            opacity: l.opacity,
+                            blend: l.blend.index(),
+                            visible: self.layers.effective_visible(i),
+                            // The mask is *not* swapped for the preview slice: a
+                            // floating transform moves the layer's pixels, not what
+                            // hides them, and the preview has to be masked exactly as
+                            // the committed result will be.
+                            mask: l.mask(),
+                            clipped: l.clipped,
                         },
-                        opacity: l.opacity,
-                        blend: l.blend.index(),
-                        visible: self.layers.effective_visible(i),
-                        // The mask is *not* swapped for the preview slice: a
-                        // floating transform moves the layer's pixels, not what
-                        // hides them, and the preview has to be masked exactly as
-                        // the committed result will be.
-                        mask: l.mask(),
-                        clipped: l.clipped,
+                        effects: l.effects(),
                     },
-                    effects: l.effects(),
-                })
+                ))
             })
             .collect()
     }
@@ -2877,6 +4299,7 @@ mod tests {
         for busy in [
             Interaction::Drawing,
             Interaction::Selecting,
+            Interaction::Pathing,
             Interaction::Panning,
             Interaction::Zooming,
         ] {
@@ -3130,7 +4553,7 @@ mod tests {
             assert_eq!(
                 ed.undo_gate(),
                 if flip {
-                    StepGate::FlipLocked
+                    StepGate::FlipRefused(FlipRefusal::Locked)
                 } else {
                     StepGate::Clear
                 },
@@ -3155,7 +4578,7 @@ mod tests {
             assert_eq!(
                 ed.redo_gate(),
                 if flip {
-                    StepGate::FlipLocked
+                    StepGate::FlipRefused(FlipRefusal::Locked)
                 } else {
                     StepGate::Clear
                 },
@@ -3212,7 +4635,7 @@ mod tests {
         assert_eq!(ed.history.len(), 4, "the redo stack was drained");
         assert_eq!(
             ed.undo_gate(),
-            StepGate::FlipLocked,
+            StepGate::FlipRefused(FlipRefusal::Locked),
             "the gate read past the flip on top of the undo stack"
         );
         assert_eq!(
@@ -3371,6 +4794,233 @@ mod tests {
         assert!(ed.notice.is_none(), "nothing was lost, so nothing is said");
     }
 
+    /// One path of one node, for the vector tests below.
+    fn a_path_at(at: Vec2, ink: bool) -> umber_core::Path {
+        umber_core::Path {
+            role: if ink {
+                umber_core::PathRole::Ink
+            } else {
+                umber_core::PathRole::Cut
+            },
+            closed: false,
+            // Two nodes at least: `VectorObject::check` refuses a path of one.
+            nodes: vec![
+                umber_core::Node::corner(at),
+                umber_core::Node::corner(at + Vec2::new(20.0, 20.0)),
+            ],
+            ink: ink.then(|| umber_core::vector::Ink {
+                brush: "round".into(),
+                size: 4.0,
+                colour: [0.1, 0.2, 0.3, 1.0],
+            }),
+        }
+    }
+
+    fn a_record_of(paths: Vec<umber_core::Path>) -> umber_core::VectorObject {
+        umber_core::VectorObject::empty()
+            .appended(paths)
+            .expect("a small record is legal")
+    }
+
+    /// **A canvas flip mirrors a vector layer's paths with its pixels, and its
+    /// undo, which is another flip, puts every node back.**
+    ///
+    /// At `Editor::flip_canvas`, the one place a flip reaches the model, and
+    /// called for the flip and again for the undo. Ink is mirrored too, which is
+    /// the difference from a resize.
+    #[test]
+    fn a_canvas_flip_and_its_undo_leave_paths_where_they_were() {
+        use umber_core::FlipAxis;
+        let mut ed = Editor::default();
+        let before = a_record_of(vec![
+            a_path_at(Vec2::new(10.0, 20.0), false),
+            a_path_at(Vec2::new(30.0, 40.0), true),
+        ]);
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", before.clone())
+            .expect("room");
+        let width = ed.doc.size.x as f32;
+
+        ed.flip_canvas(FlipAxis::Horizontal);
+        let flipped = ed.layers.vector_at(at).expect("still a record").clone();
+        assert_eq!(
+            flipped.paths()[0].nodes[0].at,
+            Vec2::new(width - 10.0, 20.0)
+        );
+        assert!(flipped.has_ink(), "a flip keeps Ink, a resize does not");
+        assert_ne!(flipped, before, "nothing was mirrored at all");
+
+        ed.flip_canvas(FlipAxis::Horizontal);
+        assert_eq!(ed.layers.vector_at(at), Some(&before));
+        assert!(ed.notice.is_none(), "nothing was lost, so nothing is said");
+    }
+
+    /// **A resize moves paths by exactly the offset the pixels move by**, which
+    /// is `CanvasCopy::plan`'s destination minus its source, whatever the
+    /// anchor and whether the canvas grew or was cropped.
+    #[test]
+    fn a_resize_moves_paths_with_the_picture() {
+        use umber_core::{Anchor, CanvasCopy};
+        let start = Vec2::new(10.0, 10.0);
+        let base = Editor::default().doc.size;
+        // The plan is what the GPU copies by, so the paths are checked against
+        // it and not against arithmetic restated here.
+        for new in [
+            glam::UVec2::new(base.x + 100, base.y + 50),
+            glam::UVec2::new(base.x - 100, base.y - 50),
+            glam::UVec2::new(base.x + 100, base.y - 50),
+        ] {
+            for anchor in Anchor::GRID {
+                let mut ed = Editor::default();
+                let at = ed
+                    .layers
+                    .add_vector_layer("Paths", a_record_of(vec![a_path_at(start, false)]))
+                    .expect("room");
+                assert!(ed.apply_canvas(Document::new(new.x, new.y), anchor));
+                let plan = CanvasCopy::plan(base, new, anchor);
+                let by = plan.to.as_vec2() - plan.from.as_vec2();
+                assert_eq!(
+                    ed.layers.vector_at(at).expect("kept").paths()[0].nodes[0].at,
+                    start + by,
+                    "{anchor:?} to {new}"
+                );
+                assert!(ed.notice.is_none(), "geometry moved cleanly: said nothing");
+            }
+        }
+        // And one answer written out, which is what tells a real offset from a
+        // plan read the wrong way round: half of (100, 50) is (50, 25).
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", a_record_of(vec![a_path_at(start, false)]))
+            .expect("room");
+        assert!(ed.apply_canvas(
+            Document::new(base.x + 100, base.y + 50),
+            umber_core::Anchor::Centre
+        ));
+        assert_eq!(
+            ed.layers.vector_at(at).unwrap().paths()[0].nodes[0].at,
+            Vec2::new(60.0, 35.0)
+        );
+    }
+
+    /// A resize strips Ink and says so once, and says nothing for a size that
+    /// did not change.
+    #[test]
+    fn a_resize_that_strips_ink_says_so() {
+        use umber_core::Anchor;
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer(
+                "Inked",
+                a_record_of(vec![a_path_at(Vec2::new(5.0, 5.0), true)]),
+            )
+            .expect("room");
+        let same = ed.doc;
+        assert!(!ed.apply_canvas(same, Anchor::Centre));
+        assert!(ed.notice.is_none(), "an untouched dialog said something");
+        assert!(ed.layers.vector_at(at).unwrap().has_ink());
+
+        let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
+        assert!(ed.apply_canvas(bigger, Anchor::TopLeft));
+        assert!(!ed.layers.vector_at(at).unwrap().has_ink());
+        let notice = ed.notice.as_ref().expect("the loss was silent");
+        assert_eq!(notice.lines, vec![VECTOR_INK_LINE.to_string()]);
+        assert!(!VECTOR_INK_LINE.contains('\u{2014}'));
+    }
+
+    /// A resize or a flip that carries a path out of bounds takes that path out
+    /// and says so, with the line the notice really drew; and a move that keeps
+    /// every path in bounds says nothing.
+    #[test]
+    fn a_path_carried_out_of_bounds_is_removed_and_named() {
+        use umber_core::vector::MAX_COORD;
+        let far = |x: f32| {
+            a_record_of(vec![
+                a_path_at(Vec2::new(x, 5.0), false),
+                a_path_at(Vec2::new(5.0, 5.0), false),
+            ])
+        };
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer("Far", far(MAX_COORD - 30.0))
+            .expect("room");
+        let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
+        assert!(ed.apply_canvas(bigger, umber_core::Anchor::TopRight));
+        assert_eq!(ed.layers.vector_at(at).unwrap().paths().len(), 1);
+        let notice = ed.notice.take().expect("the loss was silent");
+        assert_eq!(notice.lines, vec![VECTOR_LOST_ON_RESIZE_LINE.to_string()]);
+
+        let mut ed = Editor::default();
+        let at = ed
+            .layers
+            .add_vector_layer("Far", far(-MAX_COORD + 1.0))
+            .expect("room");
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+        assert_eq!(ed.layers.vector_at(at).unwrap().paths().len(), 1);
+        let notice = ed.notice.take().expect("the loss was silent");
+        assert_eq!(notice.lines, vec![VECTOR_LOST_ON_FLIP_LINE.to_string()]);
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+        assert!(
+            ed.notice.is_none(),
+            "a flip that lost nothing said something"
+        );
+        for line in [VECTOR_LOST_ON_RESIZE_LINE, VECTOR_LOST_ON_FLIP_LINE] {
+            assert!(!line.contains('\u{2014}'));
+            assert!(!line.contains("  "), "a run of spaces: {line}");
+        }
+    }
+
+    /// With text and inked paths both in the document the resize says both,
+    /// rather than the second notice replacing the first.
+    #[test]
+    fn a_resize_that_loses_text_and_ink_says_both() {
+        let mut ed = Editor::default();
+        assert!(ed.layers.set_text(0, a_record("A caption")));
+        ed.layers
+            .add_vector_layer(
+                "Inked",
+                a_record_of(vec![a_path_at(Vec2::new(5.0, 5.0), true)]),
+            )
+            .expect("room");
+        let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
+        assert!(ed.apply_canvas(bigger, umber_core::Anchor::Centre));
+        let notice = ed.notice.as_ref().expect("said");
+        assert_eq!(notice.lines.len(), 2, "{:?}", notice.lines);
+        assert!(notice.lines[0].contains("one text layer"));
+        assert_eq!(notice.lines[1], VECTOR_INK_LINE);
+    }
+
+    /// "Clear layer" is refused on a vector layer by the one reading the menu
+    /// item and the command share, and lock still comes first.
+    #[test]
+    fn clear_layer_is_refused_on_a_vector_layer() {
+        let mut ed = Editor::default();
+        assert_eq!(
+            clear_layer_refusal(&ed.layers),
+            None,
+            "a plain layer clears"
+        );
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", umber_core::VectorObject::empty())
+            .expect("room");
+        assert_eq!(clear_layer_refusal(&ed.layers), Some(CLEAR_VECTOR_TIP));
+        assert_eq!(
+            CLEAR_VECTOR_TIP,
+            "A vector layer has no paint to clear. Delete the layer to remove its paths."
+        );
+        ed.layers.get_mut(at).unwrap().locked = true;
+        assert_eq!(
+            clear_layer_refusal(&ed.layers),
+            Some("Unlock the layer to clear it."),
+            "a locked one is told to unlock first"
+        );
+    }
+
     /// **A resize takes every record off and says how many**, for the reason it
     /// clears the history: a placement is a rectangle of a canvas that no longer
     /// exists, and a canvas that shrank has cropped the pixels the record
@@ -3387,7 +5037,7 @@ mod tests {
 
         // The same size is not a resize.
         let same = ed.doc;
-        assert!(!ed.apply_canvas(same));
+        assert!(!ed.apply_canvas(same, umber_core::Anchor::Centre));
         assert!(
             ed.layers.text_at(0).is_some(),
             "an untouched dialog dropped it"
@@ -3395,7 +5045,7 @@ mod tests {
         assert!(ed.notice.is_none());
 
         let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
-        assert!(ed.apply_canvas(bigger));
+        assert!(ed.apply_canvas(bigger, umber_core::Anchor::Centre));
         assert!(
             ed.layers.text_at(0).is_none(),
             "a resized document kept a placement of the canvas it no longer has"
@@ -3938,6 +5588,279 @@ mod tests {
              which is not the step following the camera"
         );
     }
+    // --- paths from the selection ------------------------------------------
+
+    /// An editor with a rectangular selection standing, which is all the
+    /// command needs to see.
+    fn with_a_selection() -> Editor {
+        let mut ed = Editor::default();
+        let doc = ed.doc.size;
+        ed.selection = Some(Arc::new(
+            Selection::rectangle(Vec2::new(10.0, 20.0), Vec2::new(60.0, 80.0), doc)
+                .expect("a rectangle"),
+        ));
+        ed
+    }
+
+    /// Plan and carry out, as the App method does with the device parts left
+    /// out. A refused plan is the notice.
+    fn run_path_command(ed: &mut Editor, role: umber_core::PathRole) -> Result<(), Notice> {
+        match ed.plan_path_from_selection(role)? {
+            Some(plan) => ed.apply_path_plan(plan).map_err(|why| match why {
+                PathApplyRefusal::Declined(why) => path_refusal(why),
+                PathApplyRefusal::NoSlice(_) => Notice {
+                    title: "no slice".to_string(),
+                    lines: Vec::new(),
+                },
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Rings that collapse to nothing, here a ring that doubles back on itself
+    /// along one line, are refused with the record's own Impossible sentence
+    /// on an ordinary layer and on a vector layer alike, and nothing changes.
+    #[test]
+    fn rings_that_enclose_nothing_are_refused_as_impossible() {
+        let a = Vec2::new(10.0, 10.0);
+        let b = Vec2::new(40.0, 10.0);
+        let rings = vec![vec![a, b, a, b], vec![a, a, a]];
+        let mut ed = Editor::default();
+        for vector in [false, true] {
+            if vector {
+                ed.layers
+                    .add_vector_layer("Paths", umber_core::VectorObject::empty())
+                    .expect("room");
+            }
+            let before = (stack_ids(&ed), active_paths(&ed), ed.history.len());
+            let notice = ed
+                .plan_path_from_rings(&rings, umber_core::PathRole::Cut)
+                .expect_err("collapsed rings were planned");
+            assert_eq!(
+                notice.lines,
+                vec![
+                    umber_core::vector::VectorRefusal::Impossible
+                        .sentence()
+                        .to_string()
+                ],
+                "vector layer active: {vector}"
+            );
+            assert_eq!(
+                (stack_ids(&ed), active_paths(&ed), ed.history.len()),
+                before
+            );
+        }
+    }
+
+    /// **An append that the layer declines says the layer's reason, and hands
+    /// no plan back to retry**, because an append takes no slice and freeing
+    /// one would mend nothing. The stack changes between the plan and the
+    /// carrying out (the layer is locked), which is the one way it can arise.
+    #[test]
+    fn an_append_the_layer_declines_says_why_rather_than_asking_for_a_slice() {
+        let mut ed = with_a_selection();
+        ed.layers
+            .add_vector_layer("Paths", umber_core::VectorObject::empty())
+            .expect("room");
+        let plan = ed
+            .plan_path_from_selection(umber_core::PathRole::Cut)
+            .expect("plans")
+            .expect("a selection");
+        assert!(!plan.adds_a_layer(), "the fixture must append");
+        ed.layers.active_mut().locked = true;
+        match ed.apply_path_plan(plan) {
+            Err(PathApplyRefusal::Declined(why)) => assert_eq!(
+                why,
+                set_refusal_sentence(umber_core::VectorSetRefusal::Locked)
+            ),
+            other => panic!("expected the layer's own refusal, got {other:?}"),
+        }
+    }
+
+    /// What the stack is, to compare before and after a refusal: every entry's
+    /// identity in order, and the selection among them.
+    fn stack_ids(ed: &Editor) -> (Vec<u32>, usize) {
+        (
+            ed.layers.layers().iter().map(|l| l.id()).collect(),
+            ed.layers.active_index(),
+        )
+    }
+
+    fn active_paths(ed: &Editor) -> Vec<umber_core::Path> {
+        ed.layers
+            .vector_at(ed.layers.active_index())
+            .map(|v| v.paths().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// A rectangle's outline is one closed path of four corners, on a layer made
+    /// for it above the one that was selected, named for what it holds, and
+    /// the whole of it one undo entry that takes the layer back out.
+    #[test]
+    fn a_path_from_a_rectangle_selection_is_four_nodes_on_a_new_layer() {
+        let mut ed = with_a_selection();
+        let was = ed.layers.active_index();
+        let position = ed.history.position();
+
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("room");
+
+        assert_eq!(ed.layers.len(), 2);
+        assert_eq!(ed.layers.active_index(), was + 1, "above the active one");
+        let layer = ed.layers.get(ed.layers.active_index()).unwrap();
+        assert_eq!(layer.name, CUT_LAYER_NAME);
+        assert!(layer.is_vector());
+        let paths = active_paths(&ed);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].nodes.len(), 4);
+        assert!(paths[0].closed);
+        assert_eq!(paths[0].role, umber_core::PathRole::Cut);
+        assert!(ed.selection.is_some(), "the selection stays");
+
+        assert_eq!(ed.history.position(), position + 1, "one entry");
+        let entry = ed.history.take_undo().expect("the add");
+        assert_eq!(entry.kind, umber_core::EditKind::AddLayer);
+        let umber_core::EditBody::Structure(shape) = entry.body else {
+            panic!("a new layer records a shape");
+        };
+        ed.layers.restore_shape(*shape);
+        assert_eq!(ed.layers.len(), 1, "undo took the layer back out");
+        assert!(!ed.layers.has_vector_layers());
+    }
+
+    /// The second command lands on the layer the first made, as an entry that
+    /// puts back exactly the first path.
+    #[test]
+    fn a_second_path_lands_on_the_active_vector_layer() {
+        let mut ed = with_a_selection();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("first");
+        let position = ed.history.position();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("second");
+
+        assert_eq!(ed.layers.len(), 2, "no third layer");
+        assert_eq!(active_paths(&ed).len(), 2);
+        assert_eq!(ed.history.position(), position + 1);
+        let entry = ed.history.take_undo().expect("the append");
+        assert_eq!(entry.kind, umber_core::EditKind::Paths);
+        let umber_core::EditBody::Vector { slot, was } = entry.body else {
+            panic!("an append records a record");
+        };
+        ed.layers.restore_vector(slot, was).expect("the layer");
+        assert_eq!(active_paths(&ed).len(), 1, "undo left the first path");
+    }
+
+    #[test]
+    fn plot_makes_plot_paths() {
+        let mut ed = with_a_selection();
+        run_path_command(&mut ed, umber_core::PathRole::Plot).expect("room");
+        let layer = ed.layers.get(ed.layers.active_index()).unwrap();
+        assert_eq!(layer.name, PLOT_LAYER_NAME);
+        assert_eq!(active_paths(&ed).len(), 1);
+        assert!(
+            active_paths(&ed)
+                .iter()
+                .all(|p| p.role == umber_core::PathRole::Plot)
+        );
+    }
+
+    /// Nothing selected is no plan and no change.
+    #[test]
+    fn no_selection_plans_nothing() {
+        let ed = Editor::default();
+        assert!(
+            ed.plan_path_from_selection(umber_core::PathRole::Cut)
+                .expect("not a refusal")
+                .is_none()
+        );
+    }
+
+    /// **A refusal changes nothing, and a lock or a folder is a different
+    /// answer rather than a refusal.** A locked vector layer sends the paths to
+    /// a layer of their own beside it; a full stack is a sentence with the stack
+    /// byte for byte what it was; a folder selected takes the layer inside it,
+    /// exactly as the Add control does.
+    #[test]
+    fn the_command_changes_nothing_when_refused() {
+        // A locked active vector layer: a new layer instead.
+        let mut ed = with_a_selection();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("first");
+        let made = ed.layers.active_index();
+        ed.layers.get_mut(made).unwrap().locked = true;
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("beside it");
+        assert_eq!(ed.layers.len(), 3);
+        assert_eq!(
+            ed.layers.vector_at(made).unwrap().paths().len(),
+            1,
+            "the locked layer was written to"
+        );
+        assert_eq!(active_paths(&ed).len(), 1);
+
+        // A full stack: a notice, and nothing at all moved.
+        let mut ed = with_a_selection();
+        while ed.layers.len() < LayerStack::MAX {
+            ed.layers.add().expect("room");
+        }
+        let before = stack_ids(&ed);
+        let position = ed.history.position();
+        let notice = run_path_command(&mut ed, umber_core::PathRole::Cut).expect_err("full");
+        assert!(!notice.lines.is_empty());
+        assert_eq!(ed.layers.len(), LayerStack::MAX);
+        assert_eq!(stack_ids(&ed), before);
+        assert_eq!(ed.history.position(), position);
+        assert!(!ed.layers.has_vector_layers());
+
+        // A folder selected: the layer goes inside it, as Add does.
+        let mut ed = with_a_selection();
+        let folder = ed.layers.group(&[0]).expect("a folder");
+        ed.layers.set_active(folder);
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect("inside");
+        let layer = ed.layers.get(ed.layers.active_index()).unwrap();
+        assert!(layer.is_vector());
+        assert_eq!(layer.depth, 1, "inside the folder, like Add");
+
+        // And inside a locked folder is a sentence, with nothing changed.
+        let mut ed = with_a_selection();
+        let folder = ed.layers.group(&[0]).expect("a folder");
+        ed.layers.get_mut(folder).unwrap().locked = true;
+        ed.layers.set_active(folder);
+        let before = stack_ids(&ed);
+        let position = ed.history.position();
+        run_path_command(&mut ed, umber_core::PathRole::Cut).expect_err("locked");
+        assert_eq!(stack_ids(&ed), before);
+        assert_eq!(ed.history.position(), position);
+    }
+
+    /// No sentence the command raises has a run of spaces or a stray edge
+    /// space: a lost `\` continuation pads one with the file's indentation.
+    #[test]
+    fn no_path_notice_has_a_run_of_spaces() {
+        let mut said: Vec<Notice> = Vec::new();
+        let mut ed = with_a_selection();
+        while ed.layers.len() < LayerStack::MAX {
+            ed.layers.add().expect("room");
+        }
+        said.extend(run_path_command(&mut ed, umber_core::PathRole::Cut).err());
+        let mut ed = with_a_selection();
+        let folder = ed.layers.group(&[0]).expect("a folder");
+        ed.layers.get_mut(folder).unwrap().locked = true;
+        ed.layers.set_active(folder);
+        said.extend(run_path_command(&mut ed, umber_core::PathRole::Cut).err());
+        assert_eq!(said.len(), 2, "both refusals must have been raised");
+        for why in [
+            umber_core::VectorSetRefusal::Missing,
+            umber_core::VectorSetRefusal::NotVector,
+            umber_core::VectorSetRefusal::Locked,
+        ] {
+            said.push(path_refusal(set_refusal_sentence(why)));
+        }
+        for notice in said {
+            for text in std::iter::once(&notice.title).chain(notice.lines.iter()) {
+                assert!(!text.contains("  "), "a run of spaces in {text:?}");
+                assert_eq!(text.trim(), text);
+                assert!(!text.contains('\u{2014}'), "an em-dash in {text:?}");
+            }
+        }
+    }
+
     /// A placement makes its layer, records nothing, and gets its one entry at
     /// the commit.
     ///
@@ -4184,5 +6107,1788 @@ mod tests {
         ed.unmake_layer(None);
         let after: Vec<u32> = ed.layers.layers().iter().map(|l| l.id()).collect();
         assert_eq!(before, after);
+    }
+
+    // --- landing and editing paths ------------------------------------------
+
+    /// An editor whose active layer is a vector layer holding `n` closed
+    /// rectangles, made the way the commands make them.
+    fn with_vector_paths(n: usize) -> Editor {
+        let mut ed = with_a_selection();
+        for _ in 0..n {
+            run_path_command(&mut ed, umber_core::PathRole::Cut).expect("room");
+        }
+        ed
+    }
+
+    /// A closed triangle at `x`, which no rectangle the selection makes is.
+    fn triangle_at(x: f32) -> umber_core::Path {
+        umber_core::Path {
+            role: umber_core::PathRole::Cut,
+            closed: true,
+            nodes: vec![
+                umber_core::Node::corner(Vec2::new(x, 0.0)),
+                umber_core::Node::corner(Vec2::new(x + 10.0, 0.0)),
+                umber_core::Node::corner(Vec2::new(x + 5.0, 8.0)),
+            ],
+            ink: None,
+        }
+    }
+
+    fn record_of(ed: &Editor) -> umber_core::VectorObject {
+        ed.layers
+            .vector_at(ed.layers.active_index())
+            .expect("a vector layer")
+            .clone()
+    }
+
+    // --- the Path tool, wired -----------------------------------------------
+
+    /// A window's worth of canvas with the Path tool in hand, at zoom 1 and one
+    /// pixel a point, so the reach is 8 document pixels and the tap slop 6.
+    fn path_editor() -> Editor {
+        let mut ed = windowed();
+        ed.set_tool(Tool::Path);
+        ed
+    }
+
+    /// A press and its release at one point: a corner node, or a pick.
+    fn path_tap(ed: &mut Editor, at: Vec2) {
+        ed.path_press(at, false);
+        ed.path_release(at);
+    }
+
+    /// The same, as an Edit gesture borrowed with Ctrl.
+    fn path_ctrl_tap(ed: &mut Editor, at: Vec2) {
+        ed.path_press(at, true);
+        ed.path_release(at);
+    }
+
+    /// Three corners and a press on the first, which closes and lands it.
+    fn draw_closed_triangle(ed: &mut Editor, x: f32) {
+        for at in [
+            Vec2::new(x, 100.0),
+            Vec2::new(x + 100.0, 100.0),
+            Vec2::new(x + 50.0, 180.0),
+        ] {
+            path_tap(ed, at);
+        }
+        path_tap(ed, Vec2::new(x, 100.0));
+    }
+
+    /// Fill the stack with raster layers until it holds all it can.
+    fn fill_the_stack(ed: &mut Editor) {
+        while ed.layers.add().is_some() {}
+        assert_eq!(ed.layers.len(), LayerStack::MAX, "the fixture fills it");
+    }
+
+    /// A vector layer, active, holding these paths.
+    fn with_paths(paths: Vec<umber_core::Path>) -> Editor {
+        let mut ed = path_editor();
+        let record = umber_core::VectorObject::empty()
+            .appended(paths)
+            .expect("a record");
+        ed.layers
+            .add_vector_layer("Paths", record)
+            .expect("room for a layer");
+        ed
+    }
+
+    /// An open Cut line from `a` to `b`, corners only.
+    fn line(a: Vec2, b: Vec2) -> umber_core::Path {
+        umber_core::Path {
+            role: umber_core::PathRole::Cut,
+            closed: false,
+            nodes: vec![umber_core::Node::corner(a), umber_core::Node::corner(b)],
+            ink: None,
+        }
+    }
+
+    #[test]
+    fn drawing_a_closed_path_on_a_raster_layer_makes_a_vector_layer_in_one_undo() {
+        let mut ed = path_editor();
+        let entries = ed.layers.len();
+        assert!(!ed.layers.active().is_vector(), "the fixture starts raster");
+        let history = ed.history.len();
+        let slots_before: Vec<u32> = ed.layers.layers().iter().filter_map(|l| l.slot()).collect();
+
+        draw_closed_triangle(&mut ed, 100.0);
+
+        assert!(ed.path_tool.draft().is_none(), "the landing cleared it");
+        assert_eq!(ed.layers.len(), entries + 1, "one layer was made");
+        let record = record_of(&ed);
+        assert_eq!(record.paths().len(), 1);
+        let path = &record.paths()[0];
+        assert!(path.closed);
+        assert_eq!(path.nodes.len(), 3, "the closing press adds no fourth");
+        assert_eq!(path.role, umber_core::PathRole::Cut);
+        assert_eq!(ed.history.len(), history + 1, "exactly one entry");
+        assert_eq!(
+            ed.history.kind_at(history),
+            Some(umber_core::EditKind::AddLayer)
+        );
+        // The renderer is told to wipe the slice the new layer took: read off
+        // the stack rather than off the active layer, as the slice that was
+        // not held before and is now held by the one layer carrying paths.
+        let vector_slots: Vec<u32> = ed
+            .layers
+            .layers()
+            .iter()
+            .filter(|l| l.is_vector())
+            .filter_map(|l| l.slot())
+            .collect();
+        assert_eq!(vector_slots.len(), 1);
+        assert!(
+            !slots_before.contains(&vector_slots[0]),
+            "a slice nobody held"
+        );
+        assert_eq!(
+            ed.path_layers_made,
+            vec![(ed.session.tabs()[0].id, vector_slots[0])]
+        );
+    }
+
+    /// The queue the renderer drains is handed over once and emptied, so a
+    /// second drain in the same pump wipes nothing twice. This is the Editor
+    /// half only: that `App` drains at the end of every event is a call site no
+    /// test without a device can reach.
+    #[test]
+    fn a_landed_layer_is_handed_to_the_wipe_once() {
+        let mut ed = path_editor();
+        draw_closed_triangle(&mut ed, 100.0);
+        let slot = ed.layers.active_slot().expect("a slot");
+        let mut seen = Vec::new();
+        ed.take_path_layers(|id, slot| seen.push((id, slot)));
+        assert_eq!(seen, vec![(ed.session.tabs()[0].id, slot)]);
+        ed.take_path_layers(|id, slot| seen.push((id, slot)));
+        assert_eq!(seen.len(), 1, "nothing is wiped twice");
+        // An append makes no layer and queues nothing.
+        path_tap(&mut ed, Vec2::new(400.0, 400.0));
+        path_tap(&mut ed, Vec2::new(500.0, 400.0));
+        assert!(ed.path_key(PathKey::Finish));
+        ed.take_path_layers(|id, slot| seen.push((id, slot)));
+        assert_eq!(seen.len(), 1);
+    }
+
+    // --- round one: interrupted presses, closing, flips, the menu ------------
+
+    /// A node being placed whose release never comes is taken back off, and the
+    /// node before it is left as it was.
+    #[test]
+    fn an_interrupted_press_takes_back_the_node_it_was_placing() {
+        let mut ed = path_editor();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        ed.path_press(Vec2::new(300.0, 100.0), false);
+        ed.interaction = Interaction::Pathing;
+        ed.path_moved(Vec2::new(340.0, 140.0), false);
+
+        ed.interrupt_path_gesture();
+        assert_eq!(ed.interaction, Interaction::Idle);
+        assert!(!ed.path_tool.is_held());
+
+        // The pointer goes on moving with nothing held: no handle follows it.
+        ed.path_moved(Vec2::new(400.0, 300.0), false);
+        let draft = ed.path_tool.draft().expect("the draft stays");
+        assert_eq!(draft.nodes.len(), 2);
+        assert_eq!(
+            draft.nodes[1],
+            umber_core::Node::corner(Vec2::new(200.0, 100.0))
+        );
+    }
+
+    /// Only `Pathing` is the tool's to interrupt: a pan's interruption must not
+    /// take a node off a draft that was left standing between presses.
+    #[test]
+    fn interrupting_another_gesture_leaves_the_draft_alone() {
+        let mut ed = path_editor();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        ed.interaction = Interaction::Panning;
+        ed.interrupt_path_gesture();
+        assert_eq!(ed.interaction, Interaction::Panning);
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(1));
+    }
+
+    #[test]
+    fn an_interrupted_node_drag_commits_nothing() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        let before = record_of(&ed);
+        let history = ed.history.len();
+
+        ed.path_press(Vec2::new(100.0, 0.0), false);
+        ed.interaction = Interaction::Pathing;
+        ed.path_moved(Vec2::new(150.0, 40.0), false);
+        assert!(ed.path_tool.dragged().is_some(), "the fixture drags");
+        ed.interrupt_path_gesture();
+
+        assert!(ed.path_tool.dragged().is_none());
+        // A release arriving late, as a pan's would, finds nothing to commit.
+        ed.path_release(Vec2::new(150.0, 40.0));
+        assert_eq!(record_of(&ed), before);
+        assert_eq!(ed.history.len(), history);
+    }
+
+    #[test]
+    fn closing_the_tab_in_front_keeps_the_draft_and_marks_it_modified() {
+        let mut ed = path_editor();
+        ed.session.active_tab_mut().modified = false;
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let active = ed.session.active_index();
+
+        ed.settle_before_closing(active);
+
+        assert!(ed.path_tool.draft().is_none());
+        assert!(ed.session.active_tab().modified, "so the prompt asks");
+        assert_eq!(record_of(&ed).paths().len(), 1);
+    }
+
+    /// Three settle sites (the window's close, the tab's close mark, File >
+    /// Close document) do not put a float down first, so a settle with a float
+    /// up and nothing in the tool's hand must be a quiet no-op rather than a
+    /// debug assertion. The float is a transform tool's lift, which is the
+    /// state those sites reach.
+    #[test]
+    fn settling_with_a_float_up_and_nothing_in_hand_changes_nothing() {
+        let mut ed = path_editor();
+        ed.float = Some(Floating {
+            xf: umber_core::Transform::identity(umber_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }),
+            slot: ed.layers.active_slot().expect("a slot"),
+            lifted: true,
+            drag: None,
+            made: None,
+        });
+        let (entries, history) = (ed.layers.len(), ed.history.len());
+        assert!(ed.settle_path_tool().is_none());
+        ed.settle_before_quitting();
+        assert_eq!((ed.layers.len(), ed.history.len()), (entries, history));
+        assert!(ed.float.is_some(), "the float is not the settle's to touch");
+    }
+
+    #[test]
+    fn closing_another_tab_leaves_the_draft_up() {
+        let mut ed = path_editor();
+        ed.create_document(ed.doc);
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let other = 1 - ed.session.active_index();
+        ed.settle_before_closing(other);
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(2));
+    }
+
+    #[test]
+    fn quitting_keeps_the_draft_and_lists_the_document_as_unsaved() {
+        let mut ed = path_editor();
+        ed.session.active_tab_mut().modified = false;
+        assert!(ed.unsaved_documents().is_empty(), "the fixture is saved");
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+
+        ed.settle_before_quitting();
+
+        assert_eq!(ed.unsaved_documents(), vec![ed.session.active_index()]);
+        assert_eq!(record_of(&ed).paths().len(), 1);
+    }
+
+    /// The flip a command, an undo or a History jump makes goes through
+    /// `Editor::flip_canvas`, and the draft rides it rather than landing.
+    #[test]
+    fn a_canvas_flip_carries_the_draft_with_it() {
+        let mut ed = path_editor();
+        let width = ed.doc.size.x as f32;
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        ed.path_press(Vec2::new(300.0, 120.0), false);
+        ed.path_moved(Vec2::new(340.0, 150.0), false);
+        ed.path_release(Vec2::new(340.0, 150.0));
+        let before = ed.path_tool.draft().expect("a draft").nodes.clone();
+        let (entries, history) = (ed.layers.len(), ed.history.len());
+
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+
+        let after = &ed.path_tool.draft().expect("still up").nodes;
+        assert_eq!(after[0].at, Vec2::new(width - 100.0, 100.0));
+        assert_eq!(after[1].at, Vec2::new(width - 300.0, 120.0));
+        assert_eq!(after[1].handle_out, Vec2::new(-40.0, 30.0));
+        assert_eq!(after[1].handle_in, Vec2::new(40.0, -30.0));
+        assert_eq!((ed.layers.len(), ed.history.len()), (entries, history));
+
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+        assert_eq!(ed.path_tool.draft().expect("up").nodes, before);
+    }
+
+    #[test]
+    fn a_canvas_flip_lets_go_of_the_pick() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        assert!(ed.path_tool.pick().is_some());
+        ed.flip_canvas(umber_core::FlipAxis::Vertical);
+        assert_eq!(ed.path_tool.pick(), None);
+    }
+
+    #[test]
+    fn the_edit_menu_undo_is_the_drafts_while_one_is_up() {
+        let mut ed = path_editor();
+        assert!(!ed.history.can_undo(), "the fixture has nothing to undo");
+        let rows = crate::ui::step_rows(&ed);
+        assert!(!rows.undo && !rows.redo);
+        assert_eq!(rows.undo_label, crate::shortcuts::Action::Undo.label());
+
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        let rows = crate::ui::step_rows(&ed);
+        assert!(rows.undo, "an empty history and a draft still undo");
+        assert_eq!(rows.undo_label, "Undo point");
+        assert!(!rows.redo);
+
+        // With something to redo, a draft still keeps Redo dead.
+        assert!(ed.path_key(PathKey::Abandon));
+        draw_closed_triangle(&mut ed, 100.0);
+        let undone = ed.history.take_undo().expect("an entry");
+        ed.history.push_redo(undone);
+        assert!(
+            crate::ui::step_rows(&ed).redo,
+            "nothing drawn: Redo is live"
+        );
+        path_tap(&mut ed, Vec2::new(500.0, 500.0));
+        assert!(!crate::ui::step_rows(&ed).redo);
+    }
+
+    /// A pick on a layer locked since: Delete is the tool's, says why, and
+    /// changes nothing, so a binding of the key elsewhere is not reached.
+    #[test]
+    fn delete_on_a_pick_whose_layer_was_locked_says_why_and_changes_nothing() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        let before = record_of(&ed);
+        let history = ed.history.len();
+        ed.layers.active_mut().locked = true;
+
+        assert!(ed.path_key(PathKey::Remove), "swallowed");
+        assert_eq!(record_of(&ed), before);
+        assert_eq!(ed.history.len(), history);
+        assert_eq!(
+            ed.path_tool.said(),
+            Some(PathEditRefusal::Locked.sentence())
+        );
+    }
+
+    #[test]
+    fn the_node_count_stops_as_soon_as_it_knows() {
+        let at = |x: f32| umber_core::Node::corner(Vec2::new(x, 0.0));
+        let (lo, hi) = (Vec2::new(0.0, -1.0), Vec2::new(10.0, 1.0));
+        // Three inside, cap two: false.
+        assert!(!nodes_in_view_within(
+            &[at(1.0), at(2.0), at(3.0)],
+            lo,
+            hi,
+            2
+        ));
+        // Exactly the cap inside, wherever they fall among the rest.
+        assert!(nodes_in_view_within(
+            &[at(50.0), at(1.0), at(2.0), at(60.0)],
+            lo,
+            hi,
+            2
+        ));
+        assert!(nodes_in_view_within(
+            &[at(1.0), at(50.0), at(60.0), at(2.0)],
+            lo,
+            hi,
+            2
+        ));
+        // The last node is the one over.
+        assert!(!nodes_in_view_within(
+            &[at(1.0), at(50.0), at(2.0), at(3.0)],
+            lo,
+            hi,
+            2
+        ));
+        assert!(nodes_in_view_within(&[], lo, hi, 0));
+        assert!(!nodes_in_view_within(&[at(1.0)], lo, hi, 0));
+    }
+
+    /// The cache answers for the view it was taken in, never another: panning
+    /// the long path out of view and back gives each answer afresh.
+    #[test]
+    fn the_cached_node_count_follows_the_view() {
+        let mut ed = with_paths(vec![long_line(3000)]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        ed.camera.zoom = 0.1;
+        ed.camera.center = Vec2::new(1500.0, 10.0);
+        path_tap(&mut ed, Vec2::new(100.5, 10.0));
+        assert!(!ed.path_nodes_shown());
+        // Far enough along that fewer than the cap are in view.
+        ed.camera.center = Vec2::new(-4000.0, 10.0);
+        assert!(ed.path_nodes_shown());
+        ed.camera.center = Vec2::new(1500.0, 10.0);
+        assert!(!ed.path_nodes_shown());
+    }
+
+    #[test]
+    fn a_second_path_appends_to_that_layer_as_edit_paths() {
+        let mut ed = path_editor();
+        draw_closed_triangle(&mut ed, 100.0);
+        let entries = ed.layers.len();
+        let history = ed.history.len();
+
+        path_tap(&mut ed, Vec2::new(400.0, 400.0));
+        path_tap(&mut ed, Vec2::new(500.0, 400.0));
+        assert!(ed.path_key(PathKey::Finish), "Enter is the draft's");
+
+        assert_eq!(ed.layers.len(), entries, "no second layer");
+        let record = record_of(&ed);
+        assert_eq!(record.paths().len(), 2);
+        assert!(!record.paths()[1].closed, "Enter finishes it open");
+        assert_eq!(ed.history.len(), history + 1);
+        assert_eq!(
+            ed.history.kind_at(history),
+            Some(umber_core::EditKind::Paths)
+        );
+    }
+
+    /// **Review focus 2: undo with a draft up is the draft's, and the history
+    /// is not touched at all**, redo stack included. The redo stack is made
+    /// non-empty first, because a test of "nothing is drained" that starts
+    /// from nothing to drain proves nothing.
+    #[test]
+    fn undo_with_a_draft_up_pops_a_node_and_leaves_the_history_alone() {
+        let mut ed = path_editor();
+        draw_closed_triangle(&mut ed, 100.0);
+        draw_closed_triangle(&mut ed, 300.0);
+        // Step one back by hand: what `App::undo` does to the history, with
+        // the device half left out.
+        let undone = ed.history.take_undo().expect("an entry");
+        ed.history.push_redo(undone);
+        let (position, len) = (ed.history.position(), ed.history.len());
+        assert!(len > position, "the fixture has something to redo");
+
+        path_tap(&mut ed, Vec2::new(600.0, 600.0));
+        path_tap(&mut ed, Vec2::new(700.0, 600.0));
+        assert!(ed.path_key(PathKey::Undo), "undo is the draft's");
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(1));
+        assert_eq!((ed.history.position(), ed.history.len()), (position, len));
+
+        assert!(ed.path_key(PathKey::Redo), "redo is swallowed too");
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(1));
+        assert_eq!((ed.history.position(), ed.history.len()), (position, len));
+
+        // The last node going ends the draft, and then both are ordinary.
+        assert!(ed.path_key(PathKey::Undo));
+        assert!(ed.path_tool.draft().is_none());
+        assert!(!ed.path_key(PathKey::Undo), "no draft: the ordinary undo");
+        assert!(!ed.path_key(PathKey::Redo), "no draft: the ordinary redo");
+        assert_eq!((ed.history.position(), ed.history.len()), (position, len));
+    }
+
+    /// **Review focus 1: a draft that cannot land stays up and says why.** On
+    /// the closing press itself, which is a press on the canvas, so nothing may
+    /// be raised in a box either.
+    #[test]
+    fn a_path_that_cannot_land_stays_up_with_the_reason() {
+        let mut ed = path_editor();
+        fill_the_stack(&mut ed);
+        let why = ed.new_layer_refusal().expect("the stack is full").1;
+        let history = ed.history.len();
+
+        draw_closed_triangle(&mut ed, 100.0);
+
+        let draft = ed.path_tool.draft().expect("the draft is still up");
+        assert_eq!(draft.nodes.len(), 3, "every node drawn is still there");
+        assert_eq!(ed.path_tool.said(), Some(why),);
+        assert_eq!(ed.history.len(), history);
+        assert!(ed.notice.is_none(), "no dialog on a canvas press");
+        assert!(ed.path_layers_made.is_empty());
+    }
+
+    /// Review Focus 1 at the record's own bound rather than the stack's: a
+    /// vector layer already holding every path it may is refused the draft,
+    /// which stays up whole with that refusal's sentence and records nothing.
+    #[test]
+    fn a_path_onto_a_full_record_stays_up_with_the_reason() {
+        let full: Vec<umber_core::Path> = (0..umber_core::vector::MAX_PATHS)
+            .map(|i| {
+                let y = i as f32 * 0.01;
+                line(Vec2::new(0.0, y), Vec2::new(5.0, y))
+            })
+            .collect();
+        let mut ed = with_paths(full);
+        let before = record_of(&ed);
+        let history = ed.history.len();
+        let entries = ed.layers.len();
+
+        draw_closed_triangle(&mut ed, 100.0);
+
+        let draft = ed.path_tool.draft().expect("the draft is still up");
+        assert_eq!(draft.nodes.len(), 3, "every node drawn is still there");
+        assert_eq!(
+            ed.path_tool.said(),
+            Some(umber_core::vector::VectorRefusal::TooManyPaths.sentence())
+        );
+        assert_eq!(ed.history.len(), history);
+        assert_eq!(ed.layers.len(), entries, "no layer made to hold it");
+        assert_eq!(record_of(&ed), before, "the record is untouched");
+        assert!(ed.notice.is_none(), "no dialog on a canvas press");
+    }
+
+    #[test]
+    fn leaving_the_tool_keeps_a_draft_of_two_nodes() {
+        let mut ed = path_editor();
+        let entries = ed.layers.len();
+        let history = ed.history.len();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+
+        ed.set_tool(Tool::Brush);
+
+        assert!(ed.path_tool.draft().is_none());
+        assert_eq!(ed.layers.len(), entries + 1);
+        let record = record_of(&ed);
+        assert_eq!(record.paths().len(), 1);
+        assert!(!record.paths()[0].closed, "kept as an open path");
+        assert_eq!(ed.history.len(), history + 1, "one undo entry");
+        assert!(ed.notice.is_none());
+    }
+
+    #[test]
+    fn leaving_the_tool_with_one_node_drops_it_quietly() {
+        let mut ed = path_editor();
+        let entries = ed.layers.len();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        ed.set_tool(Tool::Brush);
+        assert!(ed.path_tool.draft().is_none());
+        assert_eq!(ed.layers.len(), entries);
+        assert!(ed.notice.is_none());
+    }
+
+    #[test]
+    fn leaving_the_tool_with_a_draft_that_cannot_land_says_so() {
+        let mut ed = path_editor();
+        fill_the_stack(&mut ed);
+        let why = ed.new_layer_refusal().expect("the stack is full").1;
+        let history = ed.history.len();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+
+        ed.set_tool(Tool::Brush);
+
+        let notice = ed.notice.as_ref().expect("leaving says so");
+        assert_eq!(notice.title, PATH_NOT_KEPT_TITLE);
+        assert_eq!(notice.title, "The path being drawn was not kept");
+        assert_eq!(notice.lines, vec![why.to_string()]);
+        assert!(ed.path_tool.draft().is_none(), "and the draft is gone");
+        assert_eq!(ed.history.len(), history);
+    }
+
+    /// Picking the same tool again is not leaving it.
+    #[test]
+    fn choosing_the_path_tool_again_keeps_the_draft() {
+        let mut ed = path_editor();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        ed.set_tool(Tool::Path);
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(2));
+    }
+
+    #[test]
+    fn a_change_of_active_layer_lets_go_of_the_pick_and_keeps_the_draft() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.follow_path_ground();
+        // A draft away from the line, then a Ctrl press on the line: both are
+        // up at once, which is the state the two readings disagree about.
+        path_tap(&mut ed, Vec2::new(300.0, 300.0));
+        path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+        assert!(ed.path_tool.pick().is_some(), "the fixture picks the line");
+        assert!(ed.path_tool.draft().is_some());
+
+        ed.layers.set_active(0);
+        ed.follow_path_ground();
+
+        assert_eq!(ed.path_tool.pick(), None, "the pick named the other layer");
+        assert_eq!(
+            ed.path_tool.draft().map(|d| d.nodes.len()),
+            Some(1),
+            "the draft is on no layer and stays"
+        );
+    }
+
+    /// **Taking a path up and putting it down again is not an edit.** Enter
+    /// and a settle, from either end: the history, the redo stack, the tab's
+    /// dot and the record's bytes are all as they were. The redo stack is made
+    /// non-empty first, or "nothing drained" would hold of an empty one.
+    #[test]
+    fn a_path_taken_up_and_given_nothing_records_nothing() {
+        for (end, by_enter) in [
+            (Vec2::new(100.0, 0.0), true),
+            (Vec2::new(0.0, 0.0), true),
+            (Vec2::new(100.0, 0.0), false),
+            (Vec2::new(0.0, 0.0), false),
+        ] {
+            let mut ed = with_paths(vec![
+                line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)),
+                line(Vec2::new(0.0, 300.0), Vec2::new(100.0, 300.0)),
+            ]);
+            let other = record_of(&ed)
+                .with_path(1, line(Vec2::new(0.0, 400.0), Vec2::new(100.0, 400.0)))
+                .expect("a record");
+            ed.apply_path_edit(other).expect("an edit");
+            let undone = ed.history.take_undo().expect("the edit");
+            ed.history.push_redo(undone);
+            ed.session.active_tab_mut().modified = false;
+            ed.follow_path_ground();
+            let before = record_of(&ed);
+            let (position, len) = (ed.history.position(), ed.history.len());
+            assert!(len > position, "the fixture has something to redo");
+
+            path_tap(&mut ed, end);
+            assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+            if by_enter {
+                assert!(ed.path_key(PathKey::Finish), "Enter is still the draft's");
+            } else {
+                assert!(ed.settle_path_tool().is_none());
+            }
+
+            assert!(ed.path_tool.draft().is_none());
+            assert_eq!(record_of(&ed), before, "from {end:?}");
+            assert_eq!((ed.history.position(), ed.history.len()), (position, len));
+            assert!(!ed.session.active_tab().modified);
+        }
+    }
+
+    /// An append plan that would leave the record as it is records nothing,
+    /// whoever made it: the Path tool's guard and this one are two doors.
+    #[test]
+    fn an_append_plan_that_changes_nothing_records_nothing() {
+        let mut ed = with_vector_paths(1);
+        ed.session.active_tab_mut().modified = false;
+        let slot = ed.layers.active_slot().expect("a slot");
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        let plan = PathPlan::Append {
+            slot,
+            after: Box::new(record_of(&ed)),
+        };
+        ed.apply_path_plan(plan).expect("nothing to do");
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(ed.layers.vector_revision(), revision);
+        assert!(!ed.session.active_tab().modified);
+    }
+
+    /// A draft carrying a path on must not replace a path on another layer.
+    #[test]
+    fn a_change_of_active_layer_detaches_a_continued_draft() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(100.0, 0.0));
+        assert_eq!(
+            ed.path_tool.draft().and_then(|d| d.continues),
+            Some(0),
+            "the press took the line up"
+        );
+        path_tap(&mut ed, Vec2::new(150.0, 50.0));
+        let index = ed.layers.active_index();
+        ed.layers.set_active(0);
+        ed.follow_path_ground();
+        let draft = ed.path_tool.draft().expect("still up");
+        assert_eq!(draft.continues, None, "it lands as a new path now");
+        assert_eq!(draft.nodes.len(), 3, "with every node it had");
+
+        // Taken up and given nothing, there is nothing drawn to keep: a
+        // detach drops it rather than leaving a copy of the path to land.
+        ed.path_tool.abandon();
+        ed.layers.set_active(index);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(100.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+        ed.layers.set_active(0);
+        ed.follow_path_ground();
+        assert!(ed.path_tool.draft().is_none(), "an untouched continuation");
+    }
+
+    /// **The reviewer's sequence: a count that comes back equal is not the
+    /// same path.** The record is [B, C] when path 0 (B) is taken up; a jump
+    /// makes it [A, B], two paths again, with index 0 now naming A. The landing
+    /// must not replace A: B carried on lands as a new path and A and B stand.
+    #[test]
+    fn a_jump_that_keeps_the_count_detaches_a_draft_whose_path_moved() {
+        let a = line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0));
+        let b = line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0));
+        let c = line(Vec2::new(0.0, 400.0), Vec2::new(100.0, 400.0));
+        let mut ed = with_paths(vec![b.clone(), c]);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(100.0, 200.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+        // A node first: a continuation given nothing is dropped by a detach
+        // (`a_ctrl_edit_of_a_path_taken_up_and_given_nothing_leaves_no_copy`),
+        // and the case here is one with something drawn to keep.
+        path_tap(&mut ed, Vec2::new(150.0, 225.0));
+
+        let index = ed.layers.active_index();
+        let jumped = umber_core::VectorObject::empty()
+            .appended(vec![a.clone(), b.clone()])
+            .expect("a record");
+        ed.layers.set_vector(index, jumped).expect("set");
+        path_tap(&mut ed, Vec2::new(150.0, 250.0));
+        assert!(ed.path_key(PathKey::Finish));
+
+        let paths = record_of(&ed).paths().to_vec();
+        assert_eq!(paths.len(), 3, "appended, not replaced");
+        assert_eq!(paths[0], a);
+        assert_eq!(paths[1], b);
+        assert_eq!(paths[2].nodes.len(), 4, "B and the nodes added to it");
+    }
+
+    /// A foreign edit that leaves the continued path where it was keeps the
+    /// draft attached: the content check decides in both directions, so an
+    /// edit to another path does not leave the continued one doubled. Taken
+    /// from the first node, so the comparison runs reversed.
+    #[test]
+    fn a_foreign_edit_that_leaves_the_continued_path_alone_keeps_the_draft_attached() {
+        let a = line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0));
+        let b = line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0));
+        let mut ed = with_paths(vec![a, b]);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(0.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+
+        let index = ed.layers.active_index();
+        let moved = record_of(&ed)
+            .with_path(1, line(Vec2::new(0.0, 300.0), Vec2::new(100.0, 300.0)))
+            .expect("a record");
+        ed.layers.set_vector(index, moved).expect("set");
+        ed.follow_path_ground();
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+    }
+
+    /// **The tool's own edit of the path a draft continues detaches it.** A
+    /// Ctrl drag moves the continued path's first node; the landing that
+    /// follows must not put the old node back, so it lands as a new path and
+    /// the edit stands.
+    #[test]
+    fn a_ctrl_edit_of_the_continued_path_is_not_undone_by_the_landing() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(100.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+        // Something drawn, so the detach keeps the draft rather than dropping
+        // an untouched continuation.
+        path_tap(&mut ed, Vec2::new(150.0, 50.0));
+
+        path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+        ed.path_press(Vec2::new(0.0, 0.0), true);
+        ed.path_moved(Vec2::new(0.0, 50.0), false);
+        ed.path_release(Vec2::new(0.0, 50.0));
+        assert_eq!(record_of(&ed).paths()[0].nodes[0].at, Vec2::new(0.0, 50.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), None);
+
+        assert!(ed.path_key(PathKey::Finish));
+        let paths = record_of(&ed).paths().to_vec();
+        assert_eq!(paths.len(), 2, "a new path beside the edited one");
+        assert_eq!(
+            paths[0].nodes[0].at,
+            Vec2::new(0.0, 50.0),
+            "the edit stands"
+        );
+        let at: Vec<Vec2> = paths[1].nodes.iter().map(|n| n.at).collect();
+        assert_eq!(
+            at,
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(100.0, 0.0),
+                Vec2::new(150.0, 50.0)
+            ]
+        );
+    }
+
+    /// **A path taken up and then Ctrl-edited, with nothing drawn, leaves the
+    /// edited path alone.** The edit detaches the draft, and a draft holding
+    /// only the path's old nodes would land as a copy of the path before the
+    /// edit. It is dropped instead: Enter afterwards records nothing.
+    #[test]
+    fn a_ctrl_edit_of_a_path_taken_up_and_given_nothing_leaves_no_copy() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.follow_path_ground();
+        let history = ed.history.len();
+        path_tap(&mut ed, Vec2::new(100.0, 0.0));
+        assert_eq!(ed.path_tool.draft().and_then(|d| d.continues), Some(0));
+
+        path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+        ed.path_press(Vec2::new(0.0, 0.0), true);
+        ed.path_moved(Vec2::new(0.0, 50.0), false);
+        ed.path_release(Vec2::new(0.0, 50.0));
+        ed.path_key(PathKey::Finish);
+
+        let paths = record_of(&ed).paths().to_vec();
+        assert_eq!(paths.len(), 1, "no copy of the pre-edit path");
+        assert_eq!(
+            paths[0].nodes[0].at,
+            Vec2::new(0.0, 50.0),
+            "the edit stands"
+        );
+        assert_eq!(ed.history.len(), history + 1, "the edit's entry alone");
+        assert!(ed.path_tool.draft().is_none());
+    }
+
+    /// A Ctrl press in Draw on a layer that cannot be edited says why, for a
+    /// lock and for a hidden eye, and picks nothing.
+    #[test]
+    fn a_ctrl_press_on_a_layer_that_cannot_be_edited_says_why() {
+        for why in [PathEditRefusal::Locked, PathEditRefusal::Hidden] {
+            let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+            match why {
+                PathEditRefusal::Locked => ed.layers.active_mut().locked = true,
+                PathEditRefusal::Hidden => ed.layers.active_mut().visible = false,
+                PathEditRefusal::NotVector | PathEditRefusal::Newer => unreachable!(),
+            }
+            path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+            assert_eq!(ed.path_tool.pick(), None);
+            assert_eq!(ed.path_tool.said(), Some(why.sentence()), "{why:?}");
+        }
+        // The same press on an editable layer says nothing and picks.
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        path_ctrl_tap(&mut ed, Vec2::new(50.0, 0.0));
+        assert!(ed.path_tool.pick().is_some());
+        assert_eq!(ed.path_tool.said(), None);
+    }
+
+    #[test]
+    fn an_undo_of_someone_elses_edit_lets_go_of_the_pick() {
+        let mut ed = with_paths(vec![
+            line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)),
+            line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0)),
+        ]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(50.0, 200.0));
+        assert_eq!(ed.path_tool.pick().map(|p| p.path), Some(1));
+
+        // The tool's own edit keeps it: dragging the picked path's node.
+        ed.path_press(Vec2::new(100.0, 200.0), false);
+        ed.path_moved(Vec2::new(120.0, 220.0), false);
+        ed.path_release(Vec2::new(120.0, 220.0));
+        ed.follow_path_ground();
+        assert_eq!(
+            ed.path_tool.pick(),
+            Some(crate::pathtool::Pick {
+                path: 1,
+                node: Some(1)
+            }),
+            "its own edit is not somebody else's"
+        );
+
+        // Somebody else's: the record swapped back under it, as an undo does.
+        let index = ed.layers.active_index();
+        let back = record_of(&ed)
+            .with_path(1, line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0)))
+            .expect("a record");
+        ed.layers.set_vector(index, back).expect("set");
+        ed.follow_path_ground();
+        assert_eq!(ed.path_tool.pick(), None);
+    }
+
+    /// **Review focus 3: a pick that outlived a foreign edit must not reach the
+    /// next key or press**, even with no frame in between. Path 0 goes, so the
+    /// index the pick holds now names what was path 2; Delete must not take it.
+    #[test]
+    fn a_stale_pick_never_reaches_the_next_key() {
+        let mut ed = with_paths(vec![
+            line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)),
+            line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0)),
+            line(Vec2::new(0.0, 400.0), Vec2::new(100.0, 400.0)),
+        ]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        ed.follow_path_ground();
+        path_tap(&mut ed, Vec2::new(50.0, 200.0));
+        assert_eq!(ed.path_tool.pick().map(|p| p.path), Some(1));
+
+        let index = ed.layers.active_index();
+        let fewer = record_of(&ed).without_path(0).expect("a record");
+        ed.layers.set_vector(index, fewer.clone()).expect("set");
+        // No `follow_path_ground` here: the key arrives before any frame.
+        let history = ed.history.len();
+        assert!(!ed.path_key(PathKey::Remove), "nothing is picked any more");
+        assert_eq!(record_of(&ed), fewer, "what was path 2 is untouched");
+        assert_eq!(ed.history.len(), history);
+    }
+
+    /// The same for a tab switch: the pick and the draft are settled into the
+    /// document they were made on, and nothing of them reaches the next.
+    #[test]
+    fn a_tab_switch_settles_the_draft_into_the_document_it_was_drawn_on() {
+        let mut ed = path_editor();
+        let entries = ed.layers.len();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let first = ed.session.active_id();
+
+        ed.create_document(ed.doc);
+
+        assert!(ed.path_tool.draft().is_none());
+        assert_eq!(ed.path_tool.pick(), None);
+        assert_eq!(ed.layers.len(), 1, "the new document has its own stack");
+        assert!(ed.switch_tab(0));
+        assert_eq!(ed.session.active_id(), first);
+        assert_eq!(ed.layers.len(), entries + 1, "the path landed back there");
+        assert_eq!(record_of(&ed).paths().len(), 1);
+    }
+
+    #[test]
+    fn closing_the_document_in_front_drops_the_draft_and_keeps_the_settings() {
+        let mut ed = path_editor();
+        ed.create_document(ed.doc);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        ed.path_tool.role = umber_core::PathRole::Plot;
+        ed.path_tool.mode = crate::pathtool::PathMode::Draw;
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let active = ed.session.active_index();
+        ed.close_tab(active).expect("closes");
+        assert!(ed.path_tool.draft().is_none());
+        assert_eq!(ed.path_tool.role, umber_core::PathRole::Plot);
+    }
+
+    #[test]
+    fn a_resize_settles_the_draft_first() {
+        let mut ed = path_editor();
+        let entries = ed.layers.len();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let mut bigger = ed.doc;
+        bigger.size += glam::UVec2::new(100, 100);
+        assert!(ed.apply_canvas(bigger, umber_core::Anchor::default()));
+        assert!(ed.path_tool.draft().is_none());
+        assert_eq!(ed.layers.len(), entries + 1, "the path is on a layer");
+    }
+
+    #[test]
+    fn a_change_of_background_alone_leaves_the_draft_up() {
+        let mut ed = path_editor();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let mut same_size = ed.doc;
+        same_size.dpi += 1.0;
+        assert!(!ed.apply_canvas(same_size, umber_core::Anchor::default()));
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(2));
+    }
+
+    #[test]
+    fn a_node_drag_is_one_undo_entry_and_the_record_is_untouched_until_release() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        let revision = ed.layers.vector_revision();
+        let history = ed.history.len();
+
+        ed.path_press(Vec2::new(100.0, 0.0), false);
+        for x in [110.0, 130.0, 150.0] {
+            ed.path_moved(Vec2::new(x, 20.0), false);
+            assert_eq!(ed.layers.vector_revision(), revision, "not during a drag");
+        }
+        ed.path_release(Vec2::new(150.0, 20.0));
+
+        assert_ne!(ed.layers.vector_revision(), revision);
+        assert_eq!(ed.history.len(), history + 1);
+        assert_eq!(
+            ed.history.kind_at(history),
+            Some(umber_core::EditKind::Paths)
+        );
+        assert_eq!(
+            record_of(&ed).paths()[0].nodes[1].at,
+            Vec2::new(150.0, 20.0)
+        );
+    }
+
+    /// **Review focus 4: a drag past the bound is not applied at all**, and the
+    /// strip says why.
+    #[test]
+    fn a_drag_past_the_bound_leaves_the_path_as_it_was() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        let before = record_of(&ed);
+        let (revision, history) = (ed.layers.vector_revision(), ed.history.len());
+
+        ed.path_press(Vec2::new(100.0, 0.0), false);
+        let far = Vec2::new(2.0e6, 0.0);
+        ed.path_moved(far, false);
+        ed.path_release(far);
+
+        assert_eq!(record_of(&ed), before);
+        assert_eq!(ed.layers.vector_revision(), revision);
+        assert_eq!(ed.history.len(), history);
+        assert!(ed.path_tool.said().is_some(), "the strip says why");
+        assert!(ed.path_tool.pick().is_some(), "and the pick is intact");
+    }
+
+    #[test]
+    fn a_hidden_layer_refuses_edit_presses() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        ed.layers.active_mut().visible = false;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        assert_eq!(ed.path_tool.pick(), None);
+        // The same press with the eye open picks, so it is the eye that
+        // refused rather than a press that missed.
+        ed.layers.active_mut().visible = true;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        assert!(ed.path_tool.pick().is_some());
+    }
+
+    /// A path of `n` nodes along a line, every one of them in view at the zoom
+    /// the test sets.
+    fn long_line(n: usize) -> umber_core::Path {
+        umber_core::Path {
+            role: umber_core::PathRole::Cut,
+            closed: false,
+            nodes: (0..n)
+                .map(|i| umber_core::Node::corner(Vec2::new(i as f32, 10.0)))
+                .collect(),
+            ink: None,
+        }
+    }
+
+    fn nodes_shown_for(n: usize) -> bool {
+        let mut ed = with_paths(vec![long_line(n)]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        // Far enough out that every node is inside the canvas region.
+        ed.camera.zoom = 0.1;
+        ed.camera.center = Vec2::new(1500.0, 10.0);
+        ed.follow_path_ground();
+        // A press between two nodes picks the line, with no node.
+        path_tap(&mut ed, Vec2::new(100.5, 10.0));
+        assert!(ed.path_tool.pick().is_some(), "the fixture picks it");
+        ed.path_nodes_shown()
+    }
+
+    #[test]
+    fn more_nodes_in_view_than_the_cap_hides_them() {
+        assert!(!nodes_shown_for(3000));
+        assert!(!nodes_shown_for(crate::pathtool::NODE_MARK_CAP + 1));
+        assert!(nodes_shown_for(crate::pathtool::NODE_MARK_CAP));
+    }
+
+    /// The count is of nodes *in view*, so the same path zoomed in shows its
+    /// nodes again. Two readings that disagree, which is what makes it a test
+    /// of the view rather than of the length.
+    #[test]
+    fn a_long_path_shows_its_nodes_once_zoomed_in() {
+        let mut ed = with_paths(vec![long_line(3000)]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        ed.camera.zoom = 0.1;
+        ed.camera.center = Vec2::new(1500.0, 10.0);
+        path_tap(&mut ed, Vec2::new(100.5, 10.0));
+        assert!(!ed.path_nodes_shown());
+        ed.camera.zoom = 1.0;
+        assert!(ed.path_nodes_shown(), "a thousand pixels of it are in view");
+        assert!(ed.path_ground().nodes_shown);
+    }
+
+    #[test]
+    fn the_reach_follows_the_zoom_and_the_scale() {
+        let mut ed = path_editor();
+        let reach = ed.path_ground().reach;
+        assert_eq!((reach.hit, reach.tap), (8.0, crate::gesture::TAP_SLOP));
+        ed.camera.zoom = 2.0;
+        ed.pixels_per_point = 1.5;
+        let reach = ed.path_ground().reach;
+        assert_eq!(reach.hit, 8.0 * 1.5 / 2.0);
+        assert_eq!(reach.tap, crate::gesture::TAP_SLOP / 2.0);
+    }
+
+    #[test]
+    fn keys_fall_through_where_the_tool_has_nothing() {
+        let mut ed = path_editor();
+        for key in [
+            PathKey::Finish,
+            PathKey::Abandon,
+            PathKey::Remove,
+            PathKey::Undo,
+            PathKey::Redo,
+        ] {
+            assert!(!ed.path_key(key), "{key:?} with nothing up");
+        }
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        assert!(
+            ed.path_key(PathKey::Finish),
+            "one node: Enter is still the draft's"
+        );
+        assert!(ed.path_tool.draft().is_some(), "and it is kept");
+        assert!(ed.path_key(PathKey::Remove), "Backspace takes it");
+        assert!(ed.path_tool.draft().is_none());
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        assert!(ed.path_key(PathKey::Abandon));
+        assert!(
+            !ed.path_key(PathKey::Abandon),
+            "and then has nothing to take"
+        );
+    }
+
+    #[test]
+    fn delete_with_a_pick_removes_the_path_as_one_entry() {
+        let mut ed = with_paths(vec![
+            line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)),
+            line(Vec2::new(0.0, 200.0), Vec2::new(100.0, 200.0)),
+        ]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 200.0));
+        let history = ed.history.len();
+        assert!(ed.path_key(PathKey::Remove));
+        assert_eq!(record_of(&ed).paths().len(), 1);
+        assert_eq!(record_of(&ed).paths()[0].nodes[0].at, Vec2::new(0.0, 0.0));
+        assert_eq!(ed.history.len(), history + 1);
+        assert_eq!(ed.path_tool.pick(), None);
+    }
+
+    // --- what the tool watches ---------------------------------------------
+
+    fn ground(document: u64, slot: u32, revision: u64) -> PathGround {
+        PathGround {
+            document: DocId::for_test(document),
+            slot: Some(slot),
+            revision,
+        }
+    }
+
+    #[test]
+    fn the_first_look_gives_nothing_up() {
+        let mut watch = PathWatch::default();
+        assert_eq!(watch.observe(ground(1, 1, 1)), Follow::default());
+        assert_eq!(watch.observe(ground(1, 1, 1)), Follow::default());
+    }
+
+    /// A foreign revision lets go of the pick and leaves the detach to the
+    /// content check, which the watch cannot make.
+    #[test]
+    fn a_foreign_revision_lets_go_and_leaves_the_detach_to_the_record() {
+        let mut watch = PathWatch::default();
+        watch.observe(ground(1, 1, 1));
+        assert_eq!(
+            watch.observe(ground(1, 1, 2)),
+            Follow {
+                let_go: true,
+                detach: false
+            },
+        );
+    }
+
+    #[test]
+    fn a_change_of_document_or_layer_gives_both_up() {
+        let mut watch = PathWatch::default();
+        watch.observe(ground(1, 1, 1));
+        let both = Follow {
+            let_go: true,
+            detach: true,
+        };
+        assert_eq!(watch.observe(ground(1, 2, 1)), both, "another layer");
+        assert_eq!(watch.observe(ground(2, 2, 1)), both, "another document");
+    }
+
+    #[test]
+    fn the_tools_own_edit_is_taken_in_and_a_new_layer_still_lets_go() {
+        let mut watch = PathWatch::default();
+        watch.observe(ground(1, 1, 1));
+        watch.own_edit(ground(1, 1, 2));
+        assert_eq!(watch.observe(ground(1, 1, 2)), Follow::default());
+        // A landing that made a layer: the revision is its own, the slot is
+        // not, so a pick on the old layer still goes.
+        watch.own_edit(ground(1, 7, 3));
+        assert_eq!(
+            watch.observe(ground(1, 7, 3)),
+            Follow {
+                let_go: true,
+                detach: true
+            }
+        );
+    }
+
+    /// **A hidden layer is not one to draw onto blind.** The two readings
+    /// disagree here: the layer is a vector layer, unlocked and not opaque, so
+    /// only its eye can tell the plans apart.
+    #[test]
+    fn paths_drawn_over_a_hidden_vector_layer_go_to_a_new_layer() {
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        let plan = ed.plan_paths(vec![triangle_at(0.0)], None).expect("a plan");
+        let PathPlan::Append { .. } = plan else {
+            panic!("visible appends");
+        };
+
+        ed.layers.get_mut(active).unwrap().visible = false;
+        let plan = ed.plan_paths(vec![triangle_at(0.0)], None).expect("a plan");
+        let PathPlan::NewLayer { .. } = plan else {
+            panic!("hidden goes beside");
+        };
+    }
+
+    /// A layer inside a hidden folder is hidden, which is the stack's reading
+    /// and not the layer's own flag.
+    #[test]
+    fn a_layer_inside_a_hidden_folder_is_hidden_to_the_path_tool() {
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        let folder = ed.layers.group(&[active]).expect("a folder");
+        ed.layers.get_mut(folder).unwrap().visible = false;
+        let inner = (0..ed.layers.len())
+            .find(|&i| ed.layers.vector_at(i).is_some())
+            .expect("the vector layer");
+        ed.layers.set_active(inner);
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Hidden));
+    }
+
+    #[test]
+    fn a_replacement_swaps_one_path_and_keeps_the_count() {
+        let mut ed = with_vector_paths(2);
+        let before = record_of(&ed);
+        let plan = ed
+            .plan_paths(vec![triangle_at(100.0)], Some(0))
+            .expect("a plan");
+        let PathPlan::Append { after, .. } = plan.clone() else {
+            panic!("a replacement lands on the layer");
+        };
+        assert_eq!(after.paths().len(), before.paths().len());
+        assert_eq!(after.paths()[0], triangle_at(100.0));
+        assert_eq!(after.paths()[1], before.paths()[1]);
+        ed.apply_path_plan(plan).expect("carried out");
+        assert_eq!(active_paths(&ed).len(), 2);
+    }
+
+    /// A replacement of a path that is not there, or on a layer that cannot be
+    /// edited, is a sentence and not a new layer.
+    #[test]
+    fn a_replacement_is_refused_rather_than_made_a_layer() {
+        let mut ed = with_vector_paths(1);
+        let ids = stack_ids(&ed);
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        assert_eq!(
+            ed.plan_paths(vec![triangle_at(0.0)], Some(5)).unwrap_err(),
+            umber_core::vector::VectorRefusal::Impossible.sentence()
+        );
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        assert_eq!(
+            ed.plan_paths(vec![triangle_at(0.0)], Some(0)).unwrap_err(),
+            PathEditRefusal::Locked.sentence()
+        );
+        assert_eq!(stack_ids(&ed), ids, "no layer was made");
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(ed.layers.vector_revision(), revision);
+    }
+
+    /// The full-stack sentence states the figure the stack really holds.
+    #[test]
+    fn the_full_stack_sentence_names_the_real_maximum() {
+        assert!(stack_full_line!().contains(&LayerStack::MAX.to_string()));
+        let mut ed = with_a_selection();
+        while ed.layers.len() < LayerStack::MAX {
+            ed.layers.add().expect("room");
+        }
+        let said = ed
+            .plan_paths(vec![triangle_at(0.0)], None)
+            .expect_err("full");
+        assert!(said.contains(&LayerStack::MAX.to_string()), "{said}");
+    }
+
+    /// An edit one ulp from the record there is still an edit: equality is
+    /// exact, so a nudge too small to see is not thrown away.
+    #[test]
+    fn a_one_ulp_edit_still_records() {
+        let mut ed = with_vector_paths(1);
+        let before = record_of(&ed);
+        let mut after = before.clone();
+        let umber_core::VectorObject::Paths(paths) = &mut after else {
+            panic!("paths");
+        };
+        let x = &mut paths[0].nodes[0].at.x;
+        *x = f32::from_bits(x.to_bits() + 1);
+        assert_ne!(after, before);
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        ed.apply_path_edit(after.clone()).expect("an edit");
+        assert_eq!(ed.history.position(), position + 1);
+        assert_ne!(ed.layers.vector_revision(), revision, "the overlay is told");
+        assert_eq!(record_of(&ed), after);
+    }
+
+    /// One entry, of the kind the History panel draws a spline for, and undo
+    /// through the same door `App::reverse` uses restores the record exactly.
+    ///
+    /// `App` cannot be built without a device, so the undo is
+    /// [`LayerStack::restore_vector`] with the entry's own `was`, which is the
+    /// whole of what `reverse_vector` does.
+    #[test]
+    fn a_path_edit_is_one_undo_entry_and_undo_restores_it() {
+        let mut ed = with_vector_paths(2);
+        let before = record_of(&ed);
+        let position = ed.history.position();
+        let after = before.with_path(1, triangle_at(30.0)).expect("a record");
+
+        ed.apply_path_edit(after.clone()).expect("an edit");
+
+        assert_eq!(record_of(&ed), after);
+        assert_eq!(ed.history.position(), position + 1, "exactly one entry");
+        let entry = ed.history.take_undo().expect("the edit");
+        assert_eq!(entry.kind, umber_core::EditKind::Paths);
+        let umber_core::EditBody::Vector { slot, was } = entry.body else {
+            panic!("an edit records a record");
+        };
+        ed.layers.restore_vector(slot, was).expect("the layer");
+        assert_eq!(record_of(&ed), before, "back as it was");
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_records_nothing() {
+        let mut ed = with_vector_paths(1);
+        let position = ed.history.position();
+        let revision = ed.layers.vector_revision();
+        ed.apply_path_edit(record_of(&ed)).expect("nothing to do");
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(ed.layers.vector_revision(), revision);
+    }
+
+    /// A coordinate past the bound never becomes a record, and a record the
+    /// layer would refuse is an `Err` with the layer left alone.
+    #[test]
+    fn an_edit_past_the_coordinate_bound_changes_nothing() {
+        let mut ed = with_vector_paths(1);
+        let before = record_of(&ed);
+        let too_far = triangle_at(umber_core::vector::MAX_COORD * 2.0);
+        assert!(
+            before.with_path(0, too_far.clone()).is_err(),
+            "the record refuses it before the editor is asked"
+        );
+
+        // Past the bound by the other door: a record built without the check.
+        let bad = umber_core::VectorObject::Paths(vec![too_far]);
+        let revision = ed.layers.vector_revision();
+        let position = ed.history.position();
+        assert!(ed.apply_path_edit(bad).is_err());
+        assert_eq!(ed.layers.vector_revision(), revision);
+        assert_eq!(ed.history.position(), position);
+        assert_eq!(record_of(&ed), before);
+    }
+
+    /// A locked layer refuses an edit with its sentence and changes nothing.
+    #[test]
+    fn a_locked_layer_refuses_a_path_edit() {
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        let revision = ed.layers.vector_revision();
+        assert_eq!(
+            ed.apply_path_edit(umber_core::VectorObject::empty()),
+            Err(PathEditRefusal::Locked.sentence())
+        );
+        assert_eq!(ed.layers.vector_revision(), revision);
+    }
+
+    #[test]
+    fn every_refusal_has_its_sentence_and_all_lists_them() {
+        for (i, why) in PathEditRefusal::ALL.iter().enumerate() {
+            let (position, sentence) = match why {
+                PathEditRefusal::NotVector => (0, "Select a vector layer to edit its paths."),
+                PathEditRefusal::Newer => (
+                    1,
+                    "These paths are from a newer Umber and cannot be changed here.",
+                ),
+                PathEditRefusal::Locked => (2, "This layer is locked."),
+                PathEditRefusal::Hidden => (3, "This layer is hidden. Show it to edit its paths."),
+            };
+            assert_eq!(i, position, "{why:?} is where ALL says");
+            assert_eq!(why.sentence(), sentence);
+        }
+    }
+
+    #[test]
+    fn the_refusals_are_tested_in_their_order() {
+        // A locked, hidden layer that is not a vector layer says so first.
+        let mut ed = Editor::default();
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        ed.layers.get_mut(active).unwrap().visible = false;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::NotVector));
+        assert!(ed.editable_paths().is_none());
+
+        // A locked, hidden vector layer says locked.
+        let mut ed = with_vector_paths(1);
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        ed.layers.get_mut(active).unwrap().visible = false;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Locked));
+
+        // Unlocked and hidden says hidden; shown and unlocked says nothing.
+        ed.layers.get_mut(active).unwrap().locked = false;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Hidden));
+        ed.layers.get_mut(active).unwrap().visible = true;
+        assert_eq!(ed.path_edit_refusal(), None);
+        assert!(ed.editable_paths().is_some());
+    }
+
+    /// A record from a newer Umber is held as bytes and said to be.
+    #[test]
+    fn a_newer_record_is_refused_before_a_lock() {
+        let mut ed = Editor::default();
+        ed.layers
+            .add_vector_layer("newer", umber_core::VectorObject::Opaque(vec![1, 2, 3]))
+            .expect("room");
+        let active = ed.layers.active_index();
+        ed.layers.get_mut(active).unwrap().locked = true;
+        assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Newer));
+    }
+
+    /// The path route's no-slice sentence stands on its own, with no "one"
+    /// left over from the notice it was borrowed from.
+    #[test]
+    fn the_path_tools_no_slice_sentence_stands_alone() {
+        assert_eq!(
+            PATH_NO_SLICE_LINE,
+            "There is no room for another layer. Save and reopen the document to free the \
+             space, though deleted layers cannot be brought back afterwards."
+        );
+        assert!(!PATH_NO_SLICE_LINE.contains(" one."));
+    }
+
+    /// None of the refusals' sentences, nor the no-slice lines and the
+    /// not-kept title beside them, has a run of spaces, a stray edge space or
+    /// an em-dash.
+    #[test]
+    fn no_path_edit_sentence_has_a_run_of_spaces() {
+        let others = [
+            PATH_NO_SLICE_LINE,
+            PATH_NOT_KEPT_TITLE,
+            NO_SLICE_LINE,
+            TOO_MANY_PIECES_LINE,
+        ];
+        for text in PathEditRefusal::ALL
+            .iter()
+            .map(|why| why.sentence())
+            .chain(others)
+            .chain(TraceSource::ALL.map(TraceSource::nothing_line))
+        {
+            assert!(!text.contains("  "), "a run of spaces in {text:?}");
+            assert_eq!(text.trim(), text);
+            assert!(!text.contains('\u{2014}'), "an em-dash in {text:?}");
+        }
+    }
+
+    // --- trace outline -----------------------------------------------------
+
+    /// An editor on a small canvas, so a hand-built coverage is cheap.
+    fn a_small_editor() -> Editor {
+        let mut ed = Editor::default();
+        ed.doc.size = glam::UVec2::new(64, 64);
+        ed
+    }
+
+    /// A solid disc of radius 15 in the middle of `ed`'s canvas.
+    fn a_disc(ed: &Editor) -> Vec<u8> {
+        let size = ed.doc.size;
+        let centre = size.as_vec2() * 0.5;
+        (0..size.y)
+            .flat_map(|y| (0..size.x).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let at = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                if at.distance(centre) <= 15.0 { 255 } else { 0 }
+            })
+            .collect()
+    }
+
+    /// A disc is one closed cut path. On a raster layer it goes on a layer of
+    /// its own; with an editable vector layer active it is appended there.
+    #[test]
+    fn a_trace_of_a_disc_plans_one_cut_path() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+
+        let ed = a_small_editor();
+        let alpha = a_disc(&ed);
+        let plan = ed
+            .plan_trace(&alpha, TraceSource::Everything, &settings)
+            .expect("a disc traces");
+        let PathPlan::NewLayer { name, record } = plan else {
+            panic!("a raster layer active makes a layer of its own");
+        };
+        assert_eq!(name, CUT_LAYER_NAME);
+        assert_eq!(record.paths().len(), 1);
+        let path = &record.paths()[0];
+        assert!(path.closed);
+        assert_eq!(path.role, umber_core::PathRole::Cut);
+
+        let mut ed = a_small_editor();
+        ed.layers
+            .add_vector_layer("Paths", umber_core::VectorObject::empty())
+            .expect("room");
+        let plan = ed
+            .plan_trace(&alpha, TraceSource::ThisLayer, &settings)
+            .expect("a disc traces");
+        let PathPlan::Append { after, .. } = plan else {
+            panic!("an editable vector layer active takes the paths");
+        };
+        assert_eq!(after.paths().len(), 1);
+
+        // The role is the settings', not a fixed Cut.
+        let ed = a_small_editor();
+        let plot = umber_core::trace::TraceSettings::new(umber_core::PathRole::Plot);
+        let plan = ed
+            .plan_trace(&alpha, TraceSource::Everything, &plot)
+            .expect("a disc traces");
+        let PathPlan::NewLayer { name, record } = plan else {
+            panic!("a raster layer active makes a layer of its own");
+        };
+        assert_eq!(name, PLOT_LAYER_NAME);
+        assert!(
+            record
+                .paths()
+                .iter()
+                .all(|p| p.role == umber_core::PathRole::Plot)
+        );
+    }
+
+    /// Nothing over the threshold is a sentence naming which source was read,
+    /// with the stack, the history and the tab's dot all as they were.
+    #[test]
+    fn a_trace_of_nothing_is_a_sentence_and_changes_nothing() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        for (source, line) in [
+            (
+                TraceSource::Everything,
+                "There is nothing to trace. The layers in view are empty.",
+            ),
+            (
+                TraceSource::ThisLayer,
+                "There is nothing to trace on this layer.",
+            ),
+        ] {
+            // Faint everywhere, under the threshold, which `region` finds
+            // nothing in; and one opaque pixel, which it does find and `trace`
+            // removes as a speck. Both are the same nothing.
+            let faint = vec![umber_core::trace::THRESHOLD - 1; 64 * 64];
+            let mut speck = vec![0; 64 * 64];
+            speck[32 * 64 + 32] = 255;
+            for alpha in [faint, speck] {
+                let mut ed = a_small_editor();
+                ed.session.active_tab_mut().modified = false;
+                let before = (stack_ids(&ed), ed.history.len());
+                let notice = ed
+                    .plan_trace(&alpha, source, &settings)
+                    .expect_err("nothing was planned");
+                assert_eq!(notice.title, "Nothing to trace");
+                assert_eq!(notice.lines, vec![line.to_string()], "{source:?}");
+                assert_eq!((stack_ids(&ed), ed.history.len()), before);
+                assert!(!ed.session.active_tab().modified);
+            }
+        }
+    }
+
+    /// More pieces than any one layer holds is its own refusal, and it says
+    /// what would help: a new layer would hold no more than the one active,
+    /// so "use another vector layer" is advice that cannot work. Changes
+    /// nothing, like every refusal.
+    #[test]
+    fn a_trace_of_more_pieces_than_a_layer_holds_says_how_to_join_them() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        // 70 by 70 dots of three pixels, six apart, is 4900 pieces.
+        let mut ed = Editor::default();
+        ed.doc.size = glam::UVec2::new(420, 420);
+        let alpha: Vec<u8> = (0..420u32)
+            .flat_map(|y| (0..420u32).map(move |x| (x, y)))
+            .map(|(x, y)| if x % 6 < 3 && y % 6 < 3 { 255 } else { 0 })
+            .collect();
+        assert!(
+            umber_core::trace::trace(
+                &umber_core::trace::region(ed.doc.size, &alpha, 0.0, umber_core::trace::MAX_CELLS)
+                    .expect("dots"),
+                &settings
+            )
+            .len()
+                > umber_core::vector::MAX_PATHS
+        );
+        ed.session.active_tab_mut().modified = false;
+        let before = (stack_ids(&ed), ed.history.len());
+        let notice = ed
+            .plan_trace(&alpha, TraceSource::Everything, &settings)
+            .expect_err("too many pieces");
+        assert_eq!(notice.title, "Too many pieces to trace");
+        assert_eq!(notice.lines, vec![TOO_MANY_PIECES_LINE.to_string()]);
+        assert_eq!((stack_ids(&ed), ed.history.len()), before);
+        assert!(!ed.session.active_tab().modified);
+    }
+
+    /// Where the trace would fit a layer of its own but not the vector layer
+    /// that is active, the active layer is what is full, and `plan_paths`'
+    /// own sentence is the right one.
+    #[test]
+    fn a_trace_onto_a_full_layer_says_the_layer_is_full() {
+        let full: Vec<umber_core::Path> = (0..umber_core::vector::MAX_PATHS)
+            .map(|i| {
+                let y = i as f32 * 0.01;
+                line(Vec2::new(0.0, y), Vec2::new(5.0, y))
+            })
+            .collect();
+        let mut ed = with_paths(full);
+        ed.doc.size = glam::UVec2::new(64, 64);
+        let alpha = a_disc(&ed);
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        let notice = ed
+            .plan_trace(&alpha, TraceSource::ThisLayer, &settings)
+            .expect_err("the layer is full");
+        assert_eq!(
+            notice.lines,
+            vec![
+                umber_core::vector::VectorRefusal::TooManyPaths
+                    .sentence()
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A trace refused while another notice is up lands under that notice's
+    /// title, so its line has to say what it is about without its own.
+    #[test]
+    fn a_trace_refusal_under_another_notice_still_says_nothing_was_traced() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        let faint = vec![umber_core::trace::THRESHOLD - 1; 64 * 64];
+        for source in TraceSource::ALL {
+            let mut ed = a_small_editor();
+            ed.add_notice(Notice {
+                title: "Some paths were not kept".to_string(),
+                lines: vec!["Another line.".to_string()],
+            });
+            let refusal = ed
+                .plan_trace(&faint, source, &settings)
+                .expect_err("nothing was planned");
+            ed.add_notice(refusal);
+            let up = ed.notice.as_ref().expect("a notice is up");
+            assert_eq!(up.title, "Some paths were not kept");
+            let line = up.lines.last().expect("the refusal's line");
+            assert!(
+                line.to_lowercase().contains("nothing to trace"),
+                "{source:?}: {line:?}"
+            );
+        }
+    }
+
+    /// What decides visibility in a draw list, since `LayerDraw` has no
+    /// equality of its own.
+    fn draw_fields(draws: &[LayerDraw]) -> Vec<(u32, f32, u32, bool, Option<u32>, bool)> {
+        draws
+            .iter()
+            .map(|d| (d.slot, d.opacity, d.blend, d.visible, d.mask, d.clipped))
+            .collect()
+    }
+
+    fn visibility(draws: &[LayerDraw]) -> Vec<bool> {
+        draws.iter().map(|d| d.visible).collect()
+    }
+
+    #[test]
+    fn trace_draws_for_everything_are_the_layer_draws() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("room");
+        ed.layers.add().expect("room");
+        ed.layers.get_mut(1).unwrap().visible = false;
+        ed.layers.group(&[0]).expect("a folder");
+        assert_eq!(
+            draw_fields(&ed.trace_draws(TraceSource::Everything)),
+            draw_fields(&ed.layer_draws(None))
+        );
+    }
+
+    /// This layer hides every draw outside the active entry's subtree: one
+    /// layer, or a folder's contents, and a layer hidden by its own eye stays
+    /// hidden, inside the subtree or out of it. The top layer is hidden from
+    /// the start so a rule that *toggled* visibility outside the subtree would
+    /// show it.
+    #[test]
+    fn trace_draws_for_this_layer_hide_everything_outside_it() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("room");
+        ed.layers.add().expect("room");
+        ed.layers.add().expect("room");
+        assert_eq!(ed.layers.len(), 4);
+        ed.layers.get_mut(3).unwrap().visible = false;
+        ed.layers.set_active(1);
+        assert_eq!(
+            visibility(&ed.trace_draws(TraceSource::ThisLayer)),
+            vec![false, true, false, false]
+        );
+
+        // The bottom two in a folder, the folder active: its contents show.
+        let folder = ed.layers.group(&[0, 1]).expect("a folder");
+        ed.layers.set_active(folder);
+        assert_eq!(
+            visibility(&ed.trace_draws(TraceSource::ThisLayer)),
+            vec![true, true, false, false]
+        );
+
+        // One of them with its own eye off traces nothing.
+        let hidden = ed.layers.subtree(folder).start;
+        ed.layers.get_mut(hidden).unwrap().visible = false;
+        assert_eq!(
+            visibility(&ed.trace_draws(TraceSource::ThisLayer)),
+            vec![false, true, false, false]
+        );
+    }
+
+    /// A second notice in one call is added under the first, not over it.
+    #[test]
+    fn a_notice_added_beside_another_keeps_both() {
+        let mut ed = Editor::default();
+        ed.add_notice(Notice {
+            title: "First".to_string(),
+            lines: vec!["one".to_string()],
+        });
+        ed.add_notice(Notice {
+            title: "Second".to_string(),
+            lines: vec!["two".to_string()],
+        });
+        let up = ed.notice.expect("a notice");
+        assert_eq!(up.title, "First");
+        assert_eq!(up.lines, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    /// A resolution that is not a positive number seeds nothing and leaves the
+    /// seed for the next document that has one.
+    #[test]
+    fn a_resolution_that_is_not_a_number_does_not_spend_the_seed() {
+        for dpi in [0.0, -72.0, f32::NAN, f32::INFINITY] {
+            let mut ed = Editor::default();
+            let margin = ed.ui.trace.settings.margin;
+            ed.doc.dpi = dpi;
+            ed.open_trace();
+            assert!(ed.ui.trace.open);
+            assert_eq!(ed.ui.trace.settings.margin, margin, "dpi {dpi}");
+            assert!(!ed.ui.trace.seeded, "dpi {dpi} spent the seed");
+
+            ed.ui.trace.open = false;
+            ed.doc.dpi = 300.0;
+            ed.open_trace();
+            assert_eq!(ed.ui.trace.settings.margin, 35.0, "after dpi {dpi}");
+            assert!(ed.ui.trace.seeded);
+        }
+    }
+
+    /// First opened, the margin is 3 mm at the document's resolution; after
+    /// that it is whatever the artist left it at.
+    #[test]
+    fn opening_the_dialog_seeds_three_millimetres_once() {
+        let mut ed = Editor::default();
+        ed.doc.dpi = 300.0;
+        assert!(!ed.ui.trace.open);
+        ed.open_trace();
+        assert!(ed.ui.trace.open);
+        assert_eq!(ed.ui.trace.settings.margin, 35.0);
+
+        ed.ui.trace.open = false;
+        ed.ui.trace.settings.margin = 12.0;
+        ed.open_trace();
+        assert!(ed.ui.trace.open);
+        assert_eq!(ed.ui.trace.settings.margin, 12.0, "the change was kept");
     }
 }

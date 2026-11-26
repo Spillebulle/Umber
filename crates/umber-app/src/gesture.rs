@@ -85,6 +85,9 @@ pub enum Press {
     Eyedropper,
     /// Carry on the brush-size drag under this contact.
     ResizeBrush,
+    /// Place a node, or pick up and reshape a path. What the press does on the
+    /// canvas is `pathtool`'s to decide; this only says it is the Path tool's.
+    Path,
 }
 
 impl Press {
@@ -94,7 +97,7 @@ impl Press {
     /// written out where it is used, which is exactly what a variant added
     /// later does not appear in — a test walking a hand-written array is a
     /// test that silently stops covering the thing it names.
-    pub const ALL: [Press; 8] = [
+    pub const ALL: [Press; 9] = [
         Press::Ignored,
         Press::Pan,
         Press::Zoom,
@@ -103,6 +106,7 @@ impl Press {
         Press::Transform,
         Press::Eyedropper,
         Press::ResizeBrush,
+        Press::Path,
     ];
 
     /// A short name for Settings → Input & pen, which records which gesture a
@@ -117,6 +121,7 @@ impl Press {
             Self::Transform => "transform",
             Self::Eyedropper => "eyedropper",
             Self::ResizeBrush => "brush size",
+            Self::Path => "path",
         }
     }
 }
@@ -174,6 +179,7 @@ pub fn press(p: Pointer) -> Press {
         Tool::Eyedropper => Press::Eyedropper,
         Tool::Pan => Press::Pan,
         Tool::Zoom => Press::Zoom,
+        Tool::Path => Press::Path,
     }
 }
 
@@ -256,7 +262,10 @@ pub fn supersedes_stroke(decision: Press) -> bool {
         | Press::Select
         | Press::Transform
         | Press::Eyedropper
-        | Press::ResizeBrush => true,
+        | Press::ResizeBrush
+        // A path press is not a stroke, so a mouse stroke a pen lands on is
+        // finished and kept rather than left for nothing to end.
+        | Press::Path => true,
     }
 }
 
@@ -354,7 +363,7 @@ mod tests {
     /// there index this array rather than returning a literal, which is the
     /// half of the rule that makes a short array an out-of-bounds panic; the
     /// first draft returned literals and could not have caught it.
-    const TOOLS: [Tool; 7] = [
+    const TOOLS: [Tool; 8] = [
         Tool::Brush,
         Tool::Eraser,
         Tool::Select,
@@ -362,6 +371,7 @@ mod tests {
         Tool::Eyedropper,
         Tool::Pan,
         Tool::Zoom,
+        Tool::Path,
     ];
 
     #[test]
@@ -388,6 +398,7 @@ mod tests {
                 Tool::Eyedropper => TOOLS[4],
                 Tool::Pan => TOOLS[5],
                 Tool::Zoom => TOOLS[6],
+                Tool::Path => TOOLS[7],
             };
             assert_eq!(*tool, expected, "{tool:?} is filed in the wrong place");
             assert_eq!(TOOLS[i], *tool, "the sweep is walking its own array");
@@ -640,16 +651,81 @@ mod tests {
         // because a fixed-size array with the right number of elements in it
         // compiles whatever those elements are. That is the whole of what the
         // two claim between them.
-        assert_eq!(Press::ALL.len(), 8, "a variant is missing from Press::ALL");
+        assert_eq!(Press::ALL.len(), 9, "a variant is missing from Press::ALL");
         for decision in Press::ALL {
             let superseded = supersedes_stroke(decision);
             match decision {
                 // The only press the canvas never sees, and the only one that
                 // may leave a stroke running. See `supersedes_stroke`.
                 Press::Ignored => assert!(!superseded, "a press on a panel ended a stroke"),
-                _ => assert!(superseded, "{decision:?} left a stroke running"),
+                Press::Pan
+                | Press::Zoom
+                | Press::Paint
+                | Press::Select
+                | Press::Transform
+                | Press::Eyedropper
+                | Press::ResizeBrush
+                | Press::Path => assert!(superseded, "{decision:?} left a stroke running"),
             }
         }
+    }
+
+    #[test]
+    fn every_press_is_filed_in_its_own_place_in_all() {
+        // The compiler catches a variant with no arm; indexing `ALL` from each
+        // arm catches the array being left short, which a length check alone
+        // only catches while somebody remembers to raise the figure.
+        for (i, decision) in Press::ALL.iter().enumerate() {
+            let expected = match decision {
+                Press::Ignored => Press::ALL[0],
+                Press::Pan => Press::ALL[1],
+                Press::Zoom => Press::ALL[2],
+                Press::Paint => Press::ALL[3],
+                Press::Select => Press::ALL[4],
+                Press::Transform => Press::ALL[5],
+                Press::Eyedropper => Press::ALL[6],
+                Press::ResizeBrush => Press::ALL[7],
+                Press::Path => Press::ALL[8],
+            };
+            assert_eq!(
+                *decision, expected,
+                "{decision:?} is filed in the wrong place"
+            );
+            assert_eq!(Press::ALL[i], *decision);
+        }
+    }
+
+    #[test]
+    fn the_path_tool_presses_resolve_to_path() {
+        // By mouse and by pen alike, which is the whole of this module's
+        // promise for a tool added after it.
+        assert_eq!(press(mouse(Tool::Path)), Press::Path);
+        assert_eq!(press(pen(Tool::Path)), Press::Path);
+        // Alt is the eyedropper on every tool, this one included: the spec
+        // keeps Shift for a handle alone and leaves Alt alone.
+        assert_eq!(
+            press(Pointer {
+                alt: true,
+                ..mouse(Tool::Path)
+            }),
+            Press::Eyedropper
+        );
+        // And the navigation overrides and the interface still come first.
+        assert_eq!(
+            press(Pointer {
+                space: true,
+                ..pen(Tool::Path)
+            }),
+            Press::Pan
+        );
+        assert_eq!(
+            press(Pointer {
+                ui_owns: true,
+                ..mouse(Tool::Path)
+            }),
+            Press::Ignored
+        );
+        assert_eq!(Press::Path.label(), "path");
     }
 
     #[test]

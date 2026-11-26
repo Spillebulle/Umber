@@ -59,6 +59,7 @@ mod panels;
 /// twice before it was written once.
 #[cfg(test)]
 mod paneltest;
+mod pathtool;
 mod prefs;
 mod recoverdlg;
 mod session;
@@ -86,6 +87,7 @@ mod themelib;
 /// Umber as a command-line thumbnailer, for the freedesktop contract.
 mod thumbnail;
 mod thumbs;
+mod tracedlg;
 mod tweaks;
 mod ui;
 /// Checking for, fetching and installing a new release.
@@ -95,6 +97,7 @@ mod ui;
 /// payload back with, so the writer and the reader cannot drift.
 pub mod update;
 mod updatedlg;
+mod vectorview;
 /// What Umber says when the graphics card will not hold a document's layers.
 mod vram;
 mod widgets;

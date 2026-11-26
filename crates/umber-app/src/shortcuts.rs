@@ -23,12 +23,21 @@ pub enum Action {
     Copy,
     Cut,
     Paste,
+    // The three paths-and-layers commands. Unbound by default: a vector layer
+    // is a new thing and a chord nobody asked for would collide with what a
+    // painter's hands already know, the argument the brush tweaks make.
+    CutPathFromSelection,
+    PlotPathFromSelection,
+    // Unbound for the same reason, and it opens a dialog rather than acting.
+    TraceOutline,
+    NewVectorLayer,
     FlipCanvasHorizontal,
     FlipCanvasVertical,
     BrushTool,
     EraserTool,
     SelectTool,
     TransformTool,
+    PathTool,
     EyedropperTool,
     PanTool,
     ZoomTool,
@@ -67,7 +76,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 39] = [
+    pub const ALL: [Action; 44] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
@@ -77,12 +86,17 @@ impl Action {
         Action::Copy,
         Action::Cut,
         Action::Paste,
+        Action::CutPathFromSelection,
+        Action::PlotPathFromSelection,
+        Action::TraceOutline,
+        Action::NewVectorLayer,
         Action::FlipCanvasHorizontal,
         Action::FlipCanvasVertical,
         Action::BrushTool,
         Action::EraserTool,
         Action::SelectTool,
         Action::TransformTool,
+        Action::PathTool,
         Action::EyedropperTool,
         Action::PanTool,
         Action::ZoomTool,
@@ -126,12 +140,17 @@ impl Action {
             Action::Copy => "Copy",
             Action::Cut => "Cut",
             Action::Paste => "Paste",
+            Action::CutPathFromSelection => "Cut path from selection",
+            Action::PlotPathFromSelection => "Plot path from selection",
+            Action::TraceOutline => "Trace outline…",
+            Action::NewVectorLayer => "New vector layer",
             Action::FlipCanvasHorizontal => "Flip canvas horizontally",
             Action::FlipCanvasVertical => "Flip canvas vertically",
             Action::BrushTool => "Brush tool",
             Action::EraserTool => "Eraser tool",
             Action::SelectTool => "Selection tool",
             Action::TransformTool => "Transform tool",
+            Action::PathTool => "Path tool",
             Action::EyedropperTool => "Eyedropper tool",
             Action::PanTool => "Pan tool",
             Action::ZoomTool => "Zoom tool",
@@ -177,7 +196,11 @@ impl Action {
             | Action::Deselect
             | Action::Copy
             | Action::Cut
-            | Action::Paste => "Edit",
+            | Action::Paste
+            | Action::CutPathFromSelection
+            | Action::PlotPathFromSelection
+            | Action::TraceOutline => "Edit",
+            Action::NewVectorLayer => "Layers",
             // Its own group rather than "Edit": these change the document
             // itself rather than the last thing done to it, and they are the
             // pair every other application files under Image.
@@ -186,6 +209,7 @@ impl Action {
             | Action::EraserTool
             | Action::SelectTool
             | Action::TransformTool
+            | Action::PathTool
             | Action::EyedropperTool
             | Action::PanTool
             | Action::ZoomTool => "Tools",
@@ -388,6 +412,10 @@ pub fn defaults() -> Vec<Binding> {
         // tool keys are unmodified throughout and a rail that was consistent
         // everywhere except here would be worse than following the crowd.
         binding(Action::TransformTool, KeyCode::KeyT, false, false, false),
+        // P for the pen, which is Photoshop's, Illustrator's, Affinity's and
+        // Inkscape's key for the bezier pen the Path tool is. Nothing else here
+        // holds it.
+        binding(Action::PathTool, KeyCode::KeyP, false, false, false),
         // I for the eyedropper, which is Photoshop's, Krita's, GIMP's and
         // Affinity's. `E` would be the other reading of the word and is the
         // eraser here; Photoshop uses `I` for exactly this reason.
@@ -579,6 +607,11 @@ pub enum Direct {
     Abandon,
     /// Enter: finish the gesture in progress.
     Finish,
+    /// Backspace or Delete: take the last node off a path being drawn, or
+    /// remove what the Path tool has picked. Unlike the other three both keys
+    /// are bindable, so `handle_keys` claims this only where the tool took it
+    /// and lets it fall through to the table otherwise.
+    Remove,
 }
 
 /// Which of the three untabled keys a press is, if any.
@@ -620,6 +653,7 @@ pub fn direct(key: KeyCode, pressed: bool, suspended: bool) -> Option<Direct> {
         KeyCode::Space => Direct::PanModifier,
         KeyCode::Escape => Direct::Abandon,
         KeyCode::Enter | KeyCode::NumpadEnter => Direct::Finish,
+        KeyCode::Backspace | KeyCode::Delete => Direct::Remove,
         _ => return None,
     };
     if !pressed && direct != Direct::PanModifier {
@@ -1651,12 +1685,107 @@ mod tests {
             if crate::tweaks::of_action(action).is_some() {
                 continue;
             }
+            // The vector commands ship unbound, for the tweaks' reason,
+            // and are named here rather than excused by a predicate so that a
+            // fourth has to be added on purpose.
+            if [
+                Action::CutPathFromSelection,
+                Action::PlotPathFromSelection,
+                Action::NewVectorLayer,
+                Action::TraceOutline,
+            ]
+            .contains(&action)
+            {
+                continue;
+            }
             assert!(
                 bindings.iter().any(|b| b.action == action),
                 "{action:?} has no default binding"
             );
         }
     }
+    /// Trace outline is listed, filed under Edit, named as a command that opens
+    /// a dialog, and bound to nothing.
+    #[test]
+    fn the_trace_action_is_listed_unbound_under_edit() {
+        assert!(Action::ALL.contains(&Action::TraceOutline));
+        assert_eq!(Action::TraceOutline.category(), "Edit");
+        assert_eq!(Action::TraceOutline.label(), "Trace outline…");
+        assert!(
+            defaults().iter().all(|b| b.action != Action::TraceOutline),
+            "Trace outline ships bound"
+        );
+    }
+
+    /// **What [`Action::ALL`] holds, as far as walking it can tell.** Each arm
+    /// of the exhaustive match marks its own cell, so this catches an entry
+    /// listed twice, and an existing entry dropped from `ALL` with the length
+    /// shortened to match: its cell is never marked.
+    ///
+    /// **It does not catch the slip it looks as though it should**: a new
+    /// variant given a new arm and left out of `ALL`. The loop only walks `ALL`,
+    /// so that arm never runs and nothing is left unmarked; the compiler forces
+    /// the arm and has no opinion about the array. The only complete fix is
+    /// deriving the enum and `ALL` from one list, the macro CLAUDE.md's
+    /// "Partial exhaustiveness" section weighs. What catches a missing command
+    /// in practice is a test that demands something of every action in a
+    /// category, such as `ui`'s menu-row test, and only for those categories.
+    #[test]
+    fn all_lists_no_action_twice_and_drops_none_it_had() {
+        let mut seen = [false; Action::ALL.len()];
+        for action in Action::ALL {
+            let cell = match action {
+                Action::Save => 0,
+                Action::SaveAs => 1,
+                Action::Export => 2,
+                Action::Undo => 3,
+                Action::Redo => 4,
+                Action::Deselect => 5,
+                Action::Copy => 6,
+                Action::Cut => 7,
+                Action::Paste => 8,
+                Action::CutPathFromSelection => 9,
+                Action::PlotPathFromSelection => 10,
+                Action::TraceOutline => 11,
+                Action::NewVectorLayer => 12,
+                Action::FlipCanvasHorizontal => 13,
+                Action::FlipCanvasVertical => 14,
+                Action::BrushTool => 15,
+                Action::EraserTool => 16,
+                Action::SelectTool => 17,
+                Action::TransformTool => 18,
+                Action::PathTool => 19,
+                Action::EyedropperTool => 20,
+                Action::PanTool => 21,
+                Action::ZoomTool => 22,
+                Action::SizeDown => 23,
+                Action::SizeUp => 24,
+                Action::OpacityDown => 25,
+                Action::OpacityUp => 26,
+                Action::HardnessDown => 27,
+                Action::HardnessUp => 28,
+                Action::SpacingDown => 29,
+                Action::SpacingUp => 30,
+                Action::RoundnessDown => 31,
+                Action::RoundnessUp => 32,
+                Action::AirbrushDown => 33,
+                Action::AirbrushUp => 34,
+                Action::AngleDown => 35,
+                Action::AngleUp => 36,
+                Action::PickupDown => 37,
+                Action::PickupUp => 38,
+                Action::SwapColours => 39,
+                Action::FitView => 40,
+                Action::ActualSize => 41,
+                Action::ZoomIn => 42,
+                Action::ZoomOut => 43,
+            };
+            assert!(!seen[cell], "{action:?} is listed twice");
+            seen[cell] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "an entry of ALL is missing");
+    }
+
     use std::collections::HashSet;
 
     const CTRL: ModifiersState = ModifiersState::CONTROL;
@@ -1670,6 +1799,33 @@ mod tests {
     // to debug.
     fn hit(key: KeyCode, mods: ModifiersState) -> Option<Action> {
         resolve_in(&defaults(), key, mods)
+    }
+
+    /// P is the Path tool's and is nobody else's: the guard names the one
+    /// binding that holds the key rather than asserting what P resolves to,
+    /// because a second binding on it would make `resolve` answer whichever
+    /// came first and this still pass.
+    #[test]
+    fn the_path_tool_is_bound_to_p_and_nothing_else_is() {
+        assert_eq!(hit(KeyCode::KeyP, NONE), Some(Action::PathTool));
+        let holders: Vec<_> = defaults()
+            .into_iter()
+            .filter(|b| b.key == KeyCode::KeyP && !b.ctrl && !b.shift && !b.alt)
+            .map(|b| b.action)
+            .collect();
+        assert_eq!(holders, vec![Action::PathTool]);
+        // Ctrl+P is not the tool, for the reason plain Z is not Ctrl+Z.
+        assert_ne!(hit(KeyCode::KeyP, CTRL), Some(Action::PathTool));
+    }
+
+    /// The id is what `shortcut = <ActionId> <ChordId>` writes, and it is a
+    /// `Debug` spelling: renaming the variant would silently unbind every
+    /// painter's customised Path tool key. Pinned as a literal.
+    #[test]
+    fn the_path_tools_id_is_a_literal() {
+        assert_eq!(Action::PathTool.id(), "PathTool");
+        assert_eq!(Action::PathTool.label(), "Path tool");
+        assert_eq!(Action::PathTool.category(), "Tools");
     }
 
     #[test]
@@ -2208,6 +2364,8 @@ mod tests {
             (KeyCode::Escape, Some(Direct::Abandon)),
             (KeyCode::Enter, Some(Direct::Finish)),
             (KeyCode::NumpadEnter, Some(Direct::Finish)),
+            (KeyCode::Backspace, Some(Direct::Remove)),
+            (KeyCode::Delete, Some(Direct::Remove)),
             (KeyCode::KeyB, None),
             (KeyCode::Tab, None),
         ] {
@@ -2234,7 +2392,15 @@ mod tests {
 
         // Escape and Enter act on the press alone, suspended or not. Reporting
         // them for a release would run the gesture's answer twice.
-        for key in [KeyCode::Escape, KeyCode::Enter, KeyCode::NumpadEnter] {
+        // Backspace and Delete too: a caret in a field is what deletes there,
+        // and a node taken off a path out of sight is the failure.
+        for key in [
+            KeyCode::Escape,
+            KeyCode::Enter,
+            KeyCode::NumpadEnter,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ] {
             assert_eq!(direct(key, true, true), None, "{key:?} while typing");
             assert_eq!(direct(key, false, false), None, "{key:?} released");
             assert_eq!(direct(key, false, true), None, "{key:?} released, typing");

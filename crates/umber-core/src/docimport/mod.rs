@@ -444,6 +444,16 @@ pub struct ImportedLayer {
     /// of those raises an [`ImportWarning::TextDropped`] and the layer opens as
     /// ordinary paint, which is what it now is. See [`crate::textobj`].
     pub text: Option<Box<crate::textobj::TextObject>>,
+    /// The paths this layer draws, where the file said so.
+    ///
+    /// `None` for every format but Umber's own, and `None` where the record was
+    /// unreadable ([`ImportWarning::VectorDropped`]). A record from a newer Umber
+    /// is **kept**, as [`crate::vector::VectorObject::Opaque`], so the next save
+    /// writes it back whole ([`ImportWarning::VectorNeedsNewer`]). A record
+    /// whose ink no longer matches its pixels arrives with the ink taken off
+    /// ([`ImportWarning::VectorInkDropped`]). Never set together with
+    /// [`ImportedLayer::text`]: the reader keeps the text one.
+    pub vector: Option<Box<crate::vector::VectorObject>>,
     /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
     ///
     /// Only ORA can carry nesting today. `.kra` has groups and `.psd` has them
@@ -475,6 +485,7 @@ impl ImportedLayer {
             locked: false,
             link: None,
             text: None,
+            vector: None,
             depth: 0,
             folder: false,
         }
@@ -542,6 +553,7 @@ impl fmt::Debug for ImportedLayer {
             .field("locked", &self.locked)
             .field("link", &self.link)
             .field("text", &self.text.is_some())
+            .field("vector", &self.vector.is_some())
             .finish()
     }
 }
@@ -612,6 +624,31 @@ pub struct Opened {
 }
 
 impl ImportedDocument {
+    /// Drop every vector record the stack would refuse, naming each.
+    ///
+    /// A record on a folder, on a layer that is also text, or past
+    /// [`crate::vector::VectorObject::check`]'s bounds cannot be installed. The
+    /// ORA reader never produces one — it makes the same three decisions as it
+    /// reads — so this is for a caller that built an `ImportedDocument` by hand,
+    /// and it is what keeps [`ImportedDocument::open`] from losing a record
+    /// without a [`ImportWarning::VectorDropped`] beside it. Idempotent.
+    pub fn settle_vector_records(&mut self) {
+        for layer in &mut self.layers {
+            let why = match layer.vector.as_deref() {
+                None => continue,
+                Some(_) if layer.folder => "A folder cannot hold paths.",
+                Some(_) if layer.text.is_some() => "The layer is also text, and keeps the text.",
+                Some(record) if record.check().is_err() => "The record is outside the limits.",
+                Some(_) => continue,
+            };
+            layer.vector = None;
+            self.warnings.push(ImportWarning::VectorDropped {
+                layer: layer.name.clone(),
+                reason: why.into(),
+            });
+        }
+    }
+
     pub fn document(&self) -> Document {
         Document::new(self.size.x, self.size.y)
             .with_background(self.background)
@@ -647,6 +684,15 @@ impl ImportedDocument {
         // between` is the guard.
 
         disable_effects_over_budget(&mut self.layers);
+
+        // The same totality for a vector record: `install_vector` refuses a
+        // folder, a text layer and a record over its bounds, and a refusal read
+        // as a shrug is a record lost with no sentence. Settled here so the
+        // install below cannot be refused, and idempotent so the reader having
+        // done it already costs nothing. The sentences land in `self.warnings`,
+        // which `open` consumes: a caller that wants to *read* them calls
+        // [`ImportedDocument::settle_vector_records`] before it looks.
+        self.settle_vector_records();
 
         let saved_history = self.history;
 
@@ -693,6 +739,18 @@ impl ImportedDocument {
                 debug_assert!(
                     placed,
                     "a reader put a text record on an entry that cannot hold one"
+                );
+            }
+            // The paths, through `install_vector` for the reason the text record
+            // goes through `set_text`: the stack refuses a folder and a layer
+            // that is already text, and a refusal is the model's to make. The
+            // reader keeps one record per layer, so a `false` here means a
+            // caller hand-built something it should not have.
+            if let Some(vector) = layer.vector {
+                let placed = stack.install_vector(i, *vector);
+                debug_assert!(
+                    placed,
+                    "a reader put a vector record on an entry that cannot hold one"
                 );
             }
             // Through `set_effect` rather than onto the field, because
@@ -1103,6 +1161,27 @@ pub enum ImportWarning {
     /// make. Re-rendering then would destroy that painting, so the record goes
     /// and the picture stays. Nothing in the picture is ever lost to this.
     TextDropped { layer: String, reason: String },
+    /// The layer's paths were made by a newer Umber. They are kept whole and
+    /// saved back, and this build can neither draw nor change them.
+    ///
+    /// Raised only where the file named a record, like every warning here. The
+    /// document itself opened, because a record's own `version` is judged apart
+    /// from [`crate::docformat::VERSION`]: that one refuses a *file*, this one
+    /// keeps a *record* it cannot read.
+    VectorNeedsNewer { layer: String },
+    /// The layer's paths could not be read and were left out. The layer opens as
+    /// an ordinary empty one and every pixel is untouched.
+    ///
+    /// Also what a record naming a folder, or a layer that already names text,
+    /// becomes: two records on one layer would each claim its pixels, and a
+    /// folder has none.
+    VectorDropped { layer: String, reason: String },
+    /// Some strokes on the layer described pixels that have since been painted
+    /// over, so they are ordinary paint now. The Cut and Plot paths are kept.
+    ///
+    /// The same fingerprint and the same reason [`ImportWarning::TextDropped`]
+    /// has, applied to the half of a record that is about pixels.
+    VectorInkDropped { layer: String },
 }
 
 impl fmt::Display for ImportWarning {
@@ -1171,6 +1250,18 @@ impl fmt::Display for ImportWarning {
             Self::TextDropped { layer, reason } => write!(
                 f,
                 "Layer “{layer}” was saved as text, and {reason}, so it opens as ordinary paint. Every pixel is there; the text cannot be edited again."
+            ),
+            Self::VectorNeedsNewer { layer } => write!(
+                f,
+                "The paths on “{layer}” were made by a newer Umber. They are kept and saved back, but cannot be shown or changed here."
+            ),
+            Self::VectorDropped { layer, reason } => write!(
+                f,
+                "The paths on “{layer}” could not be read and were left out. {reason}"
+            ),
+            Self::VectorInkDropped { layer } => write!(
+                f,
+                "Some strokes on “{layer}” were painted over elsewhere and are now ordinary paint."
             ),
         }
     }
@@ -1885,6 +1976,128 @@ mod tests {
         // failed to load, say. The top layer is the safe answer, not a panic.
         assert_eq!(build(Some(9)).open().stack.active_index(), 2);
         assert_eq!(build(None).open().stack.active_index(), 2);
+    }
+
+    /// A record the stack would refuse is named and dropped rather than lost to
+    /// a `bool` nobody reads. Hand-built, because the ORA reader makes the same
+    /// three decisions itself and so can never hand `open` one of these.
+    #[test]
+    fn a_vector_record_the_stack_would_refuse_is_dropped_with_a_sentence() {
+        use crate::vector::{Node, Path, PathRole, VectorObject};
+        let size = UVec2::new(2, 2);
+        let record = || {
+            Box::new(VectorObject::Paths(vec![Path {
+                role: PathRole::Cut,
+                closed: false,
+                nodes: vec![
+                    Node::corner(glam::Vec2::new(0.0, 0.0)),
+                    Node::corner(glam::Vec2::new(1.0, 1.0)),
+                ],
+                ink: None,
+            }]))
+        };
+        let mut on_folder = ImportedLayer::folder("Group", 0, true);
+        on_folder.vector = Some(record());
+        let mut on_text = layer("Caption", size);
+        on_text.vector = Some(record());
+        on_text.text = Some(Box::new(crate::textobj::TextObject::new(
+            crate::text::TextBlock {
+                text: "x".into(),
+                size: 12.0,
+                line_spacing: 1.0,
+                tracking: 0.0,
+                align: crate::text::Align::Left,
+            },
+            crate::textobj::TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: "Archivo-Regular".into(),
+            },
+            crate::color::Color::from_srgb_u8(0, 0, 0, 255),
+            crate::textobj::Placement::identity(PixelRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }),
+        )));
+        let mut fine = layer("Lines", size);
+        fine.vector = Some(record());
+        let mut doc = ImportedDocument {
+            format: SourceFormat::OpenRaster,
+            size,
+            layers: vec![fine, on_text, on_folder],
+            active: None,
+            background: Background::Transparent,
+            dpi: None,
+            history: None,
+            warnings: vec![],
+        };
+        doc.settle_vector_records();
+        let named: Vec<&str> = doc
+            .warnings
+            .iter()
+            .map(|w| match w {
+                ImportWarning::VectorDropped { layer, .. } => layer.as_str(),
+                other => panic!("unexpected warning {other:?}"),
+            })
+            .collect();
+        assert_eq!(named, ["Caption", "Group"]);
+        assert!(doc.layers[0].vector.is_some(), "a good record is untouched");
+        // Settled once means settled: `open` asks again and finds nothing.
+        let before = doc.warnings.len();
+        doc.settle_vector_records();
+        assert_eq!(doc.warnings.len(), before);
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().is_vector());
+    }
+
+    /// The third arm: a record outside `check`'s bounds is dropped with its own
+    /// reason, and a good record beside it is untouched. The bad record is one
+    /// node past `MAX_COORD`, which only a hand-built import can carry, since the
+    /// ORA reader makes the same decision as it reads.
+    #[test]
+    fn settling_drops_a_record_outside_the_limits_and_says_so() {
+        use crate::vector::{MAX_COORD, Node, Path, PathRole, VectorObject};
+        let size = UVec2::new(1, 1);
+        let record = |x: f32| {
+            Box::new(VectorObject::Paths(vec![Path {
+                role: PathRole::Cut,
+                closed: false,
+                nodes: vec![
+                    Node::corner(glam::Vec2::new(x, 0.0)),
+                    Node::corner(glam::Vec2::new(1.0, 1.0)),
+                ],
+                ink: None,
+            }]))
+        };
+        let mut far = layer("Far", size);
+        far.vector = Some(record(MAX_COORD * 2.0));
+        let mut fine = layer("Lines", size);
+        fine.vector = Some(record(0.0));
+        let mut doc = ImportedDocument {
+            format: SourceFormat::OpenRaster,
+            size,
+            layers: vec![fine, far],
+            active: None,
+            background: Background::Transparent,
+            dpi: None,
+            history: None,
+            warnings: vec![],
+        };
+        doc.settle_vector_records();
+        assert!(doc.layers[1].vector.is_none(), "the bad record was kept");
+        assert!(doc.layers[0].vector.is_some(), "a good record was dropped");
+        match doc.warnings.as_slice() {
+            [ImportWarning::VectorDropped { layer, reason }] => {
+                assert_eq!(layer, "Far");
+                assert_eq!(reason, "The record is outside the limits.");
+            }
+            other => panic!("expected one VectorDropped, got {other:?}"),
+        }
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().is_vector());
+        assert!(!opened.stack.get(1).unwrap().is_vector());
     }
 
     #[test]

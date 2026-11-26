@@ -1069,6 +1069,16 @@ pub struct LayerMeta {
     /// Boxed as [`umber_core::Layer`] boxes it, so a stack of ordinary painted
     /// layers pays a pointer per layer rather than a `TextObject` per layer.
     pub text: Option<Box<TextObject>>,
+    /// The paths of a vector layer, snapshotted with the names for the same
+    /// reason and with a worse failure than the text record's: an edit made
+    /// while the readback crosses frames would be written beside pixels it did
+    /// not describe, and reopening would draw the newer paths over them.
+    /// `docformat` fingerprints the record against the image it is writing, so
+    /// the pair would agree and nothing would say so.
+    ///
+    /// Boxed as [`umber_core::Layer`] boxes it. `None` for every layer that is
+    /// not a vector layer, which is nearly all of them.
+    pub vector: Option<Box<umber_core::VectorObject>>,
     pub clipped: bool,
     pub locked: bool,
     pub link: Option<u8>,
@@ -2486,6 +2496,8 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
                 // describe a caption re-set since the pixels were read, and the
                 // fingerprint the writer takes would agree with it.
                 text: l.text().cloned().map(Box::new),
+                // And the paths, for `LayerMeta::vector`'s reason.
+                vector: l.vector().cloned().map(Box::new),
                 clipped: l.clipped,
                 locked: l.locked,
                 link: l.link,
@@ -2574,6 +2586,9 @@ fn run_task(task: Task, images: &Encoded) -> Vec<Report> {
                 // that opened as text is written back as plain paint by the
                 // five-minute timer with no warning anywhere.
                 text: l.text.as_deref(),
+                // And the paths, equally silent: left out, the five-minute
+                // timer writes a vector layer back as an ordinary one.
+                vector: l.vector.as_deref(),
                 clipped: l.clipped,
                 locked: l.locked,
                 link: l.link,
@@ -3132,6 +3147,7 @@ mod tests {
                 mask: None,
                 effects: Vec::new(),
                 text: None,
+                vector: None,
                 clipped: false,
                 locked: false,
                 link: None,
@@ -4380,6 +4396,84 @@ mod tests {
         );
     }
 
+    /// A vector record for a layer of the fixture above.
+    fn some_paths() -> umber_core::VectorObject {
+        umber_core::VectorObject::empty()
+            .appended(vec![umber_core::Path {
+                role: umber_core::PathRole::Plot,
+                closed: true,
+                nodes: vec![
+                    umber_core::Node::corner(glam::Vec2::new(0.0, 0.0)),
+                    umber_core::Node::corner(glam::Vec2::new(30.0, 4.0)),
+                    umber_core::Node::corner(glam::Vec2::new(12.0, 20.0)),
+                ],
+                ink: None,
+            }])
+            .expect("a small record is legal")
+    }
+
+    /// **The autosave writes a layer's paths, as a save does**, the vector twin
+    /// of `the_autosave_writes_the_text_the_snapshot_was_taken_with` and wired
+    /// in the same change for the same reason.
+    ///
+    /// `SaveLayer::vector` defaults to `None`, so a writer that does not name it
+    /// writes a vector layer back as an ordinary one: every pixel intact, the
+    /// paths gone, nothing said. The count in `app.rs` cannot see this one,
+    /// because `autosave.rs` names the field on `LayerMeta` and in `snapshot` as
+    /// well; this is the guard that reads what came out of the file.
+    #[test]
+    fn an_autosave_writes_the_paths_a_save_does() {
+        let internal = scratch("vector-internal");
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        let record = some_paths();
+        doc.layers[0].vector = Some(Box::new(record.clone()));
+        let ours = internal.join("Untitled 1-7777777777777779.ora");
+
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}"
+        );
+
+        let back = umber_core::docimport::import(&ours).expect("reopen the copy");
+        assert_eq!(
+            back.layers[0].vector.as_deref(),
+            Some(&record),
+            "an autosave wrote a vector layer back as an ordinary one"
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
+    /// The snapshot holds the paths as they were when the capture began, so an
+    /// edit made while the readback crosses frames is not written beside pixels
+    /// it did not describe.
+    #[test]
+    fn paths_are_snapshotted_when_the_capture_begins_not_when_it_is_written() {
+        let mut editor = Editor::default();
+        let id = editor.session.active_id();
+        let at = editor
+            .layers
+            .add_vector_layer("Paths", some_paths())
+            .expect("room");
+
+        let taken = snapshot(&editor, id).expect("the tab is open");
+        assert_eq!(taken.layers[at].vector.as_deref(), Some(&some_paths()));
+        assert!(
+            taken.layers[0].vector.is_none(),
+            "and a plain layer has none"
+        );
+
+        let moved = some_paths().translated(glam::Vec2::new(9.0, 9.0));
+        editor.layers.set_vector(at, moved).expect("allowed");
+        assert_eq!(
+            taken.layers[at].vector.as_deref(),
+            Some(&some_paths()),
+            "the snapshot followed the document instead of holding its instant"
+        );
+    }
+
     #[test]
     fn a_never_saved_document_goes_only_to_the_internal_copy() {
         // There is nowhere else it could go. Umber has not been told where the
@@ -5389,6 +5483,7 @@ mod tests {
             mask,
             effects: Vec::new(),
             text: None,
+            vector: None,
             clipped: false,
             locked: false,
             link: None,
@@ -5408,6 +5503,7 @@ mod tests {
                 mask: None,
                 effects: Vec::new(),
                 text: None,
+                vector: None,
                 clipped: false,
                 locked: false,
                 link: None,

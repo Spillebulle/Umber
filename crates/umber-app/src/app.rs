@@ -2,7 +2,7 @@
 
 use crate::canvasdlg;
 use crate::crash;
-use crate::editor::{self, Editor, Floating, Interaction, StepGate, Tool};
+use crate::editor::{self, Editor, FlipRefusal, Floating, Interaction, StepGate, Tool};
 use crate::gesture;
 use crate::keylayout;
 use crate::loading;
@@ -37,7 +37,7 @@ use umber_core::{
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, EffectFrame, FloatParams, FloatSource, Gpu,
-    LayerDraw, ProbeParams, Vram,
+    LayerDraw, LayerEffects, ProbeParams, Vram,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -335,6 +335,12 @@ pub struct UmberApp {
     /// is: it is the pointer's state in physical pixels, and nothing about it
     /// survives the release.
     picked_at: Option<Vec2>,
+    /// Whether a transform-tool press on a vector layer has already said so.
+    ///
+    /// See [`LiftNotice`]. On the application for the reason `picked_at` is:
+    /// it is about what the pointer has been doing, not about a document, and
+    /// its key names the document itself.
+    lift_notice: LiftNotice,
     /// A way to wake the loop from a worker.
     ///
     /// The update check and the autosave were each handed one at construction
@@ -425,6 +431,36 @@ pub(crate) fn release_finished_textures(
     }
 }
 
+/// Bake `stack`'s effects on document `id`'s canvas and hand back the draws the
+/// composite takes. `UmberApp::baked_draws`' body, apart so a stack other than
+/// the screen's (a trace's, with layers hidden) is baked by the same lines.
+/// `None` where the document has no canvas.
+fn bake_stack(
+    gfx: &mut Graphics,
+    id: DocId,
+    base: u32,
+    stack: &[LayerEffects<'_>],
+    frame: EffectFrame,
+) -> Option<Vec<LayerDraw>> {
+    let canvas = gfx.canvases.get_mut(&id)?;
+    let mut encoder = gfx
+        .gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bake-effects"),
+        });
+    let baked = canvas.bake_effects(
+        &gfx.gpu.device,
+        &gfx.gpu.queue,
+        &mut encoder,
+        base,
+        stack,
+        frame,
+    );
+    gfx.gpu.queue.submit(Some(encoder.finish()));
+    Some(baked.draws)
+}
+
 /// What to say when the slot pool has nothing left for a text placement's layer.
 ///
 /// One sentence, once, because it is raised from two arms of the same match and
@@ -432,10 +468,7 @@ pub(crate) fn release_finished_textures(
 fn no_slice_left() -> Notice {
     Notice {
         title: "There is no room for another layer".to_string(),
-        lines: vec![
-            "Umber has no texture slice left for one. Save and reopen the document              to pack them back down, though deleted layers cannot be brought back              afterwards."
-                .to_string(),
-        ],
+        lines: vec![editor::NO_SLICE_LINE.to_string()],
     }
 }
 
@@ -475,6 +508,7 @@ impl UmberApp {
             put_down_at: None,
             sysclip: sysclip::Board::default(),
             picked_at: None,
+            lift_notice: LiftNotice::default(),
             opening,
         }
     }
@@ -841,7 +875,7 @@ impl UmberApp {
     fn settle_step(&mut self, gate: StepGate, step: &'static str) -> bool {
         match gate {
             StepGate::Clear => true,
-            StepGate::FlipLocked => {
+            StepGate::FlipRefused(why) => {
                 // A notice rather than silence, and it is the *paste's*
                 // precedent rather than the canvas press's: an undo is an
                 // explicit command with one obvious outcome, where a press on
@@ -851,7 +885,7 @@ impl UmberApp {
                 // rows are disabled to match, so this catches a keystroke
                 // rather than being the only thing between a live control and a
                 // dialog. See `ui::draw`.
-                self.editor.notice = Some(flip_step_refusal(step));
+                self.editor.notice = Some(flip_step_refusal(step, why));
                 false
             }
             StepGate::SettleForFlip => {
@@ -991,6 +1025,12 @@ impl UmberApp {
                     was: held,
                 })
             }
+            // The record is swapped by **slot**, for the reason the text arm
+            // above is, and there is no GPU work: the layer's pixels are drawn
+            // from the record, and whoever redraws them is the caller's. `Err`
+            // hands the record back when no layer holds the slot, so a refused
+            // step loses nothing.
+            EditBody::Vector { slot, was } => reverse_vector(&mut self.editor.layers, slot, was),
         }
     }
 
@@ -1027,7 +1067,7 @@ impl UmberApp {
         // and a flip that half happened cannot be undone by flipping again,
         // which is the entire reason it stores no pixels.
         //
-        // Read through `Editor::flip_refused_by_lock`, which is also what
+        // Read through `Editor::flip_refusal`, which is also what
         // disables the Image menu's two flip rows and the Edit menu's Undo and
         // Redo, so no control can offer a flip this will then decline. This
         // stays as the gate rather than becoming an assertion about the
@@ -1037,7 +1077,12 @@ impl UmberApp {
         // rather than an omission: the undo path reaches this through a gate
         // that has already said "undone" or "put back", and a second box here
         // would be two dialogs for one keystroke.
-        if self.editor.flip_refused_by_lock() {
+        //
+        // A record from a newer Umber refuses it here too, through the same
+        // reading (`Editor::flip_refusal`): those paths cannot be mirrored, and
+        // a flip that carried every pixel and left them behind is a document
+        // the build that wrote them would open wrong.
+        if self.editor.flip_refusal().is_some() {
             return false;
         }
         // Masks are slices too, and a mask that stayed put while its layer
@@ -1098,6 +1143,15 @@ impl UmberApp {
         // flight would commit unmirrored over a flipped picture.
         self.finish_stroke();
 
+        // An explicit command with one outcome, so a refusal says so, which
+        // is the paste's precedent rather than the canvas press's. The menu
+        // rows are disabled to match, so this catches a keystroke.
+        // `mirror_document` stays silent itself because the undo path has
+        // already said "undone" or "put back" by the time it gets there.
+        if let Some(why) = self.editor.flip_refusal() {
+            self.editor.notice = Some(flip_refusal_notice(why));
+            return;
+        }
         if !self.mirror_document(axis) {
             return;
         }
@@ -1173,24 +1227,18 @@ impl UmberApp {
             stroke: self.editor.stroke_style,
             stroke_live: self.editor.stroke.is_active(),
         };
-        let gfx = self.gfx.as_mut()?;
-        let canvas = gfx.canvases.get_mut(&id)?;
-        let mut encoder = gfx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bake-effects"),
-            });
-        let baked = canvas.bake_effects(
-            &gfx.gpu.device,
-            &gfx.gpu.queue,
-            &mut encoder,
-            base,
-            &stack,
-            frame,
-        );
-        gfx.gpu.queue.submit(Some(encoder.finish()));
-        Some(baked.draws)
+        bake_stack(self.gfx.as_mut()?, id, base, &stack, frame)
+    }
+
+    /// What a lift's notice is about: this document, its active layer and the
+    /// tool in hand. See [`LiftNotice`].
+    fn lift_key(&self) -> LiftKey {
+        let layers = &self.editor.layers;
+        LiftKey {
+            document: self.editor.session.active_id(),
+            layer: layers.get(layers.active_index()).map(|l| l.id()),
+            tool: self.editor.ui.tool,
+        }
     }
 
     /// Everything a float needs from the GPU, in one place.
@@ -1210,7 +1258,10 @@ impl UmberApp {
         // the arrangement that gate exists to replace: one call, one answer, and
         // the interface can say *which*.
         //
-        // A *paste* says so and a lift does not, which is not an inconsistency:
+        // A *paste* says so and a lift does not, with one exception: a lift on
+        // a vector layer, which has no pixels to take and would otherwise do
+        // nothing at all with nothing said (`float_refusal_notice`). That is
+        // not an inconsistency either, but read the rest first:
         // a paste is an explicit command with one obvious outcome, where a
         // press on the canvas with the transform tool in hand happens every
         // time somebody puts the pen down. A notice raised by that would be a
@@ -1234,8 +1285,13 @@ impl UmberApp {
             .active_refusal(umber_core::EditTarget::Layer)
             .filter(|why| pixels.is_some() || *why != EditRefusal::Text);
         if let Some(why) = refusal {
-            if pixels.is_some() {
-                self.editor.notice = Some(paste_refusal(why));
+            // A paste always says so. A lift says so once per layer, tool and
+            // document (`LiftNotice`), or every press of the pen on a vector
+            // layer would raise the same dialog over the canvas again.
+            if let Some(notice) = float_refusal_notice(why, pixels.is_some())
+                && (pixels.is_some() || self.lift_notice.due(self.lift_key()))
+            {
+                self.editor.notice = Some(notice);
             }
             return false;
         }
@@ -1891,39 +1947,17 @@ impl UmberApp {
         //
         // Exhaustive with no catch-all, so a fifth refusal cannot arrive
         // without somebody deciding whether a cut is allowed through it.
-        match self
+        if let Some(why) = self
             .editor
             .layers
             .active_refusal(umber_core::EditTarget::Layer)
         {
-            Some(EditRefusal::Locked) => {
-                self.editor.notice = Some(Notice {
-                    title: "The layer is locked".to_string(),
-                    lines: vec![
-                        "Nothing was cut. Unlock the layer in the Layers panel, or select \
-                         another one, and cut again."
-                            .to_string(),
-                    ],
-                });
-                return;
+            // Silent for a folder and a missing layer, which the `active_slot`
+            // read below would return for anyway.
+            if let Some(notice) = cut_refusal(why) {
+                self.editor.notice = Some(notice);
             }
-            Some(EditRefusal::Text) => {
-                self.editor.notice = Some(Notice {
-                    title: "This layer holds text".to_string(),
-                    lines: vec![
-                        "Nothing was cut. The text on this layer can still be set again, \
-                         so nothing may be taken out of it. Convert it to paint in the \
-                         Text panel, or select another layer."
-                            .to_string(),
-                    ],
-                });
-                return;
-            }
-            // Silent, for the reason the copy above is silent about a folder: a
-            // folder is a perfectly ordinary thing to have selected, and the
-            // `active_slot` read below already returns for both of these.
-            Some(EditRefusal::Folder | EditRefusal::Missing) => return,
-            None => {}
+            return;
         }
         let (rect, mask) = self.take_region();
         // Nothing to cut out of a folder: it holds no pixels of its own, so
@@ -2049,6 +2083,15 @@ impl UmberApp {
     fn float_a_clip(&mut self, clip: &Clip, verb: &str) -> bool {
         self.finish_transform();
         self.finish_stroke();
+        // The paste ends in the transform tool, and the `set_tool` below is
+        // where the Path tool would otherwise be settled, with the float
+        // already up: a draft landing under a standing float. So the draft is
+        // settled here, first, and a layer it made is wiped before the float
+        // reads the stack.
+        if self.editor.ui.tool == Tool::Path {
+            self.editor.settle_path_tool_noting();
+            self.drain_path_layers();
+        }
 
         let doc = self.editor.doc.size;
         // Into the middle of the selection where there is one — "put it into
@@ -2237,13 +2280,15 @@ impl UmberApp {
             Some(umber_core::AddRefusal::StackFull) => {
                 return Err(Notice {
                     title: "There is no room for another layer".to_string(),
-                    lines: vec![format!(
-                        "This document already has {} entries, which is all Umber holds. \
-                         Delete a layer to make room, or switch off \"On its own layer\" \
+                    lines: vec![
+                        concat!(
+                            crate::editor::stack_full_line!(),
+                            " Delete a layer to make room, or switch off \"On its own layer\" \
                          under the Text panel to set the words on the layer that is \
-                         selected.",
-                        umber_core::LayerStack::MAX
-                    )],
+                         selected."
+                        )
+                        .to_string(),
+                    ],
                 });
             }
             Some(umber_core::AddRefusal::TooDeep) => {
@@ -2618,7 +2663,12 @@ impl UmberApp {
     fn clear_active_layer(&mut self) {
         // **The one gate a lock has on clearing.** The menu item is disabled to
         // match, so this only catches a shortcut.
-        if self.editor.layers.active_is_locked() {
+        //
+        // **And the vector layer's.** It has no pixels to clear, and the
+        // history is thrown out below, so letting a clear through would cost
+        // somebody their undo for a command that did nothing. The menu item is
+        // disabled from the same reading, `editor::clear_layer_refusal`.
+        if editor::clear_layer_refusal(&self.editor.layers).is_some() {
             return;
         }
         // Abandoned rather than committed: clearing the layer is the artist
@@ -2682,8 +2732,7 @@ impl UmberApp {
     /// stack most of all, and freeing first would throw an artist's oldest
     /// edits away to make room for something that was never going to happen.
     fn free_a_slot(&mut self) -> bool {
-        let room = self.editor.layers.room();
-        self.editor.history.free_until(move || room.has_room())
+        self.editor.free_a_slot()
     }
 
     /// The same, for the one caller that needs a slice **above everything
@@ -2727,6 +2776,168 @@ impl UmberApp {
             return false;
         }
         self.editor.history.free_until(move || room.has_headroom())
+    }
+
+    /// Turn the selection's outline into cut or plot paths, on the active
+    /// vector layer or on a layer made for them.
+    ///
+    /// **A thin caller.** `Editor::plan_path_from_selection` decides everything
+    /// that can be decided from the model, and `Editor::apply_path_plan` changes
+    /// the stack and records the entry; what is left here is what needs a
+    /// window or a device: putting the picture down first, reserving the slice a
+    /// new layer takes, giving a parked one up when the pool is dry, and
+    /// preparing the slice on the GPU. None of those lines is under test, which
+    /// is the cost of `UmberApp` not being constructible without a window.
+    ///
+    /// The selection stays: the artist is likely to ask for the other kind next.
+    fn path_from_selection(&mut self, role: umber_core::PathRole) {
+        // The rule every path that touches the document follows. A stroke's
+        // wet scratch and a float's preview slice both stand in front of a
+        // layer, and a layer made now would take the next slice.
+        self.finish_stroke();
+        self.finish_transform();
+        let plan = match self.editor.plan_path_from_selection(role) {
+            Ok(Some(plan)) => plan,
+            // The menu rows are disabled without a selection, so this is the
+            // keystroke, which says nothing, as Copy does.
+            Ok(None) => return,
+            Err(notice) => {
+                self.editor.notice = Some(notice);
+                return;
+            }
+        };
+        let adds_a_layer = plan.adds_a_layer();
+        self.carry_out_path_plan(plan, adds_a_layer);
+    }
+
+    /// Make an empty vector layer above the active entry, for the artist to put
+    /// paths on later. The Layers panel's mark and the unbound shortcut.
+    ///
+    /// The same route as a layer made from the selection, with an empty record,
+    /// so the two cannot disagree about where it goes or what undoes it.
+    fn add_vector_layer(&mut self) {
+        self.finish_stroke();
+        self.finish_transform();
+        match self.editor.plan_new_vector_layer() {
+            Ok(plan) => {
+                self.carry_out_path_plan(plan, true);
+            }
+            Err(notice) => self.editor.notice = Some(notice),
+        }
+    }
+
+    /// The half of every path command that needs a device. True when the plan
+    /// was carried out; false when a refusal was raised as a notice instead.
+    fn carry_out_path_plan(&mut self, plan: crate::editor::PathPlan, adds_a_layer: bool) -> bool {
+        // **The device's refusal after the stack's own**, `add_layer`'s order.
+        // The plan has already answered a full stack and a nested-too-deep
+        // folder, so a refusal here is graphics memory and says so.
+        if adds_a_layer && let Err(refused) = self.reserve_a_slice() {
+            self.editor.notice = Some(vram::slice_refused("a layer", &refused));
+            return false;
+        }
+        use crate::editor::PathApplyRefusal;
+        let refused = match self.editor.apply_path_plan(plan) {
+            Ok(()) => None,
+            // The pool is dry: give a parked slice back and try once more, as
+            // every other way of adding a layer does. Only a new layer is
+            // handed back for this; an append takes no slice.
+            Err(PathApplyRefusal::NoSlice(plan)) if self.free_a_slot() => {
+                self.editor.apply_path_plan(plan).err()
+            }
+            Err(why) => Some(why),
+        };
+        match refused {
+            None => {}
+            Some(PathApplyRefusal::NoSlice(_)) => {
+                self.editor.notice = Some(no_slice_left());
+                return false;
+            }
+            Some(PathApplyRefusal::Declined(why)) => {
+                self.editor.notice = Some(crate::editor::path_refusal(why));
+                return false;
+            }
+        }
+        if adds_a_layer {
+            let slot = self.editor.layers.active_slot();
+            let needed = self.editor.layers.slot_capacity_needed();
+            let id = self.editor.session.active_id();
+            if let Some(gfx) = self.gfx.as_mut()
+                && let Some(canvas) = gfx.canvases.get_mut(&id)
+            {
+                canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
+                // A recycled slot still holds the last layer's pixels.
+                if let Some(slot) = slot {
+                    canvas.clear_layer(&gfx.gpu.queue, slot);
+                }
+            }
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Trace the artwork into cut or plot paths, as the trace outline dialog
+    /// asks, and land them as the selection commands land theirs.
+    ///
+    /// **A thin caller**, like `path_from_selection`: `Editor::plan_trace`
+    /// decides everything the model can, and what is here needs the device.
+    /// The order is the rule: everything in the air is settled first (the
+    /// stroke, the float, a Path tool draft, as `float_a_clip` settles it),
+    /// then the coverage is read, then planned, then carried out. A draft
+    /// landing after the plan would change the stack the plan was made
+    /// against, and a stroke or a float would be read half done.
+    ///
+    /// The draws are baked as an export's are, so a shadow or an outline
+    /// effect is traced with the layer that casts it. On success the dialog
+    /// closes; a refusal leaves it up behind the notice, so the artist can
+    /// change a setting and try again. With no device or no canvas there is
+    /// nothing to read and nothing happens.
+    fn trace_outline(&mut self) {
+        self.finish_stroke();
+        self.finish_transform();
+        if self.editor.ui.tool == Tool::Path {
+            self.editor.settle_path_tool_noting();
+            self.drain_path_layers();
+        }
+        let form = self.editor.ui.trace;
+        let id = self.editor.session.active_id();
+        let base = self.editor.effect_slot_base();
+        let frame = EffectFrame {
+            active_index: self.editor.active_draw_index(),
+            stroke: self.editor.stroke_style,
+            stroke_live: self.editor.stroke.is_active(),
+        };
+        let stack = self.editor.trace_effected_draws(form.source);
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(draws) = bake_stack(gfx, id, base, &stack, frame) else {
+            return;
+        };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
+        let alpha = canvas.export_coverage(&gfx.gpu.device, &gfx.gpu.queue, &draws);
+        // **Every refusal is added beside what is up, never over it.** Settling
+        // a draft above may already have raised a notice (a draft abandoned),
+        // and assigning the trace's own over it would throw that sentence
+        // away. `carry_out_path_plan` assigns, which is right for the
+        // selection commands that settle nothing, so its notice is taken back
+        // out and added here instead.
+        match self.editor.plan_trace(&alpha, form.source, &form.settings) {
+            Ok(plan) => {
+                let adds_a_layer = plan.adds_a_layer();
+                let earlier = self.editor.notice.take();
+                let landed = self.carry_out_path_plan(plan, adds_a_layer);
+                let refused = std::mem::replace(&mut self.editor.notice, earlier);
+                if let Some(refused) = refused {
+                    self.editor.add_notice(refused);
+                }
+                if landed {
+                    self.editor.ui.trace.open = false;
+                }
+            }
+            Err(notice) => self.editor.add_notice(notice),
+        }
+        self.request_redraw();
     }
 
     fn add_layer(&mut self) {
@@ -3129,6 +3340,11 @@ impl UmberApp {
             // nothing to throw away. Each is claimed only while it exists, so
             // Escape goes on reaching whatever else on the canvas wants it.
             Some(shortcuts::Direct::Abandon) => {
+                if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_key(editor::PathKey::Abandon)
+                {
+                    return true;
+                }
                 if self.editor.cancel_selection_draft() {
                     return true;
                 }
@@ -3139,6 +3355,11 @@ impl UmberApp {
             // Enter closes the outline, or puts the floating pixels down. Same
             // pair, same terms.
             Some(shortcuts::Direct::Finish) => {
+                if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_key(editor::PathKey::Finish)
+                {
+                    return true;
+                }
                 if self.editor.selection_draft.is_some() {
                     self.editor.finish_selection();
                     return true;
@@ -3148,7 +3369,16 @@ impl UmberApp {
                     return true;
                 }
             }
-            None => {}
+            // Backspace and Delete, claimed only where the Path tool took them.
+            // Anywhere else they fall through to the table, where either may be
+            // bound, exactly as before the tool existed.
+            Some(shortcuts::Direct::Remove)
+                if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_key(editor::PathKey::Remove) =>
+            {
+                return true;
+            }
+            Some(shortcuts::Direct::Remove) | None => {}
         }
         if !pressed {
             return false;
@@ -3170,22 +3400,23 @@ impl UmberApp {
             Action::Export => self.editor.export_form.open = true,
             // The answer matters only to `jump_history`, which has several
             // steps to abandon; one keystroke has nothing to stop.
-            Action::Undo => {
-                self.undo();
-            }
-            Action::Redo => {
-                self.redo();
-            }
+            Action::Undo => self.undo_command(),
+            Action::Redo => self.redo_command(),
             Action::Deselect => self.editor.deselect(),
             Action::Copy => self.copy_selection(),
             Action::Cut => self.cut_selection(),
             Action::Paste => self.paste(),
+            Action::CutPathFromSelection => self.path_from_selection(umber_core::PathRole::Cut),
+            Action::PlotPathFromSelection => self.path_from_selection(umber_core::PathRole::Plot),
+            Action::TraceOutline => self.editor.open_trace(),
+            Action::NewVectorLayer => self.add_vector_layer(),
             Action::FlipCanvasHorizontal => self.flip_canvas(umber_core::FlipAxis::Horizontal),
             Action::FlipCanvasVertical => self.flip_canvas(umber_core::FlipAxis::Vertical),
             Action::BrushTool => self.pick_tool(Tool::Brush),
             Action::EraserTool => self.pick_tool(Tool::Eraser),
             Action::SelectTool => self.pick_tool(Tool::Select),
             Action::TransformTool => self.pick_tool(Tool::Transform),
+            Action::PathTool => self.pick_tool(Tool::Path),
             Action::EyedropperTool => self.pick_tool(Tool::Eyedropper),
             Action::PanTool => self.pick_tool(Tool::Pan),
             Action::ZoomTool => self.pick_tool(Tool::Zoom),
@@ -3221,6 +3452,25 @@ impl UmberApp {
             Action::ZoomOut => self.editor.zoom_by(1.0 / ZOOM_KEY_STEP),
         }
         true
+    }
+
+    /// Undo as a command, from the keyboard or the Edit menu. With a path being
+    /// drawn it takes the draft's last node off and the history is not
+    /// touched, so nothing is committed and no redo is lost. `jump_history`
+    /// steps through [`Self::undo`] directly: a row of the History module names
+    /// an entry, and the draft is in none.
+    fn undo_command(&mut self) {
+        if !self.editor.path_key(editor::PathKey::Undo) {
+            self.undo();
+        }
+    }
+
+    /// [`Self::undo_command`]'s twin. With a draft up redo does nothing at all,
+    /// which is what keeps the redo stack whole for after the draft.
+    fn redo_command(&mut self) {
+        if !self.editor.path_key(editor::PathKey::Redo) {
+            self.redo();
+        }
     }
 
     /// Choose a tool, putting any floating transform down on the way out.
@@ -4041,6 +4291,18 @@ impl UmberApp {
         // was saved or was painted on. See `crash::note_documents`.
         crash::note_documents(&self.editor.session);
 
+        // Re-arm the lift's one notice the moment the layer, the tool or the
+        // document it was about stops being the one in hand. Three reads and a
+        // comparison, so it costs the drawing path nothing.
+        self.lift_notice.observe(self.lift_key());
+
+        // And the Path tool's pick, for the same reason and in the same place:
+        // an undo, a layer deleted or a tab switched since the last frame may
+        // have moved the path it names. Before the interface is built, so no
+        // frame draws a pick over a path it no longer means. A comparison, and
+        // it allocates nothing.
+        self.editor.follow_path_ground();
+
         // Also before the interface is built, and that is the whole point: a
         // slot is a slice of *one* document's texture array, so the frame after
         // a tab switch would otherwise draw the new document's rows wearing the
@@ -4168,6 +4430,14 @@ impl UmberApp {
             canvas_rect.width() * pixels_per_point,
             canvas_rect.height() * pixels_per_point,
         );
+
+        // A layer the Path tool made still holds whatever tiles the last layer
+        // in that slot left, as every new layer does until it is wiped. The
+        // tool can land a path from the rail, inside the interface just built,
+        // so this is after it and before anything reads a slice: the autosave
+        // and the composite below. By document, because a tab switch can land
+        // a path in the document it is leaving.
+        wipe_new_layers(&mut self.editor, gfx);
 
         // Tessellation and egui's texture uploads happen *before* the surface
         // is acquired, because every path below this can decide not to draw the
@@ -4566,10 +4836,10 @@ impl UmberApp {
         }
 
         if actions.undo {
-            self.undo();
+            self.undo_command();
         }
         if actions.redo {
-            self.redo();
+            self.redo_command();
         }
         if let Some(axis) = actions.flip_canvas {
             self.flip_canvas(axis);
@@ -4591,6 +4861,15 @@ impl UmberApp {
         }
         if actions.paste {
             self.paste();
+        }
+        if let Some(role) = actions.path_from_selection {
+            self.path_from_selection(role);
+        }
+        if std::mem::take(&mut self.editor.trace_requested) {
+            self.trace_outline();
+        }
+        if actions.new_vector_layer {
+            self.add_vector_layer();
         }
         if actions.open_export {
             self.editor.export_form.open = true;
@@ -4948,7 +5227,13 @@ impl UmberApp {
         // is the scheduler's.
         self.stop_autosave_of(id);
         let doc = change.doc;
-        let resized = self.editor.apply_canvas(doc);
+        // Refused before anything moves, and the dialog's Apply is disabled
+        // to match, so this catches only what the dialog could not see.
+        if self.editor.resize_refused(doc.size) {
+            self.editor.notice = Some(resize_refusal_notice());
+            return;
+        }
+        let resized = self.editor.apply_canvas(doc, change.anchor);
         // What the new array has to hold. Read *after* `apply_canvas`, which is
         // what drops the selection and clears the history — neither of which
         // moves a claim, but the number has to be the one the stack ends the
@@ -5413,6 +5698,13 @@ impl UmberApp {
         if gesture::supersedes_stroke(decision) && self.editor.stroke.is_active() {
             self.finish_stroke();
         }
+        // And a press the Path tool is holding, for the same reason: a middle
+        // press taking `Interaction` over as a pan means the release the tool
+        // is waiting for is dispatched as the pan's. A Path press is the tool's
+        // own and replaces its hold itself.
+        if decision != gesture::Press::Path {
+            self.editor.interrupt_path_gesture();
+        }
 
         // Every press ends the brush-size drag except the one that is carrying
         // it on. A mouse press is never a contact, so without "press to
@@ -5462,6 +5754,16 @@ impl UmberApp {
                 self.editor.selection_press(doc, op);
             }
             gesture::Press::Transform => self.transform_press(pos),
+            gesture::Press::Path => {
+                let doc = self.editor.screen_to_doc(pos);
+                // Ctrl borrows Edit for this one gesture. Read here, where both
+                // pointers arrive, so a pen with a keyboard beside it has it as
+                // a mouse does; Cmd is accepted for the reason `selection_op`
+                // gives.
+                let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+                self.editor.interaction = Interaction::Pathing;
+                self.editor.path_press(doc, ctrl);
+            }
             gesture::Press::Eyedropper => {
                 // A *drag*, not a click, and that is the whole of how a colour
                 // outside the window is reachable: winit keeps the mouse
@@ -5487,6 +5789,7 @@ impl UmberApp {
         self.editor.cursor = pos;
         let pivot = self.editor.canvas_pivot;
         let mut dragging_float = false;
+        let mut rubber_band = false;
 
         match self.editor.interaction {
             Interaction::Drawing => {
@@ -5496,6 +5799,10 @@ impl UmberApp {
             Interaction::Selecting => {
                 let doc = self.editor.screen_to_doc(pos);
                 self.editor.selection_moved(doc);
+            }
+            Interaction::Pathing => {
+                let doc = self.editor.screen_to_doc(pos);
+                self.editor.path_moved(doc, self.modifiers.shift_key());
             }
             // Nothing to do but ask for a frame, which the return below does:
             // the sample itself is taken once per *frame* rather than once per
@@ -5547,6 +5854,18 @@ impl UmberApp {
                     let doc = self.editor.screen_to_doc(pos);
                     self.editor.selection_moved(doc);
                     self.editor.interaction = Interaction::Selecting;
+                } else if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_tool.draft().is_some()
+                {
+                    // The rubber band from the last node to the pointer, which
+                    // follows a hovering pen too: the hover comes through this
+                    // same body. Exclusive with the two above, since a polygon
+                    // draft is the Select tool's and the resize needs Alt. It
+                    // asks for the frame and does not become an interaction,
+                    // because nothing is held.
+                    let doc = self.editor.screen_to_doc(pos);
+                    self.editor.path_moved(doc, self.modifiers.shift_key());
+                    rubber_band = true;
                 } else {
                     // A transform handle, which is a third thing that lives in
                     // this arm — and is exclusive with the other two the same
@@ -5564,6 +5883,7 @@ impl UmberApp {
 
         self.editor.interaction != Interaction::Idle
             || dragging_float
+            || rubber_band
             || self.editor.brush_resize.is_some()
     }
 
@@ -5621,6 +5941,15 @@ impl UmberApp {
                 let doc = self.editor.screen_to_doc(pos);
                 self.editor.selection_release(doc);
             }
+            // Ends here whatever the tool did with it. A path is a sequence of
+            // presses like the polygon, but that sequence is kept in the
+            // draft rather than in the interaction, so nothing is held between
+            // one node and the next.
+            Interaction::Pathing => {
+                let doc = self.editor.screen_to_doc(pos);
+                self.editor.path_release(doc);
+                self.editor.interaction = Interaction::Idle;
+            }
             // **No wildcard**, which is CLAUDE.md's "partial exhaustiveness is
             // worse than none" applied to the one enum in this file that gained
             // a variant. A `_` arm swallowed `Picking` silently and happened to
@@ -5659,6 +5988,491 @@ impl UmberApp {
     /// behind.
     pub fn ended_cleanly(&mut self) {
         self.editor.autosave.end_run();
+    }
+}
+
+impl UmberApp {
+    /// Wipe the slices of the layers the Path tool made, now.
+    ///
+    /// A recycled slice holds whatever the last layer in it left until it is
+    /// cleared, and the clear is the renderer's: `Editor` makes the layer and
+    /// has no `CanvasRenderer` to clear it with, so it can only queue the slot
+    /// (`Editor::path_layers_made`). The question is then who drains the queue
+    /// before anything reads that slice, and the readers are many: a save, an
+    /// export, a copy or cut, an undo or redo, the autosave, the composite.
+    /// Asking each of them to drain first is a rule enforced at every reader,
+    /// the one that is forgotten at the next.
+    ///
+    /// So it runs at the end of every `window_event`, after the event was
+    /// dispatched, and in `render` once the interface (which can land a path
+    /// from the rail) has run and before anything there reads a slice. A
+    /// landing can only come from an event or from a frame, and a reader
+    /// sitting in a later event of the same pump finds the queue already
+    /// drained, so "no reader sees an unwiped slice" is a property of these
+    /// two calls rather than of each reader. `user_event` only asks for a
+    /// frame, `about_to_wait` and `new_events` run no action that lands a
+    /// path, and the actions the interface returns are carried out inside
+    /// `render`, after its drain. With no device there is nothing to read a
+    /// slice either, and the queue waits for one.
+    fn drain_path_layers(&mut self) {
+        if let Some(gfx) = self.gfx.as_mut() {
+            wipe_new_layers(&mut self.editor, gfx);
+        }
+    }
+
+    fn dispatch_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        let Some(gfx) = self.gfx.as_mut() else { return };
+
+        let response = gfx.egui_state.on_window_event(&gfx.window, &event);
+        // egui-winit reports `repaint` for `RedrawRequested` itself, which is a
+        // tautology: acting on it means every painted frame asks for the next
+        // one, and `ControlFlow::Wait` never gets to wait. What egui genuinely
+        // wants next is read from its `viewport_output` in `render`.
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
+            gfx.window.request_redraw();
+        }
+        // The mouse's answer, from the position `CursorMoved` last reported.
+        // Anything carrying its own position — a touch, a pen — must ask
+        // `ui_owns_pointer` about *that* instead. See there.
+        let ui_has_pointer = ui_owns_pointer(&self.editor, &gfx.egui_ctx, self.editor.cursor);
+        let pivot = self.editor.canvas_pivot;
+
+        // Settings → Input & pen is a live reading of this stream, so every
+        // event is noted here — before the match, so a branch that returns
+        // early still counts, and before dispatch, so `Editor::sample` has a
+        // sample of its own to write the resolved pressure onto. Observation
+        // only; see `inputlog`.
+        self.editor.note_input(&event);
+
+        match event {
+            // Never an immediate exit. Closing the window is the one gesture
+            // that can discard *every* open document at once, so it is refused
+            // until each one with unsaved work has been accounted for — and the
+            // question has to be answerable with "actually, no".
+            WindowEvent::CloseRequested => {
+                // A path being drawn becomes a layer first, so a kept path is
+                // unsaved work the prompt below asks about.
+                self.editor.settle_before_quitting();
+                if self.editor.unsaved_documents().is_empty() {
+                    event_loop.exit();
+                } else {
+                    self.editor.ui.quit_prompt = true;
+                    gfx.window.request_redraw();
+                }
+            }
+
+            // A zero on either axis skips the whole handler: wgpu refuses a
+            // zero-area configure outright, and a window with no area is one
+            // there is nothing to draw on anyway, so the surface keeps the
+            // configuration it had. Wayland reports one while a window is
+            // being mapped.
+            //
+            // No surface texture can be alive here — `render` presents or
+            // drops its own before returning — so this may configure at once,
+            // and going through `reconfigure_surface` also drops any request a
+            // suboptimal frame left behind. That request named the *old* size.
+            WindowEvent::Resized(size) => {
+                if size.width > 0 && size.height > 0 {
+                    gfx.config.width = size.width;
+                    gfx.config.height = size.height;
+                    gfx.reconfigure_surface();
+                    gfx.window.request_redraw();
+                }
+            }
+
+            // Dropping a file on the window is the gesture people already have
+            // for this, and it reaches exactly the same importer the File menu
+            // does — including its refusals, so an unsupported format explains
+            // itself here too rather than silently doing nothing.
+            WindowEvent::DroppedFile(path) => self.open_path(&path),
+
+            WindowEvent::ModifiersChanged(m) => {
+                let was_alt = self.modifiers.alt_key();
+                self.modifiers = m.state();
+                let alt = self.modifiers.alt_key();
+                if alt != was_alt {
+                    self.set_brush_resize(alt && !ui_has_pointer);
+                }
+            }
+
+            // Losing the window ends every gesture, because **no gesture may
+            // be left in a state only a release could end** — and after this
+            // event no release is coming. A modifier let go of while another
+            // window has the keyboard never reaches us, and neither does a
+            // button.
+            WindowEvent::Focused(false) => {
+                // Alt can otherwise be "held" for ever after an Alt-Tab, so the
+                // resize would still be live — and its circle still on the
+                // canvas — when the window came back.
+                self.set_brush_resize(false);
+                // Space is the identical failure by a route `shortcuts::direct`
+                // structurally cannot see: that rule keeps a *release* always
+                // landing, and here there is no release at all. Come back from
+                // an Alt-Tab and the pan override is armed with no key down.
+                self.editor.space_down = false;
+                // A stroke is the expensive one. Alt-Tab mid-stroke and
+                // `Interaction::Drawing` and `stroke.is_active()` both stay set
+                // for ever: `render`'s `quiet` requires both to be clear and
+                // `Autosave::next_due` answers `None` while it is not, so **the
+                // document is never autosaved again for the rest of the
+                // session** — silently, with its tab still showing an unsaved
+                // dot. Finish rather than cancel, for the reason
+                // `gesture::supersedes_stroke` gives: the artist drew a visible
+                // mark.
+                self.finish_stroke();
+                // A press the Path tool held, which no release will now end.
+                self.editor.interrupt_path_gesture();
+                // And the gestures that carry no stroke behind them. `quiet`
+                // reads `Interaction` as well, so a pan or a zoom abandoned by
+                // an Alt-Tab stalls the autosave exactly as a stroke does —
+                // `finish_stroke` clears this itself, but only when there was a
+                // stroke to finish.
+                //
+                // Deliberately *not* `cancel_selection_draft`: that takes the
+                // draft away, and a polygon spans several clicks, so Alt-Tabbing
+                // to look at a reference is precisely when somebody has one
+                // half-drawn. Idle with a draft standing is an ordinary state
+                // rather than a broken one — it is what a middle-drag to pan
+                // already produces, and `pointer_moved`'s `Idle` arm keeps the
+                // rubber band following the pointer.
+                self.editor.interaction = Interaction::Idle;
+            }
+
+            // Switching input language changes what every key prints, and
+            // therefore what every shortcut label should say. Taking the window
+            // back is one of the two moments that follows such a switch; a key
+            // press is the other, below. Both are on the input path
+            // deliberately — see `keylayout`'s module docs for why the check
+            // must not be on the drawing path instead.
+            WindowEvent::Focused(true) => keylayout::forget_if_changed(),
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                keylayout::forget_if_changed();
+                // Punctuation dispatches on what the user's layout *prints*,
+                // not on the US position winit names it by — otherwise Ctrl and
+                // the key marked `+` zooms out on half the keyboards in Europe.
+                // See `shortcuts::key_for_text`. A named or dead key reports no
+                // character and keeps its position.
+                let typed = match &event.logical_key {
+                    winit::keyboard::Key::Character(text) => Some(text.as_str()),
+                    _ => None,
+                };
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && self.handle_keys(shortcuts::typed_key(code, typed), event.state.is_pressed())
+                    && let Some(g) = self.gfx.as_ref()
+                {
+                    g.window.request_redraw();
+                }
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                let pos = Vec2::new(position.x as f32, position.y as f32);
+                // A mouse event, so a mouse is what is driving the pointer:
+                // the pen's dot gives way to the ordinary arrow. A pen sends
+                // none of these — see `Editor::pen_pointer`.
+                self.editor.pen_pointer = false;
+                if self.pointer_moved(pos, None)
+                    && let Some(g) = self.gfx.as_ref()
+                {
+                    g.window.request_redraw();
+                }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                // A button is a mouse's, whatever moved the pointer last.
+                self.editor.pen_pointer = false;
+                // Middle-drag and space-drag always pan, whatever tool is
+                // selected — muscle memory should not depend on the rail. Space
+                // is the *left* button's override; a middle press already pans.
+                let pan_button = button == MouseButton::Middle;
+                let pos = self.editor.cursor;
+
+                match (pressed, button) {
+                    (true, MouseButton::Left | MouseButton::Middle) => {
+                        self.pointer_pressed(
+                            pos,
+                            // A mouse has no pressure sensor. `PressureModel`
+                            // is what turns that into a full-pressure stroke.
+                            None,
+                            gesture::Pointer {
+                                tool: self.editor.ui.tool,
+                                ui_owns: ui_has_pointer,
+                                alt: self.modifiers.alt_key(),
+                                space: self.editor.space_down && !pan_button,
+                                pan_button,
+                                // A button, not a contact — which is the whole
+                                // of how Alt keeps meaning the eyedropper here.
+                                contact: false,
+                                resizing: self.editor.brush_resize.is_some(),
+                                press_resizes: self.editor.ui.resize_needs_press,
+                            },
+                        );
+                    }
+                    // Any other button still ends the brush-size drag: it is
+                    // Alt with *nothing* down. Without this an Alt-click would
+                    // pick a colour with the resize still live, so the
+                    // eyedropper would leave a circle on the canvas and the next
+                    // flick of the wrist would silently rescale the brush.
+                    (true, _) => self.set_brush_resize(false),
+                    // The middle button pans and nothing else, so its release
+                    // has nothing to finish — but it may only end the pan it
+                    // began. Writing `Idle` unconditionally is the same defect
+                    // `gesture::supersedes_stroke` fixes, arriving from the
+                    // other direction: middle-press to pan, left-press to draw,
+                    // then let the middle button go, and this cleared the
+                    // `Drawing` the stroke was dispatching on, so the left
+                    // button coming up never finished it. That fix is what
+                    // repairs the sequence; this is what stops the arm being
+                    // able to break it again.
+                    (false, MouseButton::Middle) => {
+                        if self.editor.interaction == Interaction::Panning {
+                            self.editor.interaction = Interaction::Idle;
+                        }
+                    }
+                    (false, MouseButton::Left) => self.pointer_released(pos),
+                    (false, _) => {}
+                }
+                if let Some(g) = self.gfx.as_ref() {
+                    g.window.request_redraw();
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                if ui_has_pointer {
+                    return;
+                }
+                // Panning wants a distance and zooming wants a count of
+                // notches. A wheel reports the second and a trackpad the first,
+                // so both are worked out and each branch takes the one it means
+                // — a trackpad's own pixels give it the fine-grained pan it is
+                // for, rather than a distance rounded through a notch count.
+                let scale = self.editor.pixels_per_point.max(1e-3);
+                let (notches, pixels) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        (Vec2::new(x, y), Vec2::new(x, y) * WHEEL_PAN_POINTS * scale)
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let px = Vec2::new(p.x as f32, p.y as f32);
+                        (px / WHEEL_PIXELS_PER_NOTCH, px)
+                    }
+                };
+
+                if self.modifiers.control_key() || self.modifiers.super_key() {
+                    // Zoom keeps the wheel, one modifier along. It is where
+                    // every browser and document viewer puts it, and it is the
+                    // only one of the three that has somewhere to anchor: the
+                    // pointer.
+                    let factor = WHEEL_ZOOM_STEP.powf(notches.y);
+                    self.editor
+                        .camera
+                        .zoom_at(self.editor.cursor, factor, pivot);
+                } else {
+                    // Scrolling up shows what is above, which means the picture
+                    // moves *down* — `pan_by_screen` takes the movement of the
+                    // canvas, so the sign is already right. Shift swaps the
+                    // axis without swapping that convention, so a roll upwards
+                    // goes left.
+                    //
+                    // A horizontal wheel is honoured whether Shift is held or
+                    // not, and reversed: rolling right is asking to see what is
+                    // to the right, so the canvas goes left.
+                    let by = if self.modifiers.shift_key() {
+                        Vec2::new(pixels.y, 0.0)
+                    } else {
+                        Vec2::new(-pixels.x, pixels.y)
+                    };
+                    self.editor.camera.pan_by_screen(by);
+                }
+                if let Some(g) = self.gfx.as_ref() {
+                    g.window.request_redraw();
+                }
+            }
+
+            WindowEvent::Touch(touch) => {
+                let pos = Vec2::new(touch.location.x as f32, touch.location.y as f32);
+                // winit reports Force in either normalised or calibrated form;
+                // `normalized` flattens both to 0..=1.
+                let reported = touch.force.map(|f| f.normalized() as f32);
+                // The one place to look when a tablet does nothing:
+                // `RUST_LOG=umber_app=trace` says whether the pen is reaching
+                // the application at all, and with what pressure. A driver in
+                // "mouse mode" sends no touches and shows nothing here.
+                log::trace!(
+                    "touch {:?} id={} at {pos:?} force={reported:?}",
+                    touch.phase,
+                    touch.id
+                );
+                // Whatever else this event turns out to be, it came from a pen
+                // or a finger rather than a mouse — which is what the canvas
+                // draws its own cursor for.
+                self.editor.pen_pointer = true;
+
+                // Which of the six things a touch event can be. In
+                // `gesture::contact` rather than in a chain of `if`s here,
+                // because the two rules it carries — a `Moved` for an unknown
+                // id is a hover, and a second contact is a pinch — were both
+                // bugs, and neither can be reproduced on a machine with no
+                // tablet. The counts are taken *before* the maps are touched,
+                // so `down` includes this contact for a `Started`.
+                let known = self.editor.touches.contains_key(&touch.id);
+                let down = self.editor.touches.len() + usize::from(!known);
+                let owner = self.editor.drawing_touch == Some(touch.id);
+
+                match gesture::contact(touch.phase, down, known, owner) {
+                    gesture::Contact::Press => {
+                        self.editor.touches.insert(touch.id, pos);
+                        // Against the touch's *own* position. It carries one and
+                        // `Editor::cursor` does not follow it, so the mouse's
+                        // answer would be about somewhere else entirely — see
+                        // `ui_owns_pointer`. No window means no canvas, so the
+                        // interface owns it by default.
+                        let ui_owns = self
+                            .gfx
+                            .as_ref()
+                            .is_none_or(|g| ui_owns_pointer(&self.editor, &g.egui_ctx, pos));
+                        // The same decision the mouse press makes, from the same
+                        // function. It used to be a second `match` on the tool
+                        // here, which is how the Pan tool, the Zoom tool, Alt for
+                        // the eyedropper and Alt for the brush-size drag all came
+                        // to be reachable only by mouse — a pen produces none of
+                        // the events the arm above handles.
+                        let decision = self.pointer_pressed(
+                            pos,
+                            reported,
+                            gesture::Pointer {
+                                tool: self.editor.ui.tool,
+                                ui_owns,
+                                // A keyboard modifier reaches a pen user exactly
+                                // as it reaches a mouse user, and this arm used
+                                // to consult neither.
+                                alt: self.modifiers.alt_key(),
+                                space: self.editor.space_down,
+                                // No buttons on the glass.
+                                pan_button: false,
+                                contact: true,
+                                resizing: self.editor.brush_resize.is_some(),
+                                press_resizes: self.editor.ui.resize_needs_press,
+                            },
+                        );
+                        // A press the interface took is not this contact's to
+                        // follow. Deliberately *not* treated as a pinch either:
+                        // one finger on a panel is not a gesture, and cancelling
+                        // the stroke there threw away a stroke the other hand
+                        // was in the middle of.
+                        if decision != gesture::Press::Ignored {
+                            self.editor.drawing_touch = Some(touch.id);
+                        }
+                    }
+                    gesture::Contact::Pinch => {
+                        self.editor.touches.insert(touch.id, pos);
+                        // A second finger means the gesture was a pinch, not a
+                        // stroke. Abandon whatever the first finger was making —
+                        // all of them are gestures that must not half-happen
+                        // because a hand landed on the glass. The transform's
+                        // *float* survives it and only the drag is dropped: the
+                        // picture is still there to be moved, and throwing it
+                        // away because somebody pinched to look closer at it
+                        // would be the opposite of what they asked for.
+                        self.cancel_stroke();
+                        self.editor.cancel_selection_draft();
+                        // `Editor::transform_release` rather than this type's: a
+                        // second finger landing must drop the drag *and* the
+                        // pending "put it down", not carry it out. Nobody
+                        // pinching to look closer meant to commit.
+                        self.put_down_at = None;
+                        self.editor.transform_release();
+                        self.editor.drawing_touch = None;
+                        // A node the first finger was placing goes with it: a
+                        // pinch is not a node.
+                        self.editor.interrupt_path_gesture();
+                        // A pan or a zoom the first contact had begun goes with
+                        // the rest of it. `cancel_stroke` resets this only where
+                        // there was a stroke to cancel, and now that the Pan and
+                        // Zoom tools answer a single contact there is a live
+                        // `Interaction` here that no stroke ever produced — left
+                        // set, it would go on panning off the second finger's
+                        // every move.
+                        self.editor.interaction = Interaction::Idle;
+                        self.update_pinch();
+                    }
+                    gesture::Contact::Hover => {
+                        // A pen in range and off the glass. It is not a contact
+                        // and is deliberately not recorded as one — see
+                        // `gesture::contact` — but *where the pen is* is worth
+                        // having, and it goes through the same body a mouse move
+                        // takes, because a hover is exactly a mouse move with
+                        // nothing held. The two things that live in that state —
+                        // the brush-size circle following the hand, and a
+                        // polygon's rubber band between clicks — used to stand
+                        // still under a pen because this branch recorded the
+                        // position and returned.
+                        let previous = self.editor.last_cursor;
+                        let wants_frame = self.pointer_moved(pos, None);
+                        // `last_cursor` is the previous point of a *gesture* —
+                        // what the pan and zoom drags measure against, and what a
+                        // stroke's speed and therefore its simulated pressure
+                        // come from — and a pen waved about in mid-air is none of
+                        // those. Put back rather than never written, so that one
+                        // body stays the only place a pointer move is
+                        // interpreted.
+                        self.editor.last_cursor = previous;
+                        // A pen sends a few hundred of these a second, so the
+                        // frame is asked for only where something that moved is
+                        // actually drawn — over a panel or a menu this would be
+                        // repainting an identical picture.
+                        //
+                        // This is a *narrowing* of what already happens rather
+                        // than the thing that makes the hover paint: egui-winit
+                        // has already asked for a repaint on the same event, so
+                        // taking this out would cost frames and lose nothing.
+                        // Do not go the other way and stop the pass-through as
+                        // well. Under a pen the cursor is re-derived per frame
+                        // and hidden by `syscursor` per frame, so a hover that
+                        // stopped producing frames over a *panel* would leave
+                        // whatever the last canvas frame asked for standing —
+                        // which is no cursor at all, over the controls.
+                        if wants_frame || self.editor.pointer_over_canvas(pos) {
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                    gesture::Contact::Drag => {
+                        self.editor.touches.insert(touch.id, pos);
+                        // Dispatched on the `Interaction` the press set, not on
+                        // the tool — which is what lets a contact drive the pan
+                        // and the zoom, and what stops this arm being a second
+                        // reading of what a drag means.
+                        self.pointer_moved(pos, reported);
+                    }
+                    gesture::Contact::Pinching => {
+                        self.editor.touches.insert(touch.id, pos);
+                        self.update_pinch();
+                    }
+                    gesture::Contact::Release => {
+                        self.editor.touches.remove(&touch.id);
+                        // The float stays up, exactly as it does when a mouse
+                        // button comes up: the box is still there to be dragged
+                        // again — unless the tap was a click outside it, which
+                        // puts it down.
+                        self.pointer_released(pos);
+                        self.editor.drawing_touch = None;
+                        self.editor.pinch = None;
+                    }
+                    gesture::Contact::Lift => {
+                        self.editor.touches.remove(&touch.id);
+                        self.editor.pinch = None;
+                    }
+                }
+                if let Some(g) = self.gfx.as_ref() {
+                    g.window.request_redraw();
+                }
+            }
+
+            WindowEvent::RedrawRequested => self.render(),
+
+            _ => {}
+        }
     }
 }
 
@@ -5997,451 +6811,21 @@ impl ApplicationHandler<Wake> for UmberApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(gfx) = self.gfx.as_mut() else { return };
-
-        let response = gfx.egui_state.on_window_event(&gfx.window, &event);
-        // egui-winit reports `repaint` for `RedrawRequested` itself, which is a
-        // tautology: acting on it means every painted frame asks for the next
-        // one, and `ControlFlow::Wait` never gets to wait. What egui genuinely
-        // wants next is read from its `viewport_output` in `render`.
-        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
-            gfx.window.request_redraw();
-        }
-        // The mouse's answer, from the position `CursorMoved` last reported.
-        // Anything carrying its own position — a touch, a pen — must ask
-        // `ui_owns_pointer` about *that* instead. See there.
-        let ui_has_pointer = ui_owns_pointer(&self.editor, &gfx.egui_ctx, self.editor.cursor);
-        let pivot = self.editor.canvas_pivot;
-
-        // Settings → Input & pen is a live reading of this stream, so every
-        // event is noted here — before the match, so a branch that returns
-        // early still counts, and before dispatch, so `Editor::sample` has a
-        // sample of its own to write the resolved pressure onto. Observation
-        // only; see `inputlog`.
-        self.editor.note_input(&event);
-
-        match event {
-            // Never an immediate exit. Closing the window is the one gesture
-            // that can discard *every* open document at once, so it is refused
-            // until each one with unsaved work has been accounted for — and the
-            // question has to be answerable with "actually, no".
-            WindowEvent::CloseRequested => {
-                if self.editor.unsaved_documents().is_empty() {
-                    event_loop.exit();
-                } else {
-                    self.editor.ui.quit_prompt = true;
-                    gfx.window.request_redraw();
-                }
-            }
-
-            // A zero on either axis skips the whole handler: wgpu refuses a
-            // zero-area configure outright, and a window with no area is one
-            // there is nothing to draw on anyway, so the surface keeps the
-            // configuration it had. Wayland reports one while a window is
-            // being mapped.
-            //
-            // No surface texture can be alive here — `render` presents or
-            // drops its own before returning — so this may configure at once,
-            // and going through `reconfigure_surface` also drops any request a
-            // suboptimal frame left behind. That request named the *old* size.
-            WindowEvent::Resized(size) => {
-                if size.width > 0 && size.height > 0 {
-                    gfx.config.width = size.width;
-                    gfx.config.height = size.height;
-                    gfx.reconfigure_surface();
-                    gfx.window.request_redraw();
-                }
-            }
-
-            // Dropping a file on the window is the gesture people already have
-            // for this, and it reaches exactly the same importer the File menu
-            // does — including its refusals, so an unsupported format explains
-            // itself here too rather than silently doing nothing.
-            WindowEvent::DroppedFile(path) => self.open_path(&path),
-
-            WindowEvent::ModifiersChanged(m) => {
-                let was_alt = self.modifiers.alt_key();
-                self.modifiers = m.state();
-                let alt = self.modifiers.alt_key();
-                if alt != was_alt {
-                    self.set_brush_resize(alt && !ui_has_pointer);
-                }
-            }
-
-            // Losing the window ends every gesture, because **no gesture may
-            // be left in a state only a release could end** — and after this
-            // event no release is coming. A modifier let go of while another
-            // window has the keyboard never reaches us, and neither does a
-            // button.
-            WindowEvent::Focused(false) => {
-                // Alt can otherwise be "held" for ever after an Alt-Tab, so the
-                // resize would still be live — and its circle still on the
-                // canvas — when the window came back.
-                self.set_brush_resize(false);
-                // Space is the identical failure by a route `shortcuts::direct`
-                // structurally cannot see: that rule keeps a *release* always
-                // landing, and here there is no release at all. Come back from
-                // an Alt-Tab and the pan override is armed with no key down.
-                self.editor.space_down = false;
-                // A stroke is the expensive one. Alt-Tab mid-stroke and
-                // `Interaction::Drawing` and `stroke.is_active()` both stay set
-                // for ever: `render`'s `quiet` requires both to be clear and
-                // `Autosave::next_due` answers `None` while it is not, so **the
-                // document is never autosaved again for the rest of the
-                // session** — silently, with its tab still showing an unsaved
-                // dot. Finish rather than cancel, for the reason
-                // `gesture::supersedes_stroke` gives: the artist drew a visible
-                // mark.
-                self.finish_stroke();
-                // And the gestures that carry no stroke behind them. `quiet`
-                // reads `Interaction` as well, so a pan or a zoom abandoned by
-                // an Alt-Tab stalls the autosave exactly as a stroke does —
-                // `finish_stroke` clears this itself, but only when there was a
-                // stroke to finish.
-                //
-                // Deliberately *not* `cancel_selection_draft`: that takes the
-                // draft away, and a polygon spans several clicks, so Alt-Tabbing
-                // to look at a reference is precisely when somebody has one
-                // half-drawn. Idle with a draft standing is an ordinary state
-                // rather than a broken one — it is what a middle-drag to pan
-                // already produces, and `pointer_moved`'s `Idle` arm keeps the
-                // rubber band following the pointer.
-                self.editor.interaction = Interaction::Idle;
-            }
-
-            // Switching input language changes what every key prints, and
-            // therefore what every shortcut label should say. Taking the window
-            // back is one of the two moments that follows such a switch; a key
-            // press is the other, below. Both are on the input path
-            // deliberately — see `keylayout`'s module docs for why the check
-            // must not be on the drawing path instead.
-            WindowEvent::Focused(true) => keylayout::forget_if_changed(),
-
-            WindowEvent::KeyboardInput { event, .. } => {
-                keylayout::forget_if_changed();
-                // Punctuation dispatches on what the user's layout *prints*,
-                // not on the US position winit names it by — otherwise Ctrl and
-                // the key marked `+` zooms out on half the keyboards in Europe.
-                // See `shortcuts::key_for_text`. A named or dead key reports no
-                // character and keeps its position.
-                let typed = match &event.logical_key {
-                    winit::keyboard::Key::Character(text) => Some(text.as_str()),
-                    _ => None,
-                };
-                if let PhysicalKey::Code(code) = event.physical_key
-                    && self.handle_keys(shortcuts::typed_key(code, typed), event.state.is_pressed())
-                    && let Some(g) = self.gfx.as_ref()
-                {
-                    g.window.request_redraw();
-                }
-            }
-
-            WindowEvent::CursorMoved { position, .. } => {
-                let pos = Vec2::new(position.x as f32, position.y as f32);
-                // A mouse event, so a mouse is what is driving the pointer:
-                // the pen's dot gives way to the ordinary arrow. A pen sends
-                // none of these — see `Editor::pen_pointer`.
-                self.editor.pen_pointer = false;
-                if self.pointer_moved(pos, None)
-                    && let Some(g) = self.gfx.as_ref()
-                {
-                    g.window.request_redraw();
-                }
-            }
-
-            WindowEvent::MouseInput { state, button, .. } => {
-                let pressed = state == ElementState::Pressed;
-                // A button is a mouse's, whatever moved the pointer last.
-                self.editor.pen_pointer = false;
-                // Middle-drag and space-drag always pan, whatever tool is
-                // selected — muscle memory should not depend on the rail. Space
-                // is the *left* button's override; a middle press already pans.
-                let pan_button = button == MouseButton::Middle;
-                let pos = self.editor.cursor;
-
-                match (pressed, button) {
-                    (true, MouseButton::Left | MouseButton::Middle) => {
-                        self.pointer_pressed(
-                            pos,
-                            // A mouse has no pressure sensor. `PressureModel`
-                            // is what turns that into a full-pressure stroke.
-                            None,
-                            gesture::Pointer {
-                                tool: self.editor.ui.tool,
-                                ui_owns: ui_has_pointer,
-                                alt: self.modifiers.alt_key(),
-                                space: self.editor.space_down && !pan_button,
-                                pan_button,
-                                // A button, not a contact — which is the whole
-                                // of how Alt keeps meaning the eyedropper here.
-                                contact: false,
-                                resizing: self.editor.brush_resize.is_some(),
-                                press_resizes: self.editor.ui.resize_needs_press,
-                            },
-                        );
-                    }
-                    // Any other button still ends the brush-size drag: it is
-                    // Alt with *nothing* down. Without this an Alt-click would
-                    // pick a colour with the resize still live, so the
-                    // eyedropper would leave a circle on the canvas and the next
-                    // flick of the wrist would silently rescale the brush.
-                    (true, _) => self.set_brush_resize(false),
-                    // The middle button pans and nothing else, so its release
-                    // has nothing to finish — but it may only end the pan it
-                    // began. Writing `Idle` unconditionally is the same defect
-                    // `gesture::supersedes_stroke` fixes, arriving from the
-                    // other direction: middle-press to pan, left-press to draw,
-                    // then let the middle button go, and this cleared the
-                    // `Drawing` the stroke was dispatching on, so the left
-                    // button coming up never finished it. That fix is what
-                    // repairs the sequence; this is what stops the arm being
-                    // able to break it again.
-                    (false, MouseButton::Middle) => {
-                        if self.editor.interaction == Interaction::Panning {
-                            self.editor.interaction = Interaction::Idle;
-                        }
-                    }
-                    (false, MouseButton::Left) => self.pointer_released(pos),
-                    (false, _) => {}
-                }
-                if let Some(g) = self.gfx.as_ref() {
-                    g.window.request_redraw();
-                }
-            }
-
-            WindowEvent::MouseWheel { delta, .. } => {
-                if ui_has_pointer {
-                    return;
-                }
-                // Panning wants a distance and zooming wants a count of
-                // notches. A wheel reports the second and a trackpad the first,
-                // so both are worked out and each branch takes the one it means
-                // — a trackpad's own pixels give it the fine-grained pan it is
-                // for, rather than a distance rounded through a notch count.
-                let scale = self.editor.pixels_per_point.max(1e-3);
-                let (notches, pixels) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => {
-                        (Vec2::new(x, y), Vec2::new(x, y) * WHEEL_PAN_POINTS * scale)
-                    }
-                    MouseScrollDelta::PixelDelta(p) => {
-                        let px = Vec2::new(p.x as f32, p.y as f32);
-                        (px / WHEEL_PIXELS_PER_NOTCH, px)
-                    }
-                };
-
-                if self.modifiers.control_key() || self.modifiers.super_key() {
-                    // Zoom keeps the wheel, one modifier along. It is where
-                    // every browser and document viewer puts it, and it is the
-                    // only one of the three that has somewhere to anchor: the
-                    // pointer.
-                    let factor = WHEEL_ZOOM_STEP.powf(notches.y);
-                    self.editor
-                        .camera
-                        .zoom_at(self.editor.cursor, factor, pivot);
-                } else {
-                    // Scrolling up shows what is above, which means the picture
-                    // moves *down* — `pan_by_screen` takes the movement of the
-                    // canvas, so the sign is already right. Shift swaps the
-                    // axis without swapping that convention, so a roll upwards
-                    // goes left.
-                    //
-                    // A horizontal wheel is honoured whether Shift is held or
-                    // not, and reversed: rolling right is asking to see what is
-                    // to the right, so the canvas goes left.
-                    let by = if self.modifiers.shift_key() {
-                        Vec2::new(pixels.y, 0.0)
-                    } else {
-                        Vec2::new(-pixels.x, pixels.y)
-                    };
-                    self.editor.camera.pan_by_screen(by);
-                }
-                if let Some(g) = self.gfx.as_ref() {
-                    g.window.request_redraw();
-                }
-            }
-
-            WindowEvent::Touch(touch) => {
-                let pos = Vec2::new(touch.location.x as f32, touch.location.y as f32);
-                // winit reports Force in either normalised or calibrated form;
-                // `normalized` flattens both to 0..=1.
-                let reported = touch.force.map(|f| f.normalized() as f32);
-                // The one place to look when a tablet does nothing:
-                // `RUST_LOG=umber_app=trace` says whether the pen is reaching
-                // the application at all, and with what pressure. A driver in
-                // "mouse mode" sends no touches and shows nothing here.
-                log::trace!(
-                    "touch {:?} id={} at {pos:?} force={reported:?}",
-                    touch.phase,
-                    touch.id
-                );
-                // Whatever else this event turns out to be, it came from a pen
-                // or a finger rather than a mouse — which is what the canvas
-                // draws its own cursor for.
-                self.editor.pen_pointer = true;
-
-                // Which of the six things a touch event can be. In
-                // `gesture::contact` rather than in a chain of `if`s here,
-                // because the two rules it carries — a `Moved` for an unknown
-                // id is a hover, and a second contact is a pinch — were both
-                // bugs, and neither can be reproduced on a machine with no
-                // tablet. The counts are taken *before* the maps are touched,
-                // so `down` includes this contact for a `Started`.
-                let known = self.editor.touches.contains_key(&touch.id);
-                let down = self.editor.touches.len() + usize::from(!known);
-                let owner = self.editor.drawing_touch == Some(touch.id);
-
-                match gesture::contact(touch.phase, down, known, owner) {
-                    gesture::Contact::Press => {
-                        self.editor.touches.insert(touch.id, pos);
-                        // Against the touch's *own* position. It carries one and
-                        // `Editor::cursor` does not follow it, so the mouse's
-                        // answer would be about somewhere else entirely — see
-                        // `ui_owns_pointer`. No window means no canvas, so the
-                        // interface owns it by default.
-                        let ui_owns = self
-                            .gfx
-                            .as_ref()
-                            .is_none_or(|g| ui_owns_pointer(&self.editor, &g.egui_ctx, pos));
-                        // The same decision the mouse press makes, from the same
-                        // function. It used to be a second `match` on the tool
-                        // here, which is how the Pan tool, the Zoom tool, Alt for
-                        // the eyedropper and Alt for the brush-size drag all came
-                        // to be reachable only by mouse — a pen produces none of
-                        // the events the arm above handles.
-                        let decision = self.pointer_pressed(
-                            pos,
-                            reported,
-                            gesture::Pointer {
-                                tool: self.editor.ui.tool,
-                                ui_owns,
-                                // A keyboard modifier reaches a pen user exactly
-                                // as it reaches a mouse user, and this arm used
-                                // to consult neither.
-                                alt: self.modifiers.alt_key(),
-                                space: self.editor.space_down,
-                                // No buttons on the glass.
-                                pan_button: false,
-                                contact: true,
-                                resizing: self.editor.brush_resize.is_some(),
-                                press_resizes: self.editor.ui.resize_needs_press,
-                            },
-                        );
-                        // A press the interface took is not this contact's to
-                        // follow. Deliberately *not* treated as a pinch either:
-                        // one finger on a panel is not a gesture, and cancelling
-                        // the stroke there threw away a stroke the other hand
-                        // was in the middle of.
-                        if decision != gesture::Press::Ignored {
-                            self.editor.drawing_touch = Some(touch.id);
-                        }
-                    }
-                    gesture::Contact::Pinch => {
-                        self.editor.touches.insert(touch.id, pos);
-                        // A second finger means the gesture was a pinch, not a
-                        // stroke. Abandon whatever the first finger was making —
-                        // all of them are gestures that must not half-happen
-                        // because a hand landed on the glass. The transform's
-                        // *float* survives it and only the drag is dropped: the
-                        // picture is still there to be moved, and throwing it
-                        // away because somebody pinched to look closer at it
-                        // would be the opposite of what they asked for.
-                        self.cancel_stroke();
-                        self.editor.cancel_selection_draft();
-                        // `Editor::transform_release` rather than this type's: a
-                        // second finger landing must drop the drag *and* the
-                        // pending "put it down", not carry it out. Nobody
-                        // pinching to look closer meant to commit.
-                        self.put_down_at = None;
-                        self.editor.transform_release();
-                        self.editor.drawing_touch = None;
-                        // A pan or a zoom the first contact had begun goes with
-                        // the rest of it. `cancel_stroke` resets this only where
-                        // there was a stroke to cancel, and now that the Pan and
-                        // Zoom tools answer a single contact there is a live
-                        // `Interaction` here that no stroke ever produced — left
-                        // set, it would go on panning off the second finger's
-                        // every move.
-                        self.editor.interaction = Interaction::Idle;
-                        self.update_pinch();
-                    }
-                    gesture::Contact::Hover => {
-                        // A pen in range and off the glass. It is not a contact
-                        // and is deliberately not recorded as one — see
-                        // `gesture::contact` — but *where the pen is* is worth
-                        // having, and it goes through the same body a mouse move
-                        // takes, because a hover is exactly a mouse move with
-                        // nothing held. The two things that live in that state —
-                        // the brush-size circle following the hand, and a
-                        // polygon's rubber band between clicks — used to stand
-                        // still under a pen because this branch recorded the
-                        // position and returned.
-                        let previous = self.editor.last_cursor;
-                        let wants_frame = self.pointer_moved(pos, None);
-                        // `last_cursor` is the previous point of a *gesture* —
-                        // what the pan and zoom drags measure against, and what a
-                        // stroke's speed and therefore its simulated pressure
-                        // come from — and a pen waved about in mid-air is none of
-                        // those. Put back rather than never written, so that one
-                        // body stays the only place a pointer move is
-                        // interpreted.
-                        self.editor.last_cursor = previous;
-                        // A pen sends a few hundred of these a second, so the
-                        // frame is asked for only where something that moved is
-                        // actually drawn — over a panel or a menu this would be
-                        // repainting an identical picture.
-                        //
-                        // This is a *narrowing* of what already happens rather
-                        // than the thing that makes the hover paint: egui-winit
-                        // has already asked for a repaint on the same event, so
-                        // taking this out would cost frames and lose nothing.
-                        // Do not go the other way and stop the pass-through as
-                        // well. Under a pen the cursor is re-derived per frame
-                        // and hidden by `syscursor` per frame, so a hover that
-                        // stopped producing frames over a *panel* would leave
-                        // whatever the last canvas frame asked for standing —
-                        // which is no cursor at all, over the controls.
-                        if wants_frame || self.editor.pointer_over_canvas(pos) {
-                            self.request_redraw();
-                        }
-                        return;
-                    }
-                    gesture::Contact::Drag => {
-                        self.editor.touches.insert(touch.id, pos);
-                        // Dispatched on the `Interaction` the press set, not on
-                        // the tool — which is what lets a contact drive the pan
-                        // and the zoom, and what stops this arm being a second
-                        // reading of what a drag means.
-                        self.pointer_moved(pos, reported);
-                    }
-                    gesture::Contact::Pinching => {
-                        self.editor.touches.insert(touch.id, pos);
-                        self.update_pinch();
-                    }
-                    gesture::Contact::Release => {
-                        self.editor.touches.remove(&touch.id);
-                        // The float stays up, exactly as it does when a mouse
-                        // button comes up: the box is still there to be dragged
-                        // again — unless the tap was a click outside it, which
-                        // puts it down.
-                        self.pointer_released(pos);
-                        self.editor.drawing_touch = None;
-                        self.editor.pinch = None;
-                    }
-                    gesture::Contact::Lift => {
-                        self.editor.touches.remove(&touch.id);
-                        self.editor.pinch = None;
-                    }
-                }
-                if let Some(g) = self.gfx.as_ref() {
-                    g.window.request_redraw();
-                }
-            }
-
-            WindowEvent::RedrawRequested => self.render(),
-
-            _ => {}
-        }
+        self.dispatch_window_event(event_loop, event);
+        // After the event, whatever it did and wherever its arm returned: see
+        // `drain_path_layers`.
+        self.drain_path_layers();
     }
+}
+
+/// The one statement of the wipe `UmberApp::drain_path_layers` argues for,
+/// shared with `render`, which holds `gfx` borrowed where it drains.
+fn wipe_new_layers(editor: &mut Editor, gfx: &mut Graphics) {
+    editor.take_path_layers(|id, slot| {
+        if let Some(canvas) = gfx.canvases.get_mut(&id) {
+            canvas.clear_layer(&gfx.gpu.queue, slot);
+        }
+    });
 }
 
 /// The file's own name, for a message written to the user.
@@ -6487,6 +6871,10 @@ fn save_layer<'a>(
         // paint with nothing said. `docformat` takes the fingerprint from the
         // image *this* save is writing, so nothing stale can be handed over.
         text: layer.text(),
+        // And the paths, for the same reason and with the same silence: a save
+        // that forgot this would write a vector layer back as an ordinary one,
+        // and nothing would say a layer had stopped being editable.
+        vector: layer.vector(),
         clipped: layer.clipped,
         locked: layer.locked,
         link: layer.link,
@@ -6679,6 +7067,25 @@ fn swap_text_at_slot(
     held
 }
 
+/// `App::reverse`'s vector arm, as a function so it can be driven without an
+/// `UmberApp`, which cannot be built in a test.
+///
+/// `Err` hands the record back when no layer holds the slot, so a refused step
+/// loses nothing and the entry returns to the stack it came from.
+fn reverse_vector(
+    layers: &mut umber_core::LayerStack,
+    slot: u32,
+    was: Option<Box<umber_core::VectorObject>>,
+) -> Result<EditBody, EditBody> {
+    match layers.restore_vector(slot, was) {
+        Ok(previous) => Ok(EditBody::Vector {
+            slot,
+            was: previous,
+        }),
+        Err(was) => Err(EditBody::Vector { slot, was }),
+    }
+}
+
 /// The smallest rectangle holding both.
 ///
 /// A free function so the arithmetic is checked without a device, which is what
@@ -6792,14 +7199,162 @@ fn blit_into(dest: &mut [u8], to: PixelRect, src: &[u8], from: PixelRect) {
 /// menu rows that say the same thing. The wording has no em-dash in it, which is
 /// the rule for everything the interface draws rather than a preference about
 /// this box.
-fn flip_step_refusal(step: &'static str) -> Notice {
-    Notice {
-        title: "A layer is locked".into(),
-        lines: vec![format!(
-            "That step was not {step}. It is a canvas flip. {} and try again.",
-            editor::FLIP_LOCKED_REASON
-        )],
+fn flip_step_refusal(step: &'static str, why: FlipRefusal) -> Notice {
+    match why {
+        FlipRefusal::Locked => Notice {
+            title: "A layer is locked".into(),
+            lines: vec![format!(
+                "That step was not {step}. It is a canvas flip. {} and try again.",
+                editor::FLIP_LOCKED_REASON
+            )],
+        },
+        FlipRefusal::NewerPaths => Notice {
+            title: NEWER_PATHS_TITLE.into(),
+            lines: vec![format!(
+                "That step was not {step}. It is a canvas flip. {}",
+                editor::FLIP_NEWER_PATHS
+            )],
+        },
     }
+}
+
+/// The title of every notice a record from a newer Umber raises.
+const NEWER_PATHS_TITLE: &str = "Paths from a newer Umber";
+
+/// What a refused flip command says. Exhaustive, so a third reason has to be
+/// worded before it can be raised.
+fn flip_refusal_notice(why: FlipRefusal) -> Notice {
+    match why {
+        FlipRefusal::Locked => Notice {
+            title: "A layer is locked".into(),
+            lines: vec![format!(
+                "The canvas was not flipped. {} and try again.",
+                editor::FLIP_LOCKED_REASON
+            )],
+        },
+        FlipRefusal::NewerPaths => Notice {
+            title: NEWER_PATHS_TITLE.into(),
+            lines: vec![editor::FLIP_NEWER_PATHS.to_string()],
+        },
+    }
+}
+
+/// What a refused resize says. One reason, `Editor::resize_refused`'s.
+fn resize_refusal_notice() -> Notice {
+    Notice {
+        title: NEWER_PATHS_TITLE.into(),
+        lines: vec![editor::RESIZE_NEWER_PATHS.to_string()],
+    }
+}
+
+/// The cut's sentence for a vector layer, a const for the reason the paste's is:
+/// a test reads the sentence a lost line continuation would pad with spaces.
+const CUT_VECTOR_LINE: &str =
+    "Nothing was cut. This is a vector layer. Cut from an ordinary layer instead.";
+
+/// A const and not a literal in the match, so a test can read the sentence a
+/// lost line continuation would otherwise pad with spaces.
+const PASTE_VECTOR_LINE: &str =
+    "Nothing was pasted. This is a vector layer. Paste onto an ordinary layer instead.";
+
+/// What a lift with the transform tool says on a vector layer. A lift has no
+/// pixels to take there, and the layer has no paths to move yet.
+const LIFT_VECTOR_LINE: &str = "This is a vector layer. There is nothing here to move yet.";
+
+/// What a lift's notice is about, so it can be said once rather than per press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiftKey {
+    document: crate::session::DocId,
+    /// [`umber_core::Layer::id`], which survives a reorder where an index does
+    /// not. `None` for an empty stack.
+    layer: Option<u32>,
+    tool: Tool,
+}
+
+/// **A transform-tool press on a vector layer says so once, not once a press.**
+///
+/// The lift's notice is the one a press on the canvas raises, and a press
+/// happens every time the pen goes down: unlatched, each one raised the same
+/// modal over the canvas again, which is the dialog-that-keeps-coming-back the
+/// autosave's "say it once" rule refuses. So the notice latches on the
+/// [`LiftKey`] it was raised for and stays quiet until the active layer, the
+/// tool or the document changes, which [`LiftNotice::observe`] is told every
+/// frame. A paste is not latched: it is a command with one outcome and always
+/// says so.
+///
+/// A model with no window in it, so the rule is a test rather than a sentence.
+#[derive(Clone, Copy, Debug, Default)]
+struct LiftNotice {
+    said_for: Option<LiftKey>,
+}
+
+impl LiftNotice {
+    /// Should a lift refused at `key` raise its notice? True the first time,
+    /// and latches so the next press at the same key is quiet.
+    fn due(&mut self, key: LiftKey) -> bool {
+        let due = self.said_for != Some(key);
+        self.said_for = Some(key);
+        due
+    }
+
+    /// Re-arm when what is in hand is no longer what the notice was about.
+    fn observe(&mut self, now: LiftKey) {
+        if self.said_for.is_some_and(|said| said != now) {
+            self.said_for = None;
+        }
+    }
+}
+
+/// What a lift (a press with the transform tool, not a paste) says about a
+/// refusal, if anything.
+///
+/// A paste always says so, in [`paste_refusal`]'s words. A lift is a press on
+/// the canvas and happens every time the pen goes down, so it stays silent for
+/// every reason except the vector layer, which the artist asked for by choosing
+/// the transform tool on a layer that has nothing to lift, and even that is
+/// said once rather than per press ([`LiftNotice`]). Exhaustive with no
+/// catch-all, so a fifth refusal has to decide which of the two it is.
+fn float_refusal_notice(why: EditRefusal, paste: bool) -> Option<Notice> {
+    if paste {
+        return Some(paste_refusal(why));
+    }
+    match why {
+        EditRefusal::Vector => Some(Notice {
+            title: "This is a vector layer".to_string(),
+            lines: vec![LIFT_VECTOR_LINE.to_string()],
+        }),
+        // Locked, a folder and nothing selected are ordinary states a press
+        // lands on; `Text` is let through the gate for a lift, so it never
+        // arrives here at all.
+        EditRefusal::Locked | EditRefusal::Folder | EditRefusal::Text | EditRefusal::Missing => {
+            None
+        }
+    }
+}
+
+/// What a refused cut says, or `None` where the refusal is silent.
+///
+/// A folder is a perfectly ordinary thing to have selected and nothing is
+/// selected only by accident, so both stay quiet; the other three say what did
+/// not happen. Exhaustive with no catch-all, and a free function so the
+/// sentence that is *shown* is the one a test can read.
+fn cut_refusal(why: EditRefusal) -> Option<Notice> {
+    let (title, line) = match why {
+        EditRefusal::Locked => (
+            "The layer is locked",
+            "Nothing was cut. Unlock the layer in the Layers panel, or select another one, and cut again.",
+        ),
+        EditRefusal::Text => (
+            "This layer holds text",
+            "Nothing was cut. The text on this layer can still be set again, so nothing may be taken out of it. Convert it to paint in the Text panel, or select another layer.",
+        ),
+        EditRefusal::Vector => ("This is a vector layer", CUT_VECTOR_LINE),
+        EditRefusal::Folder | EditRefusal::Missing => return None,
+    };
+    Some(Notice {
+        title: title.to_string(),
+        lines: vec![line.to_string()],
+    })
 }
 
 /// What to tell somebody whose paste was refused.
@@ -6835,6 +7390,7 @@ fn paste_refusal(why: EditRefusal) -> Notice {
              nothing may be pasted over it. Convert it to paint in the Text panel, \
              or select another layer.",
         ),
+        EditRefusal::Vector => ("This is a vector layer", PASTE_VECTOR_LINE),
         EditRefusal::Missing => (
             "No layer is selected",
             "Nothing was pasted. Select a layer in the Layers panel and paste again.",
@@ -6866,6 +7422,151 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 
 #[cfg(test)]
 mod tests {
+
+    /// **Review Focus 2 at the keyboard's and the menu's route: undo and redo
+    /// reach the history only through `undo_command` and `redo_command`.**
+    ///
+    /// A source scan, and it says so. The decision those two make is the whole
+    /// of `Editor::path_key`, which needs no device and is driven by
+    /// `undo_with_a_draft_up_pops_a_node_and_leaves_the_history_alone`; what
+    /// is left on `UmberApp` is the GPU half of an undo and an event loop to
+    /// own it, so nothing here can call it. What can be checked is that no
+    /// third door reaches `undo` or `redo` past the draft. `jump_history` is
+    /// the one other caller and is a click on a History row, which names a
+    /// position rather than asking for one step.
+    #[test]
+    fn undo_and_redo_reach_the_history_only_past_the_draft() {
+        let source = include_str!("app.rs");
+        let body = &source[..source
+            .find(concat!("mod ", "tests {"))
+            .expect("the test module")];
+        let needles = [concat!("self.", "undo()"), concat!("self.", "redo()")];
+        let mut seen = Vec::new();
+        let mut within = "";
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            let decl = trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| trimmed.strip_prefix("pub "))
+                .unwrap_or(trimmed);
+            if let Some(rest) = decl.strip_prefix("fn ") {
+                within = rest.split('(').next().unwrap_or("");
+            }
+            if needles.iter().any(|n| line.contains(n)) {
+                seen.push(within);
+            }
+        }
+        for caller in &seen {
+            assert!(
+                ["undo_command", "redo_command", "jump_history"].contains(caller),
+                "{caller} reaches the history without asking the path tool first"
+            );
+        }
+        assert!(seen.contains(&"undo_command") && seen.contains(&"redo_command"));
+        for route in [
+            concat!("Action::Undo => self.", "undo_command()"),
+            concat!("Action::Redo => self.", "redo_command()"),
+        ] {
+            assert!(body.contains(route), "the shortcut does not take {route:?}");
+        }
+        let menu = body
+            .find(concat!("if actions.", "undo {"))
+            .expect("the menu's undo");
+        assert!(
+            body[menu..]
+                .trim_start_matches(concat!("if actions.", "undo {"))
+                .trim_start()
+                .starts_with(concat!("self.", "undo_command();")),
+            "the menu's Undo does not go through undo_command"
+        );
+    }
+
+    /// **No float is begun with the Path tool still in hand.** A source scan,
+    /// for the reason the one below gives: `UmberApp` cannot be built here. A
+    /// paste ends in the transform tool, and changing tool is what settles the
+    /// Path tool, so settling after `begin_float` lands a draft under a
+    /// standing float. Every function that begins one either settles first or
+    /// is `transform_press`, which runs with the transform tool already in
+    /// hand.
+    #[test]
+    fn no_float_is_begun_with_the_path_tool_in_hand() {
+        let source = include_str!("app.rs");
+        let body = &source[..source
+            .find(concat!("mod ", "tests {"))
+            .expect("the test module")];
+        let begin = concat!("self.", "begin_float(");
+        let settle = concat!("self.editor.", "settle_path_tool_noting()");
+        let mut within = "";
+        let mut settled = false;
+        let mut callers = Vec::new();
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            let decl = trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| trimmed.strip_prefix("pub "))
+                .unwrap_or(trimmed);
+            if let Some(rest) = decl.strip_prefix("fn ") {
+                within = rest.split('(').next().unwrap_or("");
+                settled = false;
+            }
+            if line.contains(settle) {
+                settled = true;
+            }
+            if line.contains(begin) {
+                callers.push(within);
+                assert!(
+                    settled || within == "transform_press",
+                    "{within} begins a float before settling the Path tool"
+                );
+            }
+        }
+        assert!(
+            callers.contains(&"float_a_clip") && callers.contains(&"transform_press"),
+            "the scan found the callers it is about: {callers:?}"
+        );
+    }
+
+    /// **A trace settles everything in the air before it reads the artwork.**
+    /// A source scan, for the reason the one above gives. A stroke's wet
+    /// scratch and a float's preview slice both stand in front of a layer, and
+    /// a Path tool draft landing after the plan would change the stack the plan
+    /// was made against.
+    #[test]
+    fn a_trace_settles_the_stroke_the_float_and_the_draft_before_reading() {
+        let source = include_str!("app.rs");
+        let body = &source[..source
+            .find(concat!("mod ", "tests {"))
+            .expect("the test module")];
+        let markers = [
+            concat!("self.", "finish_stroke()"),
+            concat!("self.", "finish_transform()"),
+            concat!("self.editor.", "settle_path_tool_noting()"),
+            concat!("self.", "drain_path_layers()"),
+            concat!(".export", "_coverage("),
+        ];
+        let last = markers.len() - 1;
+        let mut within = "";
+        let mut first: [Option<usize>; 5] = [None; 5];
+        for (n, line) in body.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("fn ") {
+                within = rest.split('(').next().unwrap_or("");
+            }
+            if within != "trace_outline" {
+                continue;
+            }
+            for (i, marker) in markers.iter().enumerate() {
+                if line.contains(marker) && first[i].is_none() {
+                    first[i] = Some(n);
+                }
+            }
+        }
+        let read = first[last].expect("trace_outline reads the coverage");
+        for (i, marker) in markers[..last].iter().enumerate() {
+            let at = first[i].unwrap_or_else(|| panic!("trace_outline never calls {marker}"));
+            assert!(at < read, "trace_outline calls {marker} after reading");
+        }
+    }
 
     /// **Every structural edit puts a floating transform down before it
     /// records.**
@@ -6997,7 +7698,21 @@ mod tests {
         // exempted by name because it runs from `finish_transform`, where the
         // commit is what is happening.
         let record = concat!("history", ".record(");
-        let allowed = concat!("fn commit_made_", "layer");
+        // `apply_path_plan` is the second, and it has two callers.
+        // `App::carry_out_path_plan` is reached only from the two commands
+        // that put the float down and finish the stroke before they plan
+        // anything. `Editor::carry_out` is the Path tool's, and so is
+        // `apply_path_edit`, the third: neither can meet a float, because a
+        // float exists only with the transform tool in hand and the Path tool
+        // is settled (`Editor::set_tool`) before the tool can change, so no
+        // draft and no pick is left for a commit to come from while one
+        // stands. `carry_out` asserts it in debug builds. A shape recorded
+        // there therefore never names a layer a placement holds in the air.
+        let allowed = [
+            concat!("fn commit_made_", "layer"),
+            concat!("fn apply_path_", "plan"),
+            concat!("fn apply_path_", "edit"),
+        ];
         for (what, text) in [
             ("panels.rs", shipped(include_str!("panels.rs"))),
             ("editor.rs", shipped(include_str!("editor.rs"))),
@@ -7016,7 +7731,7 @@ mod tests {
                 }
                 assert!(
                     // `contains`, because the allowed one is `pub fn`.
-                    owner.contains(allowed),
+                    allowed.iter().any(|name| owner.contains(name)),
                     "`{what}` records a history entry in `{owner}`: {trimmed}. \
                      Neither of these files can put a float down first, so what \
                      they want recorded goes through `UiActions` and `App` does it."
@@ -7282,7 +7997,7 @@ mod tests {
         ed.layers.active_mut().locked = true;
         assert_eq!(
             ed.undo_gate(),
-            crate::editor::StepGate::FlipLocked,
+            crate::editor::StepGate::FlipRefused(FlipRefusal::Locked),
             "a locked layer must refuse the step over the flip"
         );
         ed.layers.active_mut().locked = false;
@@ -7643,29 +8358,8 @@ mod tests {
         //   moment somebody wrote down what the guard was for. So the source is
         //   cut at `//` first. That can clip a string holding a `//`, which
         //   only ever lowers a count and therefore only makes this stricter.
-        let uncommented = |source: &str| {
-            source
-                .lines()
-                .map(|line| line.split("//").next().unwrap_or(line))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let named = |source: &str, field: &str| {
-            source
-                .match_indices(field)
-                .filter(|(at, _)| {
-                    let before = source[..*at]
-                        .chars()
-                        .next_back()
-                        .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != ':');
-                    let after = source[at + field.len()..]
-                        .chars()
-                        .next()
-                        .is_none_or(|c| c != ':');
-                    before && after
-                })
-                .count()
-        };
+        let uncommented = uncommented_source;
+        let named = count_named;
         for (file, whole) in [
             ("app.rs", include_str!("app.rs")),
             ("autosave.rs", include_str!("autosave.rs")),
@@ -7694,6 +8388,376 @@ mod tests {
         }
     }
 
+    /// `source` with everything from each `//` to the end of its line removed.
+    ///
+    /// Shared by the two construction-site guards, so the rule for what counts
+    /// as a statement of a field is stated once. See the long comment inside
+    /// `every_writer_of_a_save_layer_states_its_effects_and_its_text` for why it
+    /// is what it is.
+    fn uncommented_source(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How many times `field` is named as a field in `source`: at a word
+    /// boundary, and not as the first half of a path.
+    fn count_named(source: &str, field: &str) -> usize {
+        source
+            .match_indices(field)
+            .filter(|(at, _)| {
+                let before = source[..*at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != ':');
+                let after = source[at + field.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c != ':');
+                before && after
+            })
+            .count()
+    }
+
+    /// **Both writers of a document name `vector:`**, the twin of the guard above
+    /// for the field whose absence is the same kind of silent.
+    ///
+    /// `..SaveLayer::new` writes `None`, so a writer that forgot the field would
+    /// write a vector layer back as an ordinary one: every pixel intact, the
+    /// paths gone, and nothing anywhere saying so. Both writers were wired in
+    /// one change for the reason `text:` was.
+    ///
+    /// It counts at the same word boundary and outside comments (see the guard
+    /// above, which measured both), and **that is its whole reach**: it sees that
+    /// a construction site names the field, not that it names it right. The
+    /// behavioural half is `an_autosave_writes_the_paths_a_save_does`, and the
+    /// save path's is `a_save_layer_carries_the_vector_record_the_layer_holds`.
+    ///
+    /// Mutated: deleting Save's `vector:` line fails this on 0 against 1.
+    /// Deleting the autosave's passes it, `autosave.rs` naming the field on
+    /// `LayerMeta` and in `snapshot` as well, and fails the behavioural test.
+    #[test]
+    fn save_and_the_autosave_both_carry_the_vector_record() {
+        for (file, whole) in [
+            ("app.rs", include_str!("app.rs")),
+            ("autosave.rs", include_str!("autosave.rs")),
+        ] {
+            let source = uncommented_source(whole.split("#[cfg(test)]").next().unwrap_or(whole));
+            let literals = source.match_indices("SaveLayer {").count();
+            assert!(literals > 0, "{file} builds no SaveLayer any more");
+            let stated = count_named(&source, "vector:");
+            assert!(
+                stated >= literals,
+                "{file} builds {literals} SaveLayer(s) outside its tests and names \
+                 `vector:` {stated} time(s); `..SaveLayer::new` supplies `None`, so \
+                 the one that does not writes a vector layer back as an ordinary one"
+            );
+        }
+    }
+
+    /// The Save path's own helper hands the layer's record to the writer, which
+    /// is the half of the guard above that reads *what* was named.
+    #[test]
+    fn a_save_layer_carries_the_vector_record_the_layer_holds() {
+        let mut stack = umber_core::LayerStack::new();
+        let record = vector_record();
+        let at = stack
+            .add_vector_layer("Paths", record.clone())
+            .expect("room");
+        let layer = stack.get(at).expect("added");
+        let saved = save_layer(layer, umber_core::docformat::Canvas::Deferred, None);
+        assert_eq!(saved.vector, Some(&record), "Save dropped the paths");
+        let plain = save_layer(
+            stack.get(0).expect("the first layer"),
+            umber_core::docformat::Canvas::Deferred,
+            None,
+        );
+        assert!(plain.vector.is_none());
+    }
+
+    /// A record with something in it, for the tests that need paths to compare.
+    fn vector_record() -> umber_core::VectorObject {
+        umber_core::VectorObject::empty()
+            .appended(vec![umber_core::Path {
+                role: umber_core::PathRole::Cut,
+                closed: false,
+                nodes: vec![
+                    umber_core::Node::corner(glam::Vec2::new(5.0, 6.0)),
+                    umber_core::Node::corner(glam::Vec2::new(50.0, 60.0)),
+                ],
+                ink: None,
+            }])
+            .expect("a small record is legal")
+    }
+
+    /// **Undo puts the old record back and redo the new one**, through the same
+    /// function `App::reverse`'s vector arm is, with the entry `Edit::vector`
+    /// records.
+    ///
+    /// The slot is what names the layer, so the layer is reordered between the
+    /// edit and the undo: a position recorded beside the entry would put the
+    /// paths on whichever layer had moved into that row.
+    #[test]
+    fn undoing_a_path_edit_puts_the_old_record_back_and_redo_the_new() {
+        let mut ed = Editor::default();
+        let old = vector_record();
+        let at = ed
+            .layers
+            .add_vector_layer("Paths", old.clone())
+            .expect("room");
+        let slot = ed.layers.get(at).and_then(umber_core::Layer::slot).unwrap();
+        // The edit: a longer record replaces the old one, and the entry holds
+        // what was there.
+        let new = old
+            .appended(vec![umber_core::Path {
+                role: umber_core::PathRole::Plot,
+                closed: true,
+                nodes: vec![
+                    umber_core::Node::corner(glam::Vec2::new(1.0, 2.0)),
+                    umber_core::Node::corner(glam::Vec2::new(3.0, 4.0)),
+                ],
+                ink: None,
+            }])
+            .expect("legal");
+        let was = ed
+            .layers
+            .set_vector(at, new.clone())
+            .expect("allowed")
+            .expect("it held one");
+        ed.history.record(Edit::vector(
+            slot,
+            Some(was),
+            Some(umber_core::Timestamp::from_unix_millis(1)),
+        ));
+        assert!(ed.layers.reorder(at, 0), "moved beneath the plain layer");
+
+        // Undo, as `App::undo` does it.
+        let edit = ed.history.take_undo().expect("recorded");
+        assert_eq!(edit.kind, EditKind::Paths);
+        let inverse = reverse_vector_for_test(&mut ed, edit.body).expect("found by slot");
+        ed.history
+            .push_redo(Edit::made_at(edit.kind, edit.at, inverse));
+        assert_eq!(ed.layers.vector_at(0), Some(&old), "undo did not restore");
+
+        // Redo, as `App::redo` does it.
+        let edit = ed.history.take_redo().expect("pushed");
+        let inverse = reverse_vector_for_test(&mut ed, edit.body).expect("found by slot");
+        ed.history
+            .push_undo(Edit::made_at(edit.kind, edit.at, inverse));
+        assert_eq!(ed.layers.vector_at(0), Some(&new), "redo did not reapply");
+    }
+
+    /// Drives `reverse_vector` with a body the way `App::reverse` hands it one.
+    fn reverse_vector_for_test(ed: &mut Editor, body: EditBody) -> Result<EditBody, EditBody> {
+        match body {
+            EditBody::Vector { slot, was } => reverse_vector(&mut ed.layers, slot, was),
+            EditBody::Pixels(_)
+            | EditBody::Structure(_)
+            | EditBody::Flip
+            | EditBody::Text { .. } => panic!("not a vector entry"),
+        }
+    }
+
+    /// A step that cannot find the layer loses nothing: the record comes back in
+    /// the `Err`, which is what lets the entry return to the stack it left.
+    #[test]
+    fn a_refused_path_undo_hands_the_record_back() {
+        let mut layers = umber_core::LayerStack::new();
+        let record = Box::new(vector_record());
+        match reverse_vector(&mut layers, 999, Some(record.clone())) {
+            Err(EditBody::Vector { slot, was }) => {
+                assert_eq!(slot, 999);
+                assert_eq!(was, Some(record));
+            }
+            Ok(_) | Err(_) => panic!("a missing slot was carried out or lost the record"),
+        }
+    }
+
+    /// **What a cut says on a vector layer is `CUT_VECTOR_LINE`**, the sentence
+    /// `cut_selection` raises, and a lift says its own and a paste its own.
+    ///
+    /// Through the functions the commands call, because `UmberApp` cannot be
+    /// built in a test.
+    #[test]
+    fn the_notice_a_refused_cut_lift_and_paste_raise_for_a_vector_layer_is_the_const() {
+        let cut = cut_refusal(EditRefusal::Vector).expect("a cut says so");
+        assert_eq!(cut.lines, vec![CUT_VECTOR_LINE.to_string()]);
+        let paste = float_refusal_notice(EditRefusal::Vector, true).expect("a paste says so");
+        assert_eq!(paste.lines, vec![PASTE_VECTOR_LINE.to_string()]);
+        let lift = float_refusal_notice(EditRefusal::Vector, false).expect("a lift says so");
+        assert_eq!(
+            lift.lines,
+            vec!["This is a vector layer. There is nothing here to move yet.".to_string()]
+        );
+        // The three differ: a notice that says "pasted" over a lift is wrong.
+        assert_ne!(cut.lines, paste.lines);
+        assert_ne!(lift.lines, paste.lines);
+        for line in [&cut.lines[0], &lift.lines[0], &paste.lines[0]] {
+            assert!(!line.contains('\u{2014}'), "{line:?}");
+            assert!(!line.contains("  "), "{line:?}");
+        }
+    }
+
+    /// **No sentence a refusal can raise has a run of spaces or a stray edge
+    /// space.** Extracting `cut_refusal` lost the `\` line continuations once
+    /// and padded two existing notices with fourteen spaces each; this walks
+    /// every refusal through every function that words one, so a lost
+    /// continuation anywhere in them fails here rather than on a screen.
+    #[test]
+    fn no_refusal_sentence_has_a_run_of_spaces() {
+        let mut sentences: Vec<(String, String)> = Vec::new();
+        for why in EditRefusal::ALL {
+            let at = |who: &str| format!("{who} {why:?}");
+            for (who, notice) in [
+                ("cut", cut_refusal(why)),
+                ("paste", Some(paste_refusal(why))),
+                ("paste float", float_refusal_notice(why, true)),
+                ("lift", float_refusal_notice(why, false)),
+            ] {
+                if let Some(notice) = notice {
+                    sentences.push((at(who), notice.title));
+                    for line in notice.lines {
+                        sentences.push((at(who), line));
+                    }
+                }
+            }
+        }
+        for tip in [
+            crate::editor::CLEAR_VECTOR_TIP,
+            "Unlock the layer to clear it.",
+            crate::editor::VECTOR_LOST_ON_RESIZE_LINE,
+            crate::editor::VECTOR_LOST_ON_FLIP_LINE,
+            crate::editor::FLIP_NEWER_PATHS,
+            crate::editor::RESIZE_NEWER_PATHS,
+            crate::textpanel::PLACE_VECTOR_TIP,
+        ] {
+            sentences.push(("clear".to_string(), tip.to_string()));
+        }
+        for why in [FlipRefusal::Locked, FlipRefusal::NewerPaths] {
+            for notice in [
+                flip_refusal_notice(why),
+                flip_step_refusal("undone", why),
+                flip_step_refusal("put back", why),
+            ] {
+                sentences.push((format!("flip {why:?}"), notice.title));
+                for line in notice.lines {
+                    sentences.push((format!("flip {why:?}"), line));
+                }
+            }
+        }
+        let slice = no_slice_left();
+        sentences.push(("no slice".to_string(), slice.title));
+        sentences.extend(slice.lines.into_iter().map(|l| ("no slice".to_string(), l)));
+        let resize = resize_refusal_notice();
+        sentences.push(("resize".to_string(), resize.title));
+        sentences.extend(resize.lines.into_iter().map(|l| ("resize".to_string(), l)));
+        // And the one the real stack produces, so the list above cannot drift
+        // from what the function answers.
+        let mut stack = umber_core::LayerStack::new();
+        stack.add_vector_layer("P", vector_record()).expect("room");
+        let said = crate::editor::clear_layer_refusal(&stack).expect("refused");
+        sentences.push(("clear live".to_string(), said.to_string()));
+        for (who, text) in sentences {
+            assert!(!text.contains("  "), "{who}: a run of spaces in {text:?}");
+            assert_eq!(text.trim(), text, "{who}: edge space in {text:?}");
+            assert!(!text.is_empty(), "{who}: empty");
+        }
+    }
+
+    /// **A record from a newer Umber refuses a flip and a resize, and the
+    /// sentences say so.** The editor's readings are driven over a real stack,
+    /// so a stack that holds such a record and one that does not disagree; the
+    /// notices are the ones the commands raise.
+    #[test]
+    fn paths_from_a_newer_umber_refuse_a_flip_and_a_resize_with_a_sentence() {
+        let mut ed = crate::editor::Editor::default();
+        let bigger = glam::UVec2::new(ed.doc.size.x + 1, ed.doc.size.y);
+        assert_eq!(ed.flip_refusal(), None);
+        assert!(!ed.resize_refused(bigger));
+        ed.layers
+            .add_vector_layer("Newer", umber_core::VectorObject::Opaque(b"{}".to_vec()))
+            .expect("room");
+        assert_eq!(ed.flip_refusal(), Some(FlipRefusal::NewerPaths));
+        assert!(ed.resize_refused(bigger));
+        assert!(
+            !ed.resize_refused(ed.doc.size),
+            "a change that keeps the size moves nothing and is not refused"
+        );
+        ed.history.record(umber_core::Edit::new(
+            umber_core::EditKind::FlipHorizontal,
+            umber_core::EditBody::Flip,
+        ));
+        assert_eq!(
+            ed.undo_gate(),
+            StepGate::FlipRefused(FlipRefusal::NewerPaths),
+            "the undo of a flip is a flip"
+        );
+        // A lock is named first, because it is the one the artist can take off.
+        ed.layers.active_mut().locked = true;
+        assert_eq!(ed.flip_refusal(), Some(FlipRefusal::Locked));
+
+        let flip = flip_refusal_notice(FlipRefusal::NewerPaths);
+        assert_eq!(flip.lines, vec![editor::FLIP_NEWER_PATHS.to_string()]);
+        assert!(flip.lines[0].contains("Flipping the canvas"));
+        let resize = resize_refusal_notice();
+        assert_eq!(resize.lines, vec![editor::RESIZE_NEWER_PATHS.to_string()]);
+        assert!(resize.lines[0].contains("Resizing the canvas"));
+        let step = flip_step_refusal("undone", FlipRefusal::NewerPaths);
+        assert!(step.lines[0].starts_with("That step was not undone."));
+        assert!(step.lines[0].ends_with(editor::FLIP_NEWER_PATHS));
+    }
+
+    /// **A lift's notice is said once**, and re-armed by a change of layer, of
+    /// tool or of document, including a change and back that no press saw.
+    #[test]
+    fn a_lift_notice_is_said_once_until_what_is_in_hand_changes() {
+        let doc = crate::session::DocId::for_test(1);
+        let key = |layer: u32, tool: Tool| LiftKey {
+            document: doc,
+            layer: Some(layer),
+            tool,
+        };
+        let here = key(7, Tool::Transform);
+        let mut latch = LiftNotice::default();
+        assert!(latch.due(here), "the first press says so");
+        assert!(!latch.due(here), "the second does not");
+        latch.observe(here);
+        assert!(
+            !latch.due(here),
+            "a frame with nothing changed re-arms nothing"
+        );
+
+        latch.observe(key(8, Tool::Transform));
+        latch.observe(here);
+        assert!(latch.due(here), "another layer and back re-arms it");
+
+        latch.observe(key(7, Tool::Brush));
+        assert!(latch.due(here), "so does another tool");
+
+        latch.observe(LiftKey {
+            document: crate::session::DocId::for_test(2),
+            ..here
+        });
+        assert!(latch.due(here), "and another document");
+    }
+
+    /// A press with the transform tool on every other refusal stays silent, as
+    /// it always did, and a cut on a folder or no layer does too. The pen going
+    /// down is not a dialog.
+    #[test]
+    fn only_a_vector_layer_makes_a_lift_speak() {
+        for why in EditRefusal::ALL {
+            let said = float_refusal_notice(why, false).is_some();
+            assert_eq!(said, why == EditRefusal::Vector, "{why:?}");
+        }
+        assert!(cut_refusal(EditRefusal::Folder).is_none());
+        assert!(cut_refusal(EditRefusal::Missing).is_none());
+        assert!(cut_refusal(EditRefusal::Locked).is_some());
+        assert!(cut_refusal(EditRefusal::Text).is_some());
+    }
+
     /// The box a refused Ctrl+Z or Ctrl+Y raises says what did not happen, in
     /// the right direction, and names the way out.
     ///
@@ -7719,8 +8783,8 @@ mod tests {
     /// on the keyboard path alone and have two sentences to keep in step.
     #[test]
     fn a_refused_history_step_says_what_did_not_happen_and_how_to_let_it() {
-        let undone = flip_step_refusal("undone");
-        let put_back = flip_step_refusal("put back");
+        let undone = flip_step_refusal("undone", FlipRefusal::Locked);
+        let put_back = flip_step_refusal("put back", FlipRefusal::Locked);
         for (at, notice) in [("undo", &undone), ("redo", &put_back)] {
             assert_eq!(notice.lines.len(), 1, "{at}");
             let line = &notice.lines[0];
@@ -7774,6 +8838,10 @@ mod tests {
     /// `umber-core`; that the gate is *asked* is not covered.
     #[test]
     fn every_reason_a_paste_is_refused_has_a_finished_sentence() {
+        for line in [CUT_VECTOR_LINE, PASTE_VECTOR_LINE] {
+            assert!(!line.contains("  "), "a run of spaces: {line:?}");
+        }
+        assert!(paste_refusal(EditRefusal::Vector).lines[0] == PASTE_VECTOR_LINE);
         let mut said: Vec<String> = Vec::new();
         for why in EditRefusal::ALL {
             let notice = paste_refusal(why);

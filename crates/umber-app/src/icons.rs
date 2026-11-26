@@ -353,9 +353,14 @@ pub enum Icon {
     /// Not `spline`, which was the other candidate: that is two nodes joined by
     /// a *curve*, and this is the one mode in the set that cannot draw one.
     /// Not `pen-tool` either — that is the bezier pen of a vector program, and
-    /// Umber has no vector tool for it to be confused with yet, which is
-    /// exactly why it should not be spent here.
+    /// it was kept back for the Path tool, which is the tool it names.
     SelectPolygon,
+    /// Lucide `spline`: a curve joining two nodes. A change to a vector
+    /// layer's paths, which is what the History row of that name shows.
+    Spline,
+    /// Lucide `pen-tool`: a nib over a curve with its anchor, which is the mark
+    /// every vector program gives its bezier pen and what the Path tool is.
+    PenTool,
 }
 
 /// Where a mark's geometry comes from.
@@ -407,7 +412,7 @@ impl Icon {
     /// Hand-written and therefore checkable rather than self-evident: a test
     /// indexes it from an exhaustive match, so a variant added without a row
     /// here is a compile error rather than an icon nothing ever looks at.
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 56] = [
         Self::Brush,
         Self::Eraser,
         Self::Select,
@@ -462,6 +467,8 @@ impl Icon {
         Self::SelectEllipse,
         Self::SelectLasso,
         Self::SelectPolygon,
+        Self::Spline,
+        Self::PenTool,
     ];
 
     /// The icon's elements, copied from Lucide 1.34.0 unchanged.
@@ -961,6 +968,37 @@ impl Icon {
             Self::SelectPolygon => Art::Lucide(&[Node::Path(
                 "M10.83 2.38a2 2 0 0 1 2.34 0l8 5.74a2 2 0 0 1 .73 2.25l-3.04 9.26a2 2 0 0 1-1.9 1.37H7.04a2 2 0 0 1-1.9-1.37L2.1 10.37a2 2 0 0 1 .73-2.25z",
             )]),
+            // spline
+            Self::Spline => Art::Lucide(&[
+                Node::Circle {
+                    cx: 19.0,
+                    cy: 5.0,
+                    r: 2.0,
+                },
+                Node::Circle {
+                    cx: 5.0,
+                    cy: 19.0,
+                    r: 2.0,
+                },
+                Node::Path("M5 17A12 12 0 0 1 17 5"),
+            ]),
+            // pen-tool, as published on lucide-icons/lucide's main: the arc
+            // flags are packed against the next number (`00-2.756`), which
+            // `lucide::Lexer::flag` reads.
+            Self::PenTool => Art::Lucide(&[
+                Node::Path(
+                    "m18 13-.654-4.736a4 4 0 00-2.756-3.266l-9.163-2.9a2 2 0 00-2.017.493l-.82.819a2 2 0 00-.492 2.017l2.9 9.163a4 4 0 003.266 2.756L13 18",
+                ),
+                Node::Path(
+                    "M18.648 12.352a1.205 1.205 0 011.704 0l1.296 1.296a1.205 1.205 0 010 1.704l-6.296 6.296a1.205 1.205 0 01-1.704 0l-1.296-1.296a1.205 1.205 0 010-1.704z",
+                ),
+                Node::Path("m3 3 6.586 6.586"),
+                Node::Circle {
+                    cx: 11.0,
+                    cy: 11.0,
+                    r: 2.0,
+                },
+            ]),
         }
     }
 }
@@ -1191,6 +1229,8 @@ mod tests {
                 Icon::SelectEllipse => 51,
                 Icon::SelectLasso => 52,
                 Icon::SelectPolygon => 53,
+                Icon::Spline => 54,
+                Icon::PenTool => 55,
             }
         };
         for icon in Icon::ALL {
@@ -1413,6 +1453,42 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// **`pen-tool` draws exactly what it would with every arc flag spaced
+    /// out.** The packed form (`00-2.756`) is how Lucide publishes it, and a
+    /// flag read as a number takes `00` whole and the sign of the next as a
+    /// fresh figure, which parses and lands inside the box: neither guard
+    /// above could see it. The spaced data is written out by hand, so this
+    /// compares the shipped icon against what its author drew, not against a
+    /// second reading by the same lexer.
+    #[test]
+    fn pen_tool_draws_what_its_flags_written_apart_would() {
+        let Art::Lucide(packed) = Icon::PenTool.art() else {
+            panic!("pen-tool is Lucide's");
+        };
+        let spaced = [
+            Node::Path(
+                "m18 13-.654-4.736a4 4 0 0 0-2.756-3.266l-9.163-2.9a2 2 0 0 0-2.017.493l-.82.819a2 2 0 0 0-.492 2.017l2.9 9.163a4 4 0 0 0 3.266 2.756L13 18",
+            ),
+            Node::Path(
+                "M18.648 12.352a1.205 1.205 0 0 1 1.704 0l1.296 1.296a1.205 1.205 0 0 1 0 1.704l-6.296 6.296a1.205 1.205 0 0 1-1.704 0l-1.296-1.296a1.205 1.205 0 0 1 0-1.704z",
+            ),
+            Node::Path("m3 3 6.586 6.586"),
+            Node::Circle {
+                cx: 11.0,
+                cy: 11.0,
+                r: 2.0,
+            },
+        ];
+        let shipped = crate::lucide::flatten(packed);
+        let apart = crate::lucide::flatten(&spaced);
+        assert_eq!(shipped.len(), apart.len(), "a different number of outlines");
+        for (index, (a, b)) in shipped.iter().zip(&apart).enumerate() {
+            assert_eq!(a.points, b.points, "outline {index} is drawn differently");
+            assert_eq!(a.closed, b.closed, "outline {index} closes differently");
+            assert_eq!(a.filled, b.filled, "outline {index} fills differently");
         }
     }
 }

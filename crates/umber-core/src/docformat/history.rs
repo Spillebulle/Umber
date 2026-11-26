@@ -321,7 +321,11 @@ impl<'a> SaveHistory<'a> {
         let mut skipped = 0usize;
         for i in cut..history.len() {
             let edit = history.entry_at(i)?;
-            if edit.kind.is_structural() {
+            // `is_saved`, not `is_structural`: a path edit is no edit to the
+            // stack and still has no patch, so under the narrower test it would
+            // fall through to `SaveBody::Flip` below and discard the whole
+            // history on reload. See `EditKind::is_saved`.
+            if !edit.kind.is_saved() {
                 skipped += usize::from(i < history.position());
                 continue;
             }
@@ -1291,6 +1295,7 @@ mod tests {
                 "Group",
                 "AddMask",
                 "RemoveMask",
+                "Paths",
             ]
         );
     }
@@ -1530,6 +1535,126 @@ mod tests {
         let (_, doc) = round_trip(&stack, &history);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
         assert_eq!(doc.open().history.len(), 0);
+    }
+
+    /// An entry of `kind` that has no business in a file, with a body of the
+    /// shape its kind really carries, or `None` for a kind that is written.
+    ///
+    /// Exhaustive on purpose: a kind added later has to be placed on one side
+    /// here, which is the same question `EditKind::is_saved` asks.
+    fn unsaved_entry(kind: EditKind, stack: &LayerStack) -> Option<Edit> {
+        let structure = || EditBody::Structure(Box::new(stack.shape(SLICE_BYTES)));
+        match kind {
+            EditKind::AddLayer
+            | EditKind::DeleteLayer
+            | EditKind::MoveLayer
+            | EditKind::Group
+            | EditKind::AddMask
+            | EditKind::RemoveMask => Some(Edit::new(kind, structure())),
+            EditKind::Paths => Some(Edit::vector(0, None, None)),
+            EditKind::Paint
+            | EditKind::Erase
+            | EditKind::Transform
+            | EditKind::FlipHorizontal
+            | EditKind::FlipVertical => None,
+        }
+    }
+
+    /// **A path edit is not written, and leaving it out costs nothing.**
+    ///
+    /// It has no patch and is not structural, so before `is_saved` it fell
+    /// through `patches().first()` to `SaveBody::Flip` with a zero rectangle:
+    /// the file then said "flip", the reader found a kind that is no flip and
+    /// a width of zero, and refused the whole history. The assertion that no
+    /// entry is a `Flip` body is what stands in for reading the manifest, and
+    /// the reload is what shows the history survived.
+    #[test]
+    fn a_paths_entry_is_not_written_and_does_not_cost_the_history() {
+        let stack = stack(&["Paper"]);
+        let a = stack.get(0).unwrap().slot().unwrap();
+
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(a, 5, 3, 11)));
+        history.record(Edit::vector(a, None, None));
+        history.record(Edit::new(EditKind::Paint, patch(a, 4, 4, 22)));
+
+        let saved = SaveHistory::new(&history, &stack).expect("a history with a path edit");
+        assert_eq!(saved.entries.len(), 2, "the path edit was written");
+        for entry in &saved.entries {
+            assert!(
+                !matches!(entry.body, SaveBody::Flip),
+                "an entry was written as a canvas flip"
+            );
+        }
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+        assert_eq!(
+            (0..back.len()).map(|i| back.kind_at(i)).collect::<Vec<_>>(),
+            vec![Some(EditKind::Paint), Some(EditKind::Paint)],
+            "the history was lost or kept the path edit"
+        );
+        assert_eq!(
+            back.position(),
+            2,
+            "the cursor did not move by the row left out"
+        );
+    }
+
+    /// Every kind the file cannot hold is skipped and the rest reloads, wherever
+    /// in the history it sits.
+    #[test]
+    fn every_unsaved_kind_is_skipped() {
+        let stack = stack(&["Paper"]);
+        let a = stack.get(0).unwrap().slot().unwrap();
+        let mut seen = 0;
+
+        for kind in EditKind::ALL {
+            let Some(_) = unsaved_entry(kind, &stack) else {
+                assert!(kind.is_saved(), "{kind:?} is written but has no body here");
+                continue;
+            };
+            assert!(!kind.is_saved(), "{kind:?} is read back but is not saved");
+            seen += 1;
+
+            // First, which is the one place a deleting kind can sit without
+            // cutting away the paint behind it. Then in the middle, for the
+            // kinds that do not.
+            let mut places = vec![0usize];
+            if !kind.resurrects_pixels() {
+                places.push(1);
+            }
+            for place in places {
+                let mut history = History::default();
+                let mut paints = [11u8, 22].into_iter();
+                for i in 0..3 {
+                    if i == place {
+                        history.record(unsaved_entry(kind, &stack).unwrap());
+                    } else {
+                        let fill = paints.next().unwrap();
+                        history.record(Edit::new(EditKind::Paint, patch(a, 4, 4, fill)));
+                    }
+                }
+
+                let saved = SaveHistory::new(&history, &stack)
+                    .unwrap_or_else(|| panic!("{kind:?} refused the whole history"));
+                assert_eq!(saved.entries.len(), 2, "{kind:?} was written");
+
+                let (_, doc) = round_trip(&stack, &history);
+                assert!(doc.warnings.is_empty(), "{kind:?}: {:?}", doc.warnings);
+                let back = doc.open().history;
+                assert_eq!(
+                    (0..back.len()).map(|i| back.kind_at(i)).collect::<Vec<_>>(),
+                    vec![Some(EditKind::Paint), Some(EditKind::Paint)],
+                    "{kind:?} at {place} cost the saved history its paint"
+                );
+            }
+        }
+        assert_eq!(
+            seen, 7,
+            "the unsaved kinds changed; say which side the new one is on"
+        );
     }
 
     // ------------------------------------------------- the reader's own bounds

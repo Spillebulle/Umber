@@ -25,6 +25,57 @@ archive can be installed beside it.
   distributions. When an update is out, Umber says that command; on an Arch
   machine without the archive it names the exact file to fetch instead.
 
+- **Vector layers.** A new kind of layer that holds lines instead of paint.
+  Make one with the spline button beside Add on the Layers panel, or let the
+  commands below make one for you. It keeps its lines when you save and reopen,
+  follows a canvas flip, moves with the picture when you resize the canvas, and
+  every change to it is one undo step. Paste and cut are refused on it with a
+  sentence, and the brush does not paint on it. Clear layer is greyed out,
+  because there is no paint to clear. The transform tool says once that there
+  is nothing on it to move, not every time you press.
+- **The Path tool.** Press `P` or pick it on the tool rail. In Draw, click to
+  place a corner, drag to pull out a curve, and click the first point to close
+  the path. Press Enter to finish an open one, Backspace to take back the last
+  point and Escape to abandon it. Click the end of an open path to carry on from
+  it. While you are drawing, Undo takes back the last point.
+- **Edit paths by hand.** In Edit, click a line to pick it, drag a point or a
+  handle, drag a line to move the whole path, or click a line to add a point on
+  it. Delete removes the picked point or path. The options strip switches
+  between Draw and Edit and between Cut and Plot, closes or opens a path, and
+  makes a point a corner or smooth. Every change is one undo step. Paths made
+  from a selection are edited the same way.
+- **A path that has nowhere to go stays on screen**, with the reason on the
+  options strip, so nothing you drew is lost. Changing tool, switching tab or
+  closing the document puts a path you were drawing on a layer. A canvas flip
+  carries it with the picture.
+- **Cut path from selection and Plot path from selection**, on the Edit menu.
+  Each turns the outline of the current selection into a closed line, on the
+  active vector layer or on a new one made for it. A path no longer lands on a
+  hidden layer; it goes on a new one instead.
+- **Trace outline**, on the Edit menu. It draws a smooth closed line round each
+  piece of artwork, as a cut or a plot line on a vector layer, standing off by a
+  margin you set. The dialog shows the margin in millimetres too. Trace
+  everything in view or just the selected layer or folder, and keep the holes
+  inside a shape if you want them cut as well. Shadows and outline effects are
+  traced with the layer that casts them. The result is one undo step.
+- **Cut and plot lines are drawn over the canvas, not into the picture.** They
+  show as a crisp two-tone line at any zoom, in a colour of their own for each
+  kind. They never appear in an export, the flattened preview, the eyedropper
+  or a smudge, so a cut line cannot end up in what you print.
+- **A selection you have combined with Add, Subtract or Intersect gives a
+  stair-stepped path**, because its outline has to be traced back out of
+  pixels. Smoothing comes later.
+- **A document with a vector layer needs this version or newer.** An older
+  Umber refuses it rather than opening it with the lines missing and saving
+  over them.
+- **A line pushed too far off the canvas is removed, and Umber says so.** A
+  flip or a resize can carry a line that already lay far outside the picture
+  past the furthest a document can hold. That one line goes and the others on
+  the layer stay.
+- **A document with lines from a newer Umber cannot be flipped or resized.**
+  This version cannot read those lines, so it cannot move them with the
+  picture. Flip canvas and the resize in Canvas settings say so instead.
+
 ### Fixed
 
 - **A second application from the archive installs beside Umber.** The `.deb`

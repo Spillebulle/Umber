@@ -53,7 +53,7 @@ use crate::editor::Editor;
 use crate::session::DocId;
 use egui::{Context, TextureHandle};
 use std::collections::HashMap;
-use umber_core::{LayerStack, thumbnail};
+use umber_core::{Layer, LayerStack, thumbnail};
 use umber_render::{CanvasRenderer, Thumbnail};
 
 /// Ask the renderer for the next thumbnail the list is missing.
@@ -76,24 +76,13 @@ pub fn request(editor: &mut Editor, canvas: &mut CanvasRenderer) {
 
     let mut slots = [(0u32, 0u64); LayerStack::MAX];
     let mut live = [0u32; LayerStack::MAX];
-    let mut count = 0;
-    // A folder has no slice to draw a picture of. The list shows it a folder
-    // mark instead — the honest answer, where a thumbnail of one arbitrary
-    // child would be a picture that lies about what the group holds. Compositing
-    // the contents is the right answer and is a third mode for `thumbnail.wgsl`;
-    // see `docs/layer-folders.md`.
-    for slot in editor
-        .layers
-        .layers()
-        .iter()
-        .filter_map(|l| l.slot())
-        .take(LayerStack::MAX)
-    {
-        slots[count] = (slot, canvas.slot_revision(slot));
-        live[count] = slot;
-        count += 1;
-    }
-    let (slots, live) = (&slots[..count], &live[..count]);
+    let (held, asked) = thumbnail_slots(
+        editor.layers.layers(),
+        |s| canvas.slot_revision(s),
+        &mut slots,
+        &mut live,
+    );
+    let (slots, live) = (&slots[..asked], &live[..held]);
     editor.thumbs.retain(live);
 
     if canvas.thumb_in_flight() {
@@ -105,6 +94,53 @@ pub fn request(editor: &mut Editor, canvas: &mut CanvasRenderer) {
     if let Some(slot) = editor.thumbs.wanted(slots, active) {
         canvas.begin_thumb(slot);
     }
+}
+
+/// Does this layer's row show a mark of paths where a picture would be?
+///
+/// A vector layer none of whose paths is ink has nothing on the canvas yet, so
+/// a thumbnail of it would be a reading of an empty slice that costs a render
+/// pass and a readback to say "nothing". Drawn from the one rule by the row and
+/// by [`thumbnail_slots`], so the mark and the request cannot disagree: a row
+/// that drew the mark while a thumbnail was still being asked for would be a
+/// pass spent on a picture nobody sees. `has_ink` is false for a record this
+/// build cannot read, which is also right: there is nothing of it to draw.
+pub fn shows_a_path_mark(layer: &Layer) -> bool {
+    layer.vector().is_some_and(|v| !v.has_ink())
+}
+
+/// Fill the two lists `request` hands the cache, and say how many of each:
+/// `(live, asked)`.
+///
+/// A function of the layers and a revision reading, so "a vector layer asks for
+/// no thumbnail" can be tested without a renderer: the loop used to be inline
+/// in `request`, where a guard could not reach it. A folder has no slice to
+/// draw a picture of — the list shows it a folder mark instead, the honest
+/// answer, where a thumbnail of one arbitrary child would lie about what the
+/// group holds — and a path layer has the mark above.
+///
+/// `live` is every slot still in the stack, vector layers included, because
+/// `retain` forgets any slot not in it and a layer that gains ink later must
+/// not have been forgotten meanwhile. **Only `slots` leaves them out.**
+fn thumbnail_slots(
+    layers: &[Layer],
+    revision: impl Fn(u32) -> u64,
+    slots: &mut [(u32, u64); LayerStack::MAX],
+    live: &mut [u32; LayerStack::MAX],
+) -> (usize, usize) {
+    let mut asked = 0;
+    let mut held = 0;
+    for layer in layers.iter().take(LayerStack::MAX) {
+        let Some(slot) = layer.slot() else { continue };
+        live[held] = slot;
+        held += 1;
+        if !shows_a_path_mark(layer) {
+            slots[asked] = (slot, revision(slot));
+            asked += 1;
+        }
+    }
+    // The two counts differ, and `request` needs both.
+    (held, asked)
 }
 
 /// What is known about one slot.
@@ -395,5 +431,54 @@ mod tests {
         assert!(cache.picture(3).is_some(), "the same document keeps it");
         cache.follow(DocId::for_test(2));
         assert!(cache.picture(3).is_none());
+    }
+
+    /// A path layer shows a mark and is never read back.
+    ///
+    /// Three layers, because two cannot tell the rule from its neighbours: a
+    /// plain one that must still be asked for, a layer of cut lines that must
+    /// not, and a layer carrying an ink path, which has pixels to show and must
+    /// be. The slot of the middle one still has to be **live**, or `retain`
+    /// would forget it and a layer that gained ink later would start from
+    /// nothing. The loop under test is the one `request` runs, driven through
+    /// the function it calls rather than through a copy of its rule.
+    #[test]
+    fn a_vector_layers_row_asks_for_no_thumbnail() {
+        let path = |role| umber_core::Path {
+            role,
+            closed: false,
+            nodes: vec![
+                umber_core::Node::corner(glam::Vec2::new(1.0, 1.0)),
+                umber_core::Node::corner(glam::Vec2::new(9.0, 9.0)),
+            ],
+            ink: None,
+        };
+        let record = |role| {
+            umber_core::VectorObject::empty()
+                .appended(vec![path(role)])
+                .expect("a small record")
+        };
+        let mut stack = LayerStack::new();
+        let plain = stack.active_slot().expect("a layer");
+        stack
+            .add_vector_layer("Cut lines", record(umber_core::PathRole::Cut))
+            .expect("room");
+        let cut = stack.active_slot().expect("a layer");
+        stack
+            .add_vector_layer("Ink", record(umber_core::PathRole::Ink))
+            .expect("room");
+        let ink = stack.active_slot().expect("a layer");
+
+        let mut slots = [(0u32, 0u64); LayerStack::MAX];
+        let mut live = [0u32; LayerStack::MAX];
+        let (held, asked) = thumbnail_slots(stack.layers(), |_| 0, &mut slots, &mut live);
+
+        let asked_for: Vec<u32> = slots[..asked].iter().map(|(s, _)| *s).collect();
+        assert_eq!(asked_for, vec![plain, ink], "only layers with pixels");
+        assert!(!asked_for.contains(&cut));
+        assert_eq!(&live[..held], &[plain, cut, ink], "but every slot is live");
+        assert!(shows_a_path_mark(&stack.layers()[1]));
+        assert!(!shows_a_path_mark(&stack.layers()[0]));
+        assert!(!shows_a_path_mark(&stack.layers()[2]));
     }
 }

@@ -138,10 +138,13 @@ pub enum EditKind {
     /// picture — what the mask hid comes back — which is why it is not filed
     /// under `DeleteLayer`.
     RemoveMask,
+    /// A vector layer's paths changed. Holds no pixels: the layer's own record
+    /// is what is put back, and the pixels are drawn from it again.
+    Paths,
 }
 
 impl EditKind {
-    pub const ALL: [EditKind; 11] = [
+    pub const ALL: [EditKind; 12] = [
         Self::Paint,
         Self::Erase,
         Self::Transform,
@@ -153,6 +156,7 @@ impl EditKind {
         Self::Group,
         Self::AddMask,
         Self::RemoveMask,
+        Self::Paths,
     ];
 
     /// Which kind a stroke in `mode` records.
@@ -191,14 +195,18 @@ impl EditKind {
             | Self::MoveLayer
             | Self::Group
             | Self::AddMask
-            | Self::RemoveMask => None,
+            | Self::RemoveMask
+            | Self::Paths => None,
         }
     }
 
     /// Is this an edit to the *stack* rather than to pixels?
     ///
-    /// Read by the writer, which cannot yet put one in a file — see
-    /// `docformat::history::SaveHistory::new`.
+    /// **Nothing outside the tests reads this any more.** The writer and the
+    /// reader both ask [`EditKind::is_saved`] instead, because
+    /// [`EditKind::Paths`] is the first kind that is neither structural nor
+    /// writable. It is kept, exhaustive, because the question is still a real
+    /// one and the argument below is the reason `is_saved` exists.
     ///
     /// **An exhaustive `match` rather than the `matches!` this used to be**,
     /// and what it is guarding is the arms that answer `false`. Under
@@ -230,22 +238,55 @@ impl EditKind {
             | Self::Erase
             | Self::Transform
             | Self::FlipHorizontal
-            | Self::FlipVertical => false,
+            | Self::FlipVertical
+            | Self::Paths => false,
+        }
+    }
+
+    /// Does this entry go into a saved history?
+    ///
+    /// The one predicate the writer and the reader both ask, and it is not
+    /// [`EditKind::is_structural`] with a second name. A [`EditKind::Paths`]
+    /// entry is not structural (it is no edit to the stack) and still has no
+    /// patch and is no flip, so `SaveHistory::new` would fall through
+    /// `patches().first()` to `None` and write it as `SaveBody::Flip`, which
+    /// reloads as a zero-sized rectangle and discards the whole history. It
+    /// cannot be written, because the record it would restore is a value on a
+    /// layer that a reopened undo has no way to put back safely.
+    ///
+    /// Exhaustive, so a new kind has to say which side it is on. `false` is the
+    /// kind that is left out; `true` is everything the file can hold.
+    pub fn is_saved(self) -> bool {
+        match self {
+            Self::AddLayer
+            | Self::DeleteLayer
+            | Self::MoveLayer
+            | Self::Group
+            | Self::AddMask
+            | Self::RemoveMask
+            | Self::Paths => false,
+            Self::Paint
+            | Self::Erase
+            | Self::Transform
+            | Self::FlipHorizontal
+            | Self::FlipVertical => true,
         }
     }
 
     /// Does undoing this put a layer's **pixels** back in the stack?
     ///
     /// The line the saved history is cut at, and it is a narrower question than
-    /// [`EditKind::is_structural`] on purpose. None of the six can be written
-    /// into a file yet, but only these two make the entries *older* than them
-    /// unwritable as well: a patch recorded before a delete names a slice no
+    /// [`EditKind::is_structural`] on purpose. None of the six structural kinds,
+    /// and not [`EditKind::Paths`] either, can be written into a file yet, but
+    /// only these two make the entries *older* than them unwritable as well: a patch recorded before a delete names a slice no
     /// layer in the saved stack holds, so it cannot be placed at all. An add, a
     /// move, a group or a new mask leaves every patch either side naming the
     /// layer it was captured from, so those entries are simply left out and
     /// everything around them is saved whole — which matters, because dragging
     /// a layer in the panel is one of the commonest things an artist does and
-    /// cutting the history there would silently discard the morning.
+    /// cutting the history there would silently discard the morning. A
+    /// [`EditKind::Paths`] entry is the same: it swaps a record back by slot and
+    /// moves no slice, so every patch either side still names its own pixels.
     ///
     /// Exhaustive for the reason [`EditKind::is_structural`] is, and the
     /// difference is only that today's silent answer happens to be the safe
@@ -274,7 +315,8 @@ impl EditKind {
             | Self::AddLayer
             | Self::MoveLayer
             | Self::Group
-            | Self::AddMask => false,
+            | Self::AddMask
+            | Self::Paths => false,
         }
     }
 
@@ -291,14 +333,16 @@ impl EditKind {
             Self::Group => "Group",
             Self::AddMask => "Add mask",
             Self::RemoveMask => "Remove mask",
+            Self::Paths => "Edit paths",
         }
     }
 }
 
 /// What an entry holds in order to be undone.
 ///
-/// Three shapes, because there are three ways an edit can be reversible and
-/// only one of them costs memory:
+/// Five shapes. Three are the three ways an edit can be reversible, and only
+/// the first of those costs pixel memory; the last two are pixels or nothing
+/// carried together with a record that has to travel with them:
 ///
 /// * [`EditBody::Pixels`] is everything that paints. The engine cannot work out
 ///   what was under a stroke, so it keeps it.
@@ -311,6 +355,9 @@ impl EditKind {
 /// * [`EditBody::Text`] is pixels **and** the [`crate::textobj::TextObject`]
 ///   that made them. See its own docs for why that is not the mixing the
 ///   paragraph below refuses.
+/// * [`EditBody::Vector`] is a vector layer's record and no pixels, put back by
+///   slot. Cut and Plot paths draw nothing into the layer, so the record is the
+///   whole of the edit.
 ///
 /// **No entry mixes pixels and *structure*.** A structural entry never carries
 /// a patch, for the reason the timeline is stepped rather than seeked: a delete
@@ -372,6 +419,19 @@ pub enum EditBody {
         /// which is what placing text on an ordinary layer undoes to.
         was: Option<Box<crate::textobj::TextObject>>,
     },
+    /// The vector record the layer in `slot` held before the edit.
+    ///
+    /// No pixels: a path edit writes none (Cut and Plot are lines drawn over
+    /// the canvas, never into the layer), so restoring the record is the whole
+    /// undo. By **slot** and not position,
+    /// for the reason [`crate::layer::LayerStack::restore_vector`] gives.
+    /// In memory only; see [`EditKind::is_saved`].
+    Vector {
+        slot: u32,
+        /// `None` where the layer held no record, which is what making a layer
+        /// vector undoes to.
+        was: Option<Box<crate::vector::VectorObject>>,
+    },
 }
 
 impl From<PixelPatch> for EditBody {
@@ -411,6 +471,12 @@ impl EditBody {
             // uses for one.
             Self::Text { patch, was } => {
                 patch.byte_len() + was.as_ref().map_or(0, |t| t.byte_len())
+            }
+            // The record is the whole cost, and the arm is counted so that an
+            // entry holding `None` is not free: a long run of them would
+            // otherwise be a list the budget cannot see growing.
+            Self::Vector { was, .. } => {
+                std::mem::size_of::<Self>() + was.as_ref().map_or(0, |v| v.byte_len())
             }
         }
     }
@@ -460,6 +526,18 @@ impl Edit {
         }
     }
 
+    /// A vector layer's record, as it was before an edit to its paths.
+    ///
+    /// Takes the time as the caller has it, like [`Edit::made_at`]: pass
+    /// `Some(Timestamp::now())` for an edit made now.
+    pub fn vector(
+        slot: u32,
+        was: Option<Box<crate::vector::VectorObject>>,
+        at: Option<Timestamp>,
+    ) -> Self {
+        Self::made_at(EditKind::Paths, at, EditBody::Vector { slot, was })
+    }
+
     /// The pixels this entry replaced, for the entries that hold any.
     ///
     /// **A slice, and there is deliberately no singular accessor beside it.**
@@ -478,7 +556,7 @@ impl Edit {
             // arm of its own, and what makes the budget, the eviction and the
             // saved-history resolution all treat it as the paint it is.
             EditBody::Text { patch, .. } => std::slice::from_ref(patch),
-            EditBody::Structure(_) | EditBody::Flip => &[],
+            EditBody::Structure(_) | EditBody::Flip | EditBody::Vector { .. } => &[],
         }
     }
 
@@ -1161,6 +1239,7 @@ mod tests {
             EditKind::Group => EditKind::ALL[8],
             EditKind::AddMask => EditKind::ALL[9],
             EditKind::RemoveMask => EditKind::ALL[10],
+            EditKind::Paths => EditKind::ALL[11],
         }
     }
 
@@ -1194,6 +1273,42 @@ mod tests {
                  missing from it"
             );
         }
+    }
+
+    /// **A path edit costs its record**, plus the arm, so one holding nothing is
+    /// still not free, and the budget evicts it as it does any other entry.
+    #[test]
+    fn a_vector_entry_costs_its_record_and_is_evicted_like_any_other() {
+        use crate::vector::{Node, Path, PathRole, VectorObject};
+        use glam::Vec2;
+
+        let path = Path {
+            role: PathRole::Cut,
+            closed: false,
+            nodes: (0..100)
+                .map(|i| Node::corner(Vec2::new(i as f32, 0.0)))
+                .collect(),
+            ink: None,
+        };
+        let record = VectorObject::Paths(vec![path]);
+        let cost = record.byte_len();
+        assert!(cost > 0);
+
+        let none = Edit::vector(0, None, None);
+        let some = Edit::vector(0, Some(Box::new(record.clone())), None);
+        assert!(none.byte_len() > 0, "an entry with no record is free");
+        assert_eq!(some.byte_len(), none.byte_len() + cost);
+        assert!(some.patches().is_empty(), "a vector entry holds no patch");
+        assert_eq!(some.kind, EditKind::Paths);
+
+        // Room for two, then a third: the oldest goes, and it is counted.
+        let mut h = History::with_budget(some.byte_len() * 2 + some.byte_len() / 2);
+        for _ in 0..3 {
+            h.record(Edit::vector(0, Some(Box::new(record.clone())), None));
+        }
+        assert_eq!(h.len(), 2, "the budget did not evict the oldest record");
+        assert_eq!(h.dropped(), 1);
+        assert_eq!(h.used_bytes(), some.byte_len() * 2);
     }
 
     /// A list of the history has to name what each entry was, and an eraser
@@ -1587,6 +1702,14 @@ mod tests {
                     was: held,
                 }
             }
+            // The record swapped for the layer's own, by slot; no pixels.
+            EditBody::Vector { slot, was } => match stack.restore_vector(slot, was) {
+                Ok(previous) => EditBody::Vector {
+                    slot,
+                    was: previous,
+                },
+                Err(was) => EditBody::Vector { slot, was },
+            },
         };
         Edit::made_at(edit.kind, edit.at, body)
     }
@@ -1829,6 +1952,13 @@ mod tests {
                         was: held,
                     }
                 }
+                EditBody::Vector { slot, was } => match self.stack.restore_vector(slot, was) {
+                    Ok(previous) => EditBody::Vector {
+                        slot,
+                        was: previous,
+                    },
+                    Err(was) => EditBody::Vector { slot, was },
+                },
             };
             Edit::made_at(edit.kind, edit.at, body)
         }

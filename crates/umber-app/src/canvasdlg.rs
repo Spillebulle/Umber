@@ -298,6 +298,11 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
     let Some(which) = ed.canvas_form.open else {
         return;
     };
+    // Read before the form is borrowed. A document holding paths from a newer
+    // Umber cannot change size (`Editor::resize_refused`), so Apply is disabled
+    // with the sentence the command would raise, rather than offering what
+    // `App::apply_canvas` then declines.
+    let newer_paths = ed.layers.has_opaque_vector();
     let form = &mut ed.canvas_form;
     let mut close = false;
 
@@ -389,6 +394,15 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
                     }
                 });
 
+            let refused = which == Dialog::Settings && newer_paths && form.resizes();
+            if refused {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(crate::editor::RESIZE_NEWER_PATHS)
+                        .size(text::SMALL)
+                        .color(p.text),
+                );
+            }
             ui.add_space(16.0);
             // Inside a `horizontal`. A bare `right_to_left` takes the whole of
             // the remaining height of the `Ui` it is in, because the align is
@@ -403,7 +417,10 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
                         Dialog::New => "Create",
                         Dialog::Settings => "Apply",
                     };
-                    if tabs::button(ui, p, label, true) {
+                    if ui
+                        .add_enabled_ui(!refused, |ui| tabs::button(ui, p, label, true))
+                        .inner
+                    {
                         match which {
                             Dialog::New => out.create = Some(form.document()),
                             Dialog::Settings => {
@@ -1110,6 +1127,37 @@ mod tests {
 
     fn drawn_height(ed: &mut Editor, height: f32) -> f32 {
         drawn(ed, height).0
+    }
+
+    /// A document holding paths from a newer Umber says why Apply will not
+    /// resize it, read off what the dialog drew; the same dialog over an
+    /// ordinary document, and over an unchanged size, says nothing.
+    #[test]
+    fn the_settings_dialog_says_why_a_resize_is_refused() {
+        let says = |newer: bool, aspect: Option<Aspect>| {
+            let mut ed = Editor::default();
+            if newer {
+                ed.layers
+                    .add_vector_layer("Newer", umber_core::VectorObject::Opaque(b"{}".to_vec()))
+                    .expect("room");
+            }
+            ed.canvas_form
+                .open(Dialog::Settings, Document::new(1000, 1000));
+            if let Some(aspect) = aspect {
+                ed.canvas_form.pick_aspect(aspect);
+            }
+            let (_, words) = drawn(&mut ed, 900.0);
+            words.iter().any(|w| w == crate::editor::RESIZE_NEWER_PATHS)
+        };
+        assert!(
+            says(true, Some(Aspect::Paper)),
+            "a refused resize said nothing"
+        );
+        assert!(
+            !says(false, Some(Aspect::Paper)),
+            "an ordinary document was refused"
+        );
+        assert!(!says(true, None), "an unchanged size was refused");
     }
 
     #[test]

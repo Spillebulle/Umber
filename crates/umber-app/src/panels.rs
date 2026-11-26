@@ -903,7 +903,7 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing = vec2(metrics::TOOL_GAP, metrics::TOOL_GAP);
 
-        // Umber has seven tools where the design shows sixteen; the rest are
+        // Umber has eight tools where the design shows sixteen; the rest are
         // simply not drawn, rather than shown as buttons that do nothing.
         //
         // The keys come from the binding table rather than being written in:
@@ -929,6 +929,11 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                 Tool::Transform,
                 Icon::Transform,
                 shortcuts::labelled("Transform", Action::TransformTool),
+            ),
+            (
+                Tool::Path,
+                Icon::PenTool,
+                shortcuts::labelled("Path", Action::PathTool),
             ),
             (
                 Tool::Eyedropper,
@@ -1522,6 +1527,23 @@ fn add_layer_button(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActio
     ) {
         actions.add_layer = true;
     }
+    // Beside it rather than in the header: it acts on neither the selection nor
+    // the ticked set, which is the argument that put the add mark here, and the
+    // header's strip is held to a pinned 104 points that a sixth mark would move.
+    // Disabled on the stack's own limit with the add mark's tooltip's reason.
+    if icon_button(
+        ui,
+        p,
+        Icon::Spline,
+        ed.layers.len() < LayerStack::MAX,
+        if ed.layers.len() < LayerStack::MAX {
+            "New vector layer"
+        } else {
+            "The stack is full. Delete a layer to make room."
+        },
+    ) {
+        actions.new_vector_layer = true;
+    }
 }
 
 fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
@@ -2002,6 +2024,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     locked_by_folder: !layer.locked && ed.layers.effective_locked(index),
                     link: layer.link,
                     thumb: layer.slot().and_then(|s| ed.thumbs.picture(s)),
+                    paths: crate::thumbs::shows_a_path_mark(layer),
                     picked: layer.picked,
                 },
             )
@@ -2367,6 +2390,7 @@ fn edit_icon(kind: EditKind) -> Icon {
         EditKind::Group => Icon::Folder,
         EditKind::AddMask => Icon::Mask,
         EditKind::RemoveMask => Icon::MaskOff,
+        EditKind::Paths => Icon::Spline,
     }
 }
 
@@ -3523,6 +3547,80 @@ mod tests {
         );
     }
 
+    /// **No mark on the flags row lands on another, and none runs off the
+    /// column**, with the vector layer's mark beside Add, at the design's width
+    /// and at the narrowest a column may be dragged.
+    ///
+    /// Measured off the rectangles egui recorded for the widgets it laid out,
+    /// not off the arithmetic the row does: the row wraps, and a mark that
+    /// overran would be drawn over its neighbour rather than reflowed, which no
+    /// assertion about the code could see. The two marks the flags row adds,
+    /// `ui::ICON_BUTTON` square, are found side by side on one line first, so
+    /// the sweep cannot pass by having measured nothing.
+    #[test]
+    fn the_flags_row_marks_never_overlap_at_any_column_width() {
+        use crate::dock::limits;
+        use crate::editor::Editor;
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Rect, pos2, vec2};
+
+        let palette = Palette::of(ThemeKind::Graphite);
+        for width in [metrics::PANEL, limits::SIDEBAR_MIN_WIDTH] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            crate::theme::apply(&ctx, &palette);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 600.0))),
+                ..Default::default()
+            };
+            let mut ed = Editor::default();
+            ed.layers.add();
+            for _ in 0..2 {
+                let _ = ctx.run_ui(input.clone(), |ui| {
+                    let mut actions = crate::ui::UiActions::default();
+                    super::layers_body(ui, &palette, &mut ed, &mut actions);
+                });
+            }
+            let square = |r: &Rect, side: f32| {
+                (r.width() - side).abs() < 0.01 && (r.height() - side).abs() < 0.01
+            };
+            let marks: Vec<Rect> = ctx.viewport(|vp| {
+                vp.prev_pass
+                    .widgets
+                    .layers()
+                    .flat_map(|(_, rects)| rects.iter())
+                    .map(|w| w.rect)
+                    .filter(|r| {
+                        square(r, crate::ui::ICON_BUTTON) || square(r, crate::widgets::ICON_TOGGLE)
+                    })
+                    .collect()
+            });
+            let buttons: Vec<&Rect> = marks
+                .iter()
+                .filter(|r| square(r, crate::ui::ICON_BUTTON))
+                .collect();
+            assert!(
+                buttons.iter().any(|a| buttons
+                    .iter()
+                    .any(|b| (a.top() - b.top()).abs() < 0.01 && b.left() > a.left())),
+                "at {width}: the Add and vector marks were not found side by side"
+            );
+            for (i, a) in marks.iter().enumerate() {
+                assert!(
+                    a.left() >= -0.01 && a.right() <= width + 0.01,
+                    "at {width}: a mark at {a:?} runs off the column"
+                );
+                for b in &marks[i + 1..] {
+                    let overlap = a.intersect(*b);
+                    assert!(
+                        overlap.width() <= 0.01 || overlap.height() <= 0.01,
+                        "at {width}: marks at {a:?} and {b:?} overlap"
+                    );
+                }
+            }
+        }
+    }
+
     /// A module header never draws its title under its own controls, and never
     /// on a second line.
     ///
@@ -4266,6 +4364,83 @@ mod blend_picker_tests {
             widest.1,
             widest.0,
             room
+        );
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use crate::editor::{Editor, Tool};
+    use crate::theme::{Palette, ThemeKind};
+    use egui::{Event, PointerButton, RawInput, Rect, pos2, vec2};
+
+    /// **The rail has a Path button, straight after Transform.**
+    ///
+    /// Read by pressing: the same row is clicked at every few points across its
+    /// width twice, once with the Pan tool in hand and once with Zoom, so a
+    /// press that landed on a button answers the same tool both times and a
+    /// press on nothing answers whatever was already in hand. What came out,
+    /// left to right, is the rail's order as the pointer meets it, which is
+    /// the one thing a painter sees.
+    #[test]
+    fn the_rail_has_a_path_button_after_transform() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 120.0));
+        let mut now = 0.0f64;
+        let mut press = |held: Tool, at: egui::Pos2| {
+            let mut ed = Editor::default();
+            ed.ui.tool = held;
+            let button = |pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            for events in [
+                vec![Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+            ] {
+                now += 0.05;
+                let _ = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(now),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| super::tools_body(ui, &palette, &mut ed),
+                );
+            }
+            ed.ui.tool
+        };
+        // Two frames of warm-up for the font atlas, through a throwaway press.
+        let _ = press(Tool::Pan, pos2(1.0, 1.0));
+
+        let mut order: Vec<Tool> = Vec::new();
+        for step in 0..100 {
+            let at = pos2(step as f32 * 4.0, 16.0);
+            let (a, b) = (press(Tool::Pan, at), press(Tool::Zoom, at));
+            if a == b && order.last() != Some(&a) {
+                order.push(a);
+            }
+        }
+        assert_eq!(
+            order,
+            vec![
+                Tool::Brush,
+                Tool::Eraser,
+                Tool::Select,
+                Tool::Transform,
+                Tool::Path,
+                Tool::Eyedropper,
+                Tool::Pan,
+                Tool::Zoom,
+            ],
+            "the rail, left to right"
         );
     }
 }

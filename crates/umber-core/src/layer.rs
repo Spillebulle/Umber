@@ -87,6 +87,25 @@
 //!   the placement is a rectangle of a canvas that no longer exists, and the
 //!   pixels may have been cropped.
 //!
+//! # Vector layers
+//!
+//! A vector layer is a layer that carries a [`VectorObject`] beside its blank
+//! slot, exactly as a text layer carries a record, and for the same reason it
+//! is a field rather than a third kind beside a folder: it holds a slot, takes a
+//! mask, clips, links and reorders, and travels inside a structural undo entry
+//! with nothing written to make that happen.
+//!
+//! * **Paint is refused on it** at [`LayerStack::refusal_at`], the one gate,
+//!   and its mask is not, for the text layer's reason.
+//! * **It is made by [`LayerStack::add_vector_layer`] alone.**
+//!   [`LayerStack::set_vector`] refuses a layer that has no record, so a plain
+//!   layer cannot be turned into one by a stray call and a text layer cannot be
+//!   both.
+//! * **A canvas flip mirrors the paths and a resize moves them**, and a resize
+//!   strips the Ink from a record it moves, because Ink describes pixels the
+//!   resize has just cropped or shifted and Cut and Plot describe nothing but
+//!   geometry. Neither is dropped, which is the difference from text.
+//!
 //! # Folders
 //!
 //! The stack is still one `Vec` and every existing caller still indexes it by
@@ -141,13 +160,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use glam::UVec2;
+use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
 use crate::effect::{self, Effect, EffectKind};
 use crate::geom::FlipAxis;
 use crate::textobj::TextObject;
+use crate::vector::{VectorObject, VectorRefusal};
 
 /// The slices of one document's layer array: which are in use, and which
 /// number the next one would take.
@@ -358,6 +378,9 @@ pub enum EditRefusal {
     /// The layer holds text that can still be edited, so painting on it would
     /// leave a record describing pixels it did not make.
     Text,
+    /// The layer holds vector paths, which are drawn from a record and not
+    /// painted, so a brush has nothing to put pixels into.
+    Vector,
     /// There is no entry at that position.
     ///
     /// Not a state a caller should be able to reach — the selected index is
@@ -378,7 +401,13 @@ impl EditRefusal {
     /// walks this array can only ever check what is already in it. See
     /// `every_refusal_is_named_in_the_all_array`, which also names the hole that
     /// remedy still leaves.
-    pub const ALL: [EditRefusal; 4] = [Self::Folder, Self::Locked, Self::Text, Self::Missing];
+    pub const ALL: [EditRefusal; 5] = [
+        Self::Folder,
+        Self::Locked,
+        Self::Text,
+        Self::Vector,
+        Self::Missing,
+    ];
 
     /// What to tell somebody who asked for an edit this refuses.
     ///
@@ -405,9 +434,37 @@ impl EditRefusal {
                 "This layer holds text that can still be edited, so nothing may be \
                  painted or pasted onto it."
             }
+            Self::Vector => "This is a vector layer. Paint on an ordinary layer instead.",
             Self::Missing => "That layer is no longer there.",
         }
     }
+}
+
+/// What [`LayerStack::translate_vectors`] cost the vector layers, counted in
+/// records, so the caller can say so.
+///
+/// Named fields rather than a pair, because both are counts of records and a
+/// tuple would read the same the wrong way round.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VectorCarry {
+    /// Records that held Ink and lost it.
+    pub stripped_ink: usize,
+    /// Records that lost at least one path the move took out of bounds.
+    pub lost_paths: usize,
+}
+
+/// Why [`LayerStack::set_vector`] declined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorSetRefusal {
+    /// There is no entry at that position.
+    Missing,
+    /// The layer is not a vector layer. Making one is
+    /// [`LayerStack::add_vector_layer`]'s alone.
+    NotVector,
+    /// The layer is locked, by its own flag or by a folder it is inside.
+    Locked,
+    /// The record would not do, or the one already there cannot be changed.
+    Record(VectorRefusal),
 }
 
 /// How a layer combines with everything beneath it.
@@ -663,6 +720,13 @@ pub struct Layer {
     /// see [`crate::textobj`] for why the fingerprint exists and why it is not a
     /// field of the record in memory.
     text: Option<Box<TextObject>>,
+    /// The paths this layer draws, where it is a vector layer.
+    ///
+    /// **Private, and made only by [`LayerStack::add_vector_layer`]**, so a layer
+    /// cannot be both this and text and a plain layer cannot be given paths.
+    /// `Box`ed for [`Layer::text`]'s reason. Nothing here is written to the file
+    /// from this module.
+    vector: Option<Box<VectorObject>>,
     /// Non-destructive marks derived from this layer's own alpha — a stroke, a
     /// drop shadow. See [`crate::effect`] and `docs/layer-effects.md`.
     ///
@@ -720,6 +784,21 @@ impl Layer {
     /// layer with none, which is nearly all of them.
     pub fn text_bytes(&self) -> usize {
         self.text.as_ref().map_or(0, |t| t.byte_len())
+    }
+
+    /// The paths this layer draws, if it is a vector layer.
+    pub fn vector(&self) -> Option<&VectorObject> {
+        self.vector.as_deref()
+    }
+
+    /// Is this a vector layer, even an empty one?
+    pub fn is_vector(&self) -> bool {
+        self.vector.is_some()
+    }
+
+    /// Roughly what the record costs, for [`StackShape::byte_len`].
+    fn vector_bytes(&self) -> usize {
+        self.vector.as_ref().map_or(0, |v| v.byte_len())
     }
 
     /// This layer's effects, **already in composite order**, bottom to top.
@@ -781,6 +860,7 @@ impl Layer {
             slot,
             mask: None,
             text: None,
+            vector: None,
             effects: Vec::new(),
         }
     }
@@ -857,6 +937,13 @@ pub struct AddedLayer {
     pub id: u32,
 }
 
+/// The next [`LayerStack::vector_revision`], shared by every stack in the
+/// process. See there for why it is not per stack.
+fn next_vector_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bottom-to-top stack of layers. Index 0 is the bottom.
 #[derive(Debug)]
 pub struct LayerStack {
@@ -868,6 +955,8 @@ pub struct LayerStack {
     /// Next [`Layer::id`]. Never recycled, so an entry that has left the stack
     /// and comes back is still the same entry.
     next_id: u32,
+    /// What [`LayerStack::vector_revision`] answers.
+    vector_revision: u64,
 }
 
 impl Default for LayerStack {
@@ -979,6 +1068,7 @@ impl LayerStack {
             active: 0,
             pool: Arc::new(Mutex::new(SlotPool::default())),
             next_id: 0,
+            vector_revision: next_vector_revision(),
         }
     }
 
@@ -1308,6 +1398,7 @@ impl LayerStack {
         // the layer that *was* selected is still in the stack — inside the
         // folder, which is where the painter just put it.
         self.active = at + n;
+        self.touch_vectors();
         Some(at + n)
     }
 
@@ -1465,6 +1556,7 @@ impl LayerStack {
             "add left a malformed stack"
         );
         self.active = at;
+        self.touch_vectors();
         Some(AddedLayer { slot: number, id })
     }
 
@@ -1608,7 +1700,9 @@ impl LayerStack {
     /// other refusal in this module is.
     pub fn set_text(&mut self, index: usize, text: TextObject) -> bool {
         match self.layers.get_mut(index) {
-            Some(layer) if !layer.folder => {
+            // A vector layer is not a text layer: two records on one layer would
+            // each claim the pixels.
+            Some(layer) if !layer.folder && layer.vector.is_none() => {
                 layer.text = Some(Box::new(text));
                 true
             }
@@ -1691,6 +1785,211 @@ impl LayerStack {
             }
         }
         dropped
+    }
+
+    // --- vector -------------------------------------------------------------
+
+    /// Make the layer at `index` a vector layer holding `record`, where it is a
+    /// layer a file has just built and nothing has touched.
+    ///
+    /// **Import's door and nobody else's**, which is why it is `pub(crate)`:
+    /// [`LayerStack::add_vector_layer`] makes a layer, and an import has already
+    /// made its layers from the file's own stack and needs the record put on one.
+    /// False for an index off the end, a folder (no pixels for paths to stand
+    /// beside), a layer that is already text, one that already holds a record,
+    /// and a record that fails [`VectorObject::check`]. The text refusal is the
+    /// other half of the rule [`LayerStack::set_text`] keeps from its side, so a
+    /// layer is a text record or a vector record and never both, whichever
+    /// order the two arrive in.
+    pub(crate) fn install_vector(&mut self, index: usize, record: VectorObject) -> bool {
+        if record.check().is_err() {
+            return false;
+        }
+        match self.layers.get_mut(index) {
+            Some(layer) if !layer.folder && layer.text.is_none() && layer.vector.is_none() => {
+                layer.vector = Some(Box::new(record));
+                self.touch_vectors();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Add a vector layer holding `record`, and select it.
+    ///
+    /// `None` where [`LayerStack::add_refusal`] would refuse, where the pool has
+    /// no slice, or where the record fails [`VectorObject::check`]: nothing is
+    /// added in any of those cases. The record is judged **before** the layer is
+    /// made, so a refusal changes nothing at all.
+    pub fn add_vector_layer(&mut self, name: &str, record: VectorObject) -> Option<usize> {
+        record.check().ok()?;
+        if self.add_refusal().is_some() {
+            return None;
+        }
+        self.add_named(name)?;
+        let at = self.active;
+        self.layers[at].vector = Some(Box::new(record));
+        self.touch_vectors();
+        Some(at)
+    }
+
+    /// The record for the layer at `index`.
+    pub fn vector_at(&self, index: usize) -> Option<&VectorObject> {
+        self.layers.get(index)?.vector()
+    }
+
+    /// A number that changes whenever what the vector overlay draws could have.
+    ///
+    /// Moved inside every method that writes a layer's record — the field is
+    /// private to this module, so those are all of them — and inside every
+    /// structural edit, so the overlay's cache of flattened lines needs no call
+    /// site to remember to throw it away. Drawn from one process-wide counter
+    /// rather than counted per stack, so a stack built to replace another (an
+    /// open, a recovered copy) can never answer a number the old one did.
+    /// **Visibility is not in it**: the eye is a public field written from the
+    /// interface, so the overlay reads it afresh every frame instead.
+    pub fn vector_revision(&self) -> u64 {
+        self.vector_revision
+    }
+
+    /// Say that what the overlay draws may have changed.
+    fn touch_vectors(&mut self) {
+        self.vector_revision = next_vector_revision();
+    }
+
+    /// Is any layer a vector layer?
+    pub fn has_vector_layers(&self) -> bool {
+        self.layers.iter().any(Layer::is_vector)
+    }
+
+    /// Does any layer hold a record from a newer Umber
+    /// ([`VectorObject::Opaque`])?
+    ///
+    /// **What refuses a canvas flip and a canvas resize.** Such a record is held
+    /// as bytes this build cannot read, so it cannot be mirrored or moved; doing
+    /// either to the picture would carry every pixel and leave those paths where
+    /// they were, which is a document the newer build that wrote them would open
+    /// wrong. The one reading, so the menu rows, the commands and the undo of a
+    /// flip cannot disagree about it.
+    pub fn has_opaque_vector(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.vector().is_some_and(VectorObject::is_opaque))
+    }
+
+    /// Would [`LayerStack::set_vector`] install `record` at `index`?
+    ///
+    /// The one statement of the rule, which `set_vector` reads, so a control
+    /// drawn from this cannot promise what the model then declines. Ordered as
+    /// the sentences read: no such layer, not a vector layer, locked, the
+    /// existing record is one this build cannot change, and last the new record
+    /// itself.
+    pub fn can_set_vector(
+        &self,
+        index: usize,
+        record: &VectorObject,
+    ) -> Result<(), VectorSetRefusal> {
+        let layer = self.layers.get(index).ok_or(VectorSetRefusal::Missing)?;
+        let Some(existing) = layer.vector.as_deref() else {
+            return Err(VectorSetRefusal::NotVector);
+        };
+        if self.effective_locked(index) {
+            return Err(VectorSetRefusal::Locked);
+        }
+        if existing.is_opaque() {
+            return Err(VectorSetRefusal::Record(VectorRefusal::Opaque));
+        }
+        record.check().map_err(VectorSetRefusal::Record)
+    }
+
+    /// Replace the paths of the vector layer at `index`, handing back what was
+    /// there. A refusal changes nothing.
+    pub fn set_vector(
+        &mut self,
+        index: usize,
+        record: VectorObject,
+    ) -> Result<Option<Box<VectorObject>>, VectorSetRefusal> {
+        self.can_set_vector(index, &record)?;
+        self.touch_vectors();
+        Ok(self.layers[index].vector.replace(Box::new(record)))
+    }
+
+    /// Put a record back by **slot**, which is undo's door.
+    ///
+    /// By slot because an undo entry outlives reorders and a position does not;
+    /// and with **no lock gate**, because an undo that refuses to undo is worse
+    /// than a layer that was locked after the edit. `Err` hands the record back
+    /// when no layer holds the slot, so nothing is lost on the way out. A folder
+    /// holds no slot, so it can never be found here.
+    pub fn restore_vector(
+        &mut self,
+        slot: u32,
+        record: Option<Box<VectorObject>>,
+    ) -> Result<Option<Box<VectorObject>>, Option<Box<VectorObject>>> {
+        match self.layers.iter_mut().find(|l| l.slot() == Some(slot)) {
+            Some(layer) => {
+                debug_assert!(
+                    record.is_none() || layer.text.is_none(),
+                    "a layer is never both text and vector"
+                );
+                let was = std::mem::replace(&mut layer.vector, record);
+                self.touch_vectors();
+                Ok(was)
+            }
+            None => Err(record),
+        }
+    }
+
+    /// Mirror every vector layer's paths with the canvas, and say how many
+    /// records lost a path doing it.
+    ///
+    /// Beside [`LayerStack::flip_text`] and for its reason: undoing a flip is
+    /// another flip, so nothing that *can* be mirrored is dropped. Ink is
+    /// mirrored with the rest, because the pixels it describes are mirrored by
+    /// the same flip. **What cannot be is a path the mirror pushes past
+    /// [`crate::vector::MAX_COORD`]** — one lying far off the canvas, on the side
+    /// away from the edge it is mirrored about — and that path is taken out by
+    /// [`VectorObject::bounded`] rather than left to make the next save refuse
+    /// the whole record. The undo of the flip does not bring it back, which is
+    /// why the count comes back for the caller to say so.
+    pub fn flip_vectors(&mut self, axis: FlipAxis, canvas: UVec2) -> usize {
+        let mut lost = 0;
+        for layer in &mut self.layers {
+            if let Some(record) = layer.vector.as_mut() {
+                let (kept, dropped) = record.flipped(axis, canvas).bounded();
+                lost += usize::from(dropped);
+                **record = kept;
+            }
+        }
+        self.touch_vectors();
+        lost
+    }
+
+    /// Move every vector layer's paths by `by`, as a resize moves the picture.
+    ///
+    /// Cut and Plot are geometry and simply move. A record with Ink loses it,
+    /// because the pixels Ink described have been cropped or shifted by the same
+    /// resize and what is left would describe a picture that is gone. A path
+    /// the move takes past [`crate::vector::MAX_COORD`] is taken out, as
+    /// [`LayerStack::flip_vectors`] does and for its reason. Both counts come
+    /// back, so the caller can say what happened.
+    pub fn translate_vectors(&mut self, by: Vec2) -> VectorCarry {
+        let mut carry = VectorCarry::default();
+        for layer in &mut self.layers {
+            if let Some(record) = layer.vector.as_mut() {
+                let moved = if record.has_ink() {
+                    carry.stripped_ink += 1;
+                    record.without_ink().translated(by)
+                } else {
+                    record.translated(by)
+                };
+                let (kept, dropped) = moved.bounded();
+                carry.lost_paths += usize::from(dropped);
+                **record = kept;
+            }
+        }
+        self.touch_vectors();
+        carry
     }
 
     // --- effects ------------------------------------------------------------
@@ -2013,6 +2312,7 @@ impl LayerStack {
         // Deleting one of a pair would otherwise leave the survivor in a group
         // of one — see `dissolve_lone_groups`.
         self.dissolve_lone_groups();
+        self.touch_vectors();
         Some(taken)
     }
 
@@ -2114,6 +2414,15 @@ impl LayerStack {
             // anybody checked.
             match target {
                 EditTarget::Layer => return Some(EditRefusal::Text),
+                EditTarget::Mask => {}
+            }
+        }
+        if layer.is_vector() {
+            // Exhaustive for the text arm's reason above: a vector layer's mask
+            // may be painted, because it bounds what the composite reads and
+            // changes no path.
+            match target {
+                EditTarget::Layer => return Some(EditRefusal::Vector),
                 EditTarget::Mask => {}
             }
         }
@@ -2414,6 +2723,7 @@ impl LayerStack {
             .iter()
             .position(|(i, _)| *i == was)
             .unwrap_or_else(|| self.active.min(self.layers.len() - 1));
+        self.touch_vectors();
         true
     }
 
@@ -2642,6 +2952,9 @@ impl LayerStack {
         let was: Vec<(u32, u8)> = self.layers.iter().map(|l| (l.id, l.depth)).collect();
         let was_active = self.layers.get(self.active).map_or(0, |l| l.id);
 
+        // Here rather than at the end, which has more than one way out: from
+        // this line on the stack is being rebuilt whatever happens next.
+        self.touch_vectors();
         let mut held: Vec<Option<Layer>> = self.layers.drain(..).map(Some).collect();
         let mut find = |id: u32| -> Option<Layer> {
             held.iter_mut()
@@ -2908,6 +3221,7 @@ impl StackShape {
                             + layer.name.len()
                             + layer.effects.capacity() * std::mem::size_of::<Effect>()
                             + layer.text_bytes()
+                            + layer.vector_bytes()
                     }
                 })
                 .sum::<usize>()
@@ -4391,7 +4705,8 @@ mod tests {
                 EditRefusal::Folder => 0,
                 EditRefusal::Locked => 1,
                 EditRefusal::Text => 2,
-                EditRefusal::Missing => 3,
+                EditRefusal::Vector => 3,
+                EditRefusal::Missing => 4,
             };
             assert_eq!(EditRefusal::ALL[at], refusal);
         }
@@ -4439,6 +4754,533 @@ mod tests {
                 refusal.reason()
             );
         }
+    }
+
+    // --- vector layers ------------------------------------------------------
+
+    fn a_path(role: crate::vector::PathRole, x: f32) -> crate::vector::Path {
+        use crate::vector::Node;
+        crate::vector::Path {
+            role,
+            closed: false,
+            nodes: vec![
+                Node::corner(Vec2::new(x, 10.0)),
+                Node::corner(Vec2::new(x + 20.0, 30.0)),
+            ],
+            ink: None,
+        }
+    }
+
+    fn some_paths() -> VectorObject {
+        use crate::vector::PathRole;
+        VectorObject::empty()
+            .appended(vec![
+                a_path(PathRole::Cut, 5.0),
+                a_path(PathRole::Plot, 40.0),
+            ])
+            .expect("a small record is legal")
+    }
+
+    fn with_ink() -> VectorObject {
+        use crate::vector::{Ink, PathRole};
+        let mut inked = a_path(PathRole::Ink, 60.0);
+        inked.ink = Some(Ink {
+            brush: "round".into(),
+            size: 4.0,
+            colour: [0.1, 0.2, 0.3, 1.0],
+        });
+        some_paths().appended(vec![inked]).expect("legal")
+    }
+
+    /// What a stack holds in vector records, for "unchanged" comparisons:
+    /// `LayerStack` has no `PartialEq`, and the records are the part under test.
+    fn records_of(s: &LayerStack) -> Vec<Option<VectorObject>> {
+        s.layers().iter().map(|l| l.vector().cloned()).collect()
+    }
+
+    /// **Every door a record comes through moves the revision**, and the list
+    /// was taken by searching for writes to the field rather than from memory:
+    /// `slot_revision` was once called exhaustive by construction and was false
+    /// for exactly one method. The overlay keeps its flattened lines until this
+    /// number moves, so a writer missing here is a cut line left drawn where the
+    /// path no longer is.
+    ///
+    /// The structural edits are here too, though the overlay also reads which
+    /// layers exist and which are visible afresh every frame: a layer leaving
+    /// and coming back is the case where that reading alone could match a
+    /// cache built before it went.
+    #[test]
+    fn every_writer_of_a_vector_record_moves_the_revision() {
+        fn bumps(s: &mut LayerStack, what: &str, f: impl FnOnce(&mut LayerStack)) {
+            let before = s.vector_revision();
+            f(s);
+            assert_ne!(
+                before,
+                s.vector_revision(),
+                "{what} left the revision alone"
+            );
+        }
+        fn still(s: &mut LayerStack, what: &str, f: impl FnOnce(&mut LayerStack)) {
+            let before = s.vector_revision();
+            f(s);
+            assert_eq!(before, s.vector_revision(), "{what} moved the revision");
+        }
+
+        let mut s = LayerStack::new();
+        bumps(&mut s, "install_vector", |s| {
+            assert!(s.install_vector(0, some_paths()));
+        });
+        let mut at = 0;
+        bumps(&mut s, "add_vector_layer", |s| {
+            at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        });
+        bumps(&mut s, "set_vector", |s| {
+            s.set_vector(at, with_ink()).expect("legal");
+        });
+        still(&mut s, "a refused set_vector", |s| {
+            assert!(s.set_vector(99, some_paths()).is_err());
+        });
+        let slot = s.get(at).and_then(Layer::slot).expect("a layer");
+        bumps(&mut s, "restore_vector", |s| {
+            s.restore_vector(slot, Some(Box::new(some_paths())))
+                .expect("held");
+        });
+        bumps(&mut s, "flip_vectors", |s| {
+            s.flip_vectors(FlipAxis::Horizontal, UVec2::new(100, 100));
+        });
+        bumps(&mut s, "translate_vectors", |s| {
+            s.translate_vectors(Vec2::new(3.0, 4.0));
+        });
+        bumps(&mut s, "add", |s| {
+            s.add().expect("room");
+        });
+        bumps(&mut s, "reorder", |s| {
+            assert!(s.reorder(0, 2));
+        });
+        bumps(&mut s, "group", |s| {
+            s.group(&[1]).expect("grouped");
+        });
+        let shape = s.shape(0);
+        let mut removed = Vec::new();
+        bumps(&mut s, "remove", |s| {
+            removed = s.remove(0).expect("removed");
+        });
+        bumps(&mut s, "restore_shape", |s| {
+            s.restore_shape(shape.with_removed(removed));
+        });
+        bumps(&mut s, "remove_many", |s| {
+            s.remove_many(&[0]).expect("removed");
+        });
+    }
+
+    /// Two stacks never answer the same revision, so a document opened into a
+    /// tab cannot be drawn from the lines of the one it replaced.
+    #[test]
+    fn two_stacks_never_share_a_vector_revision() {
+        let a = LayerStack::new();
+        let b = LayerStack::new();
+        assert_ne!(a.vector_revision(), b.vector_revision());
+    }
+
+    /// **The paint gate refuses a vector layer and not its mask**, for the text
+    /// layer's reason: a mask bounds what the composite reads and changes no path.
+    #[test]
+    fn painting_on_a_vector_layer_is_refused_and_its_mask_is_not() {
+        let mut s = LayerStack::new();
+        let at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        assert_eq!(
+            s.refusal_at(at, EditTarget::Layer),
+            Some(EditRefusal::Vector)
+        );
+        assert_eq!(
+            s.refusal_at(at, EditTarget::Mask),
+            None,
+            "a stroke on the mask cannot make the paths wrong"
+        );
+        assert_eq!(
+            s.active_refusal(EditTarget::Layer),
+            Some(EditRefusal::Vector)
+        );
+        assert_eq!(
+            EditRefusal::Vector.reason(),
+            "This is a vector layer. Paint on an ordinary layer instead."
+        );
+        assert_eq!(
+            s.refusal_at(0, EditTarget::Layer),
+            None,
+            "the plain layer beside it is untouched"
+        );
+    }
+
+    #[test]
+    fn a_lock_and_a_folder_beat_vector_at_the_gate() {
+        let mut s = LayerStack::new();
+        let at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        s.get_mut(at).unwrap().locked = true;
+        assert_eq!(
+            s.refusal_at(at, EditTarget::Layer),
+            Some(EditRefusal::Locked)
+        );
+        s.get_mut(at).unwrap().locked = false;
+        let folder = s.group(&[at]).expect("grouped");
+        assert_eq!(
+            s.refusal_at(folder, EditTarget::Layer),
+            Some(EditRefusal::Folder)
+        );
+        s.get_mut(folder).unwrap().locked = true;
+        assert_eq!(
+            s.refusal_at(at, EditTarget::Layer),
+            Some(EditRefusal::Locked),
+            "a locked parent folder too"
+        );
+    }
+
+    #[test]
+    fn an_empty_vector_layer_is_a_vector_layer() {
+        let mut s = LayerStack::new();
+        assert!(!s.has_vector_layers());
+        let at = s
+            .add_vector_layer("Paths", VectorObject::empty())
+            .expect("room");
+        assert!(s.get(at).unwrap().is_vector());
+        assert_eq!(s.vector_at(at), Some(&VectorObject::empty()));
+        assert!(s.has_vector_layers());
+        assert_eq!(s.get(at).unwrap().name, "Paths");
+        assert_eq!(s.active_index(), at, "and it is selected");
+        assert!(s.vector_at(0).is_none() && s.vector_at(9).is_none());
+    }
+
+    #[test]
+    fn a_plain_layer_cannot_be_given_paths() {
+        let mut s = LayerStack::new();
+        let before = records_of(&s);
+        assert_eq!(
+            s.can_set_vector(0, &some_paths()),
+            Err(VectorSetRefusal::NotVector)
+        );
+        assert_eq!(
+            s.set_vector(0, some_paths()),
+            Err(VectorSetRefusal::NotVector)
+        );
+        assert_eq!(
+            s.set_vector(7, some_paths()),
+            Err(VectorSetRefusal::Missing)
+        );
+        assert_eq!(records_of(&s), before, "and nothing changed");
+        assert!(!s.has_vector_layers());
+    }
+
+    #[test]
+    fn a_locked_vector_layer_refuses_new_paths() {
+        let mut s = LayerStack::new();
+        let at = s
+            .add_vector_layer("Paths", VectorObject::empty())
+            .expect("room");
+        s.get_mut(at).unwrap().locked = true;
+        assert_eq!(
+            s.set_vector(at, some_paths()),
+            Err(VectorSetRefusal::Locked)
+        );
+        assert_eq!(s.vector_at(at), Some(&VectorObject::empty()));
+
+        // And a lock on the folder it sits in reaches it too.
+        s.get_mut(at).unwrap().locked = false;
+        let folder = s.group(&[at]).expect("grouped");
+        s.get_mut(folder).unwrap().locked = true;
+        let inner = s
+            .layers()
+            .iter()
+            .position(Layer::is_vector)
+            .expect("still there");
+        assert!(!s.get(inner).unwrap().locked, "its own flag is open");
+        assert_eq!(
+            s.set_vector(inner, some_paths()),
+            Err(VectorSetRefusal::Locked)
+        );
+    }
+
+    #[test]
+    fn a_refused_set_changes_nothing() {
+        use crate::vector::{Node, Path, PathRole};
+        let mut s = LayerStack::new();
+        let at = s.add_vector_layer("Paths", some_paths()).expect("room");
+
+        // A figure no record may hold.
+        let bad = VectorObject::Paths(vec![Path {
+            role: PathRole::Cut,
+            closed: false,
+            nodes: vec![
+                Node::corner(Vec2::new(f32::NAN, 0.0)),
+                Node::corner(Vec2::new(1.0, 1.0)),
+            ],
+            ink: None,
+        }]);
+        assert_eq!(
+            s.set_vector(at, bad.clone()),
+            Err(VectorSetRefusal::Record(VectorRefusal::Impossible))
+        );
+        assert_eq!(s.vector_at(at), Some(&some_paths()));
+        assert!(
+            s.add_vector_layer("Bad", bad).is_none(),
+            "and a layer is not made for it"
+        );
+        assert_eq!(s.len(), 2);
+
+        // A record from a newer Umber refuses every edit.
+        let opaque = s
+            .add_vector_layer("Newer", VectorObject::Opaque(b"{}".to_vec()))
+            .expect("an opaque record can be held");
+        assert_eq!(
+            s.set_vector(opaque, some_paths()),
+            Err(VectorSetRefusal::Record(VectorRefusal::Opaque))
+        );
+        assert!(s.vector_at(opaque).unwrap().is_opaque());
+
+        // A set hands back what was there.
+        let old = s.set_vector(at, VectorObject::empty()).expect("allowed");
+        assert_eq!(old.as_deref(), Some(&some_paths()));
+    }
+
+    /// A vector layer deleted and undone comes back with its paths, with nothing
+    /// written to make that happen: the record travels in the `Layer`.
+    #[test]
+    fn deleting_a_vector_layer_and_undoing_brings_its_paths_back() {
+        let mut s = LayerStack::new();
+        let at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        let before = s.shape(64 * 64 * 4);
+        let removed = s.remove_many(&[at]).expect("removable");
+        assert!(removed[0].is_vector());
+        assert!(!s.has_vector_layers(), "the record left with its layer");
+
+        let parked = before.with_removed(removed);
+        assert!(
+            parked.byte_len() >= 64 * 64 * 4 + some_paths().byte_len(),
+            "the record is charged beside the slice"
+        );
+        s.restore_shape(parked);
+        assert_eq!(s.vector_at(at), Some(&some_paths()));
+    }
+
+    /// The record is charged **on its own**, which the delete test above cannot
+    /// say: its `>=` is met by the slice and the layer's own bytes whether or not
+    /// the record is counted. Two parked layers differing only in their records
+    /// must differ in cost by exactly the difference between the records.
+    #[test]
+    fn a_parked_vector_layer_is_charged_for_its_paths() {
+        let park = |record: VectorObject| {
+            let mut s = LayerStack::new();
+            let at = s.add_vector_layer("Paths", record).expect("room");
+            let before = s.shape(64 * 64 * 4);
+            let removed = s.remove_many(&[at]).expect("removable");
+            before.with_removed(removed).byte_len()
+        };
+        let (small, large) = (VectorObject::empty(), with_ink());
+        assert!(large.byte_len() > small.byte_len());
+        assert_eq!(
+            park(large.clone()) - park(small.clone()),
+            large.byte_len() - small.byte_len()
+        );
+    }
+
+    #[test]
+    fn a_folder_deleted_with_a_vector_layer_in_it_comes_back_whole() {
+        let mut s = grouped();
+        // grouped(): the folder is at 3 with layers at 1 and 2.
+        let slot = s.get(1).unwrap().slot().unwrap();
+        s.restore_vector(slot, Some(Box::new(some_paths())))
+            .expect("the slot is held");
+        assert!(s.get(1).unwrap().is_vector());
+        let before = s.shape(64 * 64 * 4);
+        let removed = s.remove(3).expect("the folder and its contents");
+        assert_eq!(removed.iter().filter(|l| l.is_vector()).count(), 1);
+        s.restore_shape(before.with_removed(removed));
+        assert_eq!(s.len(), 4);
+        assert_eq!(s.vector_at(1), Some(&some_paths()));
+        for other in [0, 2, 3] {
+            assert!(
+                s.vector_at(other).is_none(),
+                "entry {other} gained a record"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flip_mirrors_every_vector_layer_and_twice_restores_it() {
+        let canvas = UVec2::new(100, 80);
+        let mut s = LayerStack::new();
+        s.add_vector_layer("A", some_paths()).expect("room");
+        s.add_vector_layer("B", with_ink()).expect("room");
+        let before = records_of(&s);
+        s.flip_vectors(FlipAxis::Horizontal, canvas);
+        let flipped = s.vector_at(1).unwrap();
+        assert_ne!(Some(flipped), before[1].as_ref());
+        assert_eq!(flipped.paths()[0].nodes[0].at.x, 100.0 - 5.0);
+        assert!(
+            s.vector_at(2).unwrap().has_ink(),
+            "a flip keeps Ink, unlike a resize"
+        );
+        assert!(s.vector_at(0).is_none(), "and the plain layer has none");
+        s.flip_vectors(FlipAxis::Horizontal, canvas);
+        assert_eq!(records_of(&s), before);
+    }
+
+    #[test]
+    fn a_resize_moves_cut_paths_and_strips_ink() {
+        let mut s = LayerStack::new();
+        s.add_vector_layer("Plain", some_paths()).expect("room");
+        s.add_vector_layer("Inked", with_ink()).expect("room");
+        let by = Vec2::new(7.0, -3.0);
+        assert_eq!(
+            s.translate_vectors(by),
+            VectorCarry {
+                stripped_ink: 1,
+                lost_paths: 0
+            },
+            "one record lost its Ink"
+        );
+        assert_eq!(s.vector_at(1), Some(&some_paths().translated(by)));
+        let inked = s.vector_at(2).unwrap();
+        assert!(!inked.has_ink());
+        assert_eq!(inked, &with_ink().without_ink().translated(by));
+        assert_eq!(inked.paths().len(), 2, "Cut and Plot survived");
+        assert_eq!(
+            s.translate_vectors(Vec2::ZERO),
+            VectorCarry::default(),
+            "and it is one-off"
+        );
+    }
+
+    /// Only a record this build cannot read answers yes; an empty record, an
+    /// ordinary one and a stack with no vector layer all answer no.
+    #[test]
+    fn only_a_newer_builds_record_refuses_a_flip_or_a_resize() {
+        let mut s = LayerStack::new();
+        assert!(!s.has_opaque_vector(), "no vector layer");
+        s.add_vector_layer("Empty", VectorObject::empty())
+            .expect("room");
+        s.add_vector_layer("Paths", some_paths()).expect("room");
+        assert!(!s.has_opaque_vector(), "records this build can read");
+        s.add_vector_layer("Newer", VectorObject::Opaque(b"{}".to_vec()))
+            .expect("room");
+        assert!(s.has_opaque_vector());
+        assert!(s.remove(3).is_some());
+        assert!(!s.has_opaque_vector(), "and the answer follows the stack");
+    }
+
+    /// **A move that takes a path out of bounds takes that path out, and only
+    /// that one.** Left in, the record fails `check` at the next save and
+    /// `to_json` refuses the whole of it, so every other path on the layer went
+    /// with the one that strayed. The far path starts legal and is pushed past
+    /// `MAX_COORD` by the move; the near one is moved and kept.
+    #[test]
+    fn a_move_past_the_bound_drops_that_path_and_keeps_the_rest() {
+        use crate::vector::{MAX_COORD, PathRole};
+        let far = a_path(PathRole::Cut, MAX_COORD - 30.0);
+        let near = a_path(PathRole::Plot, 5.0);
+        let record = VectorObject::empty()
+            .appended(vec![far, near.clone()])
+            .expect("both start in bounds");
+        let mut s = LayerStack::new();
+        s.add_vector_layer("Far", record).expect("room");
+        s.add_vector_layer("Plain", some_paths()).expect("room");
+        let by = Vec2::new(100.0, 0.0);
+        assert_eq!(
+            s.translate_vectors(by),
+            VectorCarry {
+                stripped_ink: 0,
+                lost_paths: 1
+            },
+            "one record lost a path, the other lost nothing"
+        );
+        let kept = s.vector_at(1).unwrap();
+        assert_eq!(kept.paths().len(), 1, "the far path is gone");
+        assert_eq!(kept.paths()[0].nodes[0].at, near.nodes[0].at + by);
+        assert!(kept.to_json(None).is_ok(), "and what is left can be saved");
+        assert_eq!(s.vector_at(2), Some(&some_paths().translated(by)));
+    }
+
+    /// The flip's twin: a path far off the canvas on the side away from the
+    /// edge it is mirrored about lands past the bound, and goes.
+    #[test]
+    fn a_flip_past_the_bound_drops_that_path_and_keeps_the_rest() {
+        use crate::vector::{MAX_COORD, PathRole};
+        let canvas = UVec2::new(100, 80);
+        let far = a_path(PathRole::Cut, -MAX_COORD + 10.0);
+        let near = a_path(PathRole::Plot, 5.0);
+        let record = VectorObject::empty()
+            .appended(vec![far, near])
+            .expect("both start in bounds");
+        let mut s = LayerStack::new();
+        s.add_vector_layer("Far", record).expect("room");
+        assert_eq!(s.flip_vectors(FlipAxis::Horizontal, canvas), 1);
+        let kept = s.vector_at(1).unwrap();
+        assert_eq!(kept.paths().len(), 1);
+        assert_eq!(kept.paths()[0].nodes[0].at.x, 100.0 - 5.0);
+        assert!(kept.to_json(None).is_ok());
+        assert_eq!(
+            s.flip_vectors(FlipAxis::Horizontal, canvas),
+            0,
+            "and what is left mirrors back without loss"
+        );
+    }
+
+    /// **Review focus 3**: undo finds the layer by slot, which a position is not
+    /// once something has been reordered.
+    #[test]
+    fn restoring_by_slot_finds_the_layer_after_a_reorder() {
+        let mut s = LayerStack::new();
+        let at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        let slot = s.get(at).unwrap().slot().unwrap();
+        assert!(s.reorder(at, 0), "moved to the bottom");
+        assert!(s.get(0).unwrap().is_vector());
+
+        let put = s
+            .restore_vector(slot, Some(Box::new(VectorObject::empty())))
+            .expect("found by slot");
+        assert_eq!(put.as_deref(), Some(&some_paths()), "what was there");
+        assert_eq!(s.vector_at(0), Some(&VectorObject::empty()));
+        assert!(s.vector_at(1).is_none(), "the layer now at 1 is untouched");
+
+        // Undo has no lock gate: a locked layer is restored all the same.
+        s.get_mut(0).unwrap().locked = true;
+        assert!(s.restore_vector(slot, Some(Box::new(some_paths()))).is_ok());
+        assert_eq!(s.vector_at(0), Some(&some_paths()));
+        s.get_mut(0).unwrap().locked = false;
+        assert!(
+            s.restore_vector(slot, Some(Box::new(VectorObject::empty())))
+                .is_ok()
+        );
+
+        // A slot nobody holds hands the record back.
+        let missing = s.restore_vector(9_999, Some(Box::new(some_paths())));
+        assert_eq!(missing, Err(Some(Box::new(some_paths()))));
+        // And taking the record off through the same door is allowed.
+        assert!(s.restore_vector(slot, None).is_ok());
+        assert!(!s.has_vector_layers());
+    }
+
+    #[test]
+    fn a_text_layer_cannot_become_a_vector_layer_and_the_reverse() {
+        let mut s = LayerStack::new();
+        assert!(s.set_text(0, some_text()));
+        assert_eq!(
+            s.set_vector(0, some_paths()),
+            Err(VectorSetRefusal::NotVector),
+            "a text layer has no vector record to set"
+        );
+        // Import's door too, which is the other half of "never both, in either
+        // order": `install_vector` refuses a text layer on its own account.
+        assert!(
+            !s.install_vector(0, some_paths()),
+            "import put a record on a text layer"
+        );
+        assert!(s.vector_at(0).is_none());
+        let at = s.add_vector_layer("Paths", some_paths()).expect("room");
+        assert!(
+            !s.set_text(at, some_text()),
+            "and a vector layer cannot take a text record"
+        );
+        assert!(s.text_at(at).is_none());
     }
 
     /// A folder cannot carry a record: it holds no pixels for one to describe,

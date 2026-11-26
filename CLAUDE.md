@@ -1226,15 +1226,17 @@ dense 83,740. Re-run both before quoting any of it.
   class is what `back_tiles`' clear, the readback's empty value and the flip's
   `tile_load` already answer to, and a wrong class breaks a mask there first. The
   blended commit asks *both* and fails closed.
-- **`umber-version` is 4, and it is the one revision about what an older build
-  would *show* rather than drop** — every mask a full gamma curve out, silently.
+- **`umber-version` went to 4 here, and it is the one revision about what an
+  older build would *show* rather than drop** — every mask a full gamma curve out, silently.
   A version-3 document is converted on load, for the layer's mask entry and for
   mask patches in its saved history, and **that conversion is not lossless**: the
   multiplier survives to within 0.499 of a level, the byte cannot.
   `history::VERSION` did **not** move, because a mask patch can only exist in a
-  document that already declares 4. Group compositing therefore needs **5**;
-  `docs/group-compositing.md` §4.3, `docs/layer-effects.md` and
-  `docs/layer-rename.md` all still claim 4.
+  document that already declares 4. Group compositing needed **5** when this
+  was written and needs **6** now, vector layers having taken 5 (see "Vector
+  layers"); `docs/group-compositing.md` §4.3 says 6 and `docs/layer-effects.md`
+  §8.2 notes that it moved. `docs/layer-rename.md` speaks of a future revision
+  and states no figure for group compositing.
 - **`fill_layer_white` is a table write and a new mask therefore costs nothing.**
   Full reveal *is* a mask slot's empty value. `SlotClass` is what carries the two
   empty values into the three places that need them in Rust and cannot ask a
@@ -1727,6 +1729,515 @@ are the contiguous run immediately below it whose `depth` is greater.
   back per stroke it would be once a stroke. Clearing can only make a pixel
   defined, never move a defined one.
 
+#### Vector layers
+
+`umber-core::vector` is the model, `umber-app::vectorview` is the lines on
+screen, and `docs/superpowers/specs/2026-11-25-vector-layers-design.md` is the
+design. **Stage one: a layer that holds Cut and Plot paths, made from a
+selection's outline.** Drawing and editing them is "The Path tool", below;
+tracing artwork and the machine are later projects, and nothing here has a
+control for either.
+
+- **A layer is a vector layer exactly when it carries a record, and an empty
+  record is a record.** `Layer::vector` is an `Option<Box<VectorObject>>` and
+  `Some(empty)` is what a fresh one holds. Reading "has paths" as the test would
+  turn the layer back into a paintable one the moment its last path went, and a
+  layer that is a vector layer only while it is non-empty is a layer whose kind
+  changes under the artist. Same shape as text, and the same door: nothing but
+  `add_vector_layer` (and `install_vector`, import's) makes one, `set_vector`
+  refuses a layer with no record, and a layer is text or vector and never both
+  in *either* order — `set_text` refuses a vector layer and `install_vector`
+  refuses a text one.
+- **Cut and Plot never rasterise, and Ink is reserved with no control anywhere.**
+  They are lines drawn over the canvas by `ui::vector_paths`, so the layer's
+  pixels stay blank, and that is what keeps a cut line out of an export, the
+  flattened preview, the eyedropper and a smudge pickup with no code that has to
+  remember to leave it out. `a_document_export_ignores_cut_paths` is the guard
+  and **it cannot be red today**, because nothing rasterises a path: its
+  mutation must write a *different* colour into the slot, since writing the same
+  opaque picture over itself composites to itself and the guard passes — which
+  is what the first mutation did. `Ink` is in the model and the file so that
+  brush-look strokes, later, change no document already saved; `vectorview`
+  skips it through an exhaustive `match` and no panel, menu or command can
+  make one. A control for it would be a live control that lies.
+- **`VectorObject::Opaque` keeps a newer build's record whole.** A record whose
+  version is past this build's is not parsed: it is held as bytes, written back
+  byte for byte, and the layer is still a vector layer — it refuses paint, draws
+  nothing and cannot be appended to (`can_set_vector` refuses it). Dropping it
+  would make the layer paintable, and the next save would delete the paths a
+  newer Umber put there, which is the failure the version bump exists to prevent
+  arriving by the side door. The version is probed as a `u64`, so a figure past
+  `u32` is `Opaque` rather than unreadable. **A canvas flip and a canvas resize
+  are refused while any layer holds one**, with a sentence, because this build
+  cannot mirror or move paths it cannot read, and carrying every pixel while
+  leaving those paths where they were is a document the newer build would open
+  wrong. `LayerStack::has_opaque_vector` is the one predicate;
+  `Editor::flip_refusal` (lock first, because that one the artist can take off)
+  feeds the flip rows, the flip command, the undo and redo of a flip through
+  `StepGate::FlipRefused` and `mirror_document`, and `Editor::resize_refused`
+  gates `App::apply_canvas`. **The Canvas settings dialog disables its Apply
+  from a second statement of that rule**, `has_opaque_vector() &&
+  form.resizes()`, which agrees only because the form's starting size is the
+  document's at open; it should call `resize_refused` and does not yet.
+  A change to the resolution or the background alone moves nothing and is
+  never refused.
+- **`print` is written only beside Ink, and a mismatch drops Ink and keeps Cut
+  and Plot.** It is the text record's fingerprint of the layer image, and it
+  means something only for paths that describe pixels. Cut and Plot describe
+  none and cannot go stale, so an older build painting on the layer cannot
+  invalidate them. Nothing in this stage writes Ink, so the pinned literal has no
+  `print` and the mismatch path is reached only by a hand-built fixture. The
+  record's own `print` is a private `{rect, hash}` because `Fingerprint` has no
+  serde, and the hash is a hex string for the text record's reason.
+- **`umber-version` is 5 for this, and group compositing therefore takes 6.**
+  The argument is the effects one, not the folder one: the paths are the whole
+  content of the layer, so an older build would open a blank layer and drop
+  `umber/vector/` for ever at its next save. It *refuses* the file instead.
+  `required_version` answers 5 where any layer carries a record — **an empty one
+  included**, for the first rule above — and what it answered before otherwise.
+  `docs/group-compositing.md` §4.3 now says 6 and says why, which is the lesson
+  of 3: the person who builds it reads the document. A record is
+  `umber/vector/<n>.json` named by `umber-vector`, the mask's and the text
+  record's shape; a record that cannot be parsed costs that layer its paths and
+  nothing else, a folder naming one loses it with a warning, and a layer naming
+  both text and vector keeps the text.
+- **The record has a derived bound and a literal pin.** `MAX_NODES` (65,536),
+  `MAX_PATHS` (4,096), `MAX_COORD` and `MAX_BRUSH_ID` are enforced where a record
+  is *installed*, so one over the bound is unwritable, and `MAX_RECORD_BYTES` is
+  derived from them with a measured worst-case node. That is why only the reader
+  needs the size gate. `MAX_BRUSH_ID` is not in the design: `Ink::brush` is the
+  one unbounded string and without a bound the derivation has no top. The whole
+  serialised text of a fixture is pinned as a literal and `role` has no serde
+  default — a path missing one is refused, not read as a Cut — for the rule
+  `Effect` records: a struct's field names are a format, and a default turns an
+  unrecognised one into a silence.
+- **`EditKind::is_saved` replaced the `is_structural` skip, and this is the
+  "Partial exhaustiveness" lesson cashed in.** `EditKind::Paths` is a bodiless
+  kind that is not structural, which is exactly the shape that fell through
+  `SaveHistory::new`'s `match edit.patches().first()` to `SaveBody::Flip` and
+  discarded the history on reload. `is_saved` is one exhaustive predicate and
+  both `SaveHistory::new` and `docimport::history`'s guard ask it, so the writer
+  and the reader cannot disagree about which kinds the file holds. `is_structural`
+  has no production caller left. `every_unsaved_kind_is_skipped` walks every kind
+  with `!is_saved`, at the first position and a middle one, and asserts the
+  count so a new unsaved kind has to be placed. A path edit is not written
+  because the record it restores is a value on a layer that a reopened undo has
+  no safe way to put back.
+- **`EditBody::Vector` names a *slot*, not a position.** An entry outlives
+  reorders and a position does not, so `restore_vector` finds the layer by the
+  slice it holds, for the reason a `PixelPatch` names one. It has **no lock gate**
+  — an undo that refuses is worse than a lock set after the edit — and on `Err`
+  it hands the record back so nothing is lost on the way out. Its cost to the
+  budget is `size_of::<EditBody>() + was.byte_len()`, and a parked layer is
+  charged for its record too: `vector_bytes` in `byte_len` is guarded by a test
+  that compares two layers differing *only* in the record, because a `>=` against
+  a parked layer is met by the slice alone and a mutation removing the term
+  survived the first guard.
+- **`vector_revision` is bumped inside every method that writes a record, and
+  inside the structural edits.** The overlay's cache keys on it. The field is
+  private to `layer.rs`, so the writers were found by grepping that file for
+  writes to it rather than from memory: `install_vector`, `add_vector_layer`,
+  `set_vector` (on success only), `restore_vector`, `flip_vectors` and
+  `translate_vectors`, plus `add_named`, `remove_many`, `reorder_to`, `group` and
+  `restore_shape`, which move a layer without touching its record. It is drawn
+  from one **process-wide counter** so a stack built to replace another can never
+  answer a number the old one did. **Visibility is deliberately not in it**:
+  `Layer::visible` is a public field the interface writes through `get_mut`, so
+  there is no method to bump from, and the overlay reads `effective_visible`
+  afresh every frame as a bitmask in the cache key. This is `slot_revision`'s
+  rule and its warning — a list enforced inside N methods still needs somebody to
+  check that N is all of them.
+- **A flip is bounded, not exact.** The design said "exact" and that is false in
+  `f32`: mirroring a non-dyadic figure about a canvas edge rounds. What holds, and
+  is tested, is that one round trip costs at most one rounding at the larger of
+  the canvas and the figure, and that a thousand of them equal the first — no
+  accumulating drift. The bound the test asserts is the canvas's
+  (`canvas * EPSILON`); its figures reach about 5000 on a 700-wide canvas and
+  nothing near `MAX_COORD`. This is *not* the layer array's `flip.wgsl`, which
+  is an exact texel permutation; a path is a float. Undoing a flip is another
+  flip, so nothing that can be mirrored is dropped: Ink is mirrored with the
+  rest, because the pixels it describes are mirrored by the same flip. A path
+  the flip pushes out of bounds is the exception, below.
+- **A resize translates paths where it drops text records.** The text record
+  is a placement over pixels the resize may have cropped, so it goes. A path is
+  geometry, exact under a translation, and may lie outside the canvas, so a
+  shrink carries it with the picture. The offset is `CanvasCopy::plan`'s
+  destination minus its source — the plan `CanvasRenderer::resize` copies the
+  pixels by — so the two cannot disagree about where the picture went. **Ink is
+  the exception**, stripped with a notice appended to any already up (text's
+  stays), because Ink describes pixels the resize cropped or moved.
+- **A flip or a resize drops a path it pushed out of bounds, and says so.**
+  Neither transform clamps, because clamping deforms a shape, so a path lying
+  far off the canvas can be carried past `MAX_COORD` by a mirror or by enough
+  anchored resizes. Left there, `to_json` would refuse the whole record at the
+  next save and every other path on the layer would go with it.
+  `VectorObject::bounded` takes out each path that fails the per-path half of
+  `check` (`path_in_bounds`, one statement shared by both), so the rest
+  survive; `translate_vectors` returns a `VectorCarry` (Ink stripped, paths
+  lost) and `flip_vectors` the lost count, and `Editor::apply_canvas` and
+  `flip_canvas` append a line to the notice. The undo of the flip does not
+  bring the path back, which is why the line is said.
+- **A record `to_json` refuses is saved as an empty record, never as no
+  record.** Writing nothing reopened the layer as an ordinary paintable one,
+  changing its kind under the artist, while `required_version` still declared 5
+  for a record the archive did not hold. The writer writes
+  `VectorObject::empty()` in its place, the attribute still points at it, and
+  `SaveWarning::VectorNotRecorded` says the layer was saved as an empty vector
+  layer.
+- **The paint gate is `EditRefusal::Vector`, at `refusal_at`, and a mask is not
+  refused.** A stroke on a vector layer's *mask* changes no layer pixel and
+  cannot put the record out of step, for the reason it is allowed on text. Cut
+  and paste say a sentence through the existing refusal tables; **a lift raises
+  one too** (`float_refusal_notice`) where every other lift refusal stays silent,
+  and a canvas press with a brush raises none, or the pen going down would be a
+  dialog. **The lift's sentence is said once, not once a press**: `LiftNotice`
+  latches on the document, the active layer's id and the tool it was raised for,
+  `render` observes that key every frame and re-arms when any of the three
+  changes, so another layer and back says it again. A paste is not latched.
+  With "On its own layer" off, the Text panel's Place is disabled over a vector
+  layer with its own sentence, read from the same `active_refusal` the paste
+  gate uses, rather than lit and then refused in a paste's words. "Clear layer" is *disabled* with a tooltip rather than meaning
+  "convert to paint" as it does on text: there may be no paint to keep, and
+  throwing away paths silently is the wrong reading. The one reading is
+  `editor::clear_layer_refusal`, shared by the menu item and the command so the
+  control and the gate cannot disagree. Deleting the layer is how paths go, and
+  it is undoable. `no_refusal_sentence_has_a_run_of_spaces` walks every refusal
+  through every table, because the sentences were first written with a lost
+  string continuation and came out with a run of spaces in the middle.
+- **A path from the selection is planned by `&self` and applied separately.**
+  `Editor::plan_path_from_selection` decides append, new layer or refusal from
+  the model alone, so a refusal changes nothing because the planner cannot;
+  `apply_path_plan` changes the stack and records one entry (`Paths` for an
+  append, `AddLayer` for a new layer). `App::path_from_selection` puts the float
+  down and finishes the stroke first, then reserves a slice and retries once
+  after `free_a_slot`. `apply_path_plan` is exempted by name in
+  `every_structural_edit_settles_a_float_before_it_records`, which forbids
+  `history.record(` in `editor.rs` elsewhere: its only caller has already settled
+  the float. A locked or `Opaque` active vector layer is not a refusal — the
+  paths go on a layer of their own — while a full stack, a folder at `MAX_DEPTH`
+  and a locked folder are sentences. The two commands and "New vector layer" are
+  `Action`s with no default key, and are named as the exceptions in
+  `every_action_ships_bound_unless_it_is_a_brush_tweak`.
+- **A new layer lands where Add puts it, which with a folder selected is
+  *inside* the folder.** The plan said "at top level beside it" and that was
+  wrong against the existing route: `add_named` puts a layer at the active
+  entry's depth plus one when it is a folder, and a vector layer making a second,
+  different rule would be one more thing to keep in step. A new layer inside a
+  locked folder is refused with a sentence, as Text's Place is, rather than made
+  born-locked with paths in it. The mark is on the Layers panel's flags row
+  beside Add, not in the header: it acts on neither the selection nor the ticked
+  set, and the header's strip is pinned at 104.
+- **The overlay is cached, and a still frame allocates nothing.**
+  `vectorview::VectorView::lines` keys on the document, `vector_revision`, the
+  visibility bitmask, the camera, the canvas region and the scale. **There is no
+  clamp.** A whole path whose bounds miss the view is culled; each cubic whose
+  control-point hull misses the view grown by `CULL_MARGIN` (8 points) is culled
+  before it is flattened; what is left is flattened per cubic by
+  `umber_core::vector::flatten_cubic`, the one flattener, which `Path::flatten`
+  also uses through `Path::segments`, at `0.25 / zoom / ppp` document pixels;
+  and each segment is clipped to the same rectangle by an `f64` Liang-Barsky
+  clip, so a path that leaves the view and comes back splits into separate runs
+  rather than drawing a chord. A clamp was the first draft and was wrong: it
+  slides each axis separately, bending a diagonal where it is seen. `MAX_POINTS`
+  (262,144) is spent on visible segments only, and past it the overlay stops
+  drawing, with a `debug` log and nothing on screen; the scratch holds one cubic
+  and is shrunk back to `SCRATCH_KEEP`. **The residual work bound is the number
+  of cubics whose hull meets the view times 256**, the flattener's segment cap,
+  and a hull can meet the view while its curve does not. The tessellated line is
+  an `Arc<Mesh>` rebuilt only when the lines, the scale or the three colours
+  change, because egui takes a path's points by value and `Shape::line` would
+  copy every point every frame.
+- **The machine lines snap themselves, and both passes are an *odd* number of
+  device pixels wide.** egui snaps a `LineSegment` (the marquee) and never a
+  path, so an axis-aligned run is rounded to the pixel grid here with egui's own
+  `Stroke::round_center_to_pixel`; diagonals are not moved. Odd widths centre on
+  a pixel centre, and the underlay is exactly two device pixels wider so one
+  underlay pixel shows on each side. **That shares the marquee's centre only at
+  100% and 125%**, where the marquee is one device pixel and so is the top pass:
+  there the two are the same width and only the colour and solid against dashed
+  tell them apart. At 150% to 200% the marquee is two device pixels centred on a
+  pixel boundary, and the three-pixel top pass sits half a device pixel off it. The overlay's screen points equal the marquee's for the same selection,
+  and `the_lines_land_where_the_marquee_does` compares them against
+  `selection_screen` itself at 150% with an off-grid camera.
+- **The palette's two derived colours, and the hue that had to move.**
+  `Palette::cut_line` and `plot_line` are a fixed hue mixed towards the end of
+  the lightness axis `accent_underlay` is *not*, bisected until the top pass
+  stands `MACHINE_LINE_CONTRAST` — `READABLE²`, 9:1 — off the underlay. That figure
+  is exact rather than generous: for artwork lying between the two passes
+  `ratio(top, under) = ratio(top, art) × ratio(art, under)`, so 9:1 is precisely
+  the condition for one of the two to reach 3:1 on **any** painting, which the
+  marquee cannot promise because its top pass is the accent, a mid tone it does
+  not get to move. The hues are **355° and 195°**: the first draft's 345° made
+  the dark themes' pink 64 from the rose link colour, under the 68 the closest
+  accent pair sets, and the sweep over all 24 theme and accent pairs put the
+  worst separation at 85. **Nobody has seen these lines in a running window.**
+  The guards measure contrast and separation; whether a 1 px line in a 3 px halo
+  looks like a line or a smear at 100% is a look.
+- **The thumbnail is the mark while there is nothing to picture.** A vector layer
+  with no Ink shows `Icon::Spline` in its row and asks for no thumbnail, through
+  `thumbs::shows_a_path_mark`, which the row and `thumbnail_slots` both read. Its
+  slot stays in the live list so a layer that later gains pixels is not
+  forgotten. `Icon::Spline` is a Lucide paste.
+- **Both writers name `vector:`, and the count guard is weak against
+  replacement.** `SaveLayer::vector` is filled by `save_layer` and by the
+  autosave's `LayerMeta`, snapshotted when the capture begins like `effects`.
+  `..SaveLayer::new` writes `None`, so a writer that forgot is silent.
+  `save_and_the_autosave_both_carry_the_vector_record` counts the literal, which
+  still passes if the value is replaced by `None`; the guards that read the file
+  are `a_save_layer_carries_the_vector_record_the_layer_holds` and
+  `an_autosave_writes_the_paths_a_save_does`.
+- **What was not looked at.** The Edit-menu rows and the Layers-panel mark have
+  no `docshot` picture, which needs a GPU adapter, and the overlay's joins on
+  curves and its halo at 150% and above have never been seen. A combined
+  selection's path is a pixel staircase and a self-crossing lasso gives a path
+  that crosses itself, which is project 3's to smooth and is said in the
+  CHANGELOG rather than hidden.
+
+#### The Path tool
+
+`umber-core::pathedit` is the geometry (pure functions over `Path`, each
+returning a new value so the caller can diff for undo), `umber-app::pathtool`
+is the model (presses, moves, releases and keys in document space, no winit and
+no drawing), `Editor` turns its commits into record swaps and undo entries, and
+`ui::path_marks` and `vectorview::PathPreview` paint it. The design is
+`docs/superpowers/specs/2026-11-25-path-tool-design.md`. There is one kind of
+path: one made from a selection is edited by exactly the same means as one
+drawn by hand.
+
+- **The layer's record is not written during a drag.** The original stays drawn
+  by the overlay and the edited copy is painted over it from the tool's own
+  state; the record is swapped once, at the release. That keeps the overlay
+  cache and `vector_revision` out of the pointer path, makes "one gesture, one
+  undo entry" structural rather than disciplined, and means an autosave cannot
+  see a half-dragged path. `Interaction::Pathing` is not idle, so none starts
+  mid-gesture either. A drag that ends where it began, and a strip press that
+  changes nothing, record nothing (`apply_path_edit` returns early on an equal
+  record).
+- **`Tool::Path` resolves to `Press::Path` in `gesture.rs`, and no event arm
+  matches on `Tool`.** A pen reaches it exactly as a mouse does. `Press::ALL`
+  and `every_press_is_filed_in_its_own_place_in_all` keep the list honest.
+- **A held gesture ended by anything but its release goes through
+  `Editor::interrupt_path_gesture`.** A press of another gesture, a pinch and
+  the window losing focus all take `Pathing` away with no release coming, so
+  the node the press was placing is taken back (and the draft ends if it was the
+  only one), a closing press reopens the draft, and a drag is dropped without
+  committing. It acts on `Pathing` only. The `app.rs` call sites cannot be
+  driven without an `App`; the model half and the Editor half are tested.
+- **Undo with a draft up belongs to the draft.** It takes the last node off,
+  redo is swallowed, and neither touches `History`, so no redo stack is lost to
+  a node. `App::undo_command` is the keyboard's and the menu's route, and
+  `ui::step_rows` draws Undo as "Undo point" and Redo disabled while a draft is
+  up. `jump_history` still steps the history directly, because a row names an
+  entry and a draft is in none.
+- **A path taken up and given nothing lands nothing.** Clicking an open end
+  takes the path up as a draft that already holds its nodes, so Enter or a
+  settle straight afterwards would land the same path back over itself: an
+  "Edit paths" row that undoes to itself, a cleared redo stack and a dot on the
+  tab, for a click. `PathTool::land` answers `Commit::Nothing` while a
+  continuation holds exactly `base_len` nodes, `finish` then drops the draft
+  and a settle drops it on `Nothing`; the closing press is a change and still
+  lands. `apply_path_plan`'s Append compares records as `apply_path_edit` does,
+  so a plan that changes nothing records nothing by either door.
+- **A draft that cannot land stays up and the strip says why.** A full stack, no
+  slice, too many paths or nodes: nothing drawn is lost and the artist can make
+  room. The one notice, "The path being drawn was not kept", is raised on
+  leaving the tool (or a tab switch or a resize), never on a canvas press, so a
+  pen going down is never a dialog. `plan_paths` is the one door a finished path
+  lands by, shared with the selection commands; `path_edit_refusal` is the one
+  reading of whether the active layer may be edited, by effective visibility and
+  lock. **A hidden layer takes no path**: it lands on a new layer instead, so
+  nothing is added where it would not be drawn.
+- **Close and quit settle the draft before the unsaved prompt is computed.**
+  `settle_before_closing` (only for the tab in front) and
+  `settle_before_quitting` run before `modified` is read, so a kept path counts
+  as unsaved work and the ordinary prompt asks about it.
+- **A draft rides a canvas flip, and a resize settles it.** `PathTool::mirror`
+  uses `Node::flipped`, the arithmetic `VectorObject::flipped` maps over, and is
+  called inside `Editor::flip_canvas`, so a flip reached by undo, redo or a
+  History jump carries the draft as the command does; settling there would
+  record a landing inside the history being walked. A resize clears the
+  history, so it settles first.
+- **The pick is let go on a foreign revision, and a continued draft is checked
+  against the path it names.** A pick and a continued draft name a path by
+  index, and `PathWatch` compares the document, the slot and `vector_revision`
+  to say when that index may have stopped meaning what it meant. A foreign
+  change drops the pick, since a fresh one is a click away. A continued draft is
+  only *detached* (it then lands as a new path), because dropping it costs what
+  the artist drew and detaching costs at most a duplicate. One given nothing yet
+  is dropped instead, since it holds only the path's old nodes and would land as
+  a copy of a path nobody drew. **What decides the
+  detach is the path, not the count.** A layer or document change detaches
+  outright; on a foreign revision `PathTool::still_continues` keeps the draft
+  only if path `i` is still an open line of the draft's role whose nodes equal
+  the draft's first `base_len` (reversed, handles swapped, when it was taken
+  from its first node). A count can come back to what it was over a different
+  path, and the landing would then replace a path the artist never touched.
+  The tool's own Ctrl-edit of the very path being continued detaches too, or
+  the landing would write the old nodes back over the edit. The watch runs at
+  the top of `render` and again at the start of every press, release, key and
+  settle, because an undo can arrive between two events with no frame between
+  them; the tool's own commits go through `own_edit` and keep their pick.
+  `a_stale_pick_never_reaches_the_next_key` and
+  `a_jump_that_keeps_the_count_detaches_a_draft_whose_path_moved` are the
+  guards.
+- **Marks and hit test share `Editor::path_nodes_shown`, and its cap is 2048.**
+  Past `NODE_MARK_CAP` nodes in view no node mark is drawn and node and handle
+  hits are off (segment hits still work), because a path traced from a lasso can
+  hold tens of thousands and a mark per node per frame is the cost the standing
+  rule forbids. The answer is cached by document, revision, pick and view, and
+  the scan stops as soon as it knows. `ui::path_marks` is the one statement of
+  where a mark is, read by the painter and the tests, and handles belong to the
+  picked node (and the draft's last) alone. A draft is capped differently: its
+  first `NODE_MARK_CAP` nodes are marked and its last always is, because a long
+  path taken up from its end is being drawn *from* that node.
+- **A still frame does no work that scales with the picked path.** The picked
+  path can be a lasso's tens of thousands of nodes, so the preview lines, the
+  mesh and the marks are rebuilt only when `ui::PaintKey` moves: the document,
+  the revision, whether the layer may be edited, the tool's content
+  `generation`, the role, the nodes shown, the hover band, the camera, the view,
+  the scale and the colours. Comparing the lines by value, which this used to
+  do, walked every node of the pick on every frame to find out nothing had
+  changed. **`PathTool::generation` is bumped inside every `&mut` method that
+  can change what is drawn**, for the reason `slot_revision` is bumped inside
+  the method rather than beside its callers; `say` is the one that does not,
+  because the strip is not the canvas. The draft and its band are traced
+  before the pick, so a pick that meets `MAX_POINTS` cannot hide the line being
+  drawn. A drag writes into one copy of the path it holds rather than cloning
+  the path per move. `a_still_frame_traces_nothing_and_walks_no_node` reads the
+  counters, and checks that a hover, a pan and a pick each rebuild, so it is not
+  satisfied by a painter that never rebuilds. `machine_line_mesh` still builds
+  a fresh tessellator per rebuild.
+- **A layer the tool makes has its slice wiped at the end of every event as well
+  as in `render`.** `Editor` has no renderer, so it queues the slot
+  (`path_layers_made`), and `App::drain_path_layers` empties the queue after
+  every `window_event` and at the top of the frame's reads. Draining only in
+  `render` left a window in which a landing made by a release, Enter or a close
+  could be read, by a save, an export, a copy or an undo, before the recycled
+  slice was cleared. `a_landed_layer_is_handed_to_the_wipe_once` covers the
+  queue; that `App` calls the drain at the end of every event is not testable
+  without a device.
+- **Ink paths are never hit or continued.** An Ink path describes pixels and is
+  not a line, and landing a continued one would strip its ink. The reading is an
+  exhaustive `match` on the role.
+- **Changing the role never changes the default by picking.** The Cut / Plot
+  switch shows the pick's role while there is one and the default otherwise;
+  pressed with a pick it changes that path alone. Switching mode leaves a draft
+  up, since neither Enter nor leaving the tool has happened
+  (`switching_mode_leaves_the_draft_up`).
+- **`lucide.rs` reads packed arc flags.** Lucide writes an arc's flags against
+  the next number (`00-2.756`), and a lexer reading a flag as a number deforms
+  the mark rather than breaking it. `Lexer::flag` reads one character, guarded
+  by `an_arcs_flags_may_run_into_the_number_after_them`. `number_tokens` reads
+  an arc's flag slots the same way, so `every_number_in_every_icon_parses` sees
+  the tokens the parser sees, and `pen_tool_draws_what_its_flags_written_apart_would`
+  compares the shipped icon with its data written out spaced by hand. The brief
+  for the rail mark carried `pen-tool` path data that is not what Lucide
+  publishes: fetch the file rather than trusting a brief.
+- **What nobody has looked at.** The marks over real artwork (their colours and
+  weights are reasoned and measured, not seen), the feel of the 8-point hit
+  radius, the pen path, and the icon sheet for `pen-tool`.
+- **Knowingly left.** Freehand drawing fitted to a curve (it belongs with
+  tracing), rectangle and ellipse path shapes, selecting several nodes or paths,
+  snapping and nudging, and editing a layer that is not the active one. Cancel on
+  a close prompt leaves the draft landed on a layer. The update-install exit
+  (`update::Exit::Quit` and `Restart`) discards unsaved work without a prompt, a
+  draft included; that is pre-existing.
+
+#### Trace outline
+
+`umber-core::trace` is the algorithm (crop and average down, distance
+transform, marching squares, then `trace::fit`), `CanvasRenderer::export_coverage`
+is the one readback, `Editor::plan_trace` decides everything the model can, and
+`tracedlg.rs` is the form. The design is
+`docs/superpowers/specs/2026-11-26-trace-outline-design.md`. The paths land
+through `carry_out_path_plan`, the route the selection commands take, as one
+undo entry.
+
+- **It is a CPU distance transform and not the outline effect's GPU distance
+  field**, though the effect already grows a shape on the device. Reading that
+  back ties an explicit command to the effect cache's working set and budget,
+  cannot be tested without a device, and still leaves the contouring and the
+  fitting to do on the CPU. The exact Euclidean transform gives round offsets
+  and the whole of it is tested with no device at all. **What makes it exact
+  is that the envelope is worked in `f64`**: a parabola intersection is a
+  difference of two squared cell indices, which `f32` stops holding at cell
+  4097, and in `f32` a block 12000 cells along a 12200-wide grid broke into ten
+  rings at margin 1. That is any strip wider than 4096 at one pixel a cell.
+  The stored field stays `f32`, exact for every squared distance a ring can be
+  at. `a_grown_outline_is_the_same_far_along_a_wide_grid_as_near_its_start`.
+- **The background is left out of the composite pass by a parameter**, the
+  `[f32; 4]` `composite_over` takes, set to transparent's all-zeroes identity
+  for that one draw. Subtracting it afterwards cannot work: a white-backed
+  document's flattened alpha is 1 everywhere, so what the artwork covered is
+  gone by the time the bytes arrive, and the trace is one rectangle the size of
+  the page. Toggling `self.background` on the renderer for the read is a
+  mutation of document state with a failure path that can leave it changed,
+  and the screen would composite against whatever the read left behind. A
+  value in a field the shader already reads is neither, and is still the
+  screen's own flattening, so masks, clipping, opacity and hidden layers are
+  honoured by construction.
+- **Inside is `THRESHOLD` (26 of 255, about 10%), not a halfway point.** A soft
+  brush edge would otherwise push the line outwards by its whole falloff, for
+  ink too faint to print. **A piece smaller than `MIN_SPECK` (4 cells) is
+  removed**, so a stray pixel does not become a sticker of its own.
+- **A margin is measured from the ink's pixel edge, and any cell at or above
+  the threshold counts as wholly inside.** The field is `margin + 0.5 -
+  distance` between cell centres, so the ring's straight edge lands exactly
+  `margin` beyond the artwork (the fitted line is within the tolerance of the
+  ring; see the next point) and a corner is a circle about the corner cell's centre,
+  which falls about 0.21 of a cell short of a true offset on the diagonal
+  (`sqrt(2)/2 - 1/2`; the test pins it). On a grid `region` has averaged down
+  to stay under `MAX_CELLS` the same rule makes a grown outline the offset of a
+  staircase, so it is faceted and costs nodes: a margin-10 disc is 2 nodes at
+  one pixel a cell and 14 at two. The repair is a sub-cell distance in `rings`,
+  never a looser fitter.
+- **With a margin, Smoothing is capped at half of it, because the fitter's
+  tolerance is symmetric.** Uncapped, the line could sit `smoothing` inside the
+  ring: a block with a 5 px wavy edge at margin 3 and smoothing 8 put the cut
+  line through solid ink, which on a cutter is material spoilt. Capped, the
+  line stands off at least half the margin, less the fifth of a cell the ring
+  itself falls short round a curve (measured: 1.63 there). The quarter-cell
+  floor still wins where the two conflict, a margin under half a cell, and at
+  margin zero the tolerance is as asked, since there is no stand-off to keep.
+  The Smoothing hover text says so. `smoothing_never_pulls_a_grown_line_into_
+  the_ink` and `a_grown_line_stands_off_at_least_half_the_margin`.
+- **A selection is ignored.** The trace reads the whole composite of what the
+  source names, whatever is selected.
+- **Holes are decided on the grown shape**, not on the artwork. A gap the
+  margin closes is not a hole any more; one it does not close is filled unless
+  Keep holes is on, because a sticker with its middle cut out is rarely what
+  anybody meant.
+- **Effects are traced, because they print.** `App::trace_outline` bakes
+  `trace_effected_draws` exactly as an export does, so a drop shadow or an
+  outline effect is inside the cut. A vector layer's own Cut and Plot paths are
+  not: they are drawn over the canvas and never composited, which is the rule
+  that keeps them out of an export too.
+- **`trace::fit` is the fitter freehand drawing will use**, which is why
+  `fit_open` exists with nothing calling it. Corners first, then Schneider's
+  algorithm between them. One consequence worth knowing before a report of
+  "the circle came out square": `corners` measures the turn between the chords
+  `CORNER_REACH` either side of a vertex, about `4/r` radians on a circle of
+  radius `r`, which passes `CORNER_DEGREES` near a radius of 4 cells. Measured
+  at margin zero, a circle of radius 4.5 cells or less fits as four kinked
+  nodes and one of 5 or more as two smooth ones. A grown corner is a circle of
+  `margin + 0.5` about the corner cell's centre, so a block grown by 4 cells
+  has smooth corners and one grown by 3 still has four kinks.
+- **An empty `trace` after a non-empty `region` is "nothing to trace"**, the
+  same notice as `region` answering `None`. Thin faint content can survive the
+  crop and vanish in the averaging, and treating the two as one is what stops
+  a successful-looking command landing an empty layer.
+- **The dialog stays open behind a refusal's notice**, which no dialog did
+  before it, so its Escape and click-outside go through `Modal::should_close`
+  and never a raw key read: egui's top-modal rule is what lets the Escape that
+  dismisses the notice leave the form standing.
+  `dismissing_a_notice_over_the_dialog_leaves_the_dialog_up` is the guard and
+  fails under a raw read.
+- **Knowingly not built.** A live preview (retune by undoing and running
+  again; the form remembers its settings for the session), centre-line tracing
+  for plot lines, clipping the result to the canvas (a margin may carry an
+  outline past the edge, and what a machine does with that is the next
+  project's), and persisting the settings across runs.
+
 ### Documents
 
 Several documents are open at once. `Session` (`umber-app/src/session.rs`) holds
@@ -1823,7 +2334,7 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   approximate — without it, reopening Umber's own file reports a loss that did
   not happen. `umber-version` is bumped only when a revision stores something an
   older build would drop silently, and an older build then **refuses** the file
-  rather than opening it with pieces missing. It is at **3**. Revision 2 was
+  rather than opening it with pieces missing. It is at **5**. Revision 2 was
   masks and clipping, because a build ignoring either shows a picture that is
   *wrong* — what the mask hid comes back, and the clipped layer paints
   everywhere. Revision 3 is **layer effects**, and that one is not about what an
@@ -1832,7 +2343,10 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   record** all ride along, because ignoring them changes no pixel — and the text
   record only rides along because of its fingerprint, without which an older
   build could paint over the layer and this one would re-render over the
-  brushwork. See "Text".
+  brushwork. See "Text". Revision 4 is the mask encoding (see "The tile
+  atlas") and revision 5 is **vector layers**, for the reason effects took 3:
+  the paths are the whole content of the layer and an older build would open it
+  blank and drop them at the next save. See "Vector layers".
 - **Umber has twenty-three blend modes and `blend.wgsl` is still the only
   statement of them.** The whole W3C separable set, Photoshop's linear burn and
   three light variants, subtract and divide, and the four non-separable modes
@@ -1972,15 +2486,16 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   `opacity` and no `composite-op`** — a group opacity is the one thing a
   flattening reader cannot reproduce, and writing one is what would earn the
   bump. `a_document_of_folders_still_declares_the_revision_it_needs` guards it.
-- **`umber-version` is at 3, and layer effects are what took it there.**
+- **`umber-version` reached 3 here, and layer effects are what took it there.**
   `docs/layer-effects.md` §8.2. The argument is not what an older build
   *shows* — a layer without its shadow is merely plainer, which is the folder
   case — it is what an older build *writes*: effects are non-destructive, the
   parameters are the whole feature, so opening and saving drops
   `umber/effects/` permanently. **`docs/group-compositing.md` §4.3 wanted 3
-  too; effects landed first, so group compositing takes 4**, and that is
+  too; effects landed first, so group compositing took 4**, and that is
   recorded in §4.3 rather than only in a Rust comment, because the person who
-  implements it reads the document.
+  implements it reads the document. It has since moved twice more, for masks and
+  for vector layers, and group compositing now takes **6**.
 - **An effects record goes outside the ORA stack, under `umber/effects/`, named
   by an attribute on the element** — the mask's shape, for the mask's reason. A
   document-wide table would need a key and every candidate is wrong: a stack
@@ -3355,10 +3870,12 @@ once per stroke but must never move into the drawing loop.
   turns out to have been.
 - **`EditKind` has a variant only for something the engine can restore**, and
   the rule is the bound rather than the count. It is Paint, Erase, Transform,
-  the two canvas flips, and the six structural edits — an entry exists where a
-  patch was captured, where the edit is its own inverse (the flips), or where
-  the *shape* of the stack can be put back (a delete, an add, a reorder,
-  entries gathered into a folder, a mask added or removed). **A layer cannot be
+  the two canvas flips, the six structural edits and Paths — an entry exists
+  where a patch was captured, where the edit is its own inverse (the flips),
+  where the *shape* of the stack can be put back (a delete, an add, a reorder,
+  entries gathered into a folder, a mask added or removed), or where a layer's
+  paths record can be swapped back by slot (`EditKind::Paths`, whose body is
+  `EditBody::Vector`). **A layer cannot be
   renamed at all**, and this line said it could until two agents went looking
   for `EditKind::Rename` on the strength of it: `Layer::name` is written only
   where a layer is created or imported, `LayerStack` has no rename method, and
@@ -3482,8 +3999,9 @@ length. `gesture::supersedes_stroke` was the same shape in a third file, a
 `Press` enum.
 
 **The silent half is the half that damages a document, and it is worth
-following one all the way down.** `SaveHistory::new` skips an entry when
-`is_structural()`; one it does not skip falls through
+following one all the way down.** `SaveHistory::new` skipped an entry when
+`is_structural()` (it asks `is_saved()` now, which `EditKind::Paths` is what
+forced; see "Vector layers"); one it did not skip falls through
 `match edit.patches().first()` to `None => SaveBody::Flip`. So a new bodiless
 variant is written into the `.ora` **as a canvas flip**. On reload,
 `docimport::history` has a deliberate guard against exactly that outcome —

@@ -3731,6 +3731,62 @@ fn a_transparent_background_leaves_the_checkerboard_alone() {
 }
 
 #[test]
+fn coverage_of_a_white_backed_document_is_the_artwork_alone() {
+    let mut h = harness_or_skip!();
+    h.set_background(Background::WHITE);
+    h.stamp(&[dab(32.0, 32.0, 6.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let draws = [layer(0, 1.0, BlendMode::Normal)];
+
+    let cov = h
+        .canvas
+        .export_coverage(&h.gpu.device, &h.gpu.queue, &draws);
+    assert_eq!(cov.len(), (DOC * DOC) as usize);
+    assert_eq!(cov[(2 * DOC + 2) as usize], 0, "far from the dab");
+    assert_eq!(cov[(32 * DOC + 32) as usize], 255, "centre of the dab");
+
+    // The same stack exported as a picture is opaque everywhere, which is
+    // what tracing it would have seen without this path.
+    let rgba = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &draws);
+    assert!(
+        rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
+        "a white page exports opaque"
+    );
+}
+
+#[test]
+fn coverage_is_the_alpha_an_export_would_have_without_a_background() {
+    let mut h = harness_or_skip!();
+    h.set_background(Background::Transparent);
+    h.stamp(&[dab(20.0, 30.0, 9.0, 0.5), dab(40.0, 34.0, 7.0, 1.0)]);
+    h.commit(Color::WHITE, 0.7, BrushMode::Paint);
+    let draws = [layer(0, 1.0, BlendMode::Normal)];
+
+    let cov = h
+        .canvas
+        .export_coverage(&h.gpu.device, &h.gpu.queue, &draws);
+    let rgba = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &draws);
+    let alpha: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+    assert!(alpha.iter().any(|&a| a > 0 && a < 255), "has soft edges");
+    assert_eq!(cov, alpha);
+}
+
+#[test]
+fn a_hidden_layer_has_no_coverage() {
+    let mut h = harness_or_skip!();
+    h.set_background(Background::WHITE);
+    h.fill(0, Color::WHITE);
+    let mut hidden = layer(0, 1.0, BlendMode::Normal);
+    hidden.visible = false;
+
+    let cov = h
+        .canvas
+        .export_coverage(&h.gpu.device, &h.gpu.queue, &[hidden]);
+    assert_eq!(cov.len(), (DOC * DOC) as usize);
+    assert!(cov.iter().all(|&a| a == 0));
+}
+
+#[test]
 fn a_document_background_shows_where_the_stack_does_not() {
     let mut h = harness_or_skip!();
     h.set_background(Background::WHITE);

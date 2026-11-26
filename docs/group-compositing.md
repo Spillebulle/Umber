@@ -378,19 +378,23 @@ change.
 ### 4.3 `required_version` gains one clause, and it is the right kind
 
 > A folder whose opacity is below 1 or whose blend mode is not Normal takes
-> `umber-version` to **4**.
+> `umber-version` to **6**.
 
 That is the same predicate as §3.1, which is what stops the file and the shader
 disagreeing.
 
-**It says 4 rather than 3 because layer effects landed first and took 3.** This
-document proposed 3, `docs/layer-effects.md` §8.2 proposed 3, and only one
-feature can have a number. The rule both stated was that whichever landed second
-records the decision rather than leaving `required_version` to reconcile it;
-effects shipped their clause in `docformat::required_version`, `VERSION` is at 3
-for them, and `docformat::VERSION`'s own doc comment names this section and says
-so. So the number here is settled, and it is settled in the document that has to
-be read by whoever implements it rather than only in a Rust comment.
+**It says 6 because three features landed first.** This document proposed 3,
+`docs/layer-effects.md` §8.2 proposed 3, and only one feature can have a number.
+Effects took 3, the linear mask took 4 (the mask's bytes changed meaning, which
+an older build would show wrongly) and vector layers took 5 (`docformat::
+VECTOR_VERSION`: an older build would open the layer empty and drop its paths
+at the next save). The rule all of them stated was that whichever landed later
+records the decision rather than leaving `required_version` to reconcile it, and
+`docformat::VERSION`'s own doc comment names this section and says so. So the
+number here is settled, and it is settled in the document that has to be read by
+whoever implements it rather than only in a Rust comment. `required_version`
+asks for the highest clause that applies, so group compositing's clause goes
+above the vector one and `VERSION` moves to 6 with it.
 
 Nothing else in this section changes. The two clauses are independent — a
 document may need one, the other or both — and the "lowest revision that

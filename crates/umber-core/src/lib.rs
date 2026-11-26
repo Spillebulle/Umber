@@ -29,6 +29,7 @@ pub mod layer;
 pub mod overlay;
 pub mod palette;
 pub mod palimport;
+pub mod pathedit;
 mod pattern_table;
 pub mod preset;
 pub mod preview;
@@ -63,7 +64,9 @@ pub mod tile;
 pub mod time;
 pub mod tip;
 mod tip_table;
+pub mod trace;
 pub mod transform;
+pub mod vector;
 
 pub use brush::{Brush, BrushMode, GrainPattern};
 pub use camera::{Camera, ScrollSpan};
@@ -92,7 +95,7 @@ pub use history::{Edit, EditBody, EditKind, History, Jump, PixelPatch};
 pub use input::InputPoint;
 pub use layer::{
     AddRefusal, AddedLayer, BlendMode, EditRefusal, EditTarget, Layer, LayerStack, SlotRoom,
-    StackShape,
+    StackShape, VectorCarry, VectorSetRefusal,
 };
 pub use overlay::{Side, Strip};
 // `palette::Palette` is deliberately **not** re-exported at the root. The app
@@ -109,3 +112,4 @@ pub use textobj::{Placement, TextFace, TextObject};
 pub use time::Timestamp;
 pub use tip::{StrokeCoverage, TipMask, TipReading, TipTarget, stroke_coverage};
 pub use transform::{Affine, Handle, Transform};
+pub use vector::{Node, Path, PathRole, VectorObject};
