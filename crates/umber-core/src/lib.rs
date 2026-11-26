@@ -64,6 +64,7 @@ pub mod tile;
 pub mod time;
 pub mod tip;
 mod tip_table;
+pub mod trace;
 pub mod transform;
 pub mod vector;
 
