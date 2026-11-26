@@ -416,13 +416,14 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .frame(Frame::NONE)
         .show(root, |ui| {
             let rect = ui.max_rect();
-            // First, so the marquee and the transform box are drawn over the
-            // machine lines: a selection made on top of a cut line is the thing
-            // being worked on, and the cut line is the thing it was made from.
-            // Under the cut lines, because a cut line crossing a mark is the
-            // thing to see: the mark is where the sensor looks, the line is
-            // what will be cut there.
+            // The registration marks first of all, under the cut lines,
+            // because a cut line crossing a mark is the thing to see: the mark
+            // is where the sensor looks, the line is what will be cut there.
             sheet_marks(ui.painter(), &p, ed, rect);
+            // The cut and plot lines next, before the marquee and the transform
+            // box, so those are drawn over them: a selection made on top of a
+            // cut line is the thing being worked on, and the cut line is the
+            // thing it was made from.
             vector_paths(ui.painter(), &p, ed, rect);
             path_tool_marks(ui.painter(), &p, ed, rect);
             selection_outline(ui, &p, ed, rect);
@@ -608,7 +609,7 @@ fn odd_device_width(points: f32, pixels_per_point: f32) -> f32 {
 /// page: `toggle_sheet_marks` and `apply_canvas` keep those two from
 /// disagreeing, and a document read from a file that disagrees anyway draws no
 /// marks rather than marks the sheet would not print.
-fn sheet_marks(painter: &egui::Painter, p: &Palette, ed: &mut Editor, view: Rect) {
+fn sheet_marks(painter: &egui::Painter, p: &Palette, ed: &Editor, view: Rect) {
     if !ed.doc.marks {
         return;
     }
@@ -2667,12 +2668,11 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     }
     // A tick rather than a row that acts, as the Window menu draws its one
     // switch, because what it says is whether this document has marks. The
-    // label is the action's, so the row and the Shortcuts page name it alike.
-    // Enabled whatever the page: a refusal is said in a notice with the
+    // label and the key are the action's, through `menu_toggle`, so the row
+    // and the Shortcuts page name it alike and a chord bound in Settings shows
+    // here. Enabled whatever the page: a refusal is said in a notice with the
     // reason, which a dead row could only hint at in a tooltip.
-    let mut marks = ed.doc.marks;
-    if ui
-        .checkbox(&mut marks, Action::ToggleSheetMarks.label())
+    if menu_toggle(ui, Action::ToggleSheetMarks, ed.doc.marks, true)
         .on_hover_text("Prints three marks the cutter uses to line its cuts up with the print.")
         .clicked()
     {
@@ -3012,12 +3012,53 @@ fn menu_item_labelled(
     label: &str,
     enabled: bool,
 ) -> egui::Response {
-    let chord = shortcuts::published()
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(label).shortcut_text(menu_chord(action)),
+    )
+}
+
+/// [`menu_item`] for a command that switches something on and off: a tick
+/// showing `on`, the action's label, and its key where one is bound. A bare
+/// `ui.checkbox` takes a label and no key, which is how a chord bound in
+/// Settings went unshown on the one switch the File menu carries.
+///
+/// The checkbox only *shows* the state; the caller reads `clicked` and runs
+/// the command, because what the switch means (and whether it is refused) is
+/// the command's, not this row's.
+fn menu_toggle(
+    ui: &mut egui::Ui,
+    action: shortcuts::Action,
+    on: bool,
+    enabled: bool,
+) -> egui::Response {
+    let mut shown = on;
+    let chord = menu_chord(action);
+    // Laid out as `Button::shortcut_text` lays a row out: a growing gap, then
+    // the key in the weak colour, so the two kinds of row line their keys up.
+    let row = if chord.is_empty() {
+        egui::Checkbox::new(&mut shown, action.label())
+    } else {
+        egui::Checkbox::new(
+            &mut shown,
+            (
+                action.label(),
+                egui::Atom::grow(),
+                egui::RichText::new(chord).weak(),
+            ),
+        )
+    };
+    ui.add_enabled(enabled, row)
+}
+
+/// The key a menu row names for `action`, as the user has it bound now, or
+/// nothing where it is unbound.
+fn menu_chord(action: shortcuts::Action) -> String {
+    shortcuts::published()
         .iter()
         .find(|b| b.action == action)
         .map(|b| b.chord().display())
-        .unwrap_or_default();
-    ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(chord))
+        .unwrap_or_default()
 }
 
 /// What the Edit menu's Undo and Redo rows offer.
@@ -5691,6 +5732,48 @@ mod tests {
         assert!(!actions.open_export, "the row opened the Export dialog");
     }
 
+    /// **The marks switch names its key once one is bound**, on its own row.
+    /// It was a bare `ui.checkbox`, which takes a label and no key, so a chord
+    /// bound to it in Settings appeared nowhere in the menu. Bound here through
+    /// the live table, as Settings binds it, to a chord nothing else holds, and
+    /// put back afterwards; under `prefs_lock`, which is what orders every test
+    /// that publishes a table.
+    #[test]
+    fn the_marks_switch_shows_a_chord_bound_to_it() {
+        let _serial = crate::prefs::prefs_lock();
+        let before = shortcuts::published();
+        let bound = shortcuts::Binding {
+            action: Action::ToggleSheetMarks,
+            key: winit::keyboard::KeyCode::F9,
+            ctrl: true,
+            shift: true,
+            alt: true,
+        };
+        let chord = bound.chord().display();
+        let mut table = shortcuts::defaults();
+        assert!(
+            table.iter().all(|b| b.chord().display() != chord),
+            "the test's chord is already taken"
+        );
+        table.push(bound);
+        shortcuts::publish(table);
+        let mut ed = Editor::default();
+        let drawn = menu_strings(Menu::File, &mut ed);
+        shortcuts::publish(before);
+
+        let label = drawn
+            .iter()
+            .find(|d| d.text == Action::ToggleSheetMarks.label())
+            .expect("the File menu draws the marks row");
+        assert!(
+            drawn
+                .iter()
+                .any(|d| d.text == chord && (d.at().y - label.at().y).abs() < 6.0),
+            "no {chord} beside the marks row; the menu draws {:?}",
+            drawn.iter().map(|d| &d.text).collect::<Vec<_>>()
+        );
+    }
+
     /// A menu row standing for a command is named as the command is named.
     ///
     /// `Action::FitView` is "Fit to view" on the Shortcuts page and the View
@@ -8201,6 +8284,16 @@ mod tests {
                 .iter()
                 .any(|r| near(r.min, want.min) && near(r.max, want.max)),
             "no filled mark at {want:?}; drew {filled:?}"
+        );
+        // And one figure worked out by hand rather than through the overlay's
+        // own mapping, which the comparison above shares and so cannot doubt:
+        // the 5 mm square at 300 dpi and zoom 0.2, one point a pixel, is
+        // 5 / 25.4 * 300 * 0.2 = 11.81 points across.
+        assert!(
+            filled
+                .iter()
+                .any(|r| (r.width() - 11.81).abs() < 0.1 && (r.height() - 11.81).abs() < 0.1),
+            "no filled mark is the square's 11.81 points; drew {filled:?}"
         );
     }
 
