@@ -230,9 +230,10 @@ with the marks on it. Print it at 100%, with no fit to page, or the cuts will no
 line up.
 
 Load the printed sheet and choose **File → Send to cutter…**. Pick Cut or Plot,
-the pressure, the speed and the number of passes, and send. **Check connection**
-asks the cutter who it is without moving anything. Close Silhouette Studio while
-Umber uses the machine.
+the pressure, the speed and the number of passes, say whether the sheet is on
+the cutting mat, and send. A blade depth can be set for the AutoBlade.
+**Check connection** asks the cutter who it is without moving anything. Close
+Silhouette Studio while Umber uses the machine.
 
 ## Colour
 

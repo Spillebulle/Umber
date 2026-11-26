@@ -32,9 +32,16 @@ lines on.
   Choose pressure, speed and how many passes, and whether the cutter reads the
   registration marks first. The dialog says how many paths will go and how long
   the cut is. Check connection asks the cutter who it is without moving
-  anything. Stop sends nothing more, and the cutter finishes what it was
-  already sent. Every message to and from the cutter goes in a log you can
-  copy.
+  anything. Every message to and from the cutter goes in a log you can copy.
+  The log leaves out the machine's serial number.
+- **Cutting mat and blade depth.** Leave Cutting mat on when the sheet is stuck
+  to the mat, and switch it off when the sheet is fed in bare. Set blade depth
+  is for the AutoBlade, from 0 to 10. It is off to begin with, which leaves the
+  blade as it was last set. Start shallow, at 2 or 3 on sticker paper, and go
+  up a step at a time.
+- **Stop sends nothing more.** The cutter still finishes the part it was
+  already sent, which can take a little while. Umber waits for it, lifts the
+  tool and sends it home, and only then says it has stopped.
 - **This is the first version, and it has not yet been run on a real
   machine.** Start with Check connection. Then try a pen on plain paper before
   a blade on sticker paper. If something goes wrong, copy the log and send it
