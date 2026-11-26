@@ -5918,6 +5918,7 @@ mod tests {
         let entries = ed.layers.len();
         assert!(!ed.layers.active().is_vector(), "the fixture starts raster");
         let history = ed.history.len();
+        let slots_before: Vec<u32> = ed.layers.layers().iter().filter_map(|l| l.slot()).collect();
 
         draw_closed_triangle(&mut ed, 100.0);
 
@@ -5934,11 +5935,260 @@ mod tests {
             ed.history.kind_at(history),
             Some(umber_core::EditKind::AddLayer)
         );
-        // The renderer is told to wipe the slice the new layer took.
+        // The renderer is told to wipe the slice the new layer took: read off
+        // the stack rather than off the active layer, as the slice that was
+        // not held before and is now held by the one layer carrying paths.
+        let vector_slots: Vec<u32> = ed
+            .layers
+            .layers()
+            .iter()
+            .filter(|l| l.is_vector())
+            .filter_map(|l| l.slot())
+            .collect();
+        assert_eq!(vector_slots.len(), 1);
+        assert!(
+            !slots_before.contains(&vector_slots[0]),
+            "a slice nobody held"
+        );
         assert_eq!(
             ed.path_layers_made,
-            vec![(ed.session.active_id(), ed.layers.active_slot().unwrap())]
+            vec![(ed.session.tabs()[0].id, vector_slots[0])]
         );
+    }
+
+    // --- round one: interrupted presses, closing, flips, the menu ------------
+
+    /// A node being placed whose release never comes is taken back off, and the
+    /// node before it is left as it was.
+    #[test]
+    fn an_interrupted_press_takes_back_the_node_it_was_placing() {
+        let mut ed = path_editor();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        ed.path_press(Vec2::new(300.0, 100.0), false);
+        ed.interaction = Interaction::Pathing;
+        ed.path_moved(Vec2::new(340.0, 140.0), false);
+
+        ed.interrupt_path_gesture();
+        assert_eq!(ed.interaction, Interaction::Idle);
+        assert!(!ed.path_tool.is_held());
+
+        // The pointer goes on moving with nothing held: no handle follows it.
+        ed.path_moved(Vec2::new(400.0, 300.0), false);
+        let draft = ed.path_tool.draft().expect("the draft stays");
+        assert_eq!(draft.nodes.len(), 2);
+        assert_eq!(
+            draft.nodes[1],
+            umber_core::Node::corner(Vec2::new(200.0, 100.0))
+        );
+    }
+
+    /// Only `Pathing` is the tool's to interrupt: a pan's interruption must not
+    /// take a node off a draft that was left standing between presses.
+    #[test]
+    fn interrupting_another_gesture_leaves_the_draft_alone() {
+        let mut ed = path_editor();
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        ed.interaction = Interaction::Panning;
+        ed.interrupt_path_gesture();
+        assert_eq!(ed.interaction, Interaction::Panning);
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(1));
+    }
+
+    #[test]
+    fn an_interrupted_node_drag_commits_nothing() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        let before = record_of(&ed);
+        let history = ed.history.len();
+
+        ed.path_press(Vec2::new(100.0, 0.0), false);
+        ed.interaction = Interaction::Pathing;
+        ed.path_moved(Vec2::new(150.0, 40.0), false);
+        assert!(ed.path_tool.dragged().is_some(), "the fixture drags");
+        ed.interrupt_path_gesture();
+
+        assert!(ed.path_tool.dragged().is_none());
+        // A release arriving late, as a pan's would, finds nothing to commit.
+        ed.path_release(Vec2::new(150.0, 40.0));
+        assert_eq!(record_of(&ed), before);
+        assert_eq!(ed.history.len(), history);
+    }
+
+    #[test]
+    fn closing_the_tab_in_front_keeps_the_draft_and_marks_it_modified() {
+        let mut ed = path_editor();
+        ed.session.active_tab_mut().modified = false;
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let active = ed.session.active_index();
+
+        ed.settle_before_closing(active);
+
+        assert!(ed.path_tool.draft().is_none());
+        assert!(ed.session.active_tab().modified, "so the prompt asks");
+        assert_eq!(record_of(&ed).paths().len(), 1);
+    }
+
+    #[test]
+    fn closing_another_tab_leaves_the_draft_up() {
+        let mut ed = path_editor();
+        ed.create_document(ed.doc);
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+        let other = 1 - ed.session.active_index();
+        ed.settle_before_closing(other);
+        assert_eq!(ed.path_tool.draft().map(|d| d.nodes.len()), Some(2));
+    }
+
+    #[test]
+    fn quitting_keeps_the_draft_and_lists_the_document_as_unsaved() {
+        let mut ed = path_editor();
+        ed.session.active_tab_mut().modified = false;
+        assert!(ed.unsaved_documents().is_empty(), "the fixture is saved");
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        path_tap(&mut ed, Vec2::new(200.0, 100.0));
+
+        ed.settle_before_quitting();
+
+        assert_eq!(ed.unsaved_documents(), vec![ed.session.active_index()]);
+        assert_eq!(record_of(&ed).paths().len(), 1);
+    }
+
+    /// The flip a command, an undo or a History jump makes goes through
+    /// `Editor::flip_canvas`, and the draft rides it rather than landing.
+    #[test]
+    fn a_canvas_flip_carries_the_draft_with_it() {
+        let mut ed = path_editor();
+        let width = ed.doc.size.x as f32;
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        ed.path_press(Vec2::new(300.0, 120.0), false);
+        ed.path_moved(Vec2::new(340.0, 150.0), false);
+        ed.path_release(Vec2::new(340.0, 150.0));
+        let before = ed.path_tool.draft().expect("a draft").nodes.clone();
+        let (entries, history) = (ed.layers.len(), ed.history.len());
+
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+
+        let after = &ed.path_tool.draft().expect("still up").nodes;
+        assert_eq!(after[0].at, Vec2::new(width - 100.0, 100.0));
+        assert_eq!(after[1].at, Vec2::new(width - 300.0, 120.0));
+        assert_eq!(after[1].handle_out, Vec2::new(-40.0, 30.0));
+        assert_eq!(after[1].handle_in, Vec2::new(40.0, -30.0));
+        assert_eq!((ed.layers.len(), ed.history.len()), (entries, history));
+
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+        assert_eq!(ed.path_tool.draft().expect("up").nodes, before);
+    }
+
+    #[test]
+    fn a_canvas_flip_lets_go_of_the_pick() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        assert!(ed.path_tool.pick().is_some());
+        ed.flip_canvas(umber_core::FlipAxis::Vertical);
+        assert_eq!(ed.path_tool.pick(), None);
+    }
+
+    #[test]
+    fn the_edit_menu_undo_is_the_drafts_while_one_is_up() {
+        let mut ed = path_editor();
+        assert!(!ed.history.can_undo(), "the fixture has nothing to undo");
+        let rows = crate::ui::step_rows(&ed);
+        assert!(!rows.undo && !rows.redo);
+        assert_eq!(rows.undo_label, crate::shortcuts::Action::Undo.label());
+
+        path_tap(&mut ed, Vec2::new(100.0, 100.0));
+        let rows = crate::ui::step_rows(&ed);
+        assert!(rows.undo, "an empty history and a draft still undo");
+        assert_eq!(rows.undo_label, "Undo point");
+        assert!(!rows.redo);
+
+        // With something to redo, a draft still keeps Redo dead.
+        assert!(ed.path_key(PathKey::Abandon));
+        draw_closed_triangle(&mut ed, 100.0);
+        let undone = ed.history.take_undo().expect("an entry");
+        ed.history.push_redo(undone);
+        assert!(
+            crate::ui::step_rows(&ed).redo,
+            "nothing drawn: Redo is live"
+        );
+        path_tap(&mut ed, Vec2::new(500.0, 500.0));
+        assert!(!crate::ui::step_rows(&ed).redo);
+    }
+
+    /// A pick on a layer locked since: Delete is the tool's, says why, and
+    /// changes nothing, so a binding of the key elsewhere is not reached.
+    #[test]
+    fn delete_on_a_pick_whose_layer_was_locked_says_why_and_changes_nothing() {
+        let mut ed = with_paths(vec![line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0))]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        path_tap(&mut ed, Vec2::new(50.0, 0.0));
+        let before = record_of(&ed);
+        let history = ed.history.len();
+        ed.layers.active_mut().locked = true;
+
+        assert!(ed.path_key(PathKey::Remove), "swallowed");
+        assert_eq!(record_of(&ed), before);
+        assert_eq!(ed.history.len(), history);
+        assert_eq!(
+            ed.path_tool.said(),
+            Some(PathEditRefusal::Locked.sentence())
+        );
+    }
+
+    #[test]
+    fn the_node_count_stops_as_soon_as_it_knows() {
+        let at = |x: f32| umber_core::Node::corner(Vec2::new(x, 0.0));
+        let (lo, hi) = (Vec2::new(0.0, -1.0), Vec2::new(10.0, 1.0));
+        // Three inside, cap two: false.
+        assert!(!nodes_in_view_within(
+            &[at(1.0), at(2.0), at(3.0)],
+            lo,
+            hi,
+            2
+        ));
+        // Exactly the cap inside, wherever they fall among the rest.
+        assert!(nodes_in_view_within(
+            &[at(50.0), at(1.0), at(2.0), at(60.0)],
+            lo,
+            hi,
+            2
+        ));
+        assert!(nodes_in_view_within(
+            &[at(1.0), at(50.0), at(60.0), at(2.0)],
+            lo,
+            hi,
+            2
+        ));
+        // The last node is the one over.
+        assert!(!nodes_in_view_within(
+            &[at(1.0), at(50.0), at(2.0), at(3.0)],
+            lo,
+            hi,
+            2
+        ));
+        assert!(nodes_in_view_within(&[], lo, hi, 0));
+        assert!(!nodes_in_view_within(&[at(1.0)], lo, hi, 0));
+    }
+
+    /// The cache answers for the view it was taken in, never another: panning
+    /// the long path out of view and back gives each answer afresh.
+    #[test]
+    fn the_cached_node_count_follows_the_view() {
+        let mut ed = with_paths(vec![long_line(3000)]);
+        ed.path_tool.mode = crate::pathtool::PathMode::Edit;
+        ed.camera.zoom = 0.1;
+        ed.camera.center = Vec2::new(1500.0, 10.0);
+        path_tap(&mut ed, Vec2::new(100.5, 10.0));
+        assert!(!ed.path_nodes_shown());
+        // Far enough along that fewer than the cap are in view.
+        ed.camera.center = Vec2::new(-4000.0, 10.0);
+        assert!(ed.path_nodes_shown());
+        ed.camera.center = Vec2::new(1500.0, 10.0);
+        assert!(!ed.path_nodes_shown());
     }
 
     #[test]

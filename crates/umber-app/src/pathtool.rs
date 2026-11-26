@@ -921,6 +921,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_interrupt_takes_back_the_node_being_placed_and_nothing_else() {
+        let mut t = PathTool::default();
+        tap(&mut t, v(0.0, 0.0), bare());
+        t.press(v(50.0, 0.0), false, bare());
+        t.moved(v(70.0, 20.0), false);
+        t.release(v(70.0, 20.0), bare());
+        let curved = t.draft().unwrap().nodes[1];
+        assert_ne!(curved.handle_out, Vec2::ZERO, "the fixture pulls a curve");
+
+        t.press(v(100.0, 0.0), false, bare());
+        t.moved(v(130.0, 30.0), false);
+        t.interrupt();
+        assert!(!t.is_held());
+        t.moved(v(200.0, 200.0), false);
+
+        let draft = t.draft().unwrap();
+        assert_eq!(draft.nodes.len(), 2);
+        assert_eq!(draft.nodes[1], curved, "the node before is untouched");
+    }
+
+    #[test]
+    fn an_interrupt_of_the_first_press_ends_the_draft() {
+        let mut t = PathTool::default();
+        t.press(v(0.0, 0.0), false, bare());
+        t.interrupt();
+        assert!(t.draft().is_none());
+    }
+
+    /// A closing press interrupted has not closed anything; a continuation
+    /// press added no node and loses none.
+    #[test]
+    fn an_interrupted_close_reopens_and_an_interrupted_continuation_keeps_its_nodes() {
+        let mut t = PathTool::default();
+        for p in [v(0.0, 0.0), v(50.0, 0.0), v(50.0, 50.0)] {
+            tap(&mut t, p, bare());
+        }
+        t.press(v(0.0, 0.0), false, bare());
+        assert!(t.draft().unwrap().closed, "the press closed it");
+        t.interrupt();
+        let draft = t.draft().unwrap();
+        assert!(!draft.closed);
+        assert_eq!(draft.nodes.len(), 3);
+
+        let record = VectorObject::empty()
+            .appended(vec![open(
+                PathRole::Cut,
+                &[(0.0, 0.0), (100.0, 0.0)],
+                false,
+            )])
+            .unwrap();
+        let ground = Ground {
+            paths: Some(&record),
+            ..bare()
+        };
+        let mut t = PathTool::default();
+        t.press(v(100.0, 0.0), false, ground);
+        assert_eq!(t.draft().unwrap().continues, Some(0));
+        t.interrupt();
+        assert_eq!(t.draft().unwrap().nodes.len(), 2);
+    }
+
+    #[test]
+    fn a_mirror_carries_the_draft_and_twice_puts_it_back() {
+        let canvas = UVec2::new(1000, 800);
+        let mut t = PathTool::default();
+        tap(&mut t, v(100.0, 50.0), bare());
+        t.press(v(300.0, 60.0), false, bare());
+        t.moved(v(320.0, 90.0), false);
+        t.release(v(320.0, 90.0), bare());
+        let before = t.draft().unwrap().nodes.clone();
+
+        t.mirror(FlipAxis::Horizontal, canvas);
+        let after = &t.draft().unwrap().nodes;
+        assert_eq!(after[0].at, v(900.0, 50.0));
+        assert_eq!(after[1].at, v(700.0, 60.0));
+        assert_eq!(after[1].handle_out, v(-20.0, 30.0));
+        assert_eq!(after[1].handle_in, v(20.0, -30.0));
+        t.mirror(FlipAxis::Horizontal, canvas);
+        assert_eq!(t.draft().unwrap().nodes, before);
+
+        t.mirror(FlipAxis::Vertical, canvas);
+        assert_eq!(t.draft().unwrap().nodes[0].at, v(100.0, 750.0));
+    }
+
     /// The document going away takes the draft and the pick, never the
     /// settings: Draw or Edit and Cut or Plot are what the artist chose for the
     /// tool, not for the document.
