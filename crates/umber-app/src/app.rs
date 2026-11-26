@@ -4310,12 +4310,12 @@ impl UmberApp {
                 log::info!("exported a print sheet to {}", path.display());
                 let mut lines = vec![
                     path.display().to_string(),
-                    "Print it at actual size (100%), with no fit to page, or the cuts will                      not line up."
+                    "Print it at actual size (100%), with no fit to page, or the cuts will not line up."
                         .to_string(),
                 ];
                 if marks.is_none() {
                     lines.push(
-                        "This document has no registration marks. Switch them on in the File                          menu to print and cut."
+                        "This document has no registration marks. Switch them on in the File menu to print and cut."
                             .to_string(),
                     );
                 }

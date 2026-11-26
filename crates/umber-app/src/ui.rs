@@ -2659,7 +2659,7 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     }
     if menu_item(ui, Action::ExportPrintSheet, true)
         .on_hover_text(
-            "A PDF of the picture at its real size, with the registration marks,              for printing and then cutting.",
+            "A PDF of the picture at its real size, with the registration marks, for printing and then cutting.",
         )
         .clicked()
     {
