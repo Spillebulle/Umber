@@ -6401,6 +6401,36 @@ mod tests {
         assert!(ed.path_layers_made.is_empty());
     }
 
+    /// Review Focus 1 at the record's own bound rather than the stack's: a
+    /// vector layer already holding every path it may is refused the draft,
+    /// which stays up whole with that refusal's sentence and records nothing.
+    #[test]
+    fn a_path_onto_a_full_record_stays_up_with_the_reason() {
+        let full: Vec<umber_core::Path> = (0..umber_core::vector::MAX_PATHS)
+            .map(|i| {
+                let y = i as f32 * 0.01;
+                line(Vec2::new(0.0, y), Vec2::new(5.0, y))
+            })
+            .collect();
+        let mut ed = with_paths(full);
+        let before = record_of(&ed);
+        let history = ed.history.len();
+        let entries = ed.layers.len();
+
+        draw_closed_triangle(&mut ed, 100.0);
+
+        let draft = ed.path_tool.draft().expect("the draft is still up");
+        assert_eq!(draft.nodes.len(), 3, "every node drawn is still there");
+        assert_eq!(
+            ed.path_tool.said(),
+            Some(umber_core::vector::VectorRefusal::TooManyPaths.sentence())
+        );
+        assert_eq!(ed.history.len(), history);
+        assert_eq!(ed.layers.len(), entries, "no layer made to hold it");
+        assert_eq!(record_of(&ed), before, "the record is untouched");
+        assert!(ed.notice.is_none(), "no dialog on a canvas press");
+    }
+
     #[test]
     fn leaving_the_tool_keeps_a_draft_of_two_nodes() {
         let mut ed = path_editor();
