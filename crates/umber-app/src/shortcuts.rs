@@ -35,6 +35,7 @@ pub enum Action {
     EraserTool,
     SelectTool,
     TransformTool,
+    PathTool,
     EyedropperTool,
     PanTool,
     ZoomTool,
@@ -73,7 +74,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 42] = [
+    pub const ALL: [Action; 43] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
@@ -92,6 +93,7 @@ impl Action {
         Action::EraserTool,
         Action::SelectTool,
         Action::TransformTool,
+        Action::PathTool,
         Action::EyedropperTool,
         Action::PanTool,
         Action::ZoomTool,
@@ -144,6 +146,7 @@ impl Action {
             Action::EraserTool => "Eraser tool",
             Action::SelectTool => "Selection tool",
             Action::TransformTool => "Transform tool",
+            Action::PathTool => "Path tool",
             Action::EyedropperTool => "Eyedropper tool",
             Action::PanTool => "Pan tool",
             Action::ZoomTool => "Zoom tool",
@@ -201,6 +204,7 @@ impl Action {
             | Action::EraserTool
             | Action::SelectTool
             | Action::TransformTool
+            | Action::PathTool
             | Action::EyedropperTool
             | Action::PanTool
             | Action::ZoomTool => "Tools",
@@ -403,6 +407,10 @@ pub fn defaults() -> Vec<Binding> {
         // tool keys are unmodified throughout and a rail that was consistent
         // everywhere except here would be worse than following the crowd.
         binding(Action::TransformTool, KeyCode::KeyT, false, false, false),
+        // P for the pen, which is Photoshop's, Illustrator's, Affinity's and
+        // Inkscape's key for the bezier pen the Path tool is. Nothing else here
+        // holds it.
+        binding(Action::PathTool, KeyCode::KeyP, false, false, false),
         // I for the eyedropper, which is Photoshop's, Krita's, GIMP's and
         // Affinity's. `E` would be the other reading of the word and is the
         // eraser here; Photoshop uses `I` for exactly this reason.
@@ -1703,6 +1711,33 @@ mod tests {
     // to debug.
     fn hit(key: KeyCode, mods: ModifiersState) -> Option<Action> {
         resolve_in(&defaults(), key, mods)
+    }
+
+    /// P is the Path tool's and is nobody else's: the guard names the one
+    /// binding that holds the key rather than asserting what P resolves to,
+    /// because a second binding on it would make `resolve` answer whichever
+    /// came first and this still pass.
+    #[test]
+    fn the_path_tool_is_bound_to_p_and_nothing_else_is() {
+        assert_eq!(hit(KeyCode::KeyP, NONE), Some(Action::PathTool));
+        let holders: Vec<_> = defaults()
+            .into_iter()
+            .filter(|b| b.key == KeyCode::KeyP && !b.ctrl && !b.shift && !b.alt)
+            .map(|b| b.action)
+            .collect();
+        assert_eq!(holders, vec![Action::PathTool]);
+        // Ctrl+P is not the tool, for the reason plain Z is not Ctrl+Z.
+        assert_ne!(hit(KeyCode::KeyP, CTRL), Some(Action::PathTool));
+    }
+
+    /// The id is what `shortcut = <ActionId> <ChordId>` writes, and it is a
+    /// `Debug` spelling: renaming the variant would silently unbind every
+    /// painter's customised Path tool key. Pinned as a literal.
+    #[test]
+    fn the_path_tools_id_is_a_literal() {
+        assert_eq!(Action::PathTool.id(), "PathTool");
+        assert_eq!(Action::PathTool.label(), "Path tool");
+        assert_eq!(Action::PathTool.category(), "Tools");
     }
 
     #[test]

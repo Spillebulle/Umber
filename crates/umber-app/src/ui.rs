@@ -21,6 +21,7 @@ use crate::editor::{self, BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::loupe;
 use crate::panels;
+use crate::pathtool::PathMode;
 use crate::shortcuts::{self, Action};
 use crate::syspick;
 use crate::tabs;
@@ -2977,6 +2978,25 @@ mod strip_budget {
     /// actually needs is somewhere in `(305, 320]` and the `ui::add_space(6.0)`
     /// before the label is part of it.
     pub const EYEDROPPER: f32 = 320.0;
+    /// The Path strip's Cut / Plot switch, the divider before it, and what the
+    /// hint cannot be drawn in less than: its leading gap and a truncated
+    /// label's own minimum. The room the strip reads is what is left after the
+    /// mode switch, and the group itself is 103 of it (divider 1, gaps 12,
+    /// switch 96).
+    ///
+    /// **Bisected against `the_path_strip_fits_its_row`, not derived**, which is
+    /// what the derivation was worth: 103 plus the gaps was 111 and failed by
+    /// twelve points, because the hint after the group claims room of its own.
+    /// The sweep passes at 122 and fails at 120; this is that with the margin
+    /// a font metric moves by.
+    pub const PATH_ROLE: f32 = 126.0;
+    /// Its Close path / Open path button and the divider before it, on top of
+    /// [`PATH_ROLE`]. Passes at 78 and fails at 72; "Close path" is the wider
+    /// of its two labels.
+    pub const PATH_CLOSE: f32 = 83.0;
+    /// Its Corner and Smooth pair and the divider before them, on top of
+    /// [`PATH_CLOSE`]. Passes at 120 and fails at 116.
+    pub const PATH_NODE: f32 = 126.0;
     // Pan's and Zoom's second sentence are budgeted per tool, on
     // `navigate_hint`'s own third field, because the two lines are a third
     // apart in width and one figure for both drops Pan's while it still fits.
@@ -3179,9 +3199,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Tool::Eyedropper => (Icon::Eyedropper, "Eyedropper"),
             Tool::Pan => (Icon::Pan, "Pan"),
             Tool::Zoom => (Icon::Zoom, "Zoom"),
-            // A placeholder mark until the rail button brings Lucide's
-            // `pen-tool`.
-            Tool::Path => (Icon::Spline, "Path"),
+            Tool::Path => (Icon::PenTool, "Path"),
         };
         let (glyph_rect, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
         icons::draw(ui.painter(), glyph_rect, icon, p.accent);
@@ -3389,6 +3407,8 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 )
                 .on_hover_text(syspick::outside_detail());
             }
+        } else if ed.ui.tool == Tool::Path {
+            path_strip(ui, p, ed);
         } else {
             // Pan and Zoom. Two sentences in the Transform hint's register
             // rather than a control, because like Transform there is nothing
@@ -3412,6 +3432,256 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             }
         }
     });
+}
+
+/// The width of each of the Path strip's two switches. Both are
+/// [`widgets::segmented`], which takes the whole of the width it is offered, so
+/// on a single unwrapped row it is given this one rather than what is left.
+const PATH_SWITCH_WIDTH: f32 = 96.0;
+
+/// The hint's sentences, one per state. Constants so that the guard over every
+/// sentence the strip can say reads the same text the strip draws.
+const PATH_HINT_ZOOM: &str = "Zoom in to edit this path's nodes.";
+const PATH_HINT_DRAFT: &str = "Click to add a point, drag to curve it. Click the first point to \
+     close, Enter to finish, Backspace to step back, Escape to throw it away.";
+const PATH_HINT_DRAW: &str = "Click to place points, drag to pull a curve. Click the end of an \
+     open path to carry it on. Hold Ctrl to edit.";
+const PATH_HINT_EDIT_PICKED: &str = "Drag a point or a handle. Click the line to add a point, \
+     drag it to move the path. Shift moves one handle alone. Delete removes.";
+const PATH_HINT_EDIT: &str = "Click a path to pick it up.";
+
+/// The tooltips of the Path strip's buttons.
+const PATH_CLOSE_TIP: &str = "Join the last point to the first.";
+const PATH_CLOSE_NEEDS_TIP: &str = "A path needs three points to close.";
+const PATH_OPEN_TIP: &str = "Take the closing line away.";
+const PATH_CORNER_TIP: &str = "Straighten this point into a corner.";
+const PATH_SMOOTH_TIP: &str = "Curve this point between its neighbours.";
+const PATH_SMOOTH_ENDS_TIP: &str = "An end of an open path has no curve to smooth.";
+
+/// Every sentence the strip draws that is not one of [`path_hint`]'s refusals,
+/// for the guard that reads them all.
+#[cfg(test)]
+const PATH_STRIP_SENTENCES: [&str; 11] = [
+    PATH_HINT_ZOOM,
+    PATH_HINT_DRAFT,
+    PATH_HINT_DRAW,
+    PATH_HINT_EDIT_PICKED,
+    PATH_HINT_EDIT,
+    PATH_CLOSE_TIP,
+    PATH_CLOSE_NEEDS_TIP,
+    PATH_OPEN_TIP,
+    PATH_CORNER_TIP,
+    PATH_SMOOTH_TIP,
+    PATH_SMOOTH_ENDS_TIP,
+];
+
+/// The one sentence the Path strip ends in, by the first arm that holds.
+///
+/// **The order is the meaning.** What the tool is saying (a refusal it has just
+/// made) is what somebody is stuck on, so it comes before any advice. A layer
+/// that cannot be edited comes next, and in Edit alone: Draw never reads the
+/// layer's record. Too many nodes to mark comes before the gesture hints
+/// because no gesture on them will work until the view changes. A draft is
+/// the gesture in hand, so it is the next thing worth saying, and only then
+/// what the mode does. Every arm is reached from a state where the next one
+/// would also hold by `the_hint_follows_the_state`.
+pub(crate) fn path_hint(ed: &Editor) -> &'static str {
+    if let Some(said) = ed.path_tool.said() {
+        return said;
+    }
+    let mode = ed.path_tool.mode;
+    if let Some(refusal) = ed.path_edit_refusal()
+        && mode == PathMode::Edit
+    {
+        return refusal.sentence();
+    }
+    let picked = ed.path_tool.pick().is_some();
+    if picked && !ed.path_nodes_shown() {
+        return PATH_HINT_ZOOM;
+    }
+    if ed.path_tool.draft().is_some() {
+        return PATH_HINT_DRAFT;
+    }
+    match mode {
+        PathMode::Draw => PATH_HINT_DRAW,
+        PathMode::Edit => {
+            if picked {
+                PATH_HINT_EDIT_PICKED
+            } else {
+                PATH_HINT_EDIT
+            }
+        }
+    }
+}
+
+/// What a press on the Path strip asks for. Collected while the row is drawn
+/// and carried out after it, so the record has one writer per frame and the
+/// buttons are all drawn from the one reading taken before any of them.
+#[derive(Clone, Copy)]
+enum PathPress {
+    Role(umber_core::PathRole),
+    ToggleClosed,
+    Corner,
+    Smooth,
+}
+
+/// What the strip reads of the tool and the layer, once, before it draws.
+#[derive(Clone, Copy)]
+struct PathReading {
+    /// The picked path's role, or the role for new paths with no pick.
+    role: umber_core::PathRole,
+    /// A pick whose path can be read: whether it is closed, and its node count.
+    path: Option<(bool, usize)>,
+    /// There is a pick the layer cannot answer for, which hides the switch: it
+    /// would show the default and change nothing.
+    unreadable: bool,
+    /// A node is picked, and whether Smooth has anything to do to it.
+    node: Option<bool>,
+}
+
+fn path_reading(ed: &Editor) -> PathReading {
+    let ground = ed.path_ground();
+    let pick = ed.path_tool.pick();
+    let path = pick.and_then(|pick| {
+        ground
+            .paths
+            .and_then(|record| record.paths().get(pick.path))
+            .map(|path| (path.closed, path.nodes.len()))
+    });
+    PathReading {
+        role: ed.path_tool.role_shown(ground),
+        path,
+        unreadable: pick.is_some() && path.is_none(),
+        node: pick
+            .and_then(|pick| pick.node)
+            .filter(|_| path.is_some())
+            .map(|_| ed.path_tool.can_smooth(ground)),
+    }
+}
+
+/// The Path tool's options strip: the Draw / Edit switch, the Cut / Plot
+/// switch, the buttons that need a pick, and the one hint that follows the
+/// state.
+///
+/// Budgets are cumulative and read once, as the Select strip's are, and the
+/// hint is last and takes what is left, truncated: it is the one part that has
+/// a second way to be read (the tooltip), where a control that is not drawn
+/// cannot be reached at all.
+///
+/// **The buttons are not a [`crate::controls::button_row`].** That is a
+/// right-to-left layout and takes the whole of the width left on its line,
+/// which on this row is the hint's. What it exists to guard is spacing
+/// inherited as zero from a modal, and this strip is not inside one; the pair
+/// that sit side by side set [`metrics::BUTTON_GAP`] themselves, and
+/// `no_two_buttons_on_the_path_strip_touch` measures the rectangles.
+fn path_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    let reading = path_reading(ed);
+    let mut press = None;
+
+    // **Changing the mode does not settle a draft.** A draft is finished by
+    // Enter and settled on leaving the tool, and a click on the strip is
+    // neither: switching to Edit with points down leaves them down, and
+    // switching back carries on.
+    let mut mode = ed.path_tool.mode;
+    ui.allocate_ui(vec2(PATH_SWITCH_WIDTH, 24.0), |ui| {
+        let options = PathMode::ALL.map(|m| (m, m.label()));
+        widgets::segmented(ui, p, &mut mode, &options);
+    });
+    ed.path_tool.mode = mode;
+
+    let room = ui.available_width();
+    if room >= strip_budget::PATH_ROLE && !reading.unreadable {
+        divider(ui, p);
+        let mut role = reading.role;
+        ui.allocate_ui(vec2(PATH_SWITCH_WIDTH, 24.0), |ui| {
+            let options = [
+                (umber_core::PathRole::Cut, "Cut"),
+                (umber_core::PathRole::Plot, "Plot"),
+            ];
+            if widgets::segmented(ui, p, &mut role, &options) {
+                press = Some(PathPress::Role(role));
+            }
+        });
+    }
+    if let Some((closed, nodes)) = reading.path
+        && room >= strip_budget::PATH_ROLE + strip_budget::PATH_CLOSE
+    {
+        divider(ui, p);
+        // Three nodes make a polygon. Two cannot be closed, and a button that
+        // answers to nothing is the thing this interface does not do.
+        let can = closed || nodes >= 3;
+        let (label, tip) = match (closed, can) {
+            (true, _) => ("Open path", PATH_OPEN_TIP),
+            (false, true) => ("Close path", PATH_CLOSE_TIP),
+            (false, false) => ("Close path", PATH_CLOSE_NEEDS_TIP),
+        };
+        if crate::controls::text_button(ui, p, label, false, can)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            press = Some(PathPress::ToggleClosed);
+        }
+    }
+    if let Some(can_smooth) = reading.node
+        && room >= strip_budget::PATH_ROLE + strip_budget::PATH_CLOSE + strip_budget::PATH_NODE
+    {
+        divider(ui, p);
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = metrics::BUTTON_GAP;
+            if crate::controls::text_button(ui, p, "Corner", false, true)
+                .on_hover_text(PATH_CORNER_TIP)
+                .clicked()
+            {
+                press = Some(PathPress::Corner);
+            }
+            if crate::controls::text_button(ui, p, "Smooth", false, can_smooth)
+                .on_hover_text(if can_smooth {
+                    PATH_SMOOTH_TIP
+                } else {
+                    PATH_SMOOTH_ENDS_TIP
+                })
+                .clicked()
+            {
+                press = Some(PathPress::Smooth);
+            }
+        });
+    }
+
+    // Last, and measured afresh: the groups above are in budgets and this is in
+    // none, so it takes whatever they left. Cut at the strip's edge, with the
+    // whole of it in the tooltip, because a sentence that runs off a row that
+    // does not reflow is a control nobody can reach the end of.
+    ui.add_space(4.0);
+    let hint = path_hint(ed);
+    let wide = ui
+        .painter()
+        .layout_no_wrap(
+            hint.to_owned(),
+            FontId::proportional(text::SMALL),
+            p.text_dim,
+        )
+        .size()
+        .x;
+    let label = ui.add(
+        egui::Label::new(
+            egui::RichText::new(hint)
+                .size(text::SMALL)
+                .color(p.text_dim),
+        )
+        .truncate()
+        .sense(Sense::hover()),
+    );
+    if wide > label.rect.width() + 0.5 {
+        label.on_hover_text(hint);
+    }
+
+    match press {
+        None => {}
+        Some(PathPress::Role(role)) => ed.path_set_role(role),
+        Some(PathPress::ToggleClosed) => ed.path_toggle_closed(),
+        Some(PathPress::Corner) => ed.path_corner(),
+        Some(PathPress::Smooth) => ed.path_smooth(),
+    }
 }
 
 /// The mark for one selection mode: a picture of the outline the gesture
@@ -8284,5 +8554,523 @@ mod tests {
         tap_at(&mut ed, glam::Vec2::new(10.0, 100.0));
         assert!(ed.path_tool.pick().is_some());
         assert_eq!(mark_nodes(&ed).len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // The Path tool's options strip
+    // -----------------------------------------------------------------------
+
+    use crate::pathtool::PathMode;
+
+    /// One frame of the strip, read back: every string with its rectangle and
+    /// the colour it was painted in, the rectangle of every text button, and
+    /// where the frame claimed to end.
+    struct StripShot {
+        texts: Vec<(String, Rect, egui::Color32)>,
+        buttons: Vec<Rect>,
+        right: f32,
+    }
+
+    impl StripShot {
+        fn text(&self, wanted: &str) -> Option<&(String, Rect, egui::Color32)> {
+            self.texts.iter().find(|(text, _, _)| text == wanted)
+        }
+
+        fn at(&self, wanted: &str) -> egui::Pos2 {
+            self.text(wanted)
+                .unwrap_or_else(|| panic!("the strip drew no {wanted:?}"))
+                .1
+                .center()
+        }
+    }
+
+    fn texts_in(shape: &egui::Shape, out: &mut Vec<(String, Rect, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().to_owned(),
+                Rect::from_min_size(text.pos, text.galley.size()),
+                text.galley
+                    .job
+                    .sections
+                    .first()
+                    .map_or(text.fallback_color, |s| s.format.color),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    texts_in(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `controls::text_button`'s outline, which is the one rectangle of its
+    /// height the strip draws: the segmented switches are 24 and the rails are
+    /// painted without one.
+    fn text_buttons_in(shape: &egui::Shape, out: &mut Vec<Rect>) {
+        match shape {
+            egui::Shape::Rect(r)
+                if !r.stroke.is_empty()
+                    && (r.rect.height() - metrics::TEXT_BUTTON).abs() < 0.01 =>
+            {
+                out.push(r.rect);
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_buttons_in(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A context that survives from frame to frame, because a press has to
+    /// meet the rectangles the frame before it laid out.
+    struct StripRun {
+        ctx: egui::Context,
+        palette: Palette,
+        now: f64,
+    }
+
+    impl StripRun {
+        fn new() -> Self {
+            let palette = Palette::of(ThemeKind::Graphite);
+            let ctx = fresh_context(&palette);
+            let mut run = Self {
+                ctx,
+                palette,
+                now: 0.0,
+            };
+            // The first frames through a fresh context build the font atlas.
+            let mut ed = Editor::default();
+            ed.set_tool(Tool::Path);
+            for _ in 0..2 {
+                run.frame(&mut ed, 900.0, Vec::new());
+            }
+            run
+        }
+
+        fn frame(&mut self, ed: &mut Editor, width: f32, events: Vec<egui::Event>) -> StripShot {
+            self.now += 0.05;
+            let right = std::cell::Cell::new(0.0);
+            let output = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(width, metrics::OPTIONS_STRIP),
+                    )),
+                    time: Some(self.now),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let frame = egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                        .show(ui, |ui| {
+                            ui.set_height(metrics::OPTIONS_STRIP);
+                            super::options_strip(ui, &self.palette, ed);
+                        });
+                    right.set(frame.response.rect.right());
+                },
+            );
+            let mut texts = Vec::new();
+            let mut buttons = Vec::new();
+            for clipped in &output.shapes {
+                texts_in(&clipped.shape, &mut texts);
+                text_buttons_in(&clipped.shape, &mut buttons);
+            }
+            buttons.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            StripShot {
+                texts,
+                buttons,
+                right: right.get(),
+            }
+        }
+
+        /// Move, press and let go, a frame each.
+        fn click(&mut self, ed: &mut Editor, width: f32, at: egui::Pos2) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            self.frame(ed, width, vec![egui::Event::PointerMoved(at)]);
+            self.frame(ed, width, vec![button(true)]);
+            self.frame(ed, width, vec![button(false)]);
+        }
+
+        /// Draw, then press whatever drew `label`.
+        fn press(&mut self, ed: &mut Editor, label: &str) {
+            let shot = self.frame(ed, 900.0, Vec::new());
+            self.click(ed, 900.0, shot.at(label));
+        }
+    }
+
+    fn picked_path(path: umber_core::Path) -> Editor {
+        let mut ed = editor_in_the_path_tool(path, 1.0);
+        tap_at(&mut ed, glam::Vec2::new(10.0, 100.0));
+        let pick = ed.path_tool.pick().expect("a path is picked");
+        assert_eq!(pick.node, None);
+        ed
+    }
+
+    /// `node` of `curvy`'s three is at x = 10, 110, 210.
+    fn picked_node(path: umber_core::Path, node: usize) -> Editor {
+        let mut ed = picked_path(path);
+        tap_at(&mut ed, glam::Vec2::new(10.0 + 100.0 * node as f32, 100.0));
+        assert_eq!(ed.path_tool.pick().expect("picked").node, Some(node));
+        ed
+    }
+
+    fn the_record(ed: &Editor) -> Vec<umber_core::Path> {
+        ed.layers
+            .vector_at(ed.layers.active_index())
+            .expect("a vector layer")
+            .paths()
+            .to_vec()
+    }
+
+    /// **One assertion per arm, each from a state where the next arm would
+    /// also hold**, so the order is what is being tested. A hint that answered
+    /// by the first arm it liked would pass every one of these in any order
+    /// if each state satisfied only its own.
+    #[test]
+    fn the_hint_follows_the_state() {
+        use super::path_hint;
+        use crate::editor::PathEditRefusal;
+
+        // 1. A sentence the tool is saying wins over everything, including a
+        //    refusal and a pick.
+        let mut ed = picked_path(curvy());
+        ed.layers.active_mut().locked = true;
+        assert!(ed.path_edit_refusal().is_some() && ed.path_tool.pick().is_some());
+        ed.path_tool.say("Said.");
+        assert_eq!(path_hint(&ed), "Said.");
+
+        // 2. In Edit, a layer that cannot be edited says why, over a pick, a
+        //    draft and the Edit hints that would otherwise apply.
+        let mut ed = picked_path(curvy());
+        ed.layers.active_mut().locked = true;
+        assert!(ed.path_tool.said().is_none());
+        assert_eq!(path_hint(&ed), PathEditRefusal::Locked.sentence());
+        let mut ed = editor_in_the_path_tool(curvy(), 1.0);
+        ed.path_tool.mode = PathMode::Draw;
+        tap_at(&mut ed, glam::Vec2::new(300.0, 20.0));
+        assert!(ed.path_tool.draft().is_some());
+        ed.path_tool.mode = PathMode::Edit;
+        ed.layers.active_mut().locked = true;
+        assert_eq!(path_hint(&ed), PathEditRefusal::Locked.sentence());
+        // A refusal is for Edit alone: Draw has no use of the layer's record.
+        ed.path_tool.mode = PathMode::Draw;
+        assert_ne!(path_hint(&ed), PathEditRefusal::Locked.sentence());
+
+        // 3. More nodes in view than may be marked, over a draft and the Edit
+        //    hint. The draft is made first and the pick taken with Ctrl,
+        //    because drawing lets go of a pick.
+        let mut ed = editor_in_the_path_tool(row_of_corners(3000, 0.1), 1.0);
+        ed.path_tool.mode = PathMode::Draw;
+        tap_at(&mut ed, glam::Vec2::new(300.0, 20.0));
+        ed.path_press(glam::Vec2::new(10.0, 100.0), true);
+        ed.path_release(glam::Vec2::new(10.0, 100.0));
+        assert!(ed.path_tool.draft().is_some(), "the fixture needs a draft");
+        assert!(ed.path_tool.pick().is_some(), "the fixture needs a pick");
+        assert!(!ed.path_nodes_shown(), "the fixture needs too many nodes");
+        assert_eq!(path_hint(&ed), "Zoom in to edit this path's nodes.");
+
+        // 4. A draft, in Draw, where the Draw hint would also hold.
+        let mut ed = editor_in_the_path_tool(curvy(), 1.0);
+        ed.path_tool.mode = PathMode::Draw;
+        tap_at(&mut ed, glam::Vec2::new(300.0, 20.0));
+        assert!(ed.path_tool.draft().is_some());
+        assert_eq!(
+            path_hint(&ed),
+            "Click to add a point, drag to curve it. Click the first point to close, \
+             Enter to finish, Backspace to step back, Escape to throw it away."
+        );
+
+        // 5. Draw, with a pick left over from Edit: the pick is no reason to
+        //    say anything about editing.
+        let mut ed = picked_path(curvy());
+        ed.path_tool.mode = PathMode::Draw;
+        assert!(ed.path_tool.pick().is_some() && ed.path_tool.draft().is_none());
+        assert_eq!(
+            path_hint(&ed),
+            "Click to place points, drag to pull a curve. Click the end of an open path to \
+             carry it on. Hold Ctrl to edit."
+        );
+
+        // 6. Edit with a pick, where "Click a path to pick it up" would also be
+        //    true of the tool.
+        let ed = picked_path(curvy());
+        assert_eq!(
+            path_hint(&ed),
+            "Drag a point or a handle. Click the line to add a point, drag it to move the \
+             path. Shift moves one handle alone. Delete removes."
+        );
+
+        // 7. Edit with nothing in hand.
+        let ed = editor_in_the_path_tool(curvy(), 1.0);
+        assert!(ed.path_tool.pick().is_none());
+        assert_eq!(path_hint(&ed), "Click a path to pick it up.");
+    }
+
+    /// Short sentences, no em-dash, and no run of spaces from a continued
+    /// string literal. Every sentence the strip can say is gathered, the
+    /// hints from the states that produce them and the rest from the
+    /// constants the strip draws them from.
+    #[test]
+    fn no_path_hint_has_an_em_dash_or_a_run_of_spaces() {
+        use super::{PATH_STRIP_SENTENCES, path_hint};
+        use crate::editor::PathEditRefusal;
+
+        let mut said = vec![
+            path_hint(&editor_in_the_path_tool(curvy(), 1.0)),
+            path_hint(&picked_path(curvy())),
+        ];
+        let mut ed = editor_in_the_path_tool(curvy(), 1.0);
+        ed.path_tool.mode = PathMode::Draw;
+        said.push(path_hint(&ed));
+        tap_at(&mut ed, glam::Vec2::new(300.0, 20.0));
+        said.push(path_hint(&ed));
+        said.extend(PathEditRefusal::ALL.map(PathEditRefusal::sentence));
+        said.extend(PATH_STRIP_SENTENCES);
+        assert!(said.len() > 8, "the sweep gathered nothing");
+        for sentence in said {
+            assert!(
+                !sentence.contains('\u{2014}'),
+                "{sentence:?} has an em-dash"
+            );
+            assert!(
+                !sentence.contains('\u{2013}'),
+                "{sentence:?} has an en-dash"
+            );
+            assert!(!sentence.contains("  "), "{sentence:?} has a run of spaces");
+            assert!(!sentence.contains('\n'), "{sentence:?} has a line break");
+            assert!(sentence.ends_with('.'), "{sentence:?} is not a sentence");
+        }
+    }
+
+    /// The switch shows the picked path's role while there is a pick, and the
+    /// role for new paths otherwise, and pressing it with a pick changes that
+    /// path alone. Started from a Plot path under a Cut default, so the two
+    /// readings disagree.
+    #[test]
+    fn the_strips_role_switch_shows_the_picks_role() {
+        use umber_core::PathRole;
+
+        let mut path = curvy();
+        path.role = PathRole::Plot;
+        let mut ed = picked_path(path);
+        assert_eq!(ed.path_tool.role, PathRole::Cut);
+        let mut run = StripRun::new();
+        let palette = run.palette;
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(shot.text("Plot").expect("Plot").2, palette.text_strong);
+        assert_eq!(shot.text("Cut").expect("Cut").2, palette.text_dim);
+
+        // Without a pick it is the default.
+        ed.path_tool.let_go();
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(shot.text("Cut").expect("Cut").2, palette.text_strong);
+        assert_eq!(shot.text("Plot").expect("Plot").2, palette.text_dim);
+
+        // Pressing it with no pick sets the default and touches no path.
+        run.press(&mut ed, "Plot");
+        assert_eq!(ed.path_tool.role, PathRole::Plot);
+        assert_eq!(the_record(&ed)[0].role, PathRole::Plot, "path as it was");
+
+        // And with a pick it changes that path alone, as one entry.
+        let mut ed = picked_path(curvy());
+        assert_eq!(the_record(&ed)[0].role, PathRole::Cut);
+        let position = ed.history.position();
+        run.press(&mut ed, "Plot");
+        assert_eq!(the_record(&ed)[0].role, PathRole::Plot);
+        assert_eq!(ed.path_tool.role, PathRole::Cut, "the default moved");
+        assert_eq!(ed.history.position(), position + 1);
+    }
+
+    /// Pressing Close path closes the picked path, as one undo entry that puts
+    /// it back open, and the button then offers to open it.
+    #[test]
+    fn pressing_close_path_closes_the_picked_path_in_one_undo() {
+        let mut ed = picked_path(curvy());
+        assert!(!the_record(&ed)[0].closed);
+        let position = ed.history.position();
+        let mut run = StripRun::new();
+        run.press(&mut ed, "Close path");
+        assert!(the_record(&ed)[0].closed, "the press did nothing");
+        assert_eq!(ed.history.position(), position + 1, "one entry");
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert!(shot.text("Close path").is_none() && shot.text("Open path").is_some());
+
+        let entry = ed.history.take_undo().expect("the edit");
+        assert_eq!(entry.kind, umber_core::EditKind::Paths);
+        let umber_core::EditBody::Vector { slot, was } = entry.body else {
+            panic!("a path edit records a record");
+        };
+        ed.layers.restore_vector(slot, was).expect("the layer");
+        assert!(!the_record(&ed)[0].closed, "undo left it closed");
+    }
+
+    /// Corner and Smooth act on the picked node, each as one entry.
+    #[test]
+    fn corner_and_smooth_reshape_the_picked_node() {
+        let mut ed = picked_node(curvy(), 1);
+        assert_ne!(the_record(&ed)[0].nodes[1].handle_out, glam::Vec2::ZERO);
+        let position = ed.history.position();
+        let mut run = StripRun::new();
+        run.press(&mut ed, "Corner");
+        let node = the_record(&ed)[0].nodes[1];
+        assert_eq!(
+            (node.handle_in, node.handle_out),
+            (glam::Vec2::ZERO, glam::Vec2::ZERO)
+        );
+        assert_eq!(ed.history.position(), position + 1);
+        run.press(&mut ed, "Smooth");
+        let node = the_record(&ed)[0].nodes[1];
+        assert_ne!(node.handle_out, glam::Vec2::ZERO, "Smooth did nothing");
+        assert_eq!(ed.history.position(), position + 2);
+    }
+
+    /// Which buttons are drawn follows the pick: none with nothing picked,
+    /// Close or Open with a path, and Corner and Smooth with a node as well.
+    #[test]
+    fn the_strips_buttons_follow_the_pick() {
+        let mut run = StripRun::new();
+        let labels = ["Close path", "Open path", "Corner", "Smooth"];
+        let drawn = |shot: &StripShot| labels.map(|l| shot.text(l).is_some());
+
+        let mut ed = editor_in_the_path_tool(curvy(), 1.0);
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(drawn(&shot), [false; 4], "nothing is picked");
+
+        let mut ed = picked_path(curvy());
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(drawn(&shot), [true, false, false, false], "a path");
+
+        let mut ed = picked_node(curvy(), 1);
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(drawn(&shot), [true, false, true, true], "a node");
+    }
+
+    /// A button that cannot act is drawn disabled, and an enabled one is not.
+    /// Each is read from a state where the other would be the answer.
+    #[test]
+    fn a_button_that_cannot_act_is_drawn_disabled() {
+        let mut run = StripRun::new();
+        let palette = run.palette;
+        let off = palette.text_dim.gamma_multiply(0.5);
+
+        // An end of an open path has no curve to smooth; the middle does.
+        let mut ed = picked_node(curvy(), 0);
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(shot.text("Smooth").expect("Smooth").2, off);
+        assert_ne!(shot.text("Corner").expect("Corner").2, off);
+        let mut ed = picked_node(curvy(), 1);
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_ne!(shot.text("Smooth").expect("Smooth").2, off);
+
+        // Two nodes cannot be closed; three can.
+        let mut ed = picked_path(row_of_corners(2, 100.0));
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(shot.text("Close path").expect("Close").2, off);
+        let before = the_record(&ed);
+        run.press(&mut ed, "Close path");
+        assert_eq!(the_record(&ed), before, "a disabled button acted");
+        let mut ed = picked_path(curvy());
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_ne!(shot.text("Close path").expect("Close").2, off);
+    }
+
+    /// The mode switch changes the mode, and leaves a draft alone: it is
+    /// finished by Enter or settled on leaving the tool, never by a click on
+    /// the strip.
+    #[test]
+    fn switching_mode_leaves_the_draft_up() {
+        let mut ed = editor_in_the_path_tool(curvy(), 1.0);
+        ed.path_tool.mode = PathMode::Draw;
+        tap_at(&mut ed, glam::Vec2::new(300.0, 20.0));
+        assert!(ed.path_tool.draft().is_some());
+        let mut run = StripRun::new();
+        run.press(&mut ed, "Edit");
+        assert_eq!(ed.path_tool.mode, PathMode::Edit);
+        assert!(
+            ed.path_tool.draft().is_some(),
+            "the switch settled the draft"
+        );
+        run.press(&mut ed, "Draw");
+        assert_eq!(ed.path_tool.mode, PathMode::Draw);
+    }
+
+    /// No two of the strip's buttons touch: the rectangles that were drawn are
+    /// measured, because a guard that asserted the spacing it sets would agree
+    /// with itself.
+    #[test]
+    fn no_two_buttons_on_the_path_strip_touch() {
+        let mut run = StripRun::new();
+        let mut ed = picked_node(curvy(), 1);
+        let shot = run.frame(&mut ed, 900.0, Vec::new());
+        assert_eq!(shot.buttons.len(), 3, "Close, Corner and Smooth");
+        for pair in shot.buttons.windows(2) {
+            let gap = pair[1].left() - pair[0].right();
+            assert!(gap > 0.0, "two buttons touch: {pair:?}");
+        }
+    }
+
+    /// **Nothing the strip draws is past its right edge, at any width**, with
+    /// everything it can show up. Swept a point at a time, because a budget is
+    /// wrong over a band of widths and the slack is a point or two. Each
+    /// group has to have been drawn at some width, or the sweep proved
+    /// nothing about it.
+    #[test]
+    fn the_path_strip_fits_its_row() {
+        let mut run = StripRun::new();
+        let long = "A sentence long enough to need cutting at every width the strip offers it.";
+        let mut said = picked_node(curvy(), 1);
+        said.path_tool.say(long);
+        let mut states: Vec<(&str, Editor)> = vec![
+            ("nothing picked", editor_in_the_path_tool(curvy(), 1.0)),
+            ("a path", picked_path(curvy())),
+            ("a node", picked_node(curvy(), 1)),
+            ("a sentence said", said),
+        ];
+        for (name, ed) in &mut states {
+            let mut drew = [false; 4];
+            for step in 0..1400 {
+                let width = 200.0 + step as f32;
+                let shot = run.frame(ed, width, Vec::new());
+                assert!(
+                    shot.right <= width + 0.5,
+                    "{name}: the strip claims {:.1} points of {width}",
+                    shot.right
+                );
+                let edge = width - f32::from(metrics::STRIP_PAD) + 0.5;
+                for (text, rect, _) in &shot.texts {
+                    assert!(
+                        rect.right() <= edge,
+                        "{name}: {text:?} runs to {:.1} on a {width} point strip",
+                        rect.right()
+                    );
+                }
+                for (i, label) in ["Plot", "Close path", "Corner", "Smooth"]
+                    .iter()
+                    .enumerate()
+                {
+                    drew[i] |= shot.text(label).is_some();
+                }
+            }
+            assert!(drew[0], "{name}: the role switch was never drawn");
+            let wants = match *name {
+                "nothing picked" => [false; 3],
+                "a path" => [true, false, false],
+                _ => [true, true, true],
+            };
+            assert_eq!(
+                &drew[1..],
+                &wants,
+                "{name}: the groups drawn over the sweep"
+            );
+        }
     }
 }

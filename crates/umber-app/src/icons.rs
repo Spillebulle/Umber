@@ -353,12 +353,14 @@ pub enum Icon {
     /// Not `spline`, which was the other candidate: that is two nodes joined by
     /// a *curve*, and this is the one mode in the set that cannot draw one.
     /// Not `pen-tool` either — that is the bezier pen of a vector program, and
-    /// Umber has no vector tool for it to be confused with yet, which is
-    /// exactly why it should not be spent here.
+    /// it was kept back for the Path tool, which is the tool it names.
     SelectPolygon,
     /// Lucide `spline`: a curve joining two nodes. A change to a vector
     /// layer's paths, which is what the History row of that name shows.
     Spline,
+    /// Lucide `pen-tool`: a nib over a curve with its anchor, which is the mark
+    /// every vector program gives its bezier pen and what the Path tool is.
+    PenTool,
 }
 
 /// Where a mark's geometry comes from.
@@ -410,7 +412,7 @@ impl Icon {
     /// Hand-written and therefore checkable rather than self-evident: a test
     /// indexes it from an exhaustive match, so a variant added without a row
     /// here is a compile error rather than an icon nothing ever looks at.
-    pub const ALL: [Self; 55] = [
+    pub const ALL: [Self; 56] = [
         Self::Brush,
         Self::Eraser,
         Self::Select,
@@ -466,6 +468,7 @@ impl Icon {
         Self::SelectLasso,
         Self::SelectPolygon,
         Self::Spline,
+        Self::PenTool,
     ];
 
     /// The icon's elements, copied from Lucide 1.34.0 unchanged.
@@ -979,6 +982,23 @@ impl Icon {
                 },
                 Node::Path("M5 17A12 12 0 0 1 17 5"),
             ]),
+            // pen-tool, as published on lucide-icons/lucide's main: the arc
+            // flags are packed against the next number (`00-2.756`), which
+            // `lucide::Lexer::flag` reads.
+            Self::PenTool => Art::Lucide(&[
+                Node::Path(
+                    "m18 13-.654-4.736a4 4 0 00-2.756-3.266l-9.163-2.9a2 2 0 00-2.017.493l-.82.819a2 2 0 00-.492 2.017l2.9 9.163a4 4 0 003.266 2.756L13 18",
+                ),
+                Node::Path(
+                    "M18.648 12.352a1.205 1.205 0 011.704 0l1.296 1.296a1.205 1.205 0 010 1.704l-6.296 6.296a1.205 1.205 0 01-1.704 0l-1.296-1.296a1.205 1.205 0 010-1.704z",
+                ),
+                Node::Path("m3 3 6.586 6.586"),
+                Node::Circle {
+                    cx: 11.0,
+                    cy: 11.0,
+                    r: 2.0,
+                },
+            ]),
         }
     }
 }
@@ -1210,6 +1230,7 @@ mod tests {
                 Icon::SelectLasso => 52,
                 Icon::SelectPolygon => 53,
                 Icon::Spline => 54,
+                Icon::PenTool => 55,
             }
         };
         for icon in Icon::ALL {

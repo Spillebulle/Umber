@@ -2302,6 +2302,44 @@ impl Editor {
         }
     }
 
+    /// A command from the options strip, carried out by the route a pointer
+    /// release takes: the tool answers a [`crate::pathtool::Commit`] and
+    /// [`Editor::carry_out`] is the one thing that lands it. The strip collects
+    /// its press while it draws and calls one of these after the row, so the
+    /// record has one writer per frame.
+    fn path_command(
+        &mut self,
+        command: impl FnOnce(
+            &mut crate::pathtool::PathTool,
+            crate::pathtool::Ground<'_>,
+        ) -> crate::pathtool::Commit,
+    ) {
+        self.follow_path_ground();
+        let commit = self.with_path_tool(command);
+        self.carry_out(commit);
+    }
+
+    /// The strip's Cut / Plot switch: the picked path's role, or with no pick
+    /// the role for new paths.
+    pub fn path_set_role(&mut self, role: umber_core::PathRole) {
+        self.path_command(|tool, ground| tool.set_role(role, ground));
+    }
+
+    /// The strip's Close path / Open path button.
+    pub fn path_toggle_closed(&mut self) {
+        self.path_command(|tool, ground| tool.toggle_closed(ground));
+    }
+
+    /// The strip's Corner button.
+    pub fn path_corner(&mut self) {
+        self.path_command(|tool, ground| tool.corner(ground));
+    }
+
+    /// The strip's Smooth button.
+    pub fn path_smooth(&mut self) {
+        self.path_command(|tool, ground| tool.smooth(ground));
+    }
+
     /// Settle the Path tool before it, or the document under it, goes away: a
     /// draft of two or more nodes is put on a layer, a shorter one is dropped,
     /// and the pick is let go of. A draft that could not land is dropped too,

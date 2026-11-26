@@ -3325,6 +3325,7 @@ impl UmberApp {
             Action::EraserTool => self.pick_tool(Tool::Eraser),
             Action::SelectTool => self.pick_tool(Tool::Select),
             Action::TransformTool => self.pick_tool(Tool::Transform),
+            Action::PathTool => self.pick_tool(Tool::Path),
             Action::EyedropperTool => self.pick_tool(Tool::Eyedropper),
             Action::PanTool => self.pick_tool(Tool::Pan),
             Action::ZoomTool => self.pick_tool(Tool::Zoom),

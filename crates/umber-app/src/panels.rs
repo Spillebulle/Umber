@@ -903,7 +903,7 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing = vec2(metrics::TOOL_GAP, metrics::TOOL_GAP);
 
-        // Umber has seven tools where the design shows sixteen; the rest are
+        // Umber has eight tools where the design shows sixteen; the rest are
         // simply not drawn, rather than shown as buttons that do nothing.
         //
         // The keys come from the binding table rather than being written in:
@@ -929,6 +929,11 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                 Tool::Transform,
                 Icon::Transform,
                 shortcuts::labelled("Transform", Action::TransformTool),
+            ),
+            (
+                Tool::Path,
+                Icon::PenTool,
+                shortcuts::labelled("Path", Action::PathTool),
             ),
             (
                 Tool::Eyedropper,
@@ -4359,6 +4364,83 @@ mod blend_picker_tests {
             widest.1,
             widest.0,
             room
+        );
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use crate::editor::{Editor, Tool};
+    use crate::theme::{Palette, ThemeKind};
+    use egui::{Event, PointerButton, RawInput, Rect, pos2, vec2};
+
+    /// **The rail has a Path button, straight after Transform.**
+    ///
+    /// Read by pressing: the same row is clicked at every few points across its
+    /// width twice, once with the Pan tool in hand and once with Zoom, so a
+    /// press that landed on a button answers the same tool both times and a
+    /// press on nothing answers whatever was already in hand. What came out,
+    /// left to right, is the rail's order as the pointer meets it, which is
+    /// the one thing a painter sees.
+    #[test]
+    fn the_rail_has_a_path_button_after_transform() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 120.0));
+        let mut now = 0.0f64;
+        let mut press = |held: Tool, at: egui::Pos2| {
+            let mut ed = Editor::default();
+            ed.ui.tool = held;
+            let button = |pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            for events in [
+                vec![Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+            ] {
+                now += 0.05;
+                let _ = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(now),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| super::tools_body(ui, &palette, &mut ed),
+                );
+            }
+            ed.ui.tool
+        };
+        // Two frames of warm-up for the font atlas, through a throwaway press.
+        let _ = press(Tool::Pan, pos2(1.0, 1.0));
+
+        let mut order: Vec<Tool> = Vec::new();
+        for step in 0..100 {
+            let at = pos2(step as f32 * 4.0, 16.0);
+            let (a, b) = (press(Tool::Pan, at), press(Tool::Zoom, at));
+            if a == b && order.last() != Some(&a) {
+                order.push(a);
+            }
+        }
+        assert_eq!(
+            order,
+            vec![
+                Tool::Brush,
+                Tool::Eraser,
+                Tool::Select,
+                Tool::Transform,
+                Tool::Path,
+                Tool::Eyedropper,
+                Tool::Pan,
+                Tool::Zoom,
+            ],
+            "the rail, left to right"
         );
     }
 }

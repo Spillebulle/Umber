@@ -304,8 +304,8 @@ fn path(d: &str, out: &mut Vec<Outline>) {
                 let rx = lexer.number();
                 let ry = lexer.number();
                 let turn = lexer.number();
-                let large = lexer.number() != 0.0;
-                let sweep = lexer.number() != 0.0;
+                let large = lexer.flag();
+                let sweep = lexer.flag();
                 let to = place(here, lexer.number(), lexer.number(), relative);
                 arc(here, Radii { rx, ry, turn }, large, sweep, to, &mut points);
                 cursor = to;
@@ -486,6 +486,18 @@ impl<'a> Lexer<'a> {
             .is_some_and(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == '.')
     }
 
+    /// An arc's flag: exactly one character, `1` for set. SVG's grammar lets
+    /// the next number follow it with no separator (`00-2.756` is two flags
+    /// and a coordinate), which [`Lexer::number`] would take whole.
+    fn flag(&mut self) -> bool {
+        self.skip();
+        let set = self.rest.starts_with('1');
+        if self.rest.starts_with(['0', '1']) {
+            self.rest = &self.rest[1..];
+        }
+        set
+    }
+
     /// The next number, or zero where there is none. A malformed path is
     /// caught by the test in [`crate::icons`] rather than by a panic in front
     /// of somebody.
@@ -593,6 +605,31 @@ mod tests {
         };
         assert_eq!(only.points.len(), 3);
         assert!(only.closed, "z closes the outline");
+    }
+
+    /// SVG's grammar makes each arc flag one character, so `00-4` is two flags
+    /// and a coordinate. Lucide's own `pen-tool` is written that way, and
+    /// reading a flag as a number takes `00` whole and then the sign of the
+    /// next as a fresh number: a mark quietly deformed rather than absent, the
+    /// failure `every_number_in_every_icon_parses` exists for.
+    #[test]
+    fn an_arcs_flags_may_run_into_the_number_after_them() {
+        let drawn = |d: &str| {
+            let mut out = Vec::new();
+            path(d, &mut out);
+            out.into_iter()
+                .flat_map(|s| s.points)
+                .map(|p| (p.x, p.y))
+                .collect::<Vec<_>>()
+        };
+        let apart = drawn("M12 18a6 6 0 0 0 0-12");
+        assert!(apart.len() > 4, "the fixture must draw an arc");
+        assert_eq!(drawn("M12 18a6 6 0 00 0-12"), apart);
+        assert_eq!(drawn("M12 18a6 6 0 00 0-12"), drawn("M12 18a6 6 0 000-12"));
+        // The second flag with a digit straight after it.
+        let apart = drawn("M2 2a5 5 0 0 1 4 4");
+        assert!(apart.len() > 4);
+        assert_eq!(drawn("M2 2a5 5 0 014 4"), apart);
     }
 
     /// A half circle by arc: the far side of a radius 6 circle centred at
