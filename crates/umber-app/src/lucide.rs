@@ -669,7 +669,9 @@ mod tests {
         );
         assert_eq!(
             number_tokens("a1 1 0 011 1 1 1 0 102 2"),
-            ["1", "1", "0", "0", "1", "1", "1", "1", "1", "0", "1", "0", "2", "2"]
+            [
+                "1", "1", "0", "0", "1", "1", "1", "1", "1", "0", "1", "0", "2", "2"
+            ]
         );
         // A flag slot holding something that is not a flag is a token the
         // guard can refuse, not one the scan quietly splits.

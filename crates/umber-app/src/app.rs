@@ -7329,6 +7329,64 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 #[cfg(test)]
 mod tests {
 
+    /// **Review Focus 2 at the keyboard's and the menu's route: undo and redo
+    /// reach the history only through `undo_command` and `redo_command`.**
+    ///
+    /// A source scan, and it says so. The decision those two make is the whole
+    /// of `Editor::path_key`, which needs no device and is driven by
+    /// `undo_with_a_draft_up_pops_a_node_and_leaves_the_history_alone`; what
+    /// is left on `UmberApp` is the GPU half of an undo and an event loop to
+    /// own it, so nothing here can call it. What can be checked is that no
+    /// third door reaches `undo` or `redo` past the draft. `jump_history` is
+    /// the one other caller and is a click on a History row, which names a
+    /// position rather than asking for one step.
+    #[test]
+    fn undo_and_redo_reach_the_history_only_past_the_draft() {
+        let source = include_str!("app.rs");
+        let body = &source[..source
+            .find(concat!("mod ", "tests {"))
+            .expect("the test module")];
+        let needles = [concat!("self.", "undo()"), concat!("self.", "redo()")];
+        let mut seen = Vec::new();
+        let mut within = "";
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            let decl = trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| trimmed.strip_prefix("pub "))
+                .unwrap_or(trimmed);
+            if let Some(rest) = decl.strip_prefix("fn ") {
+                within = rest.split('(').next().unwrap_or("");
+            }
+            if needles.iter().any(|n| line.contains(n)) {
+                seen.push(within);
+            }
+        }
+        for caller in &seen {
+            assert!(
+                ["undo_command", "redo_command", "jump_history"].contains(caller),
+                "{caller} reaches the history without asking the path tool first"
+            );
+        }
+        assert!(seen.contains(&"undo_command") && seen.contains(&"redo_command"));
+        for route in [
+            concat!("Action::Undo => self.", "undo_command()"),
+            concat!("Action::Redo => self.", "redo_command()"),
+        ] {
+            assert!(body.contains(route), "the shortcut does not take {route:?}");
+        }
+        let menu = body
+            .find(concat!("if actions.", "undo {"))
+            .expect("the menu's undo");
+        assert!(
+            body[menu..]
+                .trim_start_matches(concat!("if actions.", "undo {"))
+                .trim_start()
+                .starts_with(concat!("self.", "undo_command();")),
+            "the menu's Undo does not go through undo_command"
+        );
+    }
+
     /// **Every structural edit puts a floating transform down before it
     /// records.**
     ///
