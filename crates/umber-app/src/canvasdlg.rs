@@ -288,6 +288,22 @@ impl CanvasForm {
             .with_dpi(self.dpi as f32)
     }
 
+    /// What `which` hands back when its button is pressed.
+    ///
+    /// **Registration marks are a property of a document that already exists**,
+    /// so Apply carries the flag from the document the form was seeded from and
+    /// Create never does: a new tab opened beside a marked one is a fresh page,
+    /// and inheriting the flag there would be a document claiming marks nobody
+    /// asked for. `Editor::apply_canvas` is what drops it again where the new
+    /// size has no room.
+    fn produced(&self, which: Dialog) -> Document {
+        let doc = self.document();
+        match which {
+            Dialog::New => doc,
+            Dialog::Settings => doc.with_marks(self.from.marks),
+        }
+    }
+
     fn resizes(&self) -> bool {
         self.document().size != self.from.size
     }
@@ -422,10 +438,10 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor, out: &mut Outcome) {
                         .inner
                     {
                         match which {
-                            Dialog::New => out.create = Some(form.document()),
+                            Dialog::New => out.create = Some(form.produced(Dialog::New)),
                             Dialog::Settings => {
                                 out.change = Some(CanvasChange {
-                                    doc: form.document(),
+                                    doc: form.produced(Dialog::Settings),
                                     anchor: form.anchor,
                                 })
                             }
@@ -843,6 +859,16 @@ mod tests {
     /// everything the format allows.
     fn form_of(doc: Document) -> CanvasForm {
         CanvasForm::seeded(doc)
+    }
+
+    /// Apply keeps what the document already had and Create starts clean. Read
+    /// through `produced`, which is what the two buttons call.
+    #[test]
+    fn canvas_settings_keeps_the_marks_and_new_does_not() {
+        let doc = Document::new(1748, 2480).with_dpi(300.0).with_marks(true);
+        let form = form_of(doc);
+        assert!(form.produced(Dialog::Settings).marks);
+        assert!(!form.produced(Dialog::New).marks);
     }
 
     // The lock's own arithmetic is `LockedShape`'s and is guarded there:

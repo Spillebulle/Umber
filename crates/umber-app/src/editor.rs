@@ -2971,8 +2971,24 @@ impl Editor {
     ///
     /// The history is cleared here rather than left to the caller so it cannot
     /// be forgotten by one of two call sites.
-    pub fn apply_canvas(&mut self, doc: Document, anchor: umber_core::Anchor) -> bool {
+    pub fn apply_canvas(&mut self, mut doc: Document, anchor: umber_core::Anchor) -> bool {
         let resized = doc.size != self.doc.size;
+        // **Registration marks need a page they fit on**, and a new size or
+        // resolution can leave none. Asked of the document about to be
+        // installed, so the flag cannot outlive the room it was set for, and
+        // said aloud because the Print sheet would otherwise have lost its marks
+        // with nothing to say why. A flip never reaches here, so it leaves the
+        // flag alone.
+        if doc.marks && umber_core::sheet::Marks::for_document(&doc).is_err() {
+            doc.marks = false;
+            self.add_notice(Notice {
+                title: "Registration marks removed".to_string(),
+                lines: vec![
+                    "The new canvas size cannot hold registration marks, so they were switched off."
+                        .to_string(),
+                ],
+            });
+        }
         // The path being drawn is a statement about the canvas as it is, so it
         // goes onto a layer first and is carried by the resize like any other.
         if resized {
@@ -4903,6 +4919,41 @@ mod tests {
             ed.layers.vector_at(at).unwrap().paths()[0].nodes[0].at,
             Vec2::new(60.0, 35.0)
         );
+    }
+
+    /// A document of this size and resolution, with registration marks on.
+    fn marked(width: u32, height: u32, dpi: f32) -> Document {
+        Document::new(width, height).with_dpi(dpi).with_marks(true)
+    }
+
+    /// A5 at 300 dpi holds the marks and 300 pixels square (25 mm) cannot.
+    #[test]
+    fn a_resize_too_small_for_marks_switches_them_off_and_says_so() {
+        use umber_core::Anchor;
+        let mut ed = Editor {
+            doc: marked(1748, 2480, 300.0),
+            ..Editor::default()
+        };
+        assert!(ed.apply_canvas(marked(300, 300, 300.0), Anchor::Centre));
+        assert!(!ed.doc.marks, "the flag outlived the room for the marks");
+        let notice = ed.notice.as_ref().expect("said so");
+        assert_eq!(notice.title, "Registration marks removed");
+        assert_eq!(
+            notice.lines,
+            vec!["The new canvas size cannot hold registration marks, so they were switched off."]
+        );
+    }
+
+    #[test]
+    fn a_resize_that_still_fits_keeps_the_marks() {
+        use umber_core::Anchor;
+        let mut ed = Editor {
+            doc: marked(1748, 2480, 300.0),
+            ..Editor::default()
+        };
+        assert!(ed.apply_canvas(marked(1600, 2400, 300.0), Anchor::Centre));
+        assert!(ed.doc.marks);
+        assert!(ed.notice.is_none(), "nothing was lost, so nothing is said");
     }
 
     /// A resize strips Ink and says so once, and says nothing for a size that

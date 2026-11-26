@@ -173,6 +173,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
     let Stack {
         size,
         dpi,
+        marks,
         history: manifest,
         version,
         layers: mut specs,
@@ -262,6 +263,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         active,
         background,
         dpi,
+        marks,
         history,
         warnings,
     })
@@ -277,6 +279,8 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
 struct Stack {
     size: UVec2,
     dpi: Option<f32>,
+    /// `umber-regmarks`: registration marks, written only when set.
+    marks: bool,
     /// `umber-history`, the entry naming the saved undo history's manifest.
     history: Option<String>,
     /// `umber-version`, or **1** where the attribute is absent — which is every
@@ -323,6 +327,7 @@ fn parse_stack(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<Stack, I
     let mut size: Option<UVec2> = None;
     let mut dpi: Option<f32> = None;
     let mut manifest: Option<String> = None;
+    let mut marks = false;
     // 1 rather than 0 where the attribute is absent: revision 1 is what a file
     // carrying none of Umber's extensions declares, and it is what every other
     // application's ORA amounts to.
@@ -359,6 +364,7 @@ fn parse_stack(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<Stack, I
                         // across while rearranging the stack cannot leave a
                         // history pointing at layers that have moved.
                         manifest = attrs.string(docformat::HISTORY_ATTR);
+                        marks = attrs.string(docformat::MARKS_ATTR).as_deref() == Some("1");
 
                         // Checked before a single pixel is decoded, so a file
                         // from a future Umber costs nothing to refuse. Kept
@@ -549,6 +555,7 @@ fn parse_stack(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<Stack, I
     Ok(Stack {
         size,
         dpi,
+        marks,
         history: manifest,
         version,
         layers: specs,
@@ -975,6 +982,7 @@ fn flattened_fallback(
         // carrying the property across as well would paint it a second time.
         background: Background::Transparent,
         dpi,
+        marks: false,
         // A document whose layers could not be read has no stack for a history
         // to name, so there is nothing a patch could safely be replayed into.
         history: None,

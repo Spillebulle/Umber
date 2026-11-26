@@ -11,6 +11,7 @@
 //!     active: 0,
 //!     background: umber_core::Background::WHITE,
 //!     dpi: 72.0,
+//!     marks: false,
 //!     merged: umber_core::docformat::Canvas::Held(&merged),
 //!     history: None,
 //! };
@@ -360,6 +361,11 @@ fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
 /// `<image>` attribute naming the revision the file needs — see
 /// [`required_version`], which is not always [`VERSION`].
 pub const VERSION_ATTR: &str = "umber-version";
+
+/// `<image>` attribute, written as `1` only when the document carries
+/// registration marks. It does not raise the version: it changes no pixel, and
+/// a build that ignores it merely does not offer the marks.
+pub const MARKS_ATTR: &str = "umber-regmarks";
 
 /// `<layer>` attribute naming the archive entry holding the layer's mask.
 ///
@@ -869,6 +875,9 @@ pub struct SaveDocument<'a> {
     /// Rounded to a whole number on the way out, which is what those attributes
     /// mean and what every other writer puts there.
     pub dpi: f32,
+    /// Whether the document carries registration marks, written as
+    /// [`MARKS_ATTR`] on `<image>` and only when true.
+    pub marks: bool,
     /// The flattened composite, straight-alpha sRGB, canvas-sized.
     ///
     /// Required by the specification, and supplied by the caller rather than
@@ -1841,6 +1850,7 @@ fn write_archive<W: Write + std::io::Seek>(
         stack_xml(
             doc.size,
             doc.dpi,
+            doc.marks,
             required_version(doc.layers),
             saved_history,
             &entries,
@@ -2024,7 +2034,14 @@ struct Entry {
     xml: String,
 }
 
-fn stack_xml(size: UVec2, dpi: f32, version: u32, saved_history: bool, layers: &[Entry]) -> String {
+fn stack_xml(
+    size: UVec2,
+    dpi: f32,
+    marks: bool,
+    version: u32,
+    saved_history: bool,
+    layers: &[Entry],
+) -> String {
     // `xres`/`yres` are OpenRaster's own, in whole pixels per inch, and every
     // reader that cares about print already looks for them — which is exactly
     // why there is no `umber-dpi` beside them. Umber has one resolution rather
@@ -2037,10 +2054,15 @@ fn stack_xml(size: UVec2, dpi: f32, version: u32, saved_history: bool, layers: &
     } else {
         String::new()
     };
+    let marks = if marks {
+        format!(" {MARKS_ATTR}=\"1\"")
+    } else {
+        String::new()
+    };
     let mut out = String::from("<?xml version='1.0' encoding='UTF-8'?>\n");
     out.push_str(&format!(
         "<image w=\"{}\" h=\"{}\" xres=\"{res}\" yres=\"{res}\" \
-         version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{version}\"{history}>\n \
+         version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{version}\"{history}{marks}>\n \
          <stack>\n",
         size.x, size.y
     ));
@@ -2564,6 +2586,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(px),
             history: None,
         })
@@ -2663,6 +2686,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
+                marks: false,
                 merged: Canvas::Held(&px),
                 history: None,
             })
@@ -2792,6 +2816,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: None,
         })
@@ -2896,6 +2921,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(px),
             history: None,
         })
@@ -3163,6 +3189,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: None,
         })
@@ -3299,6 +3326,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: None,
         })
@@ -3397,6 +3425,7 @@ mod tests {
             active: 1,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: None,
         });
@@ -3450,6 +3479,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: None,
         })
@@ -3522,6 +3552,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: None,
         })
@@ -3593,6 +3624,7 @@ mod tests {
             active: 2,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: Some(saved),
         });
@@ -3689,6 +3721,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: Some(saved),
         })
@@ -3766,6 +3799,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&merged),
             history: None,
         });
@@ -3831,6 +3865,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -3951,6 +3986,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4108,6 +4144,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4243,6 +4280,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
+                marks: false,
                 merged: Canvas::Held(&px),
                 history: None,
             })
@@ -4348,6 +4386,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4401,6 +4440,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4457,6 +4497,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: 72.0,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4540,6 +4581,7 @@ mod tests {
             active: 0,
             background: Background::opaque(paper),
             dpi: 300.0,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         });
@@ -4577,6 +4619,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4609,6 +4652,7 @@ mod tests {
             active: 0,
             background: Background::opaque(Color::from_srgb_u8(20, 120, 200, 255)),
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4651,6 +4695,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: 150.0,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4680,6 +4725,7 @@ mod tests {
             active: 0,
             background: Background::WHITE,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         });
@@ -4725,6 +4771,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&merged),
             history: None,
         });
@@ -4748,6 +4795,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&merged),
             history: None,
         });
@@ -4766,6 +4814,7 @@ mod tests {
             active: 1,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&painted),
             history: None,
         });
@@ -4793,6 +4842,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         };
@@ -4827,10 +4877,56 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         });
         assert_eq!(doc.layers[0].name, "<ink> & \"paper\"");
+    }
+
+    fn marked(marks: bool) -> (Vec<u8>, Vec<u8>) {
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [5, 5, 5, 255]);
+        let layers = vec![layer("Ink", &pixels)];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            marks,
+            merged: Canvas::Held(&pixels),
+            history: None,
+        })
+        .unwrap();
+        (bytes.clone(), bytes)
+    }
+
+    #[test]
+    fn registration_marks_survive_a_save_and_a_reopen() {
+        let (bytes, _) = marked(true);
+        let back = docimport::read_openraster(&bytes).expect("read back");
+        assert!(back.document().marks);
+        let (bytes, _) = marked(false);
+        let back = docimport::read_openraster(&bytes).expect("read back");
+        assert!(!back.document().marks);
+    }
+
+    #[test]
+    fn a_document_without_marks_writes_no_attribute() {
+        let (bytes, _) = marked(false);
+        assert!(!read_stack_xml(&bytes).contains(MARKS_ATTR));
+        let (bytes, _) = marked(true);
+        assert!(read_stack_xml(&bytes).contains(&format!("{MARKS_ATTR}=\"1\"")));
+    }
+
+    #[test]
+    fn marks_do_not_raise_the_version() {
+        let (bytes, _) = marked(true);
+        assert!(
+            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"1\"")),
+            "marks change no pixel, so an older build can open the file"
+        );
     }
 
     #[test]
@@ -4844,6 +4940,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4885,6 +4982,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4937,6 +5035,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -4956,6 +5055,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&full),
             history: None,
         })
@@ -5121,6 +5221,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
+                marks: false,
                 merged: Canvas::Held(&pixels),
                 history: None,
             },
@@ -5296,6 +5397,7 @@ mod tests {
                 active: 2,
                 background: Background::WHITE,
                 dpi: 300.0,
+                marks: false,
                 merged: match deferred {
                     true => Canvas::Deferred,
                     false => Canvas::Held(&self.merged),
@@ -5593,6 +5695,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         };
@@ -5862,6 +5965,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&px),
             history: None,
         })

@@ -604,6 +604,7 @@ mod tests {
                 active: None,
                 background: umber_core::Background::Transparent,
                 dpi: None,
+                marks: false,
                 history: None,
                 warnings: Vec::new(),
             }))
