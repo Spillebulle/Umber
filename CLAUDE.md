@@ -2029,6 +2029,15 @@ drawn by hand.
   `ui::step_rows` draws Undo as "Undo point" and Redo disabled while a draft is
   up. `jump_history` still steps the history directly, because a row names an
   entry and a draft is in none.
+- **A path taken up and given nothing lands nothing.** Clicking an open end
+  takes the path up as a draft that already holds its nodes, so Enter or a
+  settle straight afterwards would land the same path back over itself: an
+  "Edit paths" row that undoes to itself, a cleared redo stack and a dot on the
+  tab, for a click. `PathTool::land` answers `Commit::Nothing` while a
+  continuation holds exactly `base_len` nodes, `finish` then drops the draft
+  and a settle drops it on `Nothing`; the closing press is a change and still
+  lands. `apply_path_plan`'s Append compares records as `apply_path_edit` does,
+  so a plan that changes nothing records nothing by either door.
 - **A draft that cannot land stays up and the strip says why.** A full stack, no
   slice, too many paths or nodes: nothing drawn is lost and the artist can make
   room. The one notice, "The path being drawn was not kept", is raised on
@@ -2048,17 +2057,27 @@ drawn by hand.
   History jump carries the draft as the command does; settling there would
   record a landing inside the history being walked. A resize clears the
   history, so it settles first.
-- **The pick is let go on a foreign revision and `detach`ed on a layer change.**
-  A pick and a continued draft name a path by index, and `PathWatch` compares
-  the document, the slot, `vector_revision` and the path count to say when that
-  index stops meaning what it meant. A foreign change drops the pick, since a
-  fresh one is a click away. A continued draft is only *detached* (it then lands
-  as a new path), because dropping it costs what the artist drew and detaching
-  costs at most a duplicate. The watch runs at the top of `render` and again at
-  the start of every press, release, key and settle, because an undo can arrive
-  between two events with no frame between them; the tool's own commits go
-  through `own_edit` and keep their pick. `a_stale_pick_never_reaches_the_next_key`
-  is the guard.
+- **The pick is let go on a foreign revision, and a continued draft is checked
+  against the path it names.** A pick and a continued draft name a path by
+  index, and `PathWatch` compares the document, the slot and `vector_revision`
+  to say when that index may have stopped meaning what it meant. A foreign
+  change drops the pick, since a fresh one is a click away. A continued draft is
+  only *detached* (it then lands as a new path), because dropping it costs what
+  the artist drew and detaching costs at most a duplicate. **What decides the
+  detach is the path, not the count.** A layer or document change detaches
+  outright; on a foreign revision `PathTool::still_continues` keeps the draft
+  only if path `i` is still an open line of the draft's role whose nodes equal
+  the draft's first `base_len` (reversed, handles swapped, when it was taken
+  from its first node). A count can come back to what it was over a different
+  path, and the landing would then replace a path the artist never touched.
+  The tool's own Ctrl-edit of the very path being continued detaches too, or
+  the landing would write the old nodes back over the edit. The watch runs at
+  the top of `render` and again at the start of every press, release, key and
+  settle, because an undo can arrive between two events with no frame between
+  them; the tool's own commits go through `own_edit` and keep their pick.
+  `a_stale_pick_never_reaches_the_next_key` and
+  `a_jump_that_keeps_the_count_detaches_a_draft_whose_path_moved` are the
+  guards.
 - **Marks and hit test share `Editor::path_nodes_shown`, and its cap is 2048.**
   Past `NODE_MARK_CAP` nodes in view no node mark is drawn and node and handle
   hits are off (segment hits still work), because a path traced from a lasso can
@@ -2066,13 +2085,26 @@ drawn by hand.
   rule forbids. The answer is cached by document, revision, pick and view, and
   the scan stops as soon as it knows. `ui::path_marks` is the one statement of
   where a mark is, read by the painter and the tests, and handles belong to the
-  picked node (and the draft's last) alone.
-- **The preview mesh is cached by value.** `PathPaint` keeps an `Arc<Mesh>` and
-  the lines it was made from, rebuilt only when the lines, the scale or a colour
-  differ (`a_still_path_in_hand_is_tessellated_once`). A dependency list would
-  go stale; a few dozen points compared by value cannot. `machine_line_mesh`
-  still builds a fresh tessellator per rebuild, so a path in hand allocates when
-  it changes and not when it stands still.
+  picked node (and the draft's last) alone. A draft is capped differently: its
+  first `NODE_MARK_CAP` nodes are marked and its last always is, because a long
+  path taken up from its end is being drawn *from* that node.
+- **A still frame does no work that scales with the picked path.** The picked
+  path can be a lasso's tens of thousands of nodes, so the preview lines, the
+  mesh and the marks are rebuilt only when `ui::PaintKey` moves: the document,
+  the revision, whether the layer may be edited, the tool's content
+  `generation`, the role, the nodes shown, the hover band, the camera, the view,
+  the scale and the colours. Comparing the lines by value, which this used to
+  do, walked every node of the pick on every frame to find out nothing had
+  changed. **`PathTool::generation` is bumped inside every `&mut` method that
+  can change what is drawn**, for the reason `slot_revision` is bumped inside
+  the method rather than beside its callers; `say` is the one that does not,
+  because the strip is not the canvas. The draft and its band are traced
+  before the pick, so a pick that meets `MAX_POINTS` cannot hide the line being
+  drawn. A drag writes into one copy of the path it holds rather than cloning
+  the path per move. `a_still_frame_traces_nothing_and_walks_no_node` reads the
+  counters, and checks that a hover, a pan and a pick each rebuild, so it is not
+  satisfied by a painter that never rebuilds. `machine_line_mesh` still builds
+  a fresh tessellator per rebuild.
 - **A layer the tool makes has its slice wiped at the end of every event as well
   as in `render`.** `Editor` has no renderer, so it queues the slot
   (`path_layers_made`), and `App::drain_path_layers` empties the queue after
@@ -2093,15 +2125,15 @@ drawn by hand.
 - **`lucide.rs` reads packed arc flags.** Lucide writes an arc's flags against
   the next number (`00-2.756`), and a lexer reading a flag as a number deforms
   the mark rather than breaking it. `Lexer::flag` reads one character, guarded
-  by `an_arcs_flags_may_run_into_the_number_after_them`; `number_tokens` still
-  tokenises flags as numbers, so `every_number_in_every_icon_parses` cannot see
-  a regression there. The brief for the rail mark carried `pen-tool` path data
-  that is not what Lucide publishes: fetch the file rather than trusting a
-  brief.
+  by `an_arcs_flags_may_run_into_the_number_after_them`. `number_tokens` reads
+  an arc's flag slots the same way, so `every_number_in_every_icon_parses` sees
+  the tokens the parser sees, and `pen_tool_draws_what_its_flags_written_apart_would`
+  compares the shipped icon with its data written out spaced by hand. The brief
+  for the rail mark carried `pen-tool` path data that is not what Lucide
+  publishes: fetch the file rather than trusting a brief.
 - **What nobody has looked at.** The marks over real artwork (their colours and
   weights are reasoned and measured, not seen), the feel of the 8-point hit
-  radius, the pen path, and the icon sheet for `pen-tool`. A pinch does not take
-  back a node the first finger placed.
+  radius, the pen path, and the icon sheet for `pen-tool`.
 - **Knowingly left.** Freehand drawing fitted to a curve (it belongs with
   tracing), rectangle and ellipse path shapes, selecting several nodes or paths,
   snapping and nudging, and editing a layer that is not the active one. Cancel on
