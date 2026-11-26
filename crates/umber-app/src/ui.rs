@@ -72,6 +72,10 @@ pub struct UiActions {
     /// this. The caller's, because the file dialog blocks and the pixels come
     /// off the GPU. See [`crate::exportdlg`].
     pub export: Option<umber_core::ExportOptions>,
+    /// Ask for a file and write the print sheet into it: the flattened picture
+    /// at its physical size with the registration marks. The caller's, for
+    /// `export`'s reasons.
+    pub export_print_sheet: bool,
     /// Write the document to the file it came from, asking for one if it has
     /// none yet.
     pub save: bool,
@@ -2650,6 +2654,15 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         .clicked()
     {
         actions.open_export = true;
+        ui.close();
+    }
+    if menu_item(ui, Action::ExportPrintSheet, true)
+        .on_hover_text(
+            "A PDF of the picture at its real size, with the registration marks,              for printing and then cutting.",
+        )
+        .clicked()
+    {
+        actions.export_print_sheet = true;
         ui.close();
     }
     // A tick rather than a row that acts, as the Window menu draws its one
@@ -5665,6 +5678,17 @@ mod tests {
             demanded >= 15,
             "only {demanded} rows were demanded, so a category has stopped being routed"
         );
+    }
+
+    /// The print sheet's row asks the caller for the print sheet, and for
+    /// nothing the Export row asks for: the two sit side by side and share a
+    /// word, which is exactly where a row wired to its neighbour's flag hides.
+    #[test]
+    fn the_print_sheet_row_asks_for_the_print_sheet() {
+        let mut ed = Editor::default();
+        let actions = click_menu_row(Menu::File, &mut ed, Action::ExportPrintSheet.label());
+        assert!(actions.export_print_sheet, "the row asked for nothing");
+        assert!(!actions.open_export, "the row opened the Export dialog");
     }
 
     /// A menu row standing for a command is named as the command is named.

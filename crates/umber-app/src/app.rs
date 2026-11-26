@@ -3398,6 +3398,7 @@ impl UmberApp {
             // Only the dialog. The chord asks the question; it does not write a
             // file behind the artist's back.
             Action::Export => self.editor.export_form.open = true,
+            Action::ExportPrintSheet => self.export_print_sheet(),
             Action::ToggleSheetMarks => self.editor.toggle_sheet_marks(),
             // The answer matters only to `jump_history`, which has several
             // steps to abandon; one keystroke has nothing to stop.
@@ -4244,6 +4245,95 @@ impl UmberApp {
         }
     }
 
+    /// Ask for a file and write the print sheet into it: the flattened picture
+    /// as a one-page PDF at the document's physical size, with the registration
+    /// marks where the cutter will look for them. See `umber_core::printsheet`.
+    ///
+    /// The same route as [`App::export`], for the same reasons: the float is put
+    /// down first, the pixels are the screen composite with effects baked in,
+    /// and the file lands whole or not at all through `docformat::write_with`.
+    fn export_print_sheet(&mut self) {
+        use umber_core::printsheet;
+        self.finish_transform();
+        let id = self.editor.session.active_id();
+        let suggested = printsheet::default_file_name(self.editor.session.active_title());
+        if self
+            .gfx
+            .as_ref()
+            .is_none_or(|g| !g.canvases.contains_key(&id))
+        {
+            return;
+        }
+
+        let Some(picked) = rfd::FileDialog::new()
+            .set_title("Export print sheet")
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(suggested)
+            .save_file()
+        else {
+            return;
+        };
+        // Not every platform's save dialog appends the filter's extension.
+        let path = printsheet::with_pdf_extension(&picked);
+        let name = file_name_of(&path);
+
+        let Some(layers) = self.baked_draws(None) else {
+            return;
+        };
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
+        let pixels = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
+        let doc = &self.editor.doc;
+        // Only marks the model accepts for this page, which is what the canvas
+        // overlay draws too: a flag a file set against a page too small for it
+        // prints no marks rather than marks in the wrong place.
+        let marks = doc
+            .marks
+            .then(|| umber_core::sheet::Marks::for_document(doc).ok())
+            .flatten();
+        let sheet = printsheet::Sheet {
+            size: doc.size,
+            dpi: doc.dpi,
+            rgba: &pixels,
+            marks,
+        };
+
+        let written = docformat::write_with(&path, |file| {
+            printsheet::write(&mut std::io::BufWriter::new(file), &sheet).map_err(Into::into)
+        })
+        .map_err(|e| e.to_string());
+
+        match written {
+            Ok(()) => {
+                log::info!("exported a print sheet to {}", path.display());
+                let mut lines = vec![
+                    path.display().to_string(),
+                    "Print it at actual size (100%), with no fit to page, or the cuts will                      not line up."
+                        .to_string(),
+                ];
+                if marks.is_none() {
+                    lines.push(
+                        "This document has no registration marks. Switch them on in the File                          menu to print and cut."
+                            .to_string(),
+                    );
+                }
+                self.editor.notice = Some(Notice {
+                    title: "Print sheet exported".to_string(),
+                    lines,
+                });
+            }
+            Err(error) => {
+                log::error!("could not export {}: {error}", path.display());
+                self.editor.notice = Some(Notice {
+                    title: format!("Could not export “{name}”"),
+                    lines: vec![error],
+                });
+            }
+        }
+    }
+
     /// Two-finger pinch: pan by the midpoint delta, zoom by the spread ratio.
     fn update_pinch(&mut self) {
         // The pivot, not the viewport size. `zoom_at` keeps the document point
@@ -4878,6 +4968,9 @@ impl UmberApp {
         }
         if let Some(options) = actions.export {
             self.export(options);
+        }
+        if actions.export_print_sheet {
+            self.export_print_sheet();
         }
         if actions.save {
             self.save_document(false);
