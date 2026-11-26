@@ -2000,9 +2000,10 @@ impl Editor {
     }
 
     /// Put the Send to cutter dialog up. Its settings are the session's, so
-    /// they are as the artist last left them.
+    /// they are as the artist last left them; its summary and its last
+    /// outcome are not, and `CutterForm::opened` drops both.
     pub fn open_cutter(&mut self) {
-        self.cutter.open = true;
+        self.cutter.opened();
     }
 
     /// Put the trace outline dialog up. The first time in a session the

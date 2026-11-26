@@ -72,6 +72,9 @@ pub enum CutterPhase {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SummaryKey {
     revision: u64,
+    /// Which vector layers are shown, folded to one number. An eye does not
+    /// move `vector_revision`, and a hidden layer's paths are not sent.
+    shown: u64,
     settings: JobSettings,
     size: glam::UVec2,
     dpi_bits: u32,
@@ -193,6 +196,7 @@ impl CutterForm {
     fn summary(&mut self, layers: &LayerStack, doc: &Document) -> (&str, bool) {
         let key = SummaryKey {
             revision: layers.vector_revision(),
+            shown: shown_vector_layers(layers),
             settings: self.effective(&Page::of(doc)),
             size: doc.size,
             dpi_bits: doc.dpi.to_bits(),
@@ -320,6 +324,39 @@ impl CutterForm {
     pub fn log_text(&self) -> &str {
         &self.log_text
     }
+
+    /// The dialog is being put up. The summary is planned afresh, whatever
+    /// was cached when it was last closed, and an outcome from an earlier job
+    /// is not shown against what may be another document. The log stays: it
+    /// is what a report is copied from.
+    pub fn opened(&mut self) {
+        self.open = true;
+        self.summary = None;
+        if !self.busy() {
+            self.outcome = None;
+        }
+    }
+}
+
+/// Which vector layers are shown, as one number: an FNV-1a fold over each
+/// one's place in the stack and whether it is effectively visible, so a
+/// folder's eye counts as well as the layer's own. No allocation, because it
+/// is worked out every frame the dialog is up.
+fn shown_vector_layers(layers: &LayerStack) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        for b in v.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (i, layer) in layers.layers().iter().enumerate() {
+        if layer.vector().is_some() {
+            mix(i as u64);
+            mix(u64::from(layers.effective_visible(i)));
+        }
+    }
+    h
 }
 
 /// The log's first line for a job: every setting it was sent with, as the
@@ -932,6 +969,57 @@ mod tests {
         form.plot.depth = Some(4);
         let job = form.plan_job(&ed.layers, &ed.doc).unwrap();
         assert!(send_header(&job).contains(", blade depth not set, "));
+    }
+
+    /// The eye is not part of the vector revision, so the summary has to be
+    /// keyed on it separately, or a layer shown again goes on being refused.
+    #[test]
+    fn showing_a_hidden_layer_changes_the_summary() {
+        let mut h = Harness::new();
+        let mut ed = opened();
+        let refusal = JobRefusal::NoPaths(PathRole::Cut).sentence();
+        let index = (0..ed.layers.layers().len())
+            .find(|&i| ed.layers.layers()[i].vector().is_some())
+            .unwrap();
+
+        ed.layers.get_mut(index).unwrap().visible = false;
+        let shot = h.settled(&mut ed);
+        assert!(shot.has(&refusal), "{:?}", shot.words());
+
+        // Closed, shown again, opened again: the summary is the job's.
+        h.press(&mut ed, "Close");
+        assert!(!ed.cutter.open);
+        ed.layers.get_mut(index).unwrap().visible = true;
+        ed.open_cutter();
+        let shot = h.settled(&mut ed);
+        assert!(!shot.has(&refusal), "still refused: {:?}", shot.words());
+        assert!(
+            shot.texts.iter().any(|(t, _)| t.starts_with("1 path, ")),
+            "{:?}",
+            shot.words()
+        );
+
+        // And with the dialog left open the whole time.
+        ed.layers.get_mut(index).unwrap().visible = false;
+        assert!(h.settled(&mut ed).has(&refusal));
+        ed.layers.get_mut(index).unwrap().visible = true;
+        let shot = h.settled(&mut ed);
+        assert!(!shot.has(&refusal), "still refused: {:?}", shot.words());
+    }
+
+    #[test]
+    fn reopening_the_dialog_forgets_the_last_outcome() {
+        let mut h = Harness::new();
+        let mut ed = opened();
+        ed.cutter.absorb(vec![Event::Sent(Ok("Sent.".to_string()))]);
+        assert!(h.settled(&mut ed).has("Sent."));
+        h.press(&mut ed, "Close");
+        ed.open_cutter();
+        let shot = h.settled(&mut ed);
+        assert!(!shot.has("Sent."), "{:?}", shot.words());
+        assert_eq!(ed.cutter.outcome, None);
+        // The log is kept: it is what a report is copied from.
+        assert!(!ed.cutter.log.is_empty());
     }
 
     #[test]
