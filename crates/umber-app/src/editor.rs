@@ -1969,15 +1969,13 @@ impl Editor {
         let dpi = self.doc.dpi;
         let form = &mut self.ui.trace;
         form.open = true;
-        if !form.seeded {
-            let margin = (dpi * 3.0 / 25.4).round();
-            // A NaN resolution comes out as no margin rather than as NaN in
-            // the dialog's field, which `clamp` would pass straight through.
-            form.settings.margin = if margin.is_nan() {
-                0.0
-            } else {
-                margin.clamp(0.0, umber_core::trace::MAX_MARGIN)
-            };
+        // A resolution that is not a positive number says nothing about how
+        // big 3 mm is, so the margin is left alone and not marked seeded: the
+        // next document with a real resolution still gets the seed.
+        if !form.seeded && dpi.is_finite() && dpi > 0.0 {
+            form.settings.margin = (dpi * 3.0 / 25.4)
+                .round()
+                .min(umber_core::trace::MAX_MARGIN);
             form.seeded = true;
         }
     }
@@ -2515,9 +2513,17 @@ impl Editor {
     /// else to put it.
     pub fn settle_path_tool_noting(&mut self) {
         if let Some(notice) = self.settle_path_tool() {
-            for line in &notice.lines {
-                add_notice_line(&mut self.notice, &notice.title, line);
-            }
+            self.add_notice(notice);
+        }
+    }
+
+    /// Raise `notice` beside whatever is already up rather than over it: its
+    /// lines go under the standing notice's title, or it becomes the notice
+    /// where none is up. For a command that can raise two in one call, so the
+    /// first is not lost to the second.
+    pub fn add_notice(&mut self, notice: Notice) {
+        for line in &notice.lines {
+            add_notice_line(&mut self.notice, &notice.title, line);
         }
     }
 
@@ -7593,6 +7599,23 @@ mod tests {
             panic!("an editable vector layer active takes the paths");
         };
         assert_eq!(after.paths().len(), 1);
+
+        // The role is the settings', not a fixed Cut.
+        let ed = a_small_editor();
+        let plot = umber_core::trace::TraceSettings::new(umber_core::PathRole::Plot);
+        let plan = ed
+            .plan_trace(&alpha, TraceSource::Everything, &plot)
+            .expect("a disc traces");
+        let PathPlan::NewLayer { name, record } = plan else {
+            panic!("a raster layer active makes a layer of its own");
+        };
+        assert_eq!(name, PLOT_LAYER_NAME);
+        assert!(
+            record
+                .paths()
+                .iter()
+                .all(|p| p.role == umber_core::PathRole::Plot)
+        );
     }
 
     /// Nothing over the threshold is a sentence naming which source was read,
@@ -7656,17 +7679,21 @@ mod tests {
 
     /// This layer hides every draw outside the active entry's subtree: one
     /// layer, or a folder's contents, and a layer hidden by its own eye stays
-    /// hidden inside it.
+    /// hidden, inside the subtree or out of it. The top layer is hidden from
+    /// the start so a rule that *toggled* visibility outside the subtree would
+    /// show it.
     #[test]
     fn trace_draws_for_this_layer_hide_everything_outside_it() {
         let mut ed = Editor::default();
         ed.layers.add().expect("room");
         ed.layers.add().expect("room");
-        assert_eq!(ed.layers.len(), 3);
+        ed.layers.add().expect("room");
+        assert_eq!(ed.layers.len(), 4);
+        ed.layers.get_mut(3).unwrap().visible = false;
         ed.layers.set_active(1);
         assert_eq!(
             visibility(&ed.trace_draws(TraceSource::ThisLayer)),
-            vec![false, true, false]
+            vec![false, true, false, false]
         );
 
         // The bottom two in a folder, the folder active: its contents show.
@@ -7674,7 +7701,7 @@ mod tests {
         ed.layers.set_active(folder);
         assert_eq!(
             visibility(&ed.trace_draws(TraceSource::ThisLayer)),
-            vec![true, true, false]
+            vec![true, true, false, false]
         );
 
         // One of them with its own eye off traces nothing.
@@ -7682,8 +7709,46 @@ mod tests {
         ed.layers.get_mut(hidden).unwrap().visible = false;
         assert_eq!(
             visibility(&ed.trace_draws(TraceSource::ThisLayer)),
-            vec![false, true, false]
+            vec![false, true, false, false]
         );
+    }
+
+    /// A second notice in one call is added under the first, not over it.
+    #[test]
+    fn a_notice_added_beside_another_keeps_both() {
+        let mut ed = Editor::default();
+        ed.add_notice(Notice {
+            title: "First".to_string(),
+            lines: vec!["one".to_string()],
+        });
+        ed.add_notice(Notice {
+            title: "Second".to_string(),
+            lines: vec!["two".to_string()],
+        });
+        let up = ed.notice.expect("a notice");
+        assert_eq!(up.title, "First");
+        assert_eq!(up.lines, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    /// A resolution that is not a positive number seeds nothing and leaves the
+    /// seed for the next document that has one.
+    #[test]
+    fn a_resolution_that_is_not_a_number_does_not_spend_the_seed() {
+        for dpi in [0.0, -72.0, f32::NAN, f32::INFINITY] {
+            let mut ed = Editor::default();
+            let margin = ed.ui.trace.settings.margin;
+            ed.doc.dpi = dpi;
+            ed.open_trace();
+            assert!(ed.ui.trace.open);
+            assert_eq!(ed.ui.trace.settings.margin, margin, "dpi {dpi}");
+            assert!(!ed.ui.trace.seeded, "dpi {dpi} spent the seed");
+
+            ed.ui.trace.open = false;
+            ed.doc.dpi = 300.0;
+            ed.open_trace();
+            assert_eq!(ed.ui.trace.settings.margin, 35.0, "after dpi {dpi}");
+            assert!(ed.ui.trace.seeded);
+        }
     }
 
     /// First opened, the margin is 3 mm at the document's resolution; after

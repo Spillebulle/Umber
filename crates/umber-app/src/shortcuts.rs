@@ -1717,12 +1717,21 @@ mod tests {
         );
     }
 
-    /// **Every variant is in [`Action::ALL`].** The match is exhaustive, so a
-    /// new variant cannot compile without an arm, and each arm marks its own
-    /// cell: a variant left out of `ALL` leaves its cell unmarked. An arm
-    /// given a cell past the end panics, which is the same failure louder.
+    /// **What [`Action::ALL`] holds, as far as walking it can tell.** Each arm
+    /// of the exhaustive match marks its own cell, so this catches an entry
+    /// listed twice, and an existing entry dropped from `ALL` with the length
+    /// shortened to match: its cell is never marked.
+    ///
+    /// **It does not catch the slip it looks as though it should**: a new
+    /// variant given a new arm and left out of `ALL`. The loop only walks `ALL`,
+    /// so that arm never runs and nothing is left unmarked; the compiler forces
+    /// the arm and has no opinion about the array. The only complete fix is
+    /// deriving the enum and `ALL` from one list, the macro CLAUDE.md's
+    /// "Partial exhaustiveness" section weighs. What catches a missing command
+    /// in practice is a test that demands something of every action in a
+    /// category, such as `ui`'s menu-row test, and only for those categories.
     #[test]
-    fn every_action_is_in_all() {
+    fn all_lists_no_action_twice_and_drops_none_it_had() {
         let mut seen = [false; Action::ALL.len()];
         for action in Action::ALL {
             let cell = match action {
@@ -1774,7 +1783,7 @@ mod tests {
             assert!(!seen[cell], "{action:?} is listed twice");
             seen[cell] = true;
         }
-        assert!(seen.iter().all(|s| *s), "a variant is missing from ALL");
+        assert!(seen.iter().all(|s| *s), "an entry of ALL is missing");
     }
 
     use std::collections::HashSet;

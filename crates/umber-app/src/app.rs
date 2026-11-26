@@ -2916,14 +2916,26 @@ impl UmberApp {
             return;
         };
         let alpha = canvas.export_coverage(&gfx.gpu.device, &gfx.gpu.queue, &draws);
+        // **Every refusal is added beside what is up, never over it.** Settling
+        // a draft above may already have raised a notice (a draft abandoned),
+        // and assigning the trace's own over it would throw that sentence
+        // away. `carry_out_path_plan` assigns, which is right for the
+        // selection commands that settle nothing, so its notice is taken back
+        // out and added here instead.
         match self.editor.plan_trace(&alpha, form.source, &form.settings) {
             Ok(plan) => {
                 let adds_a_layer = plan.adds_a_layer();
-                if self.carry_out_path_plan(plan, adds_a_layer) {
+                let earlier = self.editor.notice.take();
+                let landed = self.carry_out_path_plan(plan, adds_a_layer);
+                let refused = std::mem::replace(&mut self.editor.notice, earlier);
+                if let Some(refused) = refused {
+                    self.editor.add_notice(refused);
+                }
+                if landed {
                     self.editor.ui.trace.open = false;
                 }
             }
-            Err(notice) => self.editor.notice = Some(notice),
+            Err(notice) => self.editor.add_notice(notice),
         }
         self.request_redraw();
     }
@@ -7529,10 +7541,12 @@ mod tests {
             concat!("self.", "finish_stroke()"),
             concat!("self.", "finish_transform()"),
             concat!("self.editor.", "settle_path_tool_noting()"),
+            concat!("self.", "drain_path_layers()"),
             concat!(".export", "_coverage("),
         ];
+        let last = markers.len() - 1;
         let mut within = "";
-        let mut first: [Option<usize>; 4] = [None; 4];
+        let mut first: [Option<usize>; 5] = [None; 5];
         for (n, line) in body.lines().enumerate() {
             let trimmed = line.trim_start();
             if let Some(rest) = trimmed.strip_prefix("fn ") {
@@ -7547,8 +7561,8 @@ mod tests {
                 }
             }
         }
-        let read = first[3].expect("trace_outline reads the coverage");
-        for (i, marker) in markers[..3].iter().enumerate() {
+        let read = first[last].expect("trace_outline reads the coverage");
+        for (i, marker) in markers[..last].iter().enumerate() {
             let at = first[i].unwrap_or_else(|| panic!("trace_outline never calls {marker}"));
             assert!(at < read, "trace_outline calls {marker} after reading");
         }
