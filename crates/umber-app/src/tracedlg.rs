@@ -139,7 +139,8 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                         log: true,
                         snap: 0.0,
                         deferred: false,
-                        figure: widgets::Figure::new(1.0, " px", 1),
+                        // Two places, so the 0.25 floor reads as itself.
+                        figure: widgets::Figure::new(1.0, " px", 2),
                     },
                 );
             })
@@ -366,6 +367,21 @@ mod tests {
         for source in TraceSource::ALL {
             assert!(shot.has(source.label()), "{source:?}");
         }
+    }
+
+    /// The floor of the smoothing range is a quarter, which one decimal would
+    /// show as 0.2 or 0.3 depending on rounding: neither is a value the rail
+    /// holds.
+    #[test]
+    fn the_smoothing_readout_shows_the_floor_as_it_is() {
+        let mut h = Harness::new();
+        let mut ed = opened();
+        ed.ui.trace.settings.smoothing = *SMOOTHING.start();
+        let shot = h.settled(&mut ed);
+        assert!(shot.has("0.25 px"), "{:?}", shot.words());
+        ed.ui.trace.settings.smoothing = 1.0;
+        let shot = h.settled(&mut ed);
+        assert!(shot.has("1.00 px"), "{:?}", shot.words());
     }
 
     #[test]
