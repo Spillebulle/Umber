@@ -172,7 +172,17 @@ pub fn region(doc: UVec2, alpha: &[u8], margin: f32, max_cells: usize) -> Option
 /// [`SMOOTHING`] (NaN as its default of 1.0), and both are turned into cells
 /// by dividing by `region.cell`. The tolerance is never less than a quarter of
 /// a cell: on an averaged grid that is the finest detail there is, and asking
-/// for less fits the grid's own staircase. A ring enclosing less than a cell,
+/// for less fits the grid's own staircase.
+///
+/// **With a margin the tolerance is also never more than half of it**, because
+/// the fit is symmetric about the ring and could otherwise sit as far inside it
+/// as `smoothing`, through the artwork it is meant to stand off: a wave of 5
+/// pixels at margin 3 and smoothing 8 put the line through solid ink. So the
+/// line stands off at least half the margin, less the fifth of a cell the ring
+/// itself falls short round a curve. Where half the margin is under the
+/// quarter-cell floor, which is a margin under half a cell, the floor wins and
+/// the line may come that much closer. At margin zero the tolerance is as
+/// asked: there is no stand-off to keep. A ring enclosing less than a cell,
 /// or that fits to fewer than two nodes, is dropped. With `keep_holes` a hole
 /// is a closed path like any other, sorted by the size of what it encloses.
 pub fn trace(region: &Region, settings: &TraceSettings) -> Vec<Path> {
@@ -185,7 +195,16 @@ pub fn trace(region: &Region, settings: &TraceSettings) -> Vec<Path> {
             .smoothing
             .clamp(*SMOOTHING.start(), *SMOOTHING.end())
     };
-    let tolerance = (smoothing / cell).max(*SMOOTHING.start());
+    // The fitter's tolerance is symmetric, so the line it fits can sit that
+    // far inside the grown ring. Half the margin keeps the stand-off at least
+    // half of what was asked; at margin zero there is no stand-off to keep.
+    let asked = smoothing / cell;
+    let asked = if margin > 0.0 {
+        asked.min(margin / 2.0)
+    } else {
+        asked
+    };
+    let tolerance = asked.max(*SMOOTHING.start());
     let cov = Coverage {
         size: region.size,
         alpha: &region.alpha,
@@ -1081,6 +1100,113 @@ mod tests {
             trace(&none, &settings(-5.0)),
             trace(&none, &settings(f32::NAN))
         );
+    }
+
+    /// A block whose top edge is a sine wave of `amp` pixels, period 40.
+    fn wavy(doc: UVec2, amp: f32) -> Vec<u8> {
+        grid(doc.x, doc.y, |x, y| {
+            let top = 50.0 + amp * (x as f32 * 2.0 * PI / 40.0).sin();
+            if (20..180).contains(&x) && (y as f32) >= top && y < 110 {
+                255
+            } else {
+                0
+            }
+        })
+        .1
+    }
+
+    /// The nearest any point of `path`, flattened, comes to an inside pixel of
+    /// `alpha`, measured to the pixel's square; zero for a point on one.
+    fn stand_off(doc: UVec2, alpha: &[u8], path: &Path) -> f32 {
+        let mut pts = Vec::new();
+        path.flatten(0.05, &mut pts);
+        let ink: Vec<Vec2> = (0..alpha.len())
+            .filter(|&i| alpha[i] >= THRESHOLD)
+            .map(|i| Vec2::new((i % doc.x as usize) as f32, (i / doc.x as usize) as f32))
+            .collect();
+        pts.iter()
+            .map(|p| {
+                ink.iter()
+                    .map(|c| {
+                        let gap = (*c - *p).max(*p - (*c + 1.0)).max(Vec2::ZERO);
+                        gap.length()
+                    })
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    fn smoothed(margin: f32, smoothing: f32) -> TraceSettings {
+        TraceSettings {
+            smoothing,
+            ..settings(margin)
+        }
+    }
+
+    #[test]
+    fn smoothing_never_pulls_a_grown_line_into_the_ink() {
+        let doc = UVec2::new(200, 130);
+        let a = wavy(doc, 5.0);
+        let region = region(doc, &a, 3.0, MAX_CELLS).unwrap();
+        let paths = trace(&region, &smoothed(3.0, 8.0));
+        assert_eq!(paths.len(), 1);
+        let mut pts = Vec::new();
+        paths[0].flatten(0.05, &mut pts);
+        for p in &pts {
+            let (x, y) = (p.x.floor(), p.y.floor());
+            if x >= 0.0 && y >= 0.0 && x < doc.x as f32 && y < doc.y as f32 {
+                let i = y as usize * doc.x as usize + x as usize;
+                assert!(a[i] < THRESHOLD, "the cut line crosses ink at {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_grown_line_stands_off_at_least_half_the_margin() {
+        let doc = UVec2::new(200, 130);
+        let a = wavy(doc, 5.0);
+        // The ring itself falls about a fifth of a cell short of the margin
+        // round a curve (see `rings`), and the fitted line is within half the
+        // margin of the ring, so that fifth is the only slack. Measured: 1.63
+        // at margin 3 and smoothing 8, and 0.39 at margin 1, whose ring
+        // stands off 0.78.
+        const RING_SHORT: f32 = 0.25;
+        for (margin, smoothing) in [(3.0, 8.0), (3.0, 1.0), (6.0, 8.0), (1.0, 8.0)] {
+            let region = region(doc, &a, margin, MAX_CELLS).unwrap();
+            let paths = trace(&region, &smoothed(margin, smoothing));
+            assert_eq!(paths.len(), 1);
+            let off = stand_off(doc, &a, &paths[0]);
+            assert!(
+                off >= margin / 2.0 - RING_SHORT,
+                "margin {margin}, smoothing {smoothing}: {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn smoothing_past_the_top_of_its_range_is_the_top() {
+        // A wave the top of the range flattens and a hundred would flatten
+        // further, so removing the upper clamp changes the answer.
+        let doc = UVec2::new(200, 130);
+        let a = wavy(doc, 12.0);
+        let region = region(doc, &a, 0.0, MAX_CELLS).unwrap();
+        let top = trace(&region, &smoothed(0.0, *SMOOTHING.end()));
+        let unclamped = |s: f32| {
+            let nodes = fit_closed(
+                &rings(
+                    &Coverage {
+                        size: region.size,
+                        alpha: &region.alpha,
+                    },
+                    0.0,
+                    false,
+                )[0],
+                s,
+            );
+            nodes.len()
+        };
+        assert_ne!(unclamped(8.0), unclamped(100.0));
+        assert_eq!(trace(&region, &smoothed(0.0, 100.0)), top);
     }
 
     #[test]

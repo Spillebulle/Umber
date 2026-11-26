@@ -29,8 +29,7 @@ const ABOUT: &str = "Draws a path round each piece of artwork, standing off by t
 const SOURCE_TIP: &str = "Everything traces all the layers in view. This layer traces the \
                           selected layer, or the contents of the selected folder.";
 
-const SMOOTHING_TIP: &str =
-    "How closely the path follows the edge. Lower follows more closely and uses more points.";
+const SMOOTHING_TIP: &str = "How closely the path follows the edge. Lower follows more closely and uses more points. With a margin, it never moves the line more than half the margin.";
 
 const KEEP_HOLES_TIP: &str = "Also trace the gaps inside a shape, such as the middle of a ring.";
 
