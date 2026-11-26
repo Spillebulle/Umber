@@ -59,6 +59,11 @@ pub fn ring_area(ring: &[Vec2]) -> f32 {
 /// centre at (0.5, 0.5). `margin` grows the outline outwards, in cells.
 /// Outer rings have a positive [`ring_area`] and holes a negative one; holes
 /// are present only when `keep_holes`.
+///
+/// With a margin, any cell at or above [`THRESHOLD`] is wholly inside and the
+/// margin is measured from its pixel edge, so a round corner is a circle about
+/// the corner cell's centre and, on the diagonal, falls about 0.21 of a
+/// cell short of a true offset of the square.
 pub fn rings(cov: &Coverage, margin: f32, keep_holes: bool) -> Vec<Vec<Vec2>> {
     let (w, h) = (cov.size.x as usize, cov.size.y as usize);
     if w == 0 || h == 0 || cov.alpha.len() != w * h {
@@ -150,7 +155,8 @@ fn without_specks(alpha: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-/// Felzenszwalb and Huttenlocher's exact squared Euclidean distance, in place,
+/// Felzenszwalb and Huttenlocher's squared Euclidean distance, exact to `f32`
+/// precision, in place,
 /// in time linear in the number of cells. `grid` holds 0 for a source and
 /// [`FAR`] elsewhere.
 fn distance_squared(grid: &mut [f32], w: usize, h: usize) {
@@ -359,7 +365,12 @@ fn contour(field: &[f32], w: usize, h: usize, pad: usize) -> Vec<Vec<Vec2>> {
             ring.push(point(segments[i].0));
             let to = segments[i].1;
             let next = segments.partition_point(|s| s.0 < to);
-            if next >= segments.len() || segments[next].0 != to || used[next] {
+            let found = next < segments.len() && segments[next].0 == to;
+            // The padding makes every crossing the end of one segment and the
+            // start of exactly one other, so a ring only stops where it began.
+            debug_assert!(found, "a contour segment with no successor");
+            if !found || used[next] {
+                debug_assert!(!found || next == start, "a ring closed onto another");
                 break;
             }
             i = next;
@@ -528,6 +539,12 @@ mod tests {
             assert_eq!(r.len(), 1, "margin {margin}");
             let ring = &r[0];
             assert!(ring.len() >= 4);
+            // Closed: every step, the last back to the first included, crosses
+            // at most one cell, so the stitcher found a successor everywhere.
+            for (i, p) in ring.iter().enumerate() {
+                let q = ring[(i + 1) % ring.len()];
+                assert!(p.distance(q) <= 1.5, "margin {margin}: {p} to {q}");
+            }
             // Marching squares clips each square corner by an eighth of a
             // cell at margin zero, so the floor is the grid less that.
             let floor = if margin == 0.0 { 399.0 } else { 400.0 };
@@ -565,13 +582,30 @@ mod tests {
         let r = trace(s, &a, 0.0, false);
         assert_eq!(r.len(), 1);
         let (_, hi) = bounds(&r[0]);
-        // Between the centres of column 8 (8.5) and the empty column 9 (9.5).
-        assert!(hi.x > 8.5 && hi.x < 9.5, "{}", hi.x);
+        // Inside column 8, short of its edge: a binary field would put the line
+        // at 9.0, and the half coverage pulls it back to about 8.81.
+        assert!(hi.x > 8.5 && hi.x < 8.95, "{}", hi.x);
     }
 
     #[test]
     fn a_grid_of_the_wrong_length_has_no_rings() {
         let a = vec![255u8; 99];
         assert!(trace(UVec2::new(10, 10), &a, 0.0, false).is_empty());
+    }
+
+    #[test]
+    fn a_grown_corner_falls_a_fifth_of_a_cell_short_on_the_diagonal() {
+        // The figure `rings`' docs give: a circle of `margin + 0.5` about the
+        // corner cell's centre, against `margin` beyond the corner itself.
+        let (s, a) = grid(40, 40, |x, y| if block(x, y, 15, 25) { 255 } else { 0 });
+        let r = trace(s, &a, 6.0, false);
+        let p = r[0]
+            .iter()
+            .copied()
+            .filter(|p| p.x < 15.0 && p.y < 15.0)
+            .min_by(|a, b| (a.x - a.y).abs().total_cmp(&(b.x - b.y).abs()))
+            .unwrap();
+        let short = 6.0 - (Vec2::splat(15.0) - p).length();
+        assert!(short > 0.15 && short < 0.25, "{short}");
     }
 }
