@@ -324,6 +324,62 @@ impl PathPlan {
     }
 }
 
+/// What a trace outline reads: the whole picture, or the active entry alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceSource {
+    /// Every layer in view, as an export flattens them.
+    Everything,
+    /// The active layer, or a folder's contents, with the rest hidden.
+    ThisLayer,
+}
+
+impl TraceSource {
+    /// Both, in the order the dialog offers them.
+    pub const ALL: [TraceSource; 2] = [TraceSource::Everything, TraceSource::ThisLayer];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TraceSource::Everything => "Everything",
+            TraceSource::ThisLayer => "This layer",
+        }
+    }
+
+    /// What a trace that found nothing says. Exhaustive, so a third source
+    /// has to say what "nothing" means for it.
+    fn nothing_line(self) -> &'static str {
+        match self {
+            TraceSource::Everything => "The layers in view are empty.",
+            TraceSource::ThisLayer => "There is nothing to trace on this layer.",
+        }
+    }
+}
+
+/// The trace outline dialog's state: whether it is up, and what it will ask
+/// for. Per session rather than per document, like the rest of [`UiState`]:
+/// a margin chosen for one sticker sheet is the margin wanted on the next.
+///
+/// `Copy` because `UiState` is.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceForm {
+    pub open: bool,
+    pub source: TraceSource,
+    pub settings: umber_core::trace::TraceSettings,
+    /// True once the margin has been set from a document's resolution, after
+    /// which it is the artist's and [`Editor::open_trace`] leaves it alone.
+    pub seeded: bool,
+}
+
+impl Default for TraceForm {
+    fn default() -> Self {
+        Self {
+            open: false,
+            source: TraceSource::Everything,
+            settings: umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut),
+            seeded: false,
+        }
+    }
+}
+
 /// The one statement of what a full stack says, written as a literal so it can
 /// sit inside `concat!`. A test pins the figure to `LayerStack::MAX`.
 macro_rules! stack_full_line {
@@ -843,6 +899,8 @@ pub struct UiState {
     /// distance to the centre, `Brush::size_from_rim`, so the brush is exactly
     /// as big as the circle you left on the screen.
     pub resize_from_edge: bool,
+    /// The trace outline dialog. See [`TraceForm`].
+    pub trace: TraceForm,
 }
 
 /// Tabs of the brush editor dialog.
@@ -1007,6 +1065,7 @@ impl Default for UiState {
             // preferences file that names neither changes nothing.
             resize_needs_press: false,
             resize_from_edge: false,
+            trace: TraceForm::default(),
         }
     }
 }
@@ -1157,6 +1216,10 @@ pub struct Editor {
     /// is drawn from `ui::draw`, which has no `ActiveEventLoop` — the same
     /// arrangement `Updates::take_quit_request` uses for the Windows installer.
     pub quit_requested: bool,
+    /// The trace outline dialog's Trace was pressed. A flag for the reason
+    /// `quit_requested` is one: the dialog is drawn from `ui::draw`, and the
+    /// trace needs the device. `App` spends it once, after the frame.
+    pub trace_requested: bool,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -1469,6 +1532,7 @@ impl Default for Editor {
             autosave: crate::autosave::Autosave::default(),
             recovery: crate::recoverdlg::Recovery::default(),
             quit_requested: false,
+            trace_requested: false,
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),
@@ -1859,6 +1923,63 @@ impl Editor {
     ) -> Result<PathPlan, Notice> {
         let paths = umber_core::VectorObject::from_rings(rings, role);
         self.plan_paths(paths, None).map_err(path_refusal)
+    }
+
+    /// What tracing `alpha` would do: the paths `umber_core::trace` finds,
+    /// planned through [`Editor::plan_paths`] exactly as the selection
+    /// commands plan theirs, or the sentence for why not.
+    ///
+    /// `alpha` is one byte per document pixel, as
+    /// `CanvasRenderer::export_coverage` reads it from
+    /// [`Editor::trace_draws`]. `source` only decides what "nothing" is called.
+    ///
+    /// **Nothing found is one answer however it was reached.** `region` finds
+    /// nothing over the threshold, or `trace` finds nothing worth a path once a
+    /// large region has been averaged down and faint thin work has gone with
+    /// it; both are the same sentence. Changes nothing: `&self`.
+    pub fn plan_trace(
+        &self,
+        alpha: &[u8],
+        source: TraceSource,
+        settings: &umber_core::trace::TraceSettings,
+    ) -> Result<PathPlan, Notice> {
+        let nothing = || Notice {
+            title: "Nothing to trace".to_string(),
+            lines: vec![source.nothing_line().to_string()],
+        };
+        let Some(region) = umber_core::trace::region(
+            self.doc.size,
+            alpha,
+            settings.margin,
+            umber_core::trace::MAX_CELLS,
+        ) else {
+            return Err(nothing());
+        };
+        let paths = umber_core::trace::trace(&region, settings);
+        if paths.is_empty() {
+            return Err(nothing());
+        }
+        self.plan_paths(paths, None).map_err(path_refusal)
+    }
+
+    /// Put the trace outline dialog up. The first time in a session the
+    /// margin is seeded to 3 mm at this document's resolution, clamped to what
+    /// the trace honours; after that it is left as the artist set it.
+    pub fn open_trace(&mut self) {
+        let dpi = self.doc.dpi;
+        let form = &mut self.ui.trace;
+        form.open = true;
+        if !form.seeded {
+            let margin = (dpi * 3.0 / 25.4).round();
+            // A NaN resolution comes out as no margin rather than as NaN in
+            // the dialog's field, which `clamp` would pass straight through.
+            form.settings.margin = if margin.is_nan() {
+                0.0
+            } else {
+                margin.clamp(0.0, umber_core::trace::MAX_MARGIN)
+            };
+            form.seeded = true;
+        }
     }
 
     /// Why the active layer's paths cannot be edited, or `None` when they can.
@@ -3653,32 +3774,83 @@ impl Editor {
     ///
     /// A folder carries no effects: `LayerStack::set_effect` refuses one, because
     /// a folder holds no coverage to derive from until group compositing lands.
-    /// So the `filter_map` below drops folders exactly as it always did and never
-    /// has to ask.
+    /// So the `filter_map` in `Editor::indexed_draws` drops folders exactly as
+    /// it always did and never has to ask.
     pub fn effected_draws(&self, float: Option<(u32, u32)>) -> Vec<LayerEffects<'_>> {
+        self.indexed_draws(float)
+            .into_iter()
+            .map(|(_, draw)| draw)
+            .collect()
+    }
+
+    /// The draws a trace outline reads: [`Editor::layer_draws`] for
+    /// Everything, and for This layer the same list with every draw outside
+    /// the active entry's subtree made invisible. For a folder that is its
+    /// contents. A draw already invisible stays so, so a layer hidden by its
+    /// own eye or a folder's traces nothing.
+    pub fn trace_draws(&self, source: TraceSource) -> Vec<LayerDraw> {
+        self.trace_effected_draws(source)
+            .into_iter()
+            .map(|e| e.draw)
+            .collect()
+    }
+
+    /// [`Editor::trace_draws`] with each layer's effects beside its draw, for
+    /// `App::trace_outline` to bake. An effect's draw takes its visibility from
+    /// its layer, so hiding the layer hides what it casts.
+    ///
+    /// **Everything outside the subtree is hidden, clip bases included.** A
+    /// clipped layer whose base is outside it therefore shows nothing and
+    /// traces nothing, which is what the composite does with a clipped layer
+    /// at the bottom of a stack. Keeping the base's alpha for the clip while
+    /// hiding its colour is not something a draw can say, and tracing the
+    /// clipped layer unclipped would trace pixels nobody can see.
+    pub fn trace_effected_draws(&self, source: TraceSource) -> Vec<LayerEffects<'_>> {
+        let mut draws = self.indexed_draws(None);
+        match source {
+            TraceSource::Everything => {}
+            TraceSource::ThisLayer => {
+                let keep = self.layers.subtree(self.layers.active_index());
+                for (index, effected) in &mut draws {
+                    if !keep.contains(index) {
+                        effected.draw.visible = false;
+                    }
+                }
+            }
+        }
+        draws.into_iter().map(|(_, draw)| draw).collect()
+    }
+
+    /// The flattening itself, each draw beside the stack position it came
+    /// from. A draw's position is not a stack position once there are folders,
+    /// so anything that has to ask the stack about a draw asks with this.
+    fn indexed_draws(&self, float: Option<(u32, u32)>) -> Vec<(usize, LayerEffects<'_>)> {
         self.layers
             .layers()
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
-                Some(LayerEffects {
-                    draw: LayerDraw {
-                        slot: match (l.slot()?, float) {
-                            (slot, Some((from, to))) if from == slot => to,
-                            (slot, _) => slot,
+                Some((
+                    i,
+                    LayerEffects {
+                        draw: LayerDraw {
+                            slot: match (l.slot()?, float) {
+                                (slot, Some((from, to))) if from == slot => to,
+                                (slot, _) => slot,
+                            },
+                            opacity: l.opacity,
+                            blend: l.blend.index(),
+                            visible: self.layers.effective_visible(i),
+                            // The mask is *not* swapped for the preview slice: a
+                            // floating transform moves the layer's pixels, not what
+                            // hides them, and the preview has to be masked exactly as
+                            // the committed result will be.
+                            mask: l.mask(),
+                            clipped: l.clipped,
                         },
-                        opacity: l.opacity,
-                        blend: l.blend.index(),
-                        visible: self.layers.effective_visible(i),
-                        // The mask is *not* swapped for the preview slice: a
-                        // floating transform moves the layer's pixels, not what
-                        // hides them, and the preview has to be masked exactly as
-                        // the committed result will be.
-                        mask: l.mask(),
-                        clipped: l.clipped,
+                        effects: l.effects(),
                     },
-                    effects: l.effects(),
-                })
+                ))
             })
             .collect()
     }
@@ -7366,5 +7538,163 @@ mod tests {
             assert_eq!(text.trim(), text);
             assert!(!text.contains('\u{2014}'), "an em-dash in {text:?}");
         }
+    }
+
+    // --- trace outline -----------------------------------------------------
+
+    /// An editor on a small canvas, so a hand-built coverage is cheap.
+    fn a_small_editor() -> Editor {
+        let mut ed = Editor::default();
+        ed.doc.size = glam::UVec2::new(64, 64);
+        ed
+    }
+
+    /// A solid disc of radius 15 in the middle of `ed`'s canvas.
+    fn a_disc(ed: &Editor) -> Vec<u8> {
+        let size = ed.doc.size;
+        let centre = size.as_vec2() * 0.5;
+        (0..size.y)
+            .flat_map(|y| (0..size.x).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let at = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                if at.distance(centre) <= 15.0 { 255 } else { 0 }
+            })
+            .collect()
+    }
+
+    /// A disc is one closed cut path. On a raster layer it goes on a layer of
+    /// its own; with an editable vector layer active it is appended there.
+    #[test]
+    fn a_trace_of_a_disc_plans_one_cut_path() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+
+        let ed = a_small_editor();
+        let alpha = a_disc(&ed);
+        let plan = ed
+            .plan_trace(&alpha, TraceSource::Everything, &settings)
+            .expect("a disc traces");
+        let PathPlan::NewLayer { name, record } = plan else {
+            panic!("a raster layer active makes a layer of its own");
+        };
+        assert_eq!(name, CUT_LAYER_NAME);
+        assert_eq!(record.paths().len(), 1);
+        let path = &record.paths()[0];
+        assert!(path.closed);
+        assert_eq!(path.role, umber_core::PathRole::Cut);
+
+        let mut ed = a_small_editor();
+        ed.layers
+            .add_vector_layer("Paths", umber_core::VectorObject::empty())
+            .expect("room");
+        let plan = ed
+            .plan_trace(&alpha, TraceSource::ThisLayer, &settings)
+            .expect("a disc traces");
+        let PathPlan::Append { after, .. } = plan else {
+            panic!("an editable vector layer active takes the paths");
+        };
+        assert_eq!(after.paths().len(), 1);
+    }
+
+    /// Nothing over the threshold is a sentence naming which source was read,
+    /// with the stack, the history and the tab's dot all as they were.
+    #[test]
+    fn a_trace_of_nothing_is_a_sentence_and_changes_nothing() {
+        let settings = umber_core::trace::TraceSettings::new(umber_core::PathRole::Cut);
+        for (source, line) in [
+            (TraceSource::Everything, "The layers in view are empty."),
+            (
+                TraceSource::ThisLayer,
+                "There is nothing to trace on this layer.",
+            ),
+        ] {
+            let mut ed = a_small_editor();
+            ed.session.active_tab_mut().modified = false;
+            // Faint everywhere, under the threshold: present, and not artwork.
+            let alpha = vec![umber_core::trace::THRESHOLD - 1; 64 * 64];
+            let before = (stack_ids(&ed), ed.history.len());
+            let notice = ed
+                .plan_trace(&alpha, source, &settings)
+                .expect_err("nothing was planned");
+            assert_eq!(notice.title, "Nothing to trace");
+            assert_eq!(notice.lines, vec![line.to_string()], "{source:?}");
+            assert_eq!((stack_ids(&ed), ed.history.len()), before);
+            assert!(!ed.session.active_tab().modified);
+        }
+    }
+
+    /// What decides visibility in a draw list, since `LayerDraw` has no
+    /// equality of its own.
+    fn draw_fields(draws: &[LayerDraw]) -> Vec<(u32, f32, u32, bool, Option<u32>, bool)> {
+        draws
+            .iter()
+            .map(|d| (d.slot, d.opacity, d.blend, d.visible, d.mask, d.clipped))
+            .collect()
+    }
+
+    fn visibility(draws: &[LayerDraw]) -> Vec<bool> {
+        draws.iter().map(|d| d.visible).collect()
+    }
+
+    #[test]
+    fn trace_draws_for_everything_are_the_layer_draws() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("room");
+        ed.layers.add().expect("room");
+        ed.layers.get_mut(1).unwrap().visible = false;
+        ed.layers.group(&[0]).expect("a folder");
+        assert_eq!(
+            draw_fields(&ed.trace_draws(TraceSource::Everything)),
+            draw_fields(&ed.layer_draws(None))
+        );
+    }
+
+    /// This layer hides every draw outside the active entry's subtree: one
+    /// layer, or a folder's contents, and a layer hidden by its own eye stays
+    /// hidden inside it.
+    #[test]
+    fn trace_draws_for_this_layer_hide_everything_outside_it() {
+        let mut ed = Editor::default();
+        ed.layers.add().expect("room");
+        ed.layers.add().expect("room");
+        assert_eq!(ed.layers.len(), 3);
+        ed.layers.set_active(1);
+        assert_eq!(
+            visibility(&ed.trace_draws(TraceSource::ThisLayer)),
+            vec![false, true, false]
+        );
+
+        // The bottom two in a folder, the folder active: its contents show.
+        let folder = ed.layers.group(&[0, 1]).expect("a folder");
+        ed.layers.set_active(folder);
+        assert_eq!(
+            visibility(&ed.trace_draws(TraceSource::ThisLayer)),
+            vec![true, true, false]
+        );
+
+        // One of them with its own eye off traces nothing.
+        let hidden = ed.layers.subtree(folder).start;
+        ed.layers.get_mut(hidden).unwrap().visible = false;
+        assert_eq!(
+            visibility(&ed.trace_draws(TraceSource::ThisLayer)),
+            vec![false, true, false]
+        );
+    }
+
+    /// First opened, the margin is 3 mm at the document's resolution; after
+    /// that it is whatever the artist left it at.
+    #[test]
+    fn opening_the_dialog_seeds_three_millimetres_once() {
+        let mut ed = Editor::default();
+        ed.doc.dpi = 300.0;
+        assert!(!ed.ui.trace.open);
+        ed.open_trace();
+        assert!(ed.ui.trace.open);
+        assert_eq!(ed.ui.trace.settings.margin, 35.0);
+
+        ed.ui.trace.open = false;
+        ed.ui.trace.settings.margin = 12.0;
+        ed.open_trace();
+        assert!(ed.ui.trace.open);
+        assert_eq!(ed.ui.trace.settings.margin, 12.0, "the change was kept");
     }
 }
