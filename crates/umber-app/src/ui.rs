@@ -2677,9 +2677,12 @@ mod strip_budget {
 /// to here saying nothing is better than saying something false.
 const fn navigate_hint(tool: Tool) -> (&'static str, &'static str, f32) {
     match tool {
-        Tool::Brush | Tool::Eraser | Tool::Select | Tool::Transform | Tool::Eyedropper => {
-            ("", "", f32::INFINITY)
-        }
+        Tool::Brush
+        | Tool::Eraser
+        | Tool::Select
+        | Tool::Transform
+        | Tool::Eyedropper
+        | Tool::Path => ("", "", f32::INFINITY),
         Tool::Zoom => (
             "Drag right or up to zoom in, left or down to zoom out.",
             if cfg!(target_os = "macos") {
@@ -2830,6 +2833,9 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Tool::Eyedropper => (Icon::Eyedropper, "Eyedropper"),
             Tool::Pan => (Icon::Pan, "Pan"),
             Tool::Zoom => (Icon::Zoom, "Zoom"),
+            // A placeholder mark until the rail button brings Lucide's
+            // `pen-tool`.
+            Tool::Path => (Icon::Spline, "Path"),
         };
         let (glyph_rect, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
         icons::draw(ui.painter(), glyph_rect, icon, p.accent);

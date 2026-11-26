@@ -438,12 +438,7 @@ pub(crate) fn release_finished_textures(
 fn no_slice_left() -> Notice {
     Notice {
         title: "There is no room for another layer".to_string(),
-        lines: vec![
-            "Umber has no texture slice left for one. Save and reopen the document \
-             to pack them back down, though deleted layers cannot be brought back \
-             afterwards."
-                .to_string(),
-        ],
+        lines: vec![editor::NO_SLICE_LINE.to_string()],
     }
 }
 
@@ -1126,6 +1121,14 @@ impl UmberApp {
         if let Some(why) = self.editor.flip_refusal() {
             self.editor.notice = Some(flip_refusal_notice(why));
             return;
+        }
+        // The path being drawn is on no layer, so it would not be mirrored with
+        // the paths that are. Put on its layer first, here and not inside
+        // `mirror_document`: that is also the undo's route, and a landing
+        // recorded in the middle of a step would land in the history the step
+        // is walking.
+        if let Some(notice) = self.editor.settle_path_tool() {
+            self.editor.notice = Some(notice);
         }
         if !self.mirror_document(axis) {
             return;
@@ -2715,8 +2718,7 @@ impl UmberApp {
     /// stack most of all, and freeing first would throw an artist's oldest
     /// edits away to make room for something that was never going to happen.
     fn free_a_slot(&mut self) -> bool {
-        let room = self.editor.layers.room();
-        self.editor.history.free_until(move || room.has_room())
+        self.editor.free_a_slot()
     }
 
     /// The same, for the one caller that needs a slice **above everything
@@ -2834,8 +2836,8 @@ impl UmberApp {
                 self.editor.notice = Some(no_slice_left());
                 return;
             }
-            Some(PathApplyRefusal::Declined(notice)) => {
-                self.editor.notice = Some(notice);
+            Some(PathApplyRefusal::Declined(why)) => {
+                self.editor.notice = Some(crate::editor::path_refusal(why));
                 return;
             }
         }
@@ -3256,6 +3258,11 @@ impl UmberApp {
             // nothing to throw away. Each is claimed only while it exists, so
             // Escape goes on reaching whatever else on the canvas wants it.
             Some(shortcuts::Direct::Abandon) => {
+                if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_key(editor::PathKey::Abandon)
+                {
+                    return true;
+                }
                 if self.editor.cancel_selection_draft() {
                     return true;
                 }
@@ -3266,6 +3273,11 @@ impl UmberApp {
             // Enter closes the outline, or puts the floating pixels down. Same
             // pair, same terms.
             Some(shortcuts::Direct::Finish) => {
+                if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_key(editor::PathKey::Finish)
+                {
+                    return true;
+                }
                 if self.editor.selection_draft.is_some() {
                     self.editor.finish_selection();
                     return true;
@@ -3275,7 +3287,16 @@ impl UmberApp {
                     return true;
                 }
             }
-            None => {}
+            // Backspace and Delete, claimed only where the Path tool took them.
+            // Anywhere else they fall through to the table, where either may be
+            // bound, exactly as before the tool existed.
+            Some(shortcuts::Direct::Remove)
+                if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_key(editor::PathKey::Remove) =>
+            {
+                return true;
+            }
+            Some(shortcuts::Direct::Remove) | None => {}
         }
         if !pressed {
             return false;
@@ -3297,12 +3318,8 @@ impl UmberApp {
             Action::Export => self.editor.export_form.open = true,
             // The answer matters only to `jump_history`, which has several
             // steps to abandon; one keystroke has nothing to stop.
-            Action::Undo => {
-                self.undo();
-            }
-            Action::Redo => {
-                self.redo();
-            }
+            Action::Undo => self.undo_command(),
+            Action::Redo => self.redo_command(),
             Action::Deselect => self.editor.deselect(),
             Action::Copy => self.copy_selection(),
             Action::Cut => self.cut_selection(),
@@ -3351,6 +3368,25 @@ impl UmberApp {
             Action::ZoomOut => self.editor.zoom_by(1.0 / ZOOM_KEY_STEP),
         }
         true
+    }
+
+    /// Undo as a command, from the keyboard or the Edit menu. With a path being
+    /// drawn it takes the draft's last node off and the history is not
+    /// touched, so nothing is committed and no redo is lost. `jump_history`
+    /// steps through [`Self::undo`] directly: a row of the History module names
+    /// an entry, and the draft is in none.
+    fn undo_command(&mut self) {
+        if !self.editor.path_key(editor::PathKey::Undo) {
+            self.undo();
+        }
+    }
+
+    /// [`Self::undo_command`]'s twin. With a draft up redo does nothing at all,
+    /// which is what keeps the redo stack whole for after the draft.
+    fn redo_command(&mut self) {
+        if !self.editor.path_key(editor::PathKey::Redo) {
+            self.redo();
+        }
     }
 
     /// Choose a tool, putting any floating transform down on the way out.
@@ -4176,6 +4212,13 @@ impl UmberApp {
         // comparison, so it costs the drawing path nothing.
         self.lift_notice.observe(self.lift_key());
 
+        // And the Path tool's pick, for the same reason and in the same place:
+        // an undo, a layer deleted or a tab switched since the last frame may
+        // have moved the path it names. Before the interface is built, so no
+        // frame draws a pick over a path it no longer means. A comparison, and
+        // it allocates nothing.
+        self.editor.follow_path_ground();
+
         // Also before the interface is built, and that is the whole point: a
         // slot is a slice of *one* document's texture array, so the frame after
         // a tab switch would otherwise draw the new document's rows wearing the
@@ -4303,6 +4346,18 @@ impl UmberApp {
             canvas_rect.width() * pixels_per_point,
             canvas_rect.height() * pixels_per_point,
         );
+
+        // A layer the Path tool made still holds whatever tiles the last layer
+        // in that slot left, as every new layer does until it is wiped. The
+        // tool can land a path from the rail, inside the interface just built,
+        // so this is after it and before anything reads a slice: the autosave
+        // and the composite below. By document, because a tab switch can land
+        // a path in the document it is leaving.
+        for (id, slot) in self.editor.path_layers_made.drain(..) {
+            if let Some(canvas) = gfx.canvases.get_mut(&id) {
+                canvas.clear_layer(&gfx.gpu.queue, slot);
+            }
+        }
 
         // Tessellation and egui's texture uploads happen *before* the surface
         // is acquired, because every path below this can decide not to draw the
@@ -4701,10 +4756,10 @@ impl UmberApp {
         }
 
         if actions.undo {
-            self.undo();
+            self.undo_command();
         }
         if actions.redo {
-            self.redo();
+            self.redo_command();
         }
         if let Some(axis) = actions.flip_canvas {
             self.flip_canvas(axis);
@@ -5609,6 +5664,16 @@ impl UmberApp {
                 self.editor.selection_press(doc, op);
             }
             gesture::Press::Transform => self.transform_press(pos),
+            gesture::Press::Path => {
+                let doc = self.editor.screen_to_doc(pos);
+                // Ctrl borrows Edit for this one gesture. Read here, where both
+                // pointers arrive, so a pen with a keyboard beside it has it as
+                // a mouse does; Cmd is accepted for the reason `selection_op`
+                // gives.
+                let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+                self.editor.interaction = Interaction::Pathing;
+                self.editor.path_press(doc, ctrl);
+            }
             gesture::Press::Eyedropper => {
                 // A *drag*, not a click, and that is the whole of how a colour
                 // outside the window is reachable: winit keeps the mouse
@@ -5634,6 +5699,7 @@ impl UmberApp {
         self.editor.cursor = pos;
         let pivot = self.editor.canvas_pivot;
         let mut dragging_float = false;
+        let mut rubber_band = false;
 
         match self.editor.interaction {
             Interaction::Drawing => {
@@ -5643,6 +5709,10 @@ impl UmberApp {
             Interaction::Selecting => {
                 let doc = self.editor.screen_to_doc(pos);
                 self.editor.selection_moved(doc);
+            }
+            Interaction::Pathing => {
+                let doc = self.editor.screen_to_doc(pos);
+                self.editor.path_moved(doc, self.modifiers.shift_key());
             }
             // Nothing to do but ask for a frame, which the return below does:
             // the sample itself is taken once per *frame* rather than once per
@@ -5694,6 +5764,18 @@ impl UmberApp {
                     let doc = self.editor.screen_to_doc(pos);
                     self.editor.selection_moved(doc);
                     self.editor.interaction = Interaction::Selecting;
+                } else if self.editor.ui.tool == Tool::Path
+                    && self.editor.path_tool.draft().is_some()
+                {
+                    // The rubber band from the last node to the pointer, which
+                    // follows a hovering pen too: the hover comes through this
+                    // same body. Exclusive with the two above, since a polygon
+                    // draft is the Select tool's and the resize needs Alt. It
+                    // asks for the frame and does not become an interaction,
+                    // because nothing is held.
+                    let doc = self.editor.screen_to_doc(pos);
+                    self.editor.path_moved(doc, self.modifiers.shift_key());
+                    rubber_band = true;
                 } else {
                     // A transform handle, which is a third thing that lives in
                     // this arm — and is exclusive with the other two the same
@@ -5711,6 +5793,7 @@ impl UmberApp {
 
         self.editor.interaction != Interaction::Idle
             || dragging_float
+            || rubber_band
             || self.editor.brush_resize.is_some()
     }
 
@@ -5767,6 +5850,15 @@ impl UmberApp {
             Interaction::Selecting => {
                 let doc = self.editor.screen_to_doc(pos);
                 self.editor.selection_release(doc);
+            }
+            // Ends here whatever the tool did with it. A path is a sequence of
+            // presses like the polygon, but that sequence is kept in the
+            // draft rather than in the interaction, so nothing is held between
+            // one node and the next.
+            Interaction::Pathing => {
+                let doc = self.editor.screen_to_doc(pos);
+                self.editor.path_release(doc);
+                self.editor.interaction = Interaction::Idle;
             }
             // **No wildcard**, which is CLAUDE.md's "partial exhaustiveness is
             // worse than none" applied to the one enum in this file that gained
@@ -7316,17 +7408,16 @@ mod tests {
         // exempted by name because it runs from `finish_transform`, where the
         // commit is what is happening.
         let record = concat!("history", ".record(");
-        // `apply_path_plan` is the second, and what makes it safe is its one
-        // caller: `App::carry_out_path_plan` is reached only from the two
-        // commands that put the float down and finish the stroke before they
-        // plan anything, so a shape recorded there never names a layer a
-        // placement is holding in the air.
-        //
-        // `apply_path_edit` is the third and its safety is a promise about
-        // callers that nothing here can check yet: the Path tool is the only
-        // one, a float exists only with the transform tool in hand, and the
-        // tool must therefore put nothing in the air before it swaps a record.
-        // Where that tool is wired in, this is the line to re-read.
+        // `apply_path_plan` is the second, and it has two callers.
+        // `App::carry_out_path_plan` is reached only from the two commands
+        // that put the float down and finish the stroke before they plan
+        // anything. `Editor::carry_out` is the Path tool's, and so is
+        // `apply_path_edit`, the third: neither can meet a float, because a
+        // float exists only with the transform tool in hand and the Path tool
+        // is settled (`Editor::set_tool`) before the tool can change, so no
+        // draft and no pick is left for a commit to come from while one
+        // stands. `carry_out` asserts it in debug builds. A shape recorded
+        // there therefore never names a layer a placement holds in the air.
         let allowed = [
             concat!("fn commit_made_", "layer"),
             concat!("fn apply_path_", "plan"),

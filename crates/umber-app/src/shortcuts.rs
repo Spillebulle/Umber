@@ -594,6 +594,11 @@ pub enum Direct {
     Abandon,
     /// Enter: finish the gesture in progress.
     Finish,
+    /// Backspace or Delete: take the last node off a path being drawn, or
+    /// remove what the Path tool has picked. Unlike the other three both keys
+    /// are bindable, so `handle_keys` claims this only where the tool took it
+    /// and lets it fall through to the table otherwise.
+    Remove,
 }
 
 /// Which of the three untabled keys a press is, if any.
@@ -635,6 +640,7 @@ pub fn direct(key: KeyCode, pressed: bool, suspended: bool) -> Option<Direct> {
         KeyCode::Space => Direct::PanModifier,
         KeyCode::Escape => Direct::Abandon,
         KeyCode::Enter | KeyCode::NumpadEnter => Direct::Finish,
+        KeyCode::Backspace | KeyCode::Delete => Direct::Remove,
         _ => return None,
     };
     if !pressed && direct != Direct::PanModifier {
@@ -2235,6 +2241,8 @@ mod tests {
             (KeyCode::Escape, Some(Direct::Abandon)),
             (KeyCode::Enter, Some(Direct::Finish)),
             (KeyCode::NumpadEnter, Some(Direct::Finish)),
+            (KeyCode::Backspace, Some(Direct::Remove)),
+            (KeyCode::Delete, Some(Direct::Remove)),
             (KeyCode::KeyB, None),
             (KeyCode::Tab, None),
         ] {
@@ -2261,7 +2269,15 @@ mod tests {
 
         // Escape and Enter act on the press alone, suspended or not. Reporting
         // them for a release would run the gesture's answer twice.
-        for key in [KeyCode::Escape, KeyCode::Enter, KeyCode::NumpadEnter] {
+        // Backspace and Delete too: a caret in a field is what deletes there,
+        // and a node taken off a path out of sight is the failure.
+        for key in [
+            KeyCode::Escape,
+            KeyCode::Enter,
+            KeyCode::NumpadEnter,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ] {
             assert_eq!(direct(key, true, true), None, "{key:?} while typing");
             assert_eq!(direct(key, false, false), None, "{key:?} released");
             assert_eq!(direct(key, false, true), None, "{key:?} released, typing");

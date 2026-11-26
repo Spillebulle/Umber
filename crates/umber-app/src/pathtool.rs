@@ -31,10 +31,6 @@
 //!   node as it was then, so a handle dragged through zero cannot change which
 //!   rule applies half way.
 
-// Nothing calls the tool until the pointer is wired to it, and clippy runs
-// with `-D warnings`. The wiring removes this line.
-#![allow(dead_code)]
-
 use glam::Vec2;
 use umber_core::pathedit::{self, Side};
 use umber_core::vector::{Node, Path, PathRole, VectorObject, VectorRefusal};
@@ -56,6 +52,13 @@ impl PathMode {
         }
     }
 }
+
+/// How many of the picked path's nodes may be marked and hit at once. Past
+/// it, inside the view, no node is marked and no node or handle is hit; the
+/// line can still be picked up and moved. A path traced from a lasso can hold
+/// tens of thousands of nodes, and a mark per node per frame is the cost the
+/// standing rule forbids. `Editor::path_nodes_shown` is the one reading.
+pub const NODE_MARK_CAP: usize = 2048;
 
 /// Document-space distances for this press, from the camera.
 #[derive(Clone, Copy, Debug)]
@@ -237,6 +240,17 @@ impl PathTool {
             | Held::Node { .. }
             | Held::Segment { .. } => true,
         }
+    }
+
+    /// Drop the draft, the pick and any press, keeping the mode and the role,
+    /// which are tool settings. For the document going away under the tool,
+    /// where there is nothing left to land a path on.
+    pub fn reset(&mut self) {
+        *self = Self {
+            mode: self.mode,
+            role: self.role,
+            ..Self::default()
+        };
     }
 
     /// The active layer changed under a draft that continues one of its
@@ -847,6 +861,30 @@ mod tests {
             nodes: points.iter().map(|&(x, y)| Node::corner(v(x, y))).collect(),
             ink: None,
         }
+    }
+
+    /// The document going away takes the draft and the pick, never the
+    /// settings: Draw or Edit and Cut or Plot are what the artist chose for the
+    /// tool, not for the document.
+    #[test]
+    fn a_reset_keeps_the_mode_and_the_role_and_drops_the_rest() {
+        let mut t = PathTool {
+            mode: PathMode::Edit,
+            role: PathRole::Plot,
+            ..PathTool::default()
+        };
+        // A draft, by borrowing Draw on a tap the Edit mode would not place.
+        t.press(v(0.0, 0.0), false, bare());
+        t.release(v(0.0, 0.0), bare());
+        t.mode = PathMode::Draw;
+        tap(&mut t, v(10.0, 0.0), bare());
+        assert!(t.draft().is_some(), "the fixture has something to drop");
+        t.mode = PathMode::Edit;
+        t.reset();
+        assert!(t.draft().is_none());
+        assert_eq!(t.pick(), None);
+        assert_eq!(t.said(), None);
+        assert_eq!((t.mode, t.role), (PathMode::Edit, PathRole::Plot));
     }
 
     #[test]
