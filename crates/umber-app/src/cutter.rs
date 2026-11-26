@@ -216,7 +216,8 @@ impl SendError {
             }
             SendError::MarksNotFound(raw) => format!(
                 "The cutter did not report finding the registration marks, so nothing was \
-                 cut or drawn. It answered: {}.",
+                 cut or drawn. It answered: {}. Check that the sheet was printed with marks \
+                 and is loaded straight.",
                 escaped(raw)
             ),
             SendError::MarksTimedOut => "The cutter did not answer while looking for the \
@@ -228,8 +229,8 @@ impl SendError {
                 escaped(raw)
             ),
             SendError::NeverReady => "The cutter stayed busy and never became ready.".to_string(),
-            SendError::Stopped => "Stopped. The cutter finished the part it had already been \
-                                   sent, and nothing more was sent."
+            SendError::Stopped => "Stopped. The cutter finished what it had already been \
+                                   sent and was sent back to its starting point."
                 .to_string(),
             SendError::Unconfirmed(_) => "The whole job was sent, but the cutter did not \
                                           confirm it had finished. Check the sheet before \
@@ -1394,9 +1395,13 @@ mod win {
     // SAFETY: a `Port` owns its handle and its read operation outright. It
     // moves between threads whole and is used only by the thread that holds
     // it, and nothing else holds the pointer. The kernel objects it names may
-    // be used from any thread, and an outstanding overlapped read is not tied
-    // to the thread that started it (only cancelling with `CancelIo` would
-    // be, which is why `drop` uses `CancelIoEx`).
+    // be used from any thread. One thing is tied to a thread: Windows cancels
+    // an outstanding overlapped read when the thread that started it exits.
+    // That would surface as an ordinary read error, not as unsoundness, since
+    // the operation's memory lives until `drop` has waited. It does not arise,
+    // because the opener, every read and the drop all run on the worker
+    // thread; keep it that way. `drop` uses `CancelIoEx` so the cancel itself
+    // is not tied to a thread.
     unsafe impl Send for Port {}
 
     impl Port {
@@ -1515,7 +1520,9 @@ mod win {
                 };
                 if done == FALSE && last_error() == ERROR_IO_INCOMPLETE {
                     // Signalled and not finished is not something the event
-                    // should do; the read is left as it is.
+                    // should do; the read is left as it is. The pause is so
+                    // that an event stuck signalled cannot spin the caller.
+                    std::thread::sleep(super::EMPTY_READ_PAUSE.min(wait));
                     return Ok(false);
                 }
                 // SAFETY: it has finished, one way or the other, which
@@ -2463,7 +2470,8 @@ mod tests {
         assert_eq!(
             sentences[6],
             "The cutter did not report finding the registration marks, so nothing was cut \
-             or drawn. It answered:     1\\x03."
+             or drawn. It answered:     1\\x03. Check that the sheet was printed with marks \
+             and is loaded straight."
         );
         assert_eq!(
             sentences[7],
@@ -2473,8 +2481,8 @@ mod tests {
         assert!(sentences[8].contains("3\\x03"), "{}", sentences[8]);
         assert_eq!(
             sentences[10],
-            "Stopped. The cutter finished the part it had already been sent, and nothing \
-             more was sent."
+            "Stopped. The cutter finished what it had already been sent and was sent back \
+             to its starting point."
         );
         // One wording for the platform limit, here and in the dialog.
         assert_eq!(sentences[4], crate::cutterdlg::WINDOWS_ONLY);

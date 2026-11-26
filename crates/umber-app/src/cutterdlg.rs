@@ -52,7 +52,7 @@ const STOPPING: &str = "Stopping. The cutter is finishing the part it was alread
 const BLADE_DEPTH: &str = "For the AutoBlade. Off leaves the blade as it was last set.";
 const MAT: &str = "On when the sheet is stuck to the cutting mat. Off when it is fed in bare.";
 const HUNG: &str =
-    "If this does not finish, copy the log, close Umber and switch the cutter off and on.";
+    "If this does not finish, copy the log, switch the cutter off, then close Umber.";
 /// How long a check may run before [`HUNG`] is said. A check is three
 /// harmless commands and a few seconds at the most.
 const CHECK_PATIENCE: f64 = 10.0;
