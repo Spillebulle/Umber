@@ -633,6 +633,32 @@ mod tests {
     }
 
     #[test]
+    fn no_handle_is_longer_than_the_chord_it_spans() {
+        // A tall narrow U: up one arm, round the top, down the other. Its
+        // ends are close and its tangents parallel, so least squares asks
+        // for handles several times the chord, which is a loop an artist
+        // would have to untie.
+        let mut pts = Vec::new();
+        for i in 0..=100 {
+            pts.push(Vec2::new(0.0, 100.0 - i as f32));
+        }
+        for i in 1..20 {
+            let t = i as f32 / 20.0 * std::f32::consts::PI;
+            pts.push(Vec2::new(5.0 - 5.0 * t.cos(), -5.0 * t.sin()));
+        }
+        for i in 0..=100 {
+            pts.push(Vec2::new(10.0, i as f32));
+        }
+        let nodes = fit_open(&pts, 8.0);
+        assert!(all_finite(&nodes));
+        for w in nodes.windows(2) {
+            let chord = w[0].at.distance(w[1].at);
+            assert!(w[0].handle_out.length() <= chord + 1e-3, "{w:?}");
+            assert!(w[1].handle_in.length() <= chord + 1e-3, "{w:?}");
+        }
+    }
+
+    #[test]
     fn a_ring_too_small_to_fit_is_dropped() {
         let a = Vec2::new(1.0, 2.0);
         let b = Vec2::new(4.0, 2.0);

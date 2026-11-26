@@ -846,6 +846,13 @@ mod tests {
                 .flat_map(|&x| [10.0f32, 70.0].map(|y| Vec2::new(x, y)))
                 .any(|c| c.distance(n.at) <= 1.0);
             assert!(near, "{}", n.at);
+            // The edges leave each corner square to the grid, although
+            // marching squares chamfered it: the end tangent is measured from a
+            // cell in, past the chamfer.
+            for h in [n.handle_in, n.handle_out] {
+                let tilt = h.x.abs().min(h.y.abs()) / h.length();
+                assert!(tilt < 0.02, "{n:?}");
+            }
         }
     }
 
