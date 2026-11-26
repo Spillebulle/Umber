@@ -132,6 +132,45 @@ pub enum SendError {
     NeverReady,
     /// The stop flag was raised.
     Stopped,
+    /// Everything was written, the end block included, and then the last wait
+    /// did not end in Ready. The raw reply where there was one that was not a
+    /// status, and empty otherwise.
+    Unconfirmed(Vec<u8>),
+}
+
+/// Why a job ended early, and how far it had got: an artist who is told only
+/// that a job failed, and sends it again, cuts the sheet twice.
+#[derive(Debug)]
+pub struct Failure {
+    pub error: SendError,
+    /// Path blocks written, counting a block whose write failed or timed out,
+    /// because it may have reached the machine in part.
+    pub blocks_sent: usize,
+    /// Path blocks in the whole job.
+    pub blocks: usize,
+}
+
+impl Failure {
+    /// What to tell the artist: the error's own sentence, and, where any of
+    /// the sheet may already be cut, that it should be looked at first.
+    pub fn sentence(&self) -> String {
+        let mut s = self.error.sentence();
+        // Exhaustive on purpose: a new variant has to say whether its own
+        // sentence already tells the artist the state of the sheet.
+        let says_so = match self.error {
+            SendError::Unconfirmed(_) => true,
+            SendError::Link(_)
+            | SendError::NoMedia
+            | SendError::MarksNotFound(_)
+            | SendError::Unknown(_)
+            | SendError::NeverReady
+            | SendError::Stopped => false,
+        };
+        if self.blocks_sent > 0 && !says_so {
+            s.push_str(" Part of the sheet may already be cut. Check it before sending again.");
+        }
+        s
+    }
 }
 
 impl From<LinkError> for SendError {
@@ -151,7 +190,7 @@ impl SendError {
                 LinkError::Busy => "The cutter is in use by another program. Close Silhouette \
                                     Studio and try again."
                     .to_string(),
-                LinkError::Timeout => "The cutter stopped answering.".to_string(),
+                LinkError::Timeout => "The cutter did not respond in time.".to_string(),
                 LinkError::Io(why) => format!("The connection to the cutter failed: {why}."),
                 LinkError::Unsupported => {
                     "Sending to a cutter only works on Windows so far.".to_string()
@@ -174,6 +213,10 @@ impl SendError {
             SendError::Stopped => {
                 "Stopped. The cutter finished the part it had already been sent.".to_string()
             }
+            SendError::Unconfirmed(_) => "The whole job was sent, but the cutter did not \
+                                          confirm it had finished. Check the sheet before \
+                                          sending again."
+                .to_string(),
         }
     }
 }
@@ -210,17 +253,49 @@ impl Timing {
     };
 }
 
-/// Send a whole job. `Ok` carries the firmware string the machine gave.
+/// Send a whole job. `Ok` carries the firmware string the machine gave; a
+/// [`Failure`] says how many path blocks had been written when it ended.
 ///
-/// `stop` is read before each path block and before the end block; once it is
-/// raised nothing more is written, not even the end block, because the machine
-/// finishes what it holds whatever Umber does next.
+/// `stop` is read before each path block, before the end block, and after
+/// every Moving while the machine is being waited for, so a stop takes effect
+/// while a block is cutting. Once it is raised nothing more is written.
+///
+/// **After a stop or an error part way through, the end block is deliberately
+/// not sent.** The link may be what failed, and the end block is a move like
+/// any other, so sending it would be writing into a conversation Umber has
+/// already lost track of. What that leaves the machine doing is not known:
+/// whether the tool is left down on the sheet, and whether the carriage stays
+/// where the last block left it, has to be checked on a real Portrait 3.
+///
+/// A failure in the very last wait, after the end block went, is
+/// [`SendError::Unconfirmed`]: the whole job is on the machine, and reading
+/// that as a failed job is how a sheet gets cut twice.
 pub fn send(
     link: &mut dyn Link,
     job: &Job,
     timing: &Timing,
     stop: &AtomicBool,
     progress: &mut dyn FnMut(Stage),
+) -> Result<String, Failure> {
+    let blocks = job.path_blocks();
+    let mut sent = 0;
+    conversation(link, job, &blocks, timing, stop, progress, &mut sent).map_err(|error| Failure {
+        error,
+        blocks_sent: sent,
+        blocks: blocks.len(),
+    })
+}
+
+/// The whole of [`send`], counting into `sent` each path block as its write
+/// begins.
+fn conversation(
+    link: &mut dyn Link,
+    job: &Job,
+    blocks: &[Vec<u8>],
+    timing: &Timing,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(Stage),
+    sent: &mut usize,
 ) -> Result<String, SendError> {
     progress(Stage::Connecting);
     let firmware = hello(link, timing)?;
@@ -244,13 +319,14 @@ pub fn send(
         wait_ready(link, timing, stop)?;
     }
 
-    let blocks = job.path_blocks();
     let of = blocks.len();
     for (block, bytes) in blocks.iter().enumerate() {
         if stop.load(Ordering::SeqCst) {
             return Err(SendError::Stopped);
         }
         progress(Stage::Cutting { block, of });
+        // Counted before the write: one that fails may have gone in part.
+        *sent += 1;
         link.write(bytes)?;
         wait_ready(link, timing, stop)?;
     }
@@ -260,7 +336,19 @@ pub fn send(
     }
     progress(Stage::Finishing);
     link.write(&job.end_block())?;
-    wait_ready(link, timing, stop)?;
+    // Everything is on the machine now, so however this wait ends it is not
+    // a failed job. A stop here changes nothing the machine does either.
+    wait_ready(link, timing, stop).map_err(|e| {
+        SendError::Unconfirmed(match e {
+            SendError::Unknown(raw) => raw,
+            SendError::Link(_)
+            | SendError::NoMedia
+            | SendError::MarksNotFound(_)
+            | SendError::NeverReady
+            | SendError::Stopped
+            | SendError::Unconfirmed(_) => Vec::new(),
+        })
+    })?;
     Ok(firmware)
 }
 
@@ -924,6 +1012,8 @@ mod tests {
         statuses: VecDeque<Vec<u8>>,
         /// What every status query answers once the queue is empty.
         idle: Vec<u8>,
+        /// Once the queue is empty, status queries get no answer at all.
+        silent: bool,
         marks: Vec<u8>,
         /// The first write equal to this fails, after being recorded.
         fail_on: Option<Vec<u8>>,
@@ -948,6 +1038,7 @@ mod tests {
                 firmware: b"CAMEO V1.10    \x03".to_vec(),
                 statuses: VecDeque::new(),
                 idle: b"0\x03".to_vec(),
+                silent: false,
                 marks: MARKS_FOUND.to_vec(),
                 fail_on: None,
                 fail_at: None,
@@ -983,11 +1074,11 @@ mod tests {
             let own = if bytes == FIRMWARE {
                 Some(self.firmware.clone())
             } else if bytes == STATUS {
-                Some(
-                    self.statuses
-                        .pop_front()
-                        .unwrap_or_else(|| self.idle.clone()),
-                )
+                match self.statuses.pop_front() {
+                    Some(s) => Some(s),
+                    None if self.silent => None,
+                    None => Some(self.idle.clone()),
+                }
             } else if bytes.starts_with(b"TB99") {
                 Some(self.marks.clone())
             } else {
@@ -1048,7 +1139,7 @@ mod tests {
         job
     }
 
-    fn run(link: &mut FakeLink, job: &Job) -> (Result<String, SendError>, Vec<Stage>) {
+    fn run(link: &mut FakeLink, job: &Job) -> (Result<String, Failure>, Vec<Stage>) {
         let stop = AtomicBool::new(false);
         let mut stages = Vec::new();
         let out = send(link, job, &fast(), &stop, &mut |s| stages.push(s));
@@ -1202,6 +1293,7 @@ mod tests {
         });
         // Well short of `ready`: the stop ended the wait, not the deadline.
         assert!(started.elapsed() < Duration::from_secs(5));
+        let out = out.map_err(|f| f.error);
         assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
         assert_eq!(count(&link.writes, &blocks[0]), 1);
         for b in &blocks[1..] {
@@ -1212,12 +1304,128 @@ mod tests {
         assert!(link.writes[at + 1..].iter().all(|w| w == STATUS));
     }
 
+    const PART_CUT: &str = " Part of the sheet may already be cut. Check it before sending again.";
+
+    #[test]
+    fn a_failure_after_the_first_cut_says_the_sheet_may_be_part_cut() {
+        let job = job(true);
+        let blocks = job.path_blocks();
+        let n = blocks.len();
+
+        // The second block's write fails: it may have gone in part, so it
+        // counts as sent.
+        let mut link = FakeLink::new();
+        link.fail_on = Some(blocks[1].clone());
+        let (out, _) = run(&mut link, &job);
+        let failure = out.unwrap_err();
+        assert!(matches!(failure.error, SendError::Link(LinkError::Io(_))));
+        assert_eq!((failure.blocks_sent, failure.blocks), (2, n));
+        assert_eq!(
+            failure.sentence(),
+            format!("{}{PART_CUT}", failure.error.sentence())
+        );
+
+        // An answer Umber does not know after the first block.
+        let mut link = FakeLink::new().statuses(&[&b"0\x03"[..], b"0\x03", b"0\x03", b"3\x03"]);
+        let (out, _) = run(&mut link, &job);
+        let failure = out.unwrap_err();
+        assert!(matches!(failure.error, SendError::Unknown(_)));
+        assert_eq!((failure.blocks_sent, failure.blocks), (1, n));
+        assert!(
+            failure.sentence().ends_with(PART_CUT),
+            "{}",
+            failure.sentence()
+        );
+
+        // Stopped after the last block: the end block was not sent, and that
+        // is a stop, not an unconfirmed whole job.
+        let mut link = FakeLink::new();
+        let stop = AtomicBool::new(false);
+        let failure = send(&mut link, &job, &fast(), &stop, &mut |s| {
+            if s == (Stage::Cutting {
+                block: n - 1,
+                of: n,
+            }) {
+                stop.store(true, Ordering::SeqCst);
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(failure.error, SendError::Stopped), "{failure:?}");
+        assert_eq!(failure.blocks_sent, n);
+        assert_eq!(count(&link.writes, &job.end_block()), 0);
+        assert!(failure.sentence().ends_with(PART_CUT));
+    }
+
+    #[test]
+    fn a_failure_before_any_cut_does_not_say_so() {
+        let job = job(true);
+        let n = job.path_blocks().len();
+        let mut link = FakeLink::new();
+        link.marks = b"    1\x03".to_vec();
+        let (out, _) = run(&mut link, &job);
+        let failure = out.unwrap_err();
+        assert!(matches!(failure.error, SendError::MarksNotFound(_)));
+        assert_eq!((failure.blocks_sent, failure.blocks), (0, n));
+        assert_eq!(failure.sentence(), failure.error.sentence());
+        assert!(!failure.sentence().contains("Part of the sheet"));
+
+        let mut link = FakeLink::new();
+        link.fail_on = Some(job.setup_block());
+        let (out, _) = run(&mut link, &job);
+        let failure = out.unwrap_err();
+        assert_eq!(failure.blocks_sent, 0);
+        assert_eq!(failure.sentence(), failure.error.sentence());
+    }
+
+    #[test]
+    fn a_job_sent_whole_but_never_confirmed_says_exactly_that() {
+        const SENTENCE: &str = "The whole job was sent, but the cutter did not confirm it had \
+                                finished. Check the sheet before sending again.";
+        let job = job(true);
+        let n = job.path_blocks().len();
+        // Before setup, after setup, after the search, and after each block.
+        let ready = vec![&b"0\x03"[..]; n + 3];
+
+        let check = |link: &FakeLink, failure: &Failure| {
+            assert_eq!(failure.blocks_sent, n);
+            assert_eq!(failure.blocks, n);
+            assert_eq!(failure.sentence(), SENTENCE);
+            assert_eq!(failure.error.sentence(), SENTENCE);
+            assert_eq!(count(&link.writes, &job.end_block()), 1);
+        };
+
+        // An unknown answer to the last poll.
+        let mut link = FakeLink::new().statuses(&ready);
+        link.idle = b"3\x03".to_vec();
+        let failure = run(&mut link, &job).0.unwrap_err();
+        match &failure.error {
+            SendError::Unconfirmed(raw) => assert_eq!(raw, b"3\x03"),
+            other => panic!("{other:?}"),
+        }
+        check(&link, &failure);
+
+        // No answer at all.
+        let mut link = FakeLink::new().statuses(&ready);
+        link.silent = true;
+        let failure = run(&mut link, &job).0.unwrap_err();
+        assert!(matches!(failure.error, SendError::Unconfirmed(_)));
+        check(&link, &failure);
+
+        // Moving past the deadline.
+        let mut link = FakeLink::new().statuses(&ready);
+        link.idle = b"1\x03".to_vec();
+        let failure = run(&mut link, &job).0.unwrap_err();
+        assert!(matches!(failure.error, SendError::Unconfirmed(_)));
+        check(&link, &failure);
+    }
+
     #[test]
     fn marks_not_found_ends_the_job_before_any_cut() {
         let job = job(true);
         let mut link = FakeLink::new();
         link.marks = b"    1\x03".to_vec();
         let (out, _) = run(&mut link, &job);
+        let out = out.map_err(|f| f.error);
         match out {
             Err(SendError::MarksNotFound(raw)) => assert_eq!(raw, b"    1\x03"),
             other => panic!("{other:?}"),
@@ -1244,6 +1452,7 @@ mod tests {
             let mut link = FakeLink::new();
             link.marks = reply.to_vec();
             let (out, _) = run(&mut link, &job);
+            let out = out.map_err(|f| f.error);
             match out {
                 Err(SendError::MarksNotFound(raw)) => assert_eq!(raw, reply),
                 other => panic!("{reply:?}: {other:?}"),
@@ -1261,6 +1470,7 @@ mod tests {
         let job = job(true);
         let mut link = FakeLink::new().statuses(&[b"2\x03"]);
         let (out, _) = run(&mut link, &job);
+        let out = out.map_err(|f| f.error);
         assert!(matches!(out, Err(SendError::NoMedia)), "{out:?}");
         assert_eq!(
             link.writes,
@@ -1275,6 +1485,7 @@ mod tests {
             let job = job(true);
             let mut link = FakeLink::new().statuses(&[raw]);
             let (out, _) = run(&mut link, &job);
+            let out = out.map_err(|f| f.error);
             match out {
                 Err(SendError::Unknown(got)) => assert_eq!(got, raw),
                 other => panic!("{raw:?}: {other:?}"),
@@ -1305,6 +1516,7 @@ mod tests {
         link.idle = b"1\x03".to_vec();
         let started = Instant::now();
         let (out, _) = run(&mut link, &job);
+        let out = out.map_err(|f| f.error);
         assert!(matches!(out, Err(SendError::NeverReady)), "{out:?}");
         assert!(started.elapsed() >= fast().ready);
         assert!(count(&link.writes, STATUS) > 1);
@@ -1318,6 +1530,7 @@ mod tests {
         let mut link = FakeLink::new();
         link.fail_on = Some(second.clone());
         let (out, _) = run(&mut link, &job);
+        let out = out.map_err(|f| f.error);
         assert!(
             matches!(out, Err(SendError::Link(LinkError::Io(_)))),
             "{out:?}"
@@ -1371,6 +1584,7 @@ mod tests {
                 stop.store(true, Ordering::SeqCst);
             }
         });
+        let out = out.map_err(|f| f.error);
         assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
         assert_eq!(count(&link.writes, &blocks[0]), 1);
         for b in &blocks[1..] {
@@ -1386,6 +1600,7 @@ mod tests {
         let mut link = FakeLink::new();
         let stop = AtomicBool::new(true);
         let out = send(&mut link, &job, &fast(), &stop, &mut |_| {});
+        let out = out.map_err(|f| f.error);
         assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
         assert!(blocks.iter().all(|b| count(&link.writes, b) == 0));
         assert_eq!(count(&link.writes, &job.end_block()), 0);
@@ -1417,6 +1632,7 @@ mod tests {
                 SendError::Unknown(b"3\x03".to_vec()),
                 SendError::NeverReady,
                 SendError::Stopped,
+                SendError::Unconfirmed(b"3\x03".to_vec()),
             ] {
                 match e {
                     SendError::Link(_)
@@ -1424,13 +1640,17 @@ mod tests {
                     | SendError::MarksNotFound(_)
                     | SendError::Unknown(_)
                     | SendError::NeverReady
-                    | SendError::Stopped => all.push(e),
+                    | SendError::Stopped
+                    | SendError::Unconfirmed(_) => all.push(e),
                 }
             }
             all
         }
         let sentences: Vec<String> = every().iter().map(SendError::sentence).collect();
-        assert_eq!(sentences.len(), 10);
+        assert_eq!(sentences.len(), 11);
+        // A timeout can be a write as well as a read, so it may not say the
+        // cutter stopped answering.
+        assert_eq!(sentences[2], "The cutter did not respond in time.");
         for (i, s) in sentences.iter().enumerate() {
             assert!(!s.is_empty());
             assert!(s.ends_with('.'), "{s}");
