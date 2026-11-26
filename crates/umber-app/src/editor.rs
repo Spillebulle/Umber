@@ -7291,8 +7291,6 @@ mod tests {
         assert_eq!(ed.path_edit_refusal(), Some(PathEditRefusal::Newer));
     }
 
-    /// None of the four sentences has a run of spaces, a stray edge space or an
-    /// em-dash.
     /// The path route's no-slice sentence stands on its own, with no "one"
     /// left over from the notice it was borrowed from.
     #[test]
@@ -7305,6 +7303,9 @@ mod tests {
         assert!(!PATH_NO_SLICE_LINE.contains(" one."));
     }
 
+    /// None of the refusals' sentences, nor the no-slice lines and the
+    /// not-kept title beside them, has a run of spaces, a stray edge space or
+    /// an em-dash.
     #[test]
     fn no_path_edit_sentence_has_a_run_of_spaces() {
         let others = [PATH_NO_SLICE_LINE, PATH_NOT_KEPT_TITLE, NO_SLICE_LINE];
