@@ -68,7 +68,19 @@ pub trait Link {
     fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError>;
     /// The next reply, ETX included.
     fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError>;
+    /// Throw away everything that has arrived, and keep reading and throwing
+    /// away until `quiet` has passed with nothing new (bounded overall at
+    /// [`DISCARD_LIMIT`]). Answers what was thrown away. Nothing arriving is
+    /// not an error here; the operating system refusing is.
+    ///
+    /// Called before every status query, because anything already queued then
+    /// was sent before the question and cannot be its answer.
+    fn discard(&mut self, quiet: Duration) -> Result<Vec<u8>, LinkError>;
 }
+
+/// The longest one [`Link::discard`] goes on reading, however much keeps
+/// arriving.
+pub const DISCARD_LIMIT: Duration = Duration::from_secs(2);
 
 /// What the machine says when asked how it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,14 +189,24 @@ pub struct Timing {
     pub marks: Duration,
     /// How long any other reply may take.
     pub reply: Duration,
+    /// The quiet that ends a discard after a command that may answer more
+    /// than once: the initialise, and a marks search that succeeded.
+    pub settle: Duration,
+    /// The quiet that ends the discard before every status query.
+    pub drain: Duration,
 }
 
 impl Timing {
     pub const REAL: Timing = Timing {
         poll: Duration::from_millis(250),
-        ready: Duration::from_secs(120),
+        // One block of a kilobyte can take many minutes to cut, and a machine
+        // that keeps answering Moving has shown it is alive. A machine that
+        // stops answering at all is a `Timeout` after `reply`, not this.
+        ready: Duration::from_secs(45 * 60),
         marks: Duration::from_secs(40),
         reply: Duration::from_secs(5),
+        settle: Duration::from_millis(500),
+        drain: Duration::from_millis(30),
     };
 }
 
@@ -202,17 +224,24 @@ pub fn send(
 ) -> Result<String, SendError> {
     progress(Stage::Connecting);
     let firmware = hello(link, timing)?;
-    wait_ready(link, timing)?;
+    wait_ready(link, timing, stop)?;
     link.write(&job.setup_block())?;
-    wait_ready(link, timing)?;
+    wait_ready(link, timing, stop)?;
 
     if let Some(marks) = job.marks_block() {
         progress(Stage::FindingMarks);
         link.write(&marks)?;
+        // The first reply is the verdict. A search that succeeded answers
+        // more than once (three times, the reference implementation says),
+        // and the rest are settled away rather than left to be read as the
+        // status of the first block.
         let reply = link.read_reply(timing.marks)?;
         if !marks_found(&reply) {
             return Err(SendError::MarksNotFound(reply));
         }
+        link.discard(timing.settle)?;
+        // The search moved the carriage; nothing is cut until it is done.
+        wait_ready(link, timing, stop)?;
     }
 
     let blocks = job.path_blocks();
@@ -223,7 +252,7 @@ pub fn send(
         }
         progress(Stage::Cutting { block, of });
         link.write(bytes)?;
-        wait_ready(link, timing)?;
+        wait_ready(link, timing, stop)?;
     }
 
     if stop.load(Ordering::SeqCst) {
@@ -231,7 +260,7 @@ pub fn send(
     }
     progress(Stage::Finishing);
     link.write(&job.end_block())?;
-    wait_ready(link, timing)?;
+    wait_ready(link, timing, stop)?;
     Ok(firmware)
 }
 
@@ -242,33 +271,48 @@ pub fn probe(
     timing: &Timing,
 ) -> Result<(String, Result<Status, Vec<u8>>), LinkError> {
     let firmware = hello(link, timing)?;
-    link.write(STATUS)?;
-    let reply = link.read_reply(timing.reply)?;
+    let reply = ask_status(link, timing)?;
     Ok((firmware, status_of(&reply)))
 }
 
 /// Initialise and ask for the firmware string: what comes before the ETX, as
-/// text, trimmed.
+/// text, trimmed. Whatever the initialise answers, if it answers at all, is
+/// settled away first, so it cannot be taken for the firmware.
 fn hello(link: &mut dyn Link, timing: &Timing) -> Result<String, LinkError> {
     link.write(INIT)?;
+    link.discard(timing.settle)?;
     link.write(FIRMWARE)?;
     let reply = link.read_reply(timing.reply)?;
     let text = reply.split(|&b| b == ETX).next().unwrap_or(&[]);
     Ok(String::from_utf8_lossy(text).trim().to_string())
 }
 
+/// One status query and its reply. Anything queued before the query is
+/// written was sent before the question and cannot be its answer, so it is
+/// drained first; that is what keeps a leftover from putting every later poll
+/// one answer behind.
+fn ask_status(link: &mut dyn Link, timing: &Timing) -> Result<Vec<u8>, LinkError> {
+    link.discard(timing.drain)?;
+    link.write(STATUS)?;
+    link.read_reply(timing.reply)
+}
+
 /// Ask until the machine is ready. Moving is asked again after
-/// [`Timing::poll`] until [`Timing::ready`] has passed; anything that is not a
-/// status ends the job at once rather than being asked again.
-fn wait_ready(link: &mut dyn Link, timing: &Timing) -> Result<(), SendError> {
+/// [`Timing::poll`] until [`Timing::ready`] has passed, and the stop flag is
+/// read after every Moving, so a stop takes effect while a block is cutting.
+/// A query that gets no reply at all is a timeout at once, and anything that
+/// is not a status ends the job rather than being asked again.
+fn wait_ready(link: &mut dyn Link, timing: &Timing, stop: &AtomicBool) -> Result<(), SendError> {
     let started = Instant::now();
     loop {
-        link.write(STATUS)?;
-        let reply = link.read_reply(timing.reply)?;
+        let reply = ask_status(link, timing)?;
         match status_of(&reply) {
             Ok(Status::Ready) => return Ok(()),
             Ok(Status::NoMedia) => return Err(SendError::NoMedia),
             Ok(Status::Moving) => {
+                if stop.load(Ordering::SeqCst) {
+                    return Err(SendError::Stopped);
+                }
                 if started.elapsed() >= timing.ready {
                     return Err(SendError::NeverReady);
                 }
@@ -339,6 +383,19 @@ impl<L: Link, F: FnMut(String)> Link for Logged<L, F> {
         match &out {
             Ok(reply) => (self.sink)(log_line('<', reply)),
             Err(e) => (self.sink)(format!("< failed: {e:?}")),
+        }
+        out
+    }
+
+    /// Bytes thrown away are logged as one line with direction `x`, and a
+    /// discard that found nothing is not logged at all, so a status poll costs
+    /// the log no more than it did.
+    fn discard(&mut self, quiet: Duration) -> Result<Vec<u8>, LinkError> {
+        let out = self.link.discard(quiet);
+        match &out {
+            Ok(bytes) if bytes.is_empty() => {}
+            Ok(bytes) => (self.sink)(log_line('x', bytes)),
+            Err(e) => (self.sink)(format!("x failed: {e:?}")),
         }
         out
     }
@@ -465,6 +522,39 @@ impl Link for UsbPrint {
         #[cfg(not(windows))]
         {
             let _ = timeout;
+            Err(LinkError::Unsupported)
+        }
+    }
+
+    fn discard(&mut self, quiet: Duration) -> Result<Vec<u8>, LinkError> {
+        #[cfg(windows)]
+        {
+            let mut thrown = std::mem::take(&mut self.pending);
+            let limit = Instant::now() + DISCARD_LIMIT;
+            let mut last = Instant::now();
+            loop {
+                let now = Instant::now();
+                let quiet_left = quiet.saturating_sub(now.duration_since(last));
+                if quiet_left.is_zero() || now >= limit {
+                    return Ok(thrown);
+                }
+                let wait = quiet_left.min(limit - now);
+                let mut buf = [0u8; win::READ_BYTES];
+                // A read that times out is cancelled and waited for inside
+                // `win::read`, exactly as for a reply, and answers what arrived.
+                let got = win::read(&self.handle, &mut buf, wait)?;
+                if got > 0 {
+                    thrown.extend_from_slice(&buf[..got]);
+                    last = Instant::now();
+                } else {
+                    let left = limit.saturating_duration_since(Instant::now());
+                    std::thread::sleep(Duration::from_millis(5).min(left).min(wait));
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = quiet;
             Err(LinkError::Unsupported)
         }
     }
@@ -837,7 +927,18 @@ mod tests {
         marks: Vec<u8>,
         /// The first write equal to this fails, after being recorded.
         fail_on: Option<Vec<u8>>,
-        pending: Option<Vec<u8>>,
+        /// The write at this index (counting from zero) fails, after being
+        /// recorded.
+        fail_at: Option<usize>,
+        /// Unsolicited replies the machine queues after the first write equal
+        /// to the key, behind that write's own reply.
+        after: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+        /// Replies that have arrived and not been read, oldest first. Nothing
+        /// clears this but a read or a discard, which is what makes a leftover
+        /// reply visible to the next read, as it would be on the wire.
+        replies: VecDeque<Vec<u8>>,
+        /// How many times `discard` was asked.
+        discards: usize,
     }
 
     impl FakeLink {
@@ -849,7 +950,10 @@ mod tests {
                 idle: b"0\x03".to_vec(),
                 marks: MARKS_FOUND.to_vec(),
                 fail_on: None,
-                pending: None,
+                fail_at: None,
+                after: Vec::new(),
+                replies: VecDeque::new(),
+                discards: 0,
             }
         }
 
@@ -857,16 +961,26 @@ mod tests {
             self.statuses = s.iter().map(|b| b.to_vec()).collect();
             self
         }
+
+        fn after(mut self, write: &[u8], extra: &[&[u8]]) -> Self {
+            self.after
+                .push((write.to_vec(), extra.iter().map(|b| b.to_vec()).collect()));
+            self
+        }
     }
 
     impl Link for FakeLink {
         fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+            let index = self.writes.len();
             self.writes.push(bytes.to_vec());
             if self.fail_on.as_deref() == Some(bytes) {
                 self.fail_on = None;
                 return Err(LinkError::Io("scripted".into()));
             }
-            self.pending = if bytes == FIRMWARE {
+            if self.fail_at == Some(index) {
+                return Err(LinkError::Io("scripted".into()));
+            }
+            let own = if bytes == FIRMWARE {
                 Some(self.firmware.clone())
             } else if bytes == STATUS {
                 Some(
@@ -879,11 +993,21 @@ mod tests {
             } else {
                 None
             };
+            self.replies.extend(own);
+            if let Some(at) = self.after.iter().position(|(w, _)| w == bytes) {
+                let (_, extra) = self.after.remove(at);
+                self.replies.extend(extra);
+            }
             Ok(())
         }
 
         fn read_reply(&mut self, _timeout: Duration) -> Result<Vec<u8>, LinkError> {
-            self.pending.take().ok_or(LinkError::Timeout)
+            self.replies.pop_front().ok_or(LinkError::Timeout)
+        }
+
+        fn discard(&mut self, _quiet: Duration) -> Result<Vec<u8>, LinkError> {
+            self.discards += 1;
+            Ok(self.replies.drain(..).flatten().collect())
         }
     }
 
@@ -893,6 +1017,8 @@ mod tests {
             ready: Duration::from_millis(30),
             marks: Duration::from_millis(5),
             reply: Duration::from_millis(5),
+            settle: Duration::from_millis(1),
+            drain: Duration::from_millis(1),
         }
     }
 
@@ -947,6 +1073,7 @@ mod tests {
             job.setup_block(),
             STATUS.to_vec(),
             job.marks_block().unwrap(),
+            STATUS.to_vec(),
         ];
         for b in job.path_blocks() {
             expected.push(b);
@@ -962,6 +1089,127 @@ mod tests {
             assert_eq!(count(&link.writes, &b), 1);
         }
         assert_eq!(count(&link.writes, &job.end_block()), 1);
+    }
+
+    /// A successful search answers three times, the reference implementation
+    /// says. Only the first is the verdict; the other two must not be read as
+    /// the status of anything.
+    #[test]
+    fn extra_replies_after_the_marks_search_do_not_derail_the_job() {
+        let job = job(true);
+        let marks = job.marks_block().unwrap();
+        let mut link = FakeLink::new().after(&marks, &[b"    0\x03", b"    1\x03"]);
+        let (out, _) = run(&mut link, &job);
+        assert_eq!(out.unwrap(), "CAMEO V1.10");
+        assert_eq!(count(&link.writes, &job.setup_block()), 1);
+        assert_eq!(count(&link.writes, &marks), 1);
+        let blocks = job.path_blocks();
+        for b in &blocks {
+            assert_eq!(count(&link.writes, b), 1);
+        }
+        assert_eq!(count(&link.writes, &job.end_block()), 1);
+        // In order: every path block after the marks, the end block last.
+        let at = |b: &[u8]| link.writes.iter().position(|w| w == b).unwrap();
+        let mut last = at(&marks);
+        for b in &blocks {
+            assert!(at(b) > last);
+            last = at(b);
+        }
+        assert!(at(&job.end_block()) > last);
+    }
+
+    #[test]
+    fn a_leftover_reply_is_never_taken_for_a_status() {
+        let job = job(true);
+        let setup = job.setup_block();
+        // Ready before setup, then Moving once after it, with a stale ready
+        // reply already queued behind the setup block.
+        let mut link = FakeLink::new()
+            .statuses(&[b"0\x03", b"1\x03"])
+            .after(&setup, &[b"0\x03"]);
+        let (out, _) = run(&mut link, &job);
+        assert!(out.is_ok(), "{out:?}");
+        let at = link.writes.iter().position(|w| *w == setup).unwrap();
+        // Moving was read, so the machine was asked again before the marks.
+        assert_eq!(link.writes[at + 1], STATUS);
+        assert_eq!(link.writes[at + 2], STATUS);
+        assert_eq!(link.writes[at + 3], job.marks_block().unwrap());
+    }
+
+    #[test]
+    fn the_first_cut_waits_for_the_machine_to_be_ready_after_the_search() {
+        let job = job(true);
+        let marks = job.marks_block().unwrap();
+        // Ready before and after setup, then Moving twice after the search.
+        let mut link = FakeLink::new().statuses(&[b"0\x03", b"0\x03", b"1\x03", b"1\x03"]);
+        let (out, _) = run(&mut link, &job);
+        assert!(out.is_ok(), "{out:?}");
+        let at = link.writes.iter().position(|w| *w == marks).unwrap();
+        assert_eq!(&link.writes[at + 1..at + 4], vec![STATUS.to_vec(); 3]);
+        assert_eq!(link.writes[at + 4], job.path_blocks()[0]);
+    }
+
+    #[test]
+    fn a_long_block_is_waited_for_while_the_machine_says_moving() {
+        // One block of a kilobyte can take minutes; a machine still answering
+        // Moving is alive and is waited for.
+        assert!(Timing::REAL.ready >= Duration::from_secs(45 * 60));
+        let job = job(true);
+        let mut statuses: Vec<&[u8]> = vec![b"0\x03"; 3];
+        statuses.extend(std::iter::repeat_n(&b"1\x03"[..], 200));
+        let mut link = FakeLink::new().statuses(&statuses);
+        let timing = Timing {
+            ready: Duration::from_secs(60),
+            ..fast()
+        };
+        let stop = AtomicBool::new(false);
+        let out = send(&mut link, &job, &timing, &stop, &mut |_| {});
+        assert!(out.is_ok(), "{out:?}");
+        for b in job.path_blocks() {
+            assert_eq!(count(&link.writes, &b), 1);
+        }
+    }
+
+    #[test]
+    fn stop_during_a_wait_ends_the_job_and_writes_nothing_more() {
+        let job = job(true);
+        let blocks = job.path_blocks();
+        let timing = Timing {
+            ready: Duration::from_secs(10),
+            ..fast()
+        };
+        // Ready until the first block, then Moving for ever. The stop has to
+        // come from inside the wait, so a thread raises it once the first
+        // block has begun and the conversation is polling.
+        let mut link = FakeLink::new().statuses(&[&b"0\x03"[..]; 3]);
+        link.idle = b"1\x03".to_vec();
+        let stop = AtomicBool::new(false);
+        let cutting = AtomicBool::new(false);
+        let started = Instant::now();
+        let out = std::thread::scope(|s| {
+            s.spawn(|| {
+                while !cutting.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                stop.store(true, Ordering::SeqCst);
+            });
+            send(&mut link, &job, &timing, &stop, &mut |s| {
+                if matches!(s, Stage::Cutting { block: 0, .. }) {
+                    cutting.store(true, Ordering::SeqCst);
+                }
+            })
+        });
+        // Well short of `ready`: the stop ended the wait, not the deadline.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
+        assert_eq!(count(&link.writes, &blocks[0]), 1);
+        for b in &blocks[1..] {
+            assert_eq!(count(&link.writes, b), 0);
+        }
+        assert_eq!(count(&link.writes, &job.end_block()), 0);
+        let at = link.writes.iter().position(|w| *w == blocks[0]).unwrap();
+        assert!(link.writes[at + 1..].iter().all(|w| w == STATUS));
     }
 
     #[test]
@@ -1226,6 +1474,25 @@ mod tests {
                 "> 3 FG\\x03".to_string(),
                 "< 16 CAMEO V1.10    \\x03".to_string(),
                 "< failed: Timeout".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_discard_is_logged_only_when_it_threw_something_away() {
+        let mut lines = Vec::new();
+        let fake = FakeLink::new().after(b"FG\x03", &[b"    0\x03"]);
+        let mut link = Logged::new(fake, |l| lines.push(l));
+        assert_eq!(link.discard(Duration::ZERO).unwrap(), b"");
+        link.write(b"FG\x03").unwrap();
+        let thrown = link.discard(Duration::ZERO).unwrap();
+        assert_eq!(thrown, b"CAMEO V1.10    \x03    0\x03");
+        drop(link);
+        assert_eq!(
+            lines,
+            vec![
+                "> 3 FG\\x03".to_string(),
+                "x 22 CAMEO V1.10    \\x03    0\\x03".to_string(),
             ]
         );
     }
