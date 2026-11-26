@@ -523,6 +523,18 @@ fn take_reply(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
 /// **Nobody has run this against a machine.** It is written to what the
 /// documentation says each call does, and every signature was read from the
 /// `windows-sys` source rather than remembered.
+///
+/// **A known unknown: a cancel the driver never completes.** A read or a write
+/// that outlives its wait is cancelled with `CancelIoEx` and then waited for
+/// with `GetOverlappedResult(…, TRUE)`, which does not return until the
+/// operation has finished. A driver that never completes a cancelled request
+/// would therefore block the worker thread for good. There is no sound
+/// alternative: the buffer and the OVERLAPPED belong to the operation until it
+/// completes, so returning early would free memory the kernel may still write
+/// to. A bounded wait that then leaked both would be sound and would leave the
+/// handle unusable, which is no better for the artist. Whether the USB
+/// printing driver honours a cancel promptly is one of the things to find out
+/// on the machine.
 pub struct UsbPrint {
     #[cfg(windows)]
     handle: win::Handle,
@@ -668,8 +680,9 @@ mod win {
         SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
-        ERROR_OPERATION_ABORTED, ERROR_SHARING_VIOLATION, FALSE, GENERIC_READ, GENERIC_WRITE,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
+        ERROR_GEN_FAILURE, ERROR_IO_PENDING, ERROR_NO_SUCH_DEVICE, ERROR_OPERATION_ABORTED,
+        ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, FALSE, GENERIC_READ, GENERIC_WRITE,
         GetLastError, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -683,8 +696,11 @@ mod win {
 
     /// `GUID_DEVINTERFACE_USBPRINT`.
     const USBPRINT: GUID = GUID::from_u128(0x28d78fad_5a12_11d1_ae5b_0000f803a8c2);
-    /// Bytes asked for by one `ReadFile`.
-    pub const READ_BYTES: usize = 64;
+    /// Bytes asked for by one `ReadFile`. Generous on purpose: a buffer
+    /// smaller than one high speed packet (512 bytes) can overflow in the
+    /// driver, and whatever a read brings beyond one reply is kept for the
+    /// next by the split at ETX.
+    pub const READ_BYTES: usize = 4096;
     /// How long one write may take to be accepted. A block is at most a
     /// kilobyte and the machine is asked to be ready before each, so a write
     /// that has not gone in this long is not going to.
@@ -727,8 +743,10 @@ mod win {
         unsafe { GetLastError() }
     }
 
-    fn io(what: &str, code: u32) -> LinkError {
-        LinkError::Io(format!("{what} failed with Windows error {code}"))
+    /// `doing` is a lower-case clause, "writing" or "opening it", because the
+    /// detail lands inside "The connection to the cutter failed: …".
+    pub fn io(doing: &str, code: u32) -> LinkError {
+        LinkError::Io(format!("Windows error {code} while {doing}"))
     }
 
     /// The device paths of every present USB printing interface.
@@ -843,13 +861,24 @@ mod win {
             )
         };
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            return Err(match last_error() {
-                ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED => LinkError::Busy,
-                ERROR_FILE_NOT_FOUND => LinkError::NotFound,
-                code => io("Opening the cutter", code),
-            });
+            return Err(open_error(last_error()));
         }
         Ok(Handle(h))
+    }
+
+    /// What a failed open means. A machine unplugged or switched off between
+    /// the enumeration and the open answers any of several codes, and each of
+    /// them is "not found" to the artist.
+    pub fn open_error(code: u32) -> LinkError {
+        match code {
+            ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED => LinkError::Busy,
+            ERROR_FILE_NOT_FOUND
+            | ERROR_PATH_NOT_FOUND
+            | ERROR_DEVICE_NOT_CONNECTED
+            | ERROR_NO_SUCH_DEVICE
+            | ERROR_GEN_FAILURE => LinkError::NotFound,
+            code => io("opening it", code),
+        }
     }
 
     /// A manual-reset event, unsignalled.
@@ -858,7 +887,7 @@ mod win {
         // no name.
         let h = unsafe { CreateEventW(null(), TRUE, FALSE, null()) };
         if h.is_null() {
-            return Err(io("Creating an event", last_error()));
+            return Err(io("creating an event", last_error()));
         }
         Ok(Handle(h))
     }
@@ -943,14 +972,14 @@ mod win {
         if ok == FALSE {
             let code = last_error();
             if code != ERROR_IO_PENDING {
-                return Err(io("Reading from the cutter", code));
+                return Err(io("reading", code));
             }
         }
         // SAFETY: `ov` belongs to the read just started on `handle`, `event` is
         // its event, and nothing here touches or releases `buf`, `ov` or
         // `event` until this returns.
         let (got, _) = unsafe { settle(handle, ov.get(), &event, wait) }
-            .map_err(|code| io("Reading from the cutter", code))?;
+            .map_err(|code| io("reading", code))?;
         Ok((got as usize).min(buf.len()))
     }
 
@@ -972,12 +1001,12 @@ mod win {
         if ok == FALSE {
             let code = last_error();
             if code != ERROR_IO_PENDING {
-                return Err(io("Writing to the cutter", code));
+                return Err(io("writing", code));
             }
         }
         // SAFETY: as for the read.
         let (wrote, finished) = unsafe { settle(handle, ov.get(), &event, WRITE_TIMEOUT) }
-            .map_err(|code| io("Writing to the cutter", code))?;
+            .map_err(|code| io("writing", code))?;
         // A write cut off by the timeout may have delivered some of the block,
         // and that is exactly the case that must end the job rather than be
         // tried again.
@@ -1419,6 +1448,102 @@ mod tests {
         check(&link, &failure);
     }
 
+    /// The fake answers by the production constants, so a wrong constant
+    /// would pass every other test. These are the bytes the machine is
+    /// documented to want, written out.
+    #[test]
+    fn the_harmless_commands_are_these_exact_bytes() {
+        let mut link = FakeLink::new();
+        let (_, status) = probe(&mut link, &fast()).unwrap();
+        assert_eq!(status, Ok(Status::Ready));
+        assert_eq!(
+            link.writes,
+            vec![
+                b"\x1b\x04".to_vec(),
+                b"FG\x03".to_vec(),
+                b"\x1b\x05".to_vec()
+            ]
+        );
+
+        let job = job(true);
+        let mut link = FakeLink::new();
+        run(&mut link, &job).0.unwrap();
+        assert_eq!(
+            &link.writes[..3],
+            &[
+                b"\x1b\x04".to_vec(),
+                b"FG\x03".to_vec(),
+                b"\x1b\x05".to_vec()
+            ]
+        );
+        assert_eq!(MARKS_FOUND, b"    0\x03");
+    }
+
+    #[test]
+    fn a_failed_write_anywhere_ends_the_job_at_once() {
+        let job = job(true);
+        let n = job.path_blocks().len();
+        let check = |link: &FakeLink, failed: &[u8], at: usize| {
+            assert_eq!(link.writes.len(), at + 1, "{:?}", link.writes);
+            assert_eq!(link.writes[at], failed);
+        };
+        for (block, sent) in [
+            (job.setup_block(), 0),
+            (job.marks_block().unwrap(), 0),
+            (job.end_block(), n),
+        ] {
+            let mut link = FakeLink::new();
+            link.fail_on = Some(block.clone());
+            let failure = run(&mut link, &job).0.unwrap_err();
+            assert!(
+                matches!(failure.error, SendError::Link(LinkError::Io(_))),
+                "{failure:?}"
+            );
+            assert_eq!(failure.blocks_sent, sent);
+            assert_eq!(count(&link.writes, &block), 1);
+            let at = link.writes.iter().position(|w| *w == block).unwrap();
+            check(&link, &block, at);
+        }
+
+        // The status query after the first block: init, firmware, status,
+        // setup, status, marks, status, block 0, and then this one.
+        let mut link = FakeLink::new();
+        link.fail_at = Some(8);
+        let failure = run(&mut link, &job).0.unwrap_err();
+        assert!(matches!(failure.error, SendError::Link(LinkError::Io(_))));
+        assert_eq!(failure.blocks_sent, 1);
+        assert_eq!(link.writes[7], job.path_blocks()[0]);
+        check(&link, STATUS, 8);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_error_reads_as_one_sentence() {
+        let s = SendError::Link(win::io("writing", 31)).sentence();
+        assert_eq!(
+            s,
+            "The connection to the cutter failed: Windows error 31 while writing."
+        );
+        assert_eq!(s.matches("failed").count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_machine_that_is_gone_on_open_is_not_found() {
+        for code in [2, 3, 31, 433, 1167] {
+            assert!(
+                matches!(win::open_error(code), LinkError::NotFound),
+                "{code}"
+            );
+        }
+        for code in [5, 32] {
+            assert!(matches!(win::open_error(code), LinkError::Busy), "{code}");
+        }
+        assert!(matches!(win::open_error(87), LinkError::Io(_)));
+        // A read buffer smaller than a high speed packet can overflow.
+        const { assert!(win::READ_BYTES >= 4096) };
+    }
+
     #[test]
     fn marks_not_found_ends_the_job_before_any_cut() {
         let job = job(true);
@@ -1602,6 +1727,8 @@ mod tests {
         let out = send(&mut link, &job, &fast(), &stop, &mut |_| {});
         let out = out.map_err(|f| f.error);
         assert!(matches!(out, Err(SendError::Stopped)), "{out:?}");
+        assert_eq!(count(&link.writes, &job.setup_block()), 1);
+        assert_eq!(count(&link.writes, &job.marks_block().unwrap()), 1);
         assert!(blocks.iter().all(|b| count(&link.writes, b) == 0));
         assert_eq!(count(&link.writes, &job.end_block()), 0);
     }
