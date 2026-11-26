@@ -47,6 +47,14 @@ const MARKS_DO_NOT_FIT: &str = "This page cannot hold registration marks.";
 const STOPPING: &str = "Stopping. The cutter is finishing the part it was already sent.";
 const BLADE_DEPTH: &str = "For the AutoBlade. Off leaves the blade as it was last set.";
 const MAT: &str = "On when the sheet is stuck to the cutting mat. Off when it is fed in bare.";
+const HUNG: &str =
+    "If this does not finish, copy the log, close Umber and switch the cutter off and on.";
+/// How long a check may run before [`HUNG`] is said. A check is three
+/// harmless commands and a few seconds at the most.
+const CHECK_PATIENCE: f64 = 10.0;
+/// How long a stop may run before [`HUNG`] is said. A stop waits for the
+/// machine to finish up to a kilobyte of moves, which can be a while.
+const STOP_PATIENCE: f64 = 60.0;
 /// The depth the rail starts at the first time it is switched on.
 const FIRST_DEPTH: u8 = 3;
 
@@ -117,6 +125,9 @@ pub struct CutterForm {
     /// The blade depth last on the rail, so switching the depth off and on
     /// again brings back the figure rather than resetting it.
     last_depth: u8,
+    /// When, on egui's clock, the phase in front began, for a phase with no
+    /// button in it.
+    waiting_since: Option<(CutterPhase, f64)>,
 }
 
 impl Default for CutterForm {
@@ -134,6 +145,7 @@ impl Default for CutterForm {
             summary: None,
             planned: 0,
             last_depth: FIRST_DEPTH,
+            waiting_since: None,
         }
     }
 }
@@ -321,6 +333,34 @@ impl CutterForm {
         }
     }
 
+    /// Whether a phase with no button in it has gone on long enough to say
+    /// how to get out of it, and if not, how many seconds until it has. A
+    /// check and a stop are the two: there is nothing to press but to wait,
+    /// and a driver that hangs would leave the dialog open for good.
+    fn hung(&mut self, now: f64) -> (bool, Option<f64>) {
+        let patience = match self.phase {
+            CutterPhase::Checking => CHECK_PATIENCE,
+            CutterPhase::Stopping => STOP_PATIENCE,
+            CutterPhase::Idle | CutterPhase::Sending(_) => {
+                self.waiting_since = None;
+                return (false, None);
+            }
+        };
+        let since = match self.waiting_since {
+            Some((phase, at)) if phase == self.phase => at,
+            _ => {
+                self.waiting_since = Some((self.phase, now));
+                now
+            }
+        };
+        let waited = now - since;
+        if waited >= patience {
+            (true, None)
+        } else {
+            (false, Some(patience - waited))
+        }
+    }
+
     /// The whole log as text, one line each.
     pub fn log_text(&self) -> &str {
         &self.log_text
@@ -445,6 +485,13 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor) {
     let doc_marks = ed.doc.marks;
     let busy = ed.cutter.busy();
     let phase = ed.cutter.phase;
+    let (hung, due) = ed.cutter.hung(root.ctx().input(|i| i.time));
+    if let Some(seconds) = due {
+        // One frame when the line is due, so it appears without the pointer
+        // moving, and none in between.
+        root.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(seconds));
+    }
     let layers = &ed.layers;
     let doc = &ed.doc;
     let form = &mut ed.cutter;
@@ -552,6 +599,10 @@ pub fn show(root: &mut Ui, p: &Palette, ed: &mut Editor) {
 
             if let Some(stage) = stage_line(phase) {
                 line(ui, p, &stage);
+                if hung {
+                    ui.add_space(4.0);
+                    caption(ui, p, HUNG);
+                }
             } else if let Some(outcome) = &form.outcome {
                 match outcome {
                     Ok(said) | Err(said) => line(ui, p, said),
@@ -681,6 +732,8 @@ mod tests {
         /// Every rectangle the height of `widgets::progress_bar`.
         bars: Vec<Rect>,
         copied: Vec<String>,
+        /// How long egui was asked to wait before the next frame.
+        repaint: std::time::Duration,
     }
 
     impl Shot {
@@ -740,6 +793,11 @@ mod tests {
             toggles: Vec::new(),
             bars: Vec::new(),
             copied: Vec::new(),
+            repaint: output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay)
+                .unwrap_or(std::time::Duration::MAX),
         };
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut shot);
@@ -1159,6 +1217,61 @@ mod tests {
         assert!(h.settled(&mut ed).has(STOPPING));
         ed.cutter.phase = CutterPhase::Checking;
         assert!(h.settled(&mut ed).has("Looking for the cutter"));
+    }
+
+    /// A check or a stop has no button, so a driver that hangs would leave
+    /// the artist with a dialog that cannot be closed. After a while it says
+    /// what to do, and it says so without needing the pointer to move.
+    #[test]
+    fn a_wait_that_goes_on_too_long_says_how_to_get_out() {
+        for (phase, after) in [(CutterPhase::Checking, 10.0), (CutterPhase::Stopping, 60.0)] {
+            let mut h = Harness::new();
+            let mut ed = opened();
+            ed.cutter
+                .absorb(vec![Event::Line("> 2 \\x1b\\x04".to_string())]);
+            ed.cutter.phase = phase;
+            // egui asks for a few frames of its own as the dialog appears;
+            // what matters is what is asked for once those are over.
+            let mut shot = h.settled(&mut ed);
+            for _ in 0..10 {
+                if !shot.repaint.is_zero() {
+                    break;
+                }
+                shot = h.frame(&mut ed, Vec::new());
+            }
+            assert!(!shot.has(HUNG), "{phase:?}: said at once");
+            // A frame is asked for at the moment the line is due, and not
+            // every frame in between.
+            let due = std::time::Duration::from_secs_f64(after);
+            assert!(
+                shot.repaint <= due && shot.repaint > due / 2,
+                "{phase:?}: repaint in {:?}",
+                shot.repaint
+            );
+            // The log can still be copied.
+            assert!(shot.has("Copy log"), "{phase:?}: {:?}", shot.words());
+
+            h.now += after - 2.0;
+            assert!(!h.settled(&mut ed).has(HUNG), "{phase:?}: said too soon");
+            h.now += 2.0;
+            let shot = h.settled(&mut ed);
+            assert!(shot.has(HUNG), "{phase:?}: {:?}", shot.words());
+            assert!(shot.has("Copy log"));
+
+            // Once it is over, the line goes, and a later wait counts from
+            // its own beginning.
+            ed.cutter.phase = CutterPhase::Idle;
+            assert!(!h.settled(&mut ed).has(HUNG));
+            ed.cutter.phase = phase;
+            assert!(!h.settled(&mut ed).has(HUNG), "{phase:?}: the old clock");
+        }
+        // Cutting has a Stop button and is a long wait by nature: no line.
+        let mut h = Harness::new();
+        let mut ed = opened();
+        ed.cutter.phase = CutterPhase::Sending(Stage::Cutting { block: 0, of: 3 });
+        h.settled(&mut ed);
+        h.now += 600.0;
+        assert!(!h.settled(&mut ed).has(HUNG));
     }
 
     #[test]
