@@ -718,6 +718,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: SaveHistory::new(history, stack),
         })
@@ -796,6 +797,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
+                marks: false,
                 merged: Canvas::Deferred,
                 history: SaveHistory::new(&history, &stack),
             },
@@ -957,6 +959,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: None,
         })
@@ -1086,6 +1089,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: SaveHistory::new(&history, &stack),
         })
@@ -1738,6 +1742,7 @@ mod tests {
             active: 0,
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
+            marks: false,
             merged: Canvas::Held(&pixels),
             history: SaveHistory::new(&history, &stack),
         })

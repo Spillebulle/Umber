@@ -1872,8 +1872,8 @@ fn floored(curve: ResponseCurve, floor: f32) -> ResponseCurve {
         return curve;
     }
     let mut out = curve;
-    for i in 0..ResponseCurve::N {
-        out.set(i, floor + (1.0 - floor) * curve.points[i]);
+    for (i, point) in curve.points.iter().enumerate() {
+        out.set(i, floor + (1.0 - floor) * point);
     }
     out
 }

@@ -131,6 +131,10 @@ pub struct Document {
     /// Pixels per inch. Metadata: it changes no pixel and is used only to say
     /// what the canvas measures on paper, and to size a print preset.
     pub dpi: f32,
+    /// Whether the sheet this document prints on carries registration marks
+    /// for a cutter. See [`crate::sheet`]. Not a pixel: the marks are drawn onto
+    /// the page when it is made, never onto the canvas.
+    pub marks: bool,
 }
 
 impl Default for Document {
@@ -139,6 +143,7 @@ impl Default for Document {
             size: UVec2::new(2048, 2048),
             background: Background::default(),
             dpi: Self::DEFAULT_DPI,
+            marks: false,
         }
     }
 }
@@ -197,6 +202,10 @@ impl Document {
 
     pub fn with_background(self, background: Background) -> Self {
         Self { background, ..self }
+    }
+
+    pub fn with_marks(self, marks: bool) -> Self {
+        Self { marks, ..self }
     }
 
     pub fn with_dpi(self, dpi: f32) -> Self {

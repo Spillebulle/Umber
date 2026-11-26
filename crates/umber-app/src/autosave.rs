@@ -1125,6 +1125,11 @@ pub struct Candidate {
     pub size: UVec2,
     pub background: Background,
     pub dpi: f32,
+    /// Whether the document carries registration marks, snapshotted with the
+    /// rest and written by `run_task` exactly as Save writes it: an autosave
+    /// that dropped it would take the marks off the file five minutes after
+    /// Save put them there.
+    pub marks: bool,
     pub active_layer: usize,
     /// The lowest texture-array slice a baked effect may take —
     /// `Editor::effect_slot_base`'s number, taken here for the reason
@@ -2472,6 +2477,7 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
         size: doc.size,
         background: doc.background,
         dpi: doc.dpi,
+        marks: doc.marks,
         active_layer: layers.active_index(),
         // Snapshotted with everything else, and for the reason everything else
         // here is: the capture spans frames, so a layer added in between would
@@ -2607,6 +2613,7 @@ fn run_task(task: Task, images: &Encoded) -> Vec<Report> {
         active: doc.active_layer,
         background: doc.background,
         dpi: doc.dpi,
+        marks: doc.marks,
         merged: Canvas::Deferred,
         history: None,
     };
@@ -3134,6 +3141,7 @@ mod tests {
             size: UVec2::splat(8),
             background: Background::Transparent,
             dpi: 72.0,
+            marks: false,
             active_layer: 0,
             effect_base: 2,
             layers: vec![LayerMeta {
@@ -4223,6 +4231,32 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&blocked);
         let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// **The autosave writes the registration marks, as Save does.**
+    ///
+    /// `SaveDocument::marks` has no default to fall back on, so forgetting it
+    /// does not compile, but writing `false` there does: the marks would then
+    /// come off the file five minutes after Save put them on. Measured through
+    /// the file the autosave wrote rather than by reading the literal.
+    #[test]
+    fn an_autosave_keeps_the_registration_marks() {
+        let internal = scratch("marks-internal");
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        doc.marks = true;
+        let ours = internal.join("Untitled 1-7777777777777778.ora");
+
+        let reports = run_one_pixel(doc, Some(ours.clone()), None);
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}"
+        );
+
+        let back = umber_core::docimport::import(&ours).expect("reopen the copy");
+        assert!(back.document().marks, "an autosave dropped the marks");
+
+        let _ = std::fs::remove_dir_all(&internal);
     }
 
     /// **The autosave writes a layer's effects, and both writers had to be

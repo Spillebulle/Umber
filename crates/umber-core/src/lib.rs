@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod color;
 mod csblocks;
 pub mod curve;
+pub mod cutjob;
 pub mod damage;
 pub mod docformat;
 pub mod docimport;
@@ -33,7 +34,9 @@ pub mod pathedit;
 mod pattern_table;
 pub mod preset;
 pub mod preview;
+pub mod printsheet;
 pub mod selection;
+pub mod sheet;
 // **Public for `examples/survey-clip-schema.rs` and for nothing else.** Nothing
 // in the application reaches it: the readers that need it (`docimport` and
 // `brushimport`) are inside this crate and take the same route they always did.

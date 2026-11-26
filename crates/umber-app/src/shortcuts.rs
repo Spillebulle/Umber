@@ -17,6 +17,15 @@ pub enum Action {
     Save,
     SaveAs,
     Export,
+    // Unbound: it opens a file dialog, and it is the rarer cousin of Export,
+    // which already holds the obvious chord.
+    ExportPrintSheet,
+    // Unbound for the print sheet's reason: it opens a dialog, and nothing is
+    // sent until that dialog's own Send is pressed.
+    SendToCutter,
+    // Unbound: a switch most painters never touch, and it opens nothing, so a
+    // stray press would change what the Print sheet holds without a word.
+    ToggleSheetMarks,
     Undo,
     Redo,
     Deselect,
@@ -76,10 +85,13 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 44] = [
+    pub const ALL: [Action; 47] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
+        Action::ExportPrintSheet,
+        Action::SendToCutter,
+        Action::ToggleSheetMarks,
         Action::Undo,
         Action::Redo,
         Action::Deselect,
@@ -134,6 +146,9 @@ impl Action {
             Action::Save => "Save",
             Action::SaveAs => "Save as…",
             Action::Export => "Export image…",
+            Action::ExportPrintSheet => "Export print sheet…",
+            Action::SendToCutter => "Send to cutter…",
+            Action::ToggleSheetMarks => "Registration marks",
             Action::Undo => "Undo",
             Action::Redo => "Redo",
             Action::Deselect => "Deselect",
@@ -190,7 +205,12 @@ impl Action {
     /// Grouping for the settings list.
     pub fn category(self) -> &'static str {
         match self {
-            Action::Save | Action::SaveAs | Action::Export => "File",
+            Action::Save
+            | Action::SaveAs
+            | Action::Export
+            | Action::ExportPrintSheet
+            | Action::SendToCutter
+            | Action::ToggleSheetMarks => "File",
             Action::Undo
             | Action::Redo
             | Action::Deselect
@@ -1693,6 +1713,9 @@ mod tests {
                 Action::PlotPathFromSelection,
                 Action::NewVectorLayer,
                 Action::TraceOutline,
+                Action::ToggleSheetMarks,
+                Action::ExportPrintSheet,
+                Action::SendToCutter,
             ]
             .contains(&action)
             {
@@ -1717,6 +1740,54 @@ mod tests {
         );
     }
 
+    /// The print sheet is listed, filed under File, named as a command that
+    /// opens a dialog, and bound to nothing.
+    #[test]
+    fn the_print_sheet_action_is_listed_unbound_under_file() {
+        assert!(Action::ALL.contains(&Action::ExportPrintSheet));
+        assert_eq!(Action::ExportPrintSheet.category(), "File");
+        assert_eq!(Action::ExportPrintSheet.label(), "Export print sheet…");
+        assert!(
+            defaults()
+                .iter()
+                .all(|b| b.action != Action::ExportPrintSheet),
+            "Export print sheet ships bound"
+        );
+    }
+
+    /// Send to cutter is listed, filed under File, named as a command that
+    /// opens a dialog, bound to nothing, and sits straight after the print
+    /// sheet it follows on from.
+    #[test]
+    fn the_cutter_action_is_listed_unbound_under_file() {
+        assert_eq!(Action::SendToCutter.category(), "File");
+        assert_eq!(Action::SendToCutter.label(), "Send to cutter…");
+        assert!(
+            defaults().iter().all(|b| b.action != Action::SendToCutter),
+            "Send to cutter ships bound"
+        );
+        let at = Action::ALL
+            .iter()
+            .position(|a| *a == Action::ExportPrintSheet)
+            .unwrap();
+        assert_eq!(Action::ALL[at + 1], Action::SendToCutter);
+    }
+
+    /// Registration marks are listed, filed under File, named as the thing
+    /// they switch, and bound to nothing.
+    #[test]
+    fn the_marks_action_is_listed_unbound_under_file() {
+        assert!(Action::ALL.contains(&Action::ToggleSheetMarks));
+        assert_eq!(Action::ToggleSheetMarks.category(), "File");
+        assert_eq!(Action::ToggleSheetMarks.label(), "Registration marks");
+        assert!(
+            defaults()
+                .iter()
+                .all(|b| b.action != Action::ToggleSheetMarks),
+            "Registration marks ships bound"
+        );
+    }
+
     /// **What [`Action::ALL`] holds, as far as walking it can tell.** Each arm
     /// of the exhaustive match marks its own cell, so this catches an entry
     /// listed twice, and an existing entry dropped from `ALL` with the length
@@ -1738,47 +1809,50 @@ mod tests {
                 Action::Save => 0,
                 Action::SaveAs => 1,
                 Action::Export => 2,
-                Action::Undo => 3,
-                Action::Redo => 4,
-                Action::Deselect => 5,
-                Action::Copy => 6,
-                Action::Cut => 7,
-                Action::Paste => 8,
-                Action::CutPathFromSelection => 9,
-                Action::PlotPathFromSelection => 10,
-                Action::TraceOutline => 11,
-                Action::NewVectorLayer => 12,
-                Action::FlipCanvasHorizontal => 13,
-                Action::FlipCanvasVertical => 14,
-                Action::BrushTool => 15,
-                Action::EraserTool => 16,
-                Action::SelectTool => 17,
-                Action::TransformTool => 18,
-                Action::PathTool => 19,
-                Action::EyedropperTool => 20,
-                Action::PanTool => 21,
-                Action::ZoomTool => 22,
-                Action::SizeDown => 23,
-                Action::SizeUp => 24,
-                Action::OpacityDown => 25,
-                Action::OpacityUp => 26,
-                Action::HardnessDown => 27,
-                Action::HardnessUp => 28,
-                Action::SpacingDown => 29,
-                Action::SpacingUp => 30,
-                Action::RoundnessDown => 31,
-                Action::RoundnessUp => 32,
-                Action::AirbrushDown => 33,
-                Action::AirbrushUp => 34,
-                Action::AngleDown => 35,
-                Action::AngleUp => 36,
-                Action::PickupDown => 37,
-                Action::PickupUp => 38,
-                Action::SwapColours => 39,
-                Action::FitView => 40,
-                Action::ActualSize => 41,
-                Action::ZoomIn => 42,
-                Action::ZoomOut => 43,
+                Action::ExportPrintSheet => 3,
+                Action::SendToCutter => 4,
+                Action::ToggleSheetMarks => 5,
+                Action::Undo => 6,
+                Action::Redo => 7,
+                Action::Deselect => 8,
+                Action::Copy => 9,
+                Action::Cut => 10,
+                Action::Paste => 11,
+                Action::CutPathFromSelection => 12,
+                Action::PlotPathFromSelection => 13,
+                Action::TraceOutline => 14,
+                Action::NewVectorLayer => 15,
+                Action::FlipCanvasHorizontal => 16,
+                Action::FlipCanvasVertical => 17,
+                Action::BrushTool => 18,
+                Action::EraserTool => 19,
+                Action::SelectTool => 20,
+                Action::TransformTool => 21,
+                Action::PathTool => 22,
+                Action::EyedropperTool => 23,
+                Action::PanTool => 24,
+                Action::ZoomTool => 25,
+                Action::SizeDown => 26,
+                Action::SizeUp => 27,
+                Action::OpacityDown => 28,
+                Action::OpacityUp => 29,
+                Action::HardnessDown => 30,
+                Action::HardnessUp => 31,
+                Action::SpacingDown => 32,
+                Action::SpacingUp => 33,
+                Action::RoundnessDown => 34,
+                Action::RoundnessUp => 35,
+                Action::AirbrushDown => 36,
+                Action::AirbrushUp => 37,
+                Action::AngleDown => 38,
+                Action::AngleUp => 39,
+                Action::PickupDown => 40,
+                Action::PickupUp => 41,
+                Action::SwapColours => 42,
+                Action::FitView => 43,
+                Action::ActualSize => 44,
+                Action::ZoomIn => 45,
+                Action::ZoomOut => 46,
             };
             assert!(!seen[cell], "{action:?} is listed twice");
             seen[cell] = true;

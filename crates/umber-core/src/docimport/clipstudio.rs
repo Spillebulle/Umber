@@ -285,6 +285,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         active: None,
         background,
         dpi: canvas.dpi,
+        marks: false,
         history: None,
         warnings,
     })

@@ -201,6 +201,7 @@ pub fn read(bytes: &[u8], progress: super::Progress<'_>) -> Result<ImportedDocum
         active: None,
         background: Background::Transparent,
         dpi: doc.dpi,
+        marks: false,
         history: None,
         warnings,
     })
@@ -985,6 +986,7 @@ fn flattened_fallback(
         active: None,
         background: Background::Transparent,
         dpi: None,
+        marks: false,
         history: None,
         warnings,
     })

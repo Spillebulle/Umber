@@ -2940,6 +2940,70 @@ impl UmberApp {
         self.request_redraw();
     }
 
+    /// Carry out what the Send to cutter dialog asked for, once.
+    ///
+    /// A send settles the stroke, the float and a Path tool draft exactly as
+    /// [`Self::trace_outline`] does, so the paths read are the ones on screen,
+    /// and then plans the job through the form's own `plan_job`, the same call
+    /// the dialog's summary is drawn from. A refusal is the outcome and starts
+    /// nothing. The worker owns the job it is handed, so a tab switched or
+    /// closed while it runs changes nothing it sends.
+    ///
+    /// **This is the one place a real machine is opened.** Every test hands
+    /// the worker an opener of its own.
+    fn spend_cutter_request(&mut self) {
+        use crate::cutter::{self, Link, Timing, Work};
+        use crate::cutterdlg::CutterRequest;
+
+        let Some(request) = self.editor.cutter_request.take() else {
+            return;
+        };
+        let work = match request {
+            CutterRequest::Stop => {
+                self.editor.cutter.stop();
+                self.request_redraw();
+                return;
+            }
+            // One piece of work at a time; `begin` refuses a second as well,
+            // and this keeps a send from settling a draft for nothing.
+            CutterRequest::Check | CutterRequest::Send if self.editor.cutter.busy() => return,
+            CutterRequest::Check => Work::Check,
+            CutterRequest::Send => {
+                self.finish_stroke();
+                self.finish_transform();
+                if self.editor.ui.tool == Tool::Path {
+                    self.editor.settle_path_tool_noting();
+                    self.drain_path_layers();
+                }
+                match self
+                    .editor
+                    .cutter
+                    .plan_job(&self.editor.layers, &self.editor.doc)
+                {
+                    Ok(job) => Work::Send(job),
+                    Err(refusal) => {
+                        self.editor.cutter.outcome = Some(Err(refusal.sentence()));
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            }
+        };
+        let open: cutter::Opener = Box::new(|log| {
+            for line in cutter::found_lines(&cutter::UsbPrint::paths()) {
+                log(line);
+            }
+            cutter::UsbPrint::open(cutter::PORTRAIT_3)
+                .map(|link| Box::new(link) as Box<dyn Link + Send>)
+        });
+        let proxy = self.proxy.clone();
+        self.editor.cutter.begin(work, open, Timing::REAL, move || {
+            // The loop is gone once the window has closed. Nothing to do.
+            let _ = proxy.send_event(Wake);
+        });
+        self.request_redraw();
+    }
+
     fn add_layer(&mut self) {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
@@ -3398,6 +3462,10 @@ impl UmberApp {
             // Only the dialog. The chord asks the question; it does not write a
             // file behind the artist's back.
             Action::Export => self.editor.export_form.open = true,
+            Action::ExportPrintSheet => self.export_print_sheet(),
+            // Only the dialog, for Export's reason.
+            Action::SendToCutter => self.editor.open_cutter(),
+            Action::ToggleSheetMarks => self.editor.toggle_sheet_marks(),
             // The answer matters only to `jump_history`, which has several
             // steps to abandon; one keystroke has nothing to stop.
             Action::Undo => self.undo_command(),
@@ -4072,6 +4140,7 @@ impl UmberApp {
                     active: self.editor.layers.active_index(),
                     background: self.editor.doc.background,
                     dpi: self.editor.doc.dpi,
+                    marks: self.editor.doc.marks,
                     merged: Canvas::Deferred,
                     history,
                 },
@@ -4242,6 +4311,104 @@ impl UmberApp {
         }
     }
 
+    /// Ask for a file and write the print sheet into it: the flattened picture
+    /// as a one-page PDF at the document's physical size, with the registration
+    /// marks where the cutter will look for them. See `umber_core::printsheet`.
+    ///
+    /// The same route as [`App::export`], for the same reasons: the float is put
+    /// down first, the pixels are the screen composite with effects baked in,
+    /// and the file lands whole or not at all through `docformat::write_with`.
+    fn export_print_sheet(&mut self) {
+        use umber_core::printsheet;
+        self.finish_transform();
+        let id = self.editor.session.active_id();
+        let suggested = printsheet::default_file_name(self.editor.session.active_title());
+        if self
+            .gfx
+            .as_ref()
+            .is_none_or(|g| !g.canvases.contains_key(&id))
+        {
+            return;
+        }
+
+        let Some(picked) = rfd::FileDialog::new()
+            .set_title("Export print sheet")
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(suggested)
+            .save_file()
+        else {
+            return;
+        };
+        // Not every platform's save dialog appends the filter's extension.
+        let path = printsheet::with_pdf_extension(&picked);
+        let name = file_name_of(&path);
+
+        let Some(layers) = self.baked_draws(None) else {
+            return;
+        };
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
+        let pixels = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
+        let doc = &self.editor.doc;
+        // Only marks the model accepts for this page, which is what the canvas
+        // overlay draws too: a flag a file set against a page too small for it
+        // prints no marks rather than marks in the wrong place.
+        let marks = doc
+            .marks
+            .then(|| umber_core::sheet::Marks::for_document(doc).ok())
+            .flatten();
+        let sheet = printsheet::Sheet {
+            size: doc.size,
+            dpi: doc.dpi,
+            rgba: &pixels,
+            marks,
+        };
+
+        let written = docformat::write_with(&path, |file| {
+            printsheet::write(&mut std::io::BufWriter::new(file), &sheet).map_err(Into::into)
+        })
+        .map_err(|e| e.to_string());
+
+        match written {
+            Ok(()) => {
+                log::info!("exported a print sheet to {}", path.display());
+                let mut lines = vec![
+                    path.display().to_string(),
+                    "Print it at actual size (100%), with no fit to page, or the cuts will not line up."
+                        .to_string(),
+                ];
+                if marks.is_none() {
+                    // Two different situations and two different remedies. The
+                    // second should be unreachable through the interface, since
+                    // the File menu's switch refuses a page too small for the
+                    // marks; a file, or a resize after the switch, can still
+                    // leave the flag set against such a page, and saying "switch them on" to somebody whose
+                    // marks are already on would send them round in a circle.
+                    lines.push(if doc.marks {
+                        "This page cannot hold registration marks, so none were printed."
+                            .to_string()
+                    } else {
+                        "This document has no registration marks. Switch them on in the File menu to print and cut."
+                            .to_string()
+                    });
+                }
+                self.editor.notice = Some(Notice {
+                    title: "Print sheet exported".to_string(),
+                    lines,
+                });
+            }
+            Err(error) => {
+                log::error!("could not export {}: {error}", path.display());
+                self.editor.notice = Some(Notice {
+                    title: format!("Could not export “{name}”"),
+                    lines: vec![error],
+                });
+            }
+        }
+    }
+
     /// Two-finger pinch: pan by the midpoint delta, zoom by the spread ratio.
     fn update_pinch(&mut self) {
         // The pivot, not the viewport size. `zoom_at` keeps the document point
@@ -4280,6 +4447,10 @@ impl UmberApp {
         // is the only one with a device -- and is free, being the 0 ms end of
         // the measurement in `loading.rs`.
         self.collect_loading();
+
+        // And the cutter's worker: a stage, a log line or the outcome that
+        // arrived while the loop slept is drawn in the frame its wake asked for.
+        self.editor.cutter.pump();
 
         // What the panic hook is allowed to say about the artist's documents.
         // The hook cannot borrow the editor — it has no reference to one, and
@@ -4868,6 +5039,7 @@ impl UmberApp {
         if std::mem::take(&mut self.editor.trace_requested) {
             self.trace_outline();
         }
+        self.spend_cutter_request();
         if actions.new_vector_layer {
             self.add_vector_layer();
         }
@@ -4876,6 +5048,9 @@ impl UmberApp {
         }
         if let Some(options) = actions.export {
             self.export(options);
+        }
+        if actions.export_print_sheet {
+            self.export_print_sheet();
         }
         if actions.save {
             self.save_document(false);
@@ -8130,6 +8305,7 @@ mod tests {
                 active: 0,
                 background: umber_core::Background::Transparent,
                 dpi: 72.0,
+                marks: false,
                 merged: Canvas::Deferred,
                 history: None,
             },
@@ -8139,7 +8315,7 @@ mod tests {
 
         let back = umber_core::docimport::import(&path).expect("reopen");
         assert_eq!(back.layers.len(), stack.len(), "the stack changed length");
-        for at in 0..stack.len() {
+        for (at, layer) in back.layers.iter().enumerate() {
             // **One piece at the origin**, because these layers are solid and
             // `docformat::trim` therefore writes each at its full size. Read
             // off the piece rather than a canvas: `ImportedLayer::pixels` is a
@@ -8148,7 +8324,7 @@ mod tests {
             // as the bytes is what keeps this a check on the *picture* — a
             // layer that came back at the wrong offset would otherwise pass on
             // its first four bytes.
-            let piece = &back.layers[at].pixels[0];
+            let piece = &layer.pixels[0];
             assert_eq!(
                 (
                     piece.rect.x,
@@ -8165,7 +8341,7 @@ mod tests {
                 "layer {at} came back holding another layer's pixels"
             );
             assert_eq!(
-                back.layers[at].mask.is_some(),
+                layer.mask.is_some(),
                 stack.layers()[at].mask().is_some(),
                 "layer {at}'s mask moved"
             );

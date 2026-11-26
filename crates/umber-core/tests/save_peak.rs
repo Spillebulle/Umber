@@ -139,6 +139,7 @@ fn deferred_peak(path: &std::path::Path, layers: usize) -> usize {
             active: 0,
             background: Background::Transparent,
             dpi: 72.0,
+            marks: false,
             merged: Canvas::Deferred,
             history: None,
         },
@@ -165,6 +166,7 @@ fn held_peak(path: &std::path::Path, layers: usize) -> usize {
         active: 0,
         background: Background::Transparent,
         dpi: 72.0,
+        marks: false,
         merged: Canvas::Held(&merged),
         history: None,
     })

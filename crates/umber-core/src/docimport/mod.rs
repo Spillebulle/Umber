@@ -589,6 +589,9 @@ pub struct ImportedDocument {
     /// identical either way — and a warning on every PSD and PNG would be noise
     /// in the one list that has to stay worth reading.
     pub dpi: Option<f32>,
+    /// Whether the file says it carries registration marks. `false` for every
+    /// format but Umber's own.
+    pub marks: bool,
     /// The undo history the document was saved with, if it had one.
     ///
     /// `None` for every format but Umber's own — no other application records
@@ -653,6 +656,7 @@ impl ImportedDocument {
         Document::new(self.size.x, self.size.y)
             .with_background(self.background)
             .with_dpi(self.dpi.unwrap_or(Document::DEFAULT_DPI))
+            .with_marks(self.marks)
     }
 
     /// Build the engine-side state for this import.
@@ -1934,6 +1938,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: vec![],
         };
@@ -1967,6 +1972,7 @@ mod tests {
             active,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: vec![],
         };
@@ -2030,6 +2036,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: vec![],
         };
@@ -2082,6 +2089,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: vec![],
         };
@@ -2112,6 +2120,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: vec![],
         };
@@ -2372,6 +2381,7 @@ mod tests {
                 active: 0,
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
+                marks: false,
                 merged: Canvas::Deferred,
                 history: None,
             },
@@ -2748,6 +2758,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: vec![],
         };
@@ -2823,6 +2834,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: Vec::new(),
         };
@@ -2886,6 +2898,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            marks: false,
             history: None,
             warnings: Vec::new(),
         }

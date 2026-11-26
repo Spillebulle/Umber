@@ -1230,6 +1230,15 @@ pub struct Editor {
     /// `quit_requested` is one: the dialog is drawn from `ui::draw`, and the
     /// trace needs the device. `App` spends it once, after the frame.
     pub trace_requested: bool,
+    /// The Send to cutter dialog, and the check or job it has running. Above
+    /// the `--- documents ---` line because it describes the machine on the
+    /// desk rather than a document: a running job owns its own copy of what
+    /// it sends and reads nothing from whichever tab is in front.
+    pub cutter: crate::cutterdlg::CutterForm,
+    /// What the Send to cutter dialog asked for. Spent by `App` after the
+    /// frame, as `trace_requested` is, because a job has to settle the stroke,
+    /// the float and a Path tool draft before the paths are read.
+    pub cutter_request: Option<crate::cutterdlg::CutterRequest>,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -1543,6 +1552,8 @@ impl Default for Editor {
             recovery: crate::recoverdlg::Recovery::default(),
             quit_requested: false,
             trace_requested: false,
+            cutter: crate::cutterdlg::CutterForm::default(),
+            cutter_request: None,
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),
@@ -1986,6 +1997,13 @@ impl Editor {
             }
         }
         self.plan_paths(paths, None).map_err(path_refusal)
+    }
+
+    /// Put the Send to cutter dialog up. Its settings are the session's, so
+    /// they are as the artist last left them; its summary and its last
+    /// outcome are not, and `CutterForm::opened` drops both.
+    pub fn open_cutter(&mut self) {
+        self.cutter.opened();
     }
 
     /// Put the trace outline dialog up. The first time in a session the
@@ -2971,8 +2989,24 @@ impl Editor {
     ///
     /// The history is cleared here rather than left to the caller so it cannot
     /// be forgotten by one of two call sites.
-    pub fn apply_canvas(&mut self, doc: Document, anchor: umber_core::Anchor) -> bool {
+    pub fn apply_canvas(&mut self, mut doc: Document, anchor: umber_core::Anchor) -> bool {
         let resized = doc.size != self.doc.size;
+        // **Registration marks need a page they fit on**, and a new size or
+        // resolution can leave none. Asked of the document about to be
+        // installed, so the flag cannot outlive the room it was set for, and
+        // said aloud because the Print sheet would otherwise have lost its marks
+        // with nothing to say why. A flip never reaches here, so it leaves the
+        // flag alone.
+        if doc.marks && umber_core::sheet::Marks::for_document(&doc).is_err() {
+            doc.marks = false;
+            self.add_notice(Notice {
+                title: "Registration marks removed".to_string(),
+                lines: vec![
+                    "The new canvas size cannot hold registration marks, so they were switched off."
+                        .to_string(),
+                ],
+            });
+        }
         // The path being drawn is a statement about the canvas as it is, so it
         // goes onto a layer first and is carried by the resize like any other.
         if resized {
@@ -3009,15 +3043,18 @@ impl Editor {
             if dropped > 0 {
                 // Named rather than discovered. Unlike the flip's, this one is
                 // reachable by anybody who resizes a document holding text.
-                self.notice = Some(Notice {
-                    title: "Text on this document is paint now".to_string(),
-                    lines: vec![format!(
+                // Added to a notice already up (the marks one, above) rather
+                // than replacing it, so both sentences reach the artist.
+                add_notice_line(
+                    &mut self.notice,
+                    "Text on this document is paint now",
+                    &format!(
                         "The canvas changed size, so Umber no longer knows where the text \
                          on {} goes. Every pixel is still there. What is lost is that it \
                          can be set again.",
                         text_layers(dropped)
-                    )],
-                });
+                    ),
+                );
             }
             // **A vector layer's paths move with the picture instead.** Unlike
             // a text placement they are exact under a translation, and the
@@ -3267,6 +3304,29 @@ impl Editor {
         } else {
             self.session.remove(index).map(|tab| tab.id)
         }
+    }
+
+    /// Switch the document's registration marks on or off.
+    ///
+    /// Switching them on is refused where the page cannot hold them, with the
+    /// model's own sentence for why, so the flag never claims marks that
+    /// `sheet::Marks` would decline to place: the same rule `apply_canvas`
+    /// keeps when a resize takes the room away. A refusal changes nothing, so
+    /// it leaves the tab alone; either real change marks it modified, because
+    /// the flag is written into the `.ora` and closing would lose it.
+    pub fn toggle_sheet_marks(&mut self) {
+        if self.doc.marks {
+            self.doc.marks = false;
+        } else if let Err(reason) = umber_core::sheet::Marks::for_document(&self.doc) {
+            self.add_notice(Notice {
+                title: "No room for registration marks".to_string(),
+                lines: vec![reason.sentence().to_string()],
+            });
+            return;
+        } else {
+            self.doc.marks = true;
+        }
+        self.mark_modified();
     }
 
     /// Note that the live document has changed, so closing it would lose work.
@@ -4903,6 +4963,106 @@ mod tests {
             ed.layers.vector_at(at).unwrap().paths()[0].nodes[0].at,
             Vec2::new(60.0, 35.0)
         );
+    }
+
+    /// A document of this size and resolution, with registration marks on.
+    fn marked(width: u32, height: u32, dpi: f32) -> Document {
+        Document::new(width, height).with_dpi(dpi).with_marks(true)
+    }
+
+    /// A5 at 300 dpi holds the marks and 300 pixels square (25 mm) cannot.
+    #[test]
+    fn a_resize_too_small_for_marks_switches_them_off_and_says_so() {
+        use umber_core::Anchor;
+        let mut ed = Editor {
+            doc: marked(1748, 2480, 300.0),
+            ..Editor::default()
+        };
+        assert!(ed.apply_canvas(marked(300, 300, 300.0), Anchor::Centre));
+        assert!(!ed.doc.marks, "the flag outlived the room for the marks");
+        let notice = ed.notice.as_ref().expect("said so");
+        assert_eq!(notice.title, "Registration marks removed");
+        assert_eq!(
+            notice.lines,
+            vec!["The new canvas size cannot hold registration marks, so they were switched off."]
+        );
+    }
+
+    /// The text branch used to assign the notice rather than add to it, so a
+    /// document with marks and a caption lost the marks sentence.
+    #[test]
+    fn a_resize_that_drops_marks_and_text_says_both() {
+        use umber_core::Anchor;
+        let mut ed = Editor {
+            doc: marked(1748, 2480, 300.0),
+            ..Editor::default()
+        };
+        assert!(ed.layers.set_text(0, a_record("A caption")));
+        assert!(ed.apply_canvas(marked(300, 300, 300.0), Anchor::Centre));
+        assert!(!ed.doc.marks);
+        assert!(ed.layers.text_at(0).is_none());
+        let notice = ed.notice.as_ref().expect("said so");
+        let all = notice.lines.join("\n");
+        assert!(all.contains("cannot hold registration marks"), "{all}");
+        assert!(all.contains("one text layer"), "{all}");
+    }
+
+    /// 300 pixels square at 300 dpi is 25 mm, which has no room for a 60 mm
+    /// span: the flag stays off, the tab is untouched, and the notice carries
+    /// the model's own sentence.
+    #[test]
+    fn toggling_marks_on_a_page_too_small_refuses_and_says_why() {
+        let mut ed = Editor {
+            doc: Document::new(300, 300).with_dpi(300.0),
+            ..Editor::default()
+        };
+        ed.toggle_sheet_marks();
+        assert!(!ed.doc.marks, "the flag was set on a page with no room");
+        assert!(
+            !ed.session.active_tab().modified,
+            "a refusal changed nothing"
+        );
+        let notice = ed.notice.as_ref().expect("said why");
+        assert_eq!(notice.title, "No room for registration marks");
+        assert_eq!(
+            notice.lines,
+            vec![umber_core::sheet::NoMarks::TooSmall.sentence().to_string()]
+        );
+    }
+
+    /// On and off are both changes to the document, each puts the dot on the
+    /// tab, and neither says anything on a page that fits.
+    #[test]
+    fn toggling_marks_marks_the_document_modified() {
+        let mut ed = Editor {
+            doc: Document::new(1748, 2480).with_dpi(300.0),
+            ..Editor::default()
+        };
+        assert!(!ed.session.active_tab().modified);
+        ed.toggle_sheet_marks();
+        assert!(ed.doc.marks, "a page that fits refused the marks");
+        assert!(ed.session.active_tab().modified, "switching on left no dot");
+        assert!(ed.notice.is_none());
+
+        ed.session.active_tab_mut().modified = false;
+        ed.toggle_sheet_marks();
+        assert!(!ed.doc.marks);
+        assert!(
+            ed.session.active_tab().modified,
+            "switching off left no dot"
+        );
+    }
+
+    #[test]
+    fn a_resize_that_still_fits_keeps_the_marks() {
+        use umber_core::Anchor;
+        let mut ed = Editor {
+            doc: marked(1748, 2480, 300.0),
+            ..Editor::default()
+        };
+        assert!(ed.apply_canvas(marked(1600, 2400, 300.0), Anchor::Centre));
+        assert!(ed.doc.marks);
+        assert!(ed.notice.is_none(), "nothing was lost, so nothing is said");
     }
 
     /// A resize strips Ink and says so once, and says nothing for a size that

@@ -2238,6 +2238,175 @@ undo entry.
   outline past the edge, and what a machine does with that is the next
   project's), and persisting the settings across runs.
 
+#### Print and cut
+
+`umber-core::sheet` is where the marks are, `umber-core::printsheet` is the PDF,
+`umber-core::cutjob` is the bytes, `umber-app::cutter` is the conversation, the
+link and the worker, and `cutterdlg.rs` is the form. The design is
+`docs/superpowers/specs/2026-11-26-print-and-cut-design.md`. **Nobody has run
+any of the machine half against a Silhouette**, and every rule below about the
+conversation is a rule about a scripted fake until somebody has.
+
+- **The marks come from one function, `sheet::Marks`, and three things read
+  it**: the canvas overlay (`ui::sheet_marks`), the print sheet (`fills`) and
+  the cut job (`span` and `origin`). That is structural rather than
+  disciplined because the failure is a millimetre: a sheet and a job that
+  disagreed about where a mark is would cut that millimetre off every sticker,
+  and nothing on screen would say so. The geometry is one layout, `INSET_MM`
+  10 in from every edge, a square at the top left and an L at the other two
+  corners, and a page is refused with a sentence (`NoMarks`) unless the span is
+  at least `MIN_SPAN_MM` (60) both ways and at most `MAX_CUT_WIDTH_MM` (203)
+  across. An L is two filled rectangles, not a stroke, so no viewer's caps or
+  joins can move the corner the sensor aims at. `keep_clear` is the three
+  corners artwork must stay out of, drawn on the canvas as an outline.
+- **The document is the sheet, and millimetres come from `dpi`.**
+  `mm_per_pixel` is the one conversion. `Document::marks` is a flag, saved as
+  `umber-regmarks` on `<image>` and only when set, and it does **not** raise
+  `umber-version`: it changes no pixel, and a build that ignores it merely does
+  not offer the marks. Both writers carry it, Save off `editor.doc` and the
+  autosave off its snapshot, and `SaveDocument::marks` has no default, so a new
+  construction site that forgets it is a compile error rather than a silence.
+  `an_autosave_keeps_the_registration_marks` reads the file the autosave wrote.
+  A resize the new size cannot hold switches the flag off and says so, and
+  `toggle_sheet_marks` refuses with the model's sentence, so the flag never
+  claims marks the page would not print.
+- **The print sheet is a PDF written by hand, because a PNG has no page.** A
+  PNG's resolution is a hint every print dialog may ignore and most scale to
+  fit, which moves every mark. A PDF page *is* a size in points, `px * 72 / dpi`.
+  Printing through the system dialog would remove the one instruction the
+  artist has to follow, and was refused for now as Windows only, untestable
+  here and a large surface; a PDF is bytes, tested with no printer, on every
+  platform. One page, one image, one content stream, and no PDF crate, because
+  what a PDF library adds (fonts, text) is what this page must not carry. The picture is matted onto white **in linear light through
+  `export::matte_table`**, so a soft edge prints as the flattened export shows
+  it over white; the rows are streamed through the compressor one at a time, so
+  no second canvas is held; and the marks are black `re f` fills with y flipped
+  against the MediaBox, since PDF's origin is the bottom left. The marks are
+  drawn only where `doc.marks` is on *and* the page holds them, the condition
+  the overlay draws on. The success notice says to print at 100% with no fit to
+  page, which is the one instruction that decides whether anything lines up.
+- **The cut job is planned whole, then encoded, and the bytes are pinned as
+  literals.** 20 units a millimetre, every point sent `y,x`, every command ended
+  by ETX. With marks the origin is the top left mark's corner, because the
+  machine has measured where the square really sits. A job is refused, whole,
+  for Ink, for marks asked of a page without them, for a point outside the cut
+  area (with marks) or off the page or past 203 mm across (without), for no
+  paths of the role, and past `MAX_POINTS` counted with passes. One path skipped
+  is a sheet thrown away, so it is never skipped. **The clamp extent and the
+  `Z` command share one binding**: without marks the rounding clamp used the
+  page width while `Z` declared the width capped at 203 mm, so a point admitted
+  on the half-unit edge tolerance rounded to 4061 after `Z5940,4060`. `SO0` is
+  deliberately not sent: it moves the origin for the next job, which a roll
+  feed wants and a print-and-cut sheet does not. Do not "tidy" a command.
+- **The cutting mat is `TG3`, and no mat is `TG0`.** `JobSettings::mat`
+  defaults to on, because a sticker sheet is normally stuck to the Portrait's
+  8 by 12 inch mat, and the reference implementation's number for that mat is
+  3; it is per role, and the log header records it. It is the only thing the
+  reference sends differently for the two: `FN0` and `TB50,0` follow either way.
+  Its boundary differs too (`Z6096,4064`, the mat's 12 by 8 inches, where Umber
+  sends the page clamped to 203 mm), and that was deliberately not copied: the
+  page is the smaller, and a blade is not sent past the sheet it is cutting.
+- **The blade depth is `TF<d>,1`, last in the setup, and only for a cut.**
+  `JobSettings::depth` is `None` by default and then the setup block is byte
+  for byte what it was before the field existed; `Some(d)` is clamped to
+  `0..=10` and sent after `FE0,1`, which is where the reference sends it,
+  after the force, the speed, the offset and the lift. `blade_depth()` is the
+  one statement of "is a depth sent", matched exhaustively on the role, and a
+  pen is never sent one whatever the field holds. The reference sends it only
+  after asking the machine which tool is in the holder (`ESC NAK`) and finding
+  an AutoBlade or nothing; Umber does not ask, so a depth sent with another
+  blade in the holder does whatever the machine does with it.
+- **The conversation's rules**, each of which is a cut in the wrong place if
+  broken. See `cutter.rs`'s module docs and `send`'s.
+  - **Nothing is ever written twice.** Every write in `conversation` is a `?`. A
+    write that failed or timed out may have reached the machine in part, and
+    resending it is the blade going round again from wherever the first copy
+    stopped.
+  - **Replies are matched by exact bytes.** A status is `0`, `1` or `2` and ETX
+    and nothing else; `3`, a bare ETX or `" 0"` is `Unknown`, reported raw,
+    never ready. The marks reply is `MARKS_FOUND`, `"    0"` and ETX, spaces
+    included, and anything else is not found and ends the job before a cut.
+  - **Stale replies are drained before every status query** (`ask_status`'s
+    `discard(drain)`), **and settled after the initialise and after a marks
+    search that succeeded** (`discard(settle)`). The search answers more than
+    once, three times by the reference implementation's account, and a leftover
+    read as the status of block 0 would put every later poll one answer behind.
+    That was a critical review finding: every marked sheet died after block 0.
+  - **A machine saying Moving is alive**, so `Timing::REAL.ready` is 45 minutes
+    rather than two; a machine that stops answering is a `Timeout` after
+    `reply`, which is the other failure.
+  - **A stop does not end the job until the machine has.** It holds up to a
+    kilobyte of moves when Stop is pressed and goes on cutting, so a stop that
+    returned at once told the artist it had finished while the blade was still
+    on the sheet, and sent no end block, so the tool could be left down. Once
+    the stop is seen (between blocks, or after any Moving inside a wait, which
+    is when `Stage::Stopping` is said) nothing is written but status queries
+    and the end block: the machine is waited for until Ready, the end block
+    (a tool-up move home) goes once, it is waited for again, and only then is
+    the job `Stopped`. A failure on the way is that failure. After an *error*
+    the end block is still not sent, because the link may be what failed.
+  - **A failure says how far the job got.** `Failure::blocks_sent` counts a
+    block before its write, and the sentence adds that the sheet may be part
+    cut. A failure in the last wait, after the end block went, is
+    `Unconfirmed` and never "failed": reading it as a failed job is how a sheet
+    gets cut twice. `Failure::sentence`'s match over the error is exhaustive so
+    a new variant has to say which it is.
+- **`UsbPrint` opens the stock driver.** It enumerates the USBPRINT device
+  interface class `{28d78fad-5a12-11d1-ae5b-0000f803a8c2}` and takes the path whose second `#` field
+  carries `vid_0b4d&pid_113a`, so no driver is replaced and Silhouette Studio
+  keeps working. The open is exclusive (share 0), so Studio must be closed, and
+  a sharing violation, access denied or `ERROR_BUSY` is `Busy` with that
+  sentence. **One read is kept outstanding for the whole session and is
+  cancelled only on close**, which is what the one report of this route working
+  (a Cameo 4) does: starting and cancelling a read on every status poll, four a
+  second for up to 45 minutes, is a pattern nobody has seen the driver survive,
+  and a reply landing as a read is cancelled is lost. `win::Port` owns the read
+  in a heap allocation that never moves, reached only through a raw pointer,
+  and `Pump::pump` waits on it and leaves it outstanding when the wait runs
+  out. The deadlines and the buffer are `Reader`'s, which is pure and tested
+  against a scripted pump; the pump itself is not testable here. Writes keep
+  their own `OVERLAPPED` each, cancelled and waited for on a timeout. **The
+  known unknown** is in its docs: a cancel the driver never completes blocks the
+  thread for good, and there is no sound alternative, because returning early
+  frees memory the kernel may still write. For reads that is now met only when
+  the link is closed. Off Windows the type holds an `Infallible` and every call
+  is `Unsupported`.
+- **The worker is `loading::Finish`'s shape.** `poll` matches all three
+  `try_recv` readings, so a death is one error event and never silence.
+  `cutter::Finish` owns the only sender and its `Drop` drops it **before** the
+  wake, so the woken frame reads `Disconnected`; the log sink and the progress
+  callback borrow the `Finish` rather than cloning the sender.
+  `a_worker_that_dies_is_noticed_once_and_wakes_the_loop` fails when the order
+  is reversed. One worker at a time (`CutterForm::busy`), the link is dropped
+  before the final event so the next job never meets the old handle, and
+  `Work::Send` owns its `Job`, so nothing reads a document that may have been
+  closed. `App::spend_cutter_request` is the only `UsbPrint::open` in app code;
+  every test hands `Worker::start` an opener of its own.
+- **Not yet verified on hardware**, and the release that carries this exists so
+  the artist can find out:
+  - whether USBPRINT opens and answers on a Portrait 3 at all;
+  - which way round a sheet goes in, and whether `y,x` lands as expected;
+  - whether printed marks are found at 10 mm inset with a search origin of zero
+    and a 0.5 mm stroke;
+  - whether the machine corrects for a print that came out slightly scaled;
+  - the pressure and speed that suit sticker paper;
+  - what the machine does with `TG3` and with `TG0`, on the mat and off it;
+  - whether one read left outstanding across every poll behaves on the real
+    driver, and whether its cancel on close completes;
+  - whether `ESC EOT` answers at all;
+  - how many replies the marks search actually sends;
+  - whether the tool is left down on the sheet after an error, since the end
+    block is not sent then;
+  - the non-Windows build of `cutter.rs`, which nobody here can compile and CI
+    checks;
+  - and quitting Umber mid-job, which the close prompt does not yet know about.
+- **The protocol facts are inkscape-silhouette's** (fablabnbg, GPL-2.0-or-later,
+  which Umber's licence may build on): `Graphtec.py`, `Commands.md` and
+  `docs/cameo4-usbprint-observations.md`. Reimplemented, nothing copied.
+  `examples/probe-cutter.rs` sends the three harmless commands and prints every
+  byte both ways; the dialog's Check connection is the same three, and its
+  log is what a report from the machine should carry.
+
 ### Documents
 
 Several documents are open at once. `Session` (`umber-app/src/session.rs`) holds

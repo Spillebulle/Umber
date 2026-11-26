@@ -266,6 +266,7 @@ fn main() {
         active: 0,
         background: Background::WHITE,
         dpi: 72.0,
+        marks: false,
         merged: Canvas::Held(&layer),
         history: None,
     };
