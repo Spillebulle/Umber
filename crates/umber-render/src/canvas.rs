@@ -6121,6 +6121,23 @@ impl CanvasRenderer {
         target: &wgpu::TextureView,
         params: &CompositeParams<'_>,
     ) {
+        self.composite_over(queue, encoder, target, params, self.background);
+    }
+
+    /// [`Self::composite`] with the document background chosen by the caller.
+    ///
+    /// The one pass, the one shader: the background is only a uniform, so
+    /// leaving it out for a single draw is a different value in the same
+    /// field rather than a branch or a second pipeline, and `self.background`
+    /// is never touched.
+    fn composite_over(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        params: &CompositeParams<'_>,
+        background: [f32; 4],
+    ) {
         let scale = 1.0 / params.camera.zoom;
         // Solving `doc = screen * scale + offset` for the pivot mapping to the
         // camera centre. Must stay in step with `Camera::screen_to_doc`, which
@@ -6189,7 +6206,7 @@ impl CanvasRenderer {
                     params.backdrop[2],
                     1.0,
                 ],
-                background: self.background,
+                background,
                 layer_count: count as u32,
                 stroke_mode: mode_index(params.stroke.mode),
                 active_index: params.active_index,
@@ -7949,6 +7966,7 @@ impl CanvasRenderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         layers: &[LayerDraw],
+        background: [f32; 4],
     ) {
         // Zoom 1 with the pivot at the document centre makes screen and
         // document coordinates identical, so the render is 1:1.
@@ -7956,7 +7974,7 @@ impl CanvasRenderer {
             center: Vec2::new(self.doc_size.x as f32 * 0.5, self.doc_size.y as f32 * 0.5),
             zoom: 1.0,
         };
-        self.composite(
+        self.composite_over(
             queue,
             encoder,
             view,
@@ -7980,6 +7998,7 @@ impl CanvasRenderer {
                 // the pixels are for.
                 minify: false,
             },
+            background,
         );
     }
 
@@ -8006,7 +8025,7 @@ impl CanvasRenderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("export"),
         });
-        self.render_export(queue, &mut encoder, &view, layers);
+        self.render_export(queue, &mut encoder, &view, layers, self.background);
         // Submitted before the readback rather than sharing its encoder: the
         // readback may take several submits, and the flatten has to happen once
         // and before all of them.
@@ -8024,6 +8043,55 @@ impl CanvasRenderer {
             },
             (w, h),
         )
+    }
+
+    /// The flattened stack's alpha with the document background left out, one
+    /// byte per document pixel, row-major, `doc.x * doc.y` long.
+    ///
+    /// It exists so that tracing the artwork sees the artwork. A white-backed
+    /// document exports opaque everywhere, so reading [`Self::export_rgba`]'s
+    /// alpha would trace the whole page. This is the alpha that call gives for
+    /// a transparent-backed document: the same composite pass, with the
+    /// background term made the exact identity for this one draw.
+    ///
+    /// **Blocks on the GPU**, like `export_rgba`: an explicit command only,
+    /// never the drawing loop.
+    pub fn export_coverage(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[LayerDraw],
+    ) -> Vec<u8> {
+        let (w, h) = (self.doc_size.x, self.doc_size.y);
+
+        let target = self.export_target(device);
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("export-coverage"),
+        });
+        // Transparent is all zeroes, which is `Background`'s own identity.
+        self.render_export(queue, &mut encoder, &view, layers, [0.0; 4]);
+        queue.submit(Some(encoder.finish()));
+
+        let mut bytes = self.read_texture_rows(
+            device,
+            queue,
+            "export-coverage",
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            (w, h),
+        );
+        // Compact in place, so the RGBA copy is not held beside the result.
+        let n = (w as usize) * (h as usize);
+        for i in 0..n {
+            bytes[i] = bytes[i * 4 + 3];
+        }
+        bytes.truncate(n);
+        bytes
     }
 
     /// Sample the flattened stack at one document pixel.
@@ -10121,7 +10189,7 @@ impl CanvasRenderer {
             if job.merged_target.is_none() {
                 let target = self.export_target(device);
                 let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-                self.render_export(queue, encoder, &view, &job.draws);
+                self.render_export(queue, encoder, &view, &job.draws, self.background);
                 job.merged_target = Some(target);
             }
             wgpu::TexelCopyTextureInfo {
