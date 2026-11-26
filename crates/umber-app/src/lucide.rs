@@ -542,29 +542,56 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Every number token in `d`, as [`Lexer`] scans them, unparsed.
+/// Every number token in `d`, as [`path`] scans them, unparsed.
 ///
 /// The scan and the parse are one line apart in [`Lexer::number`] and the
 /// `unwrap_or` between them is what makes a scanning bug invisible: a token
 /// that does not parse becomes 0.0, which is a plausible coordinate. This hands
 /// the tokens back so a guard can ask the question that `unwrap_or` answers
 /// away. See `icons::tests::every_number_in_every_icon_parses`.
+///
+/// **An arc's two flag slots are read with [`Lexer::flag`], as [`path`] reads
+/// them**, so the guard sees the tokens the parser sees. Reading every slot as
+/// a number would take a packed `00-2.756` as `00` and `-2.756`, which parse,
+/// and the guard would pass on a scan the parser does not make.
 #[cfg(test)]
 pub fn number_tokens(d: &str) -> Vec<String> {
     let mut lexer = Lexer::new(d);
     let mut out = Vec::new();
+    let mut command = ' ';
+    let mut slot = 0usize;
     loop {
-        if lexer.command().is_some() {
+        if let Some(letter) = lexer.command() {
+            command = letter;
+            slot = 0;
             continue;
         }
         if !lexer.at_number() {
             break;
         }
         let before = lexer.rest;
-        lexer.number();
+        // An arc takes seven figures and repeats; the fourth and fifth of each
+        // seven are its flags.
+        let flag_slot = command.eq_ignore_ascii_case(&'a') && matches_flag_slot(slot);
+        if flag_slot {
+            lexer.flag();
+        }
+        if !flag_slot || lexer.rest.len() == before.len() {
+            // Not a flag, or a flag slot holding neither 0 nor 1: whatever the
+            // number scan takes is the token, so the guard sees it fail.
+            lexer.number();
+        }
         out.push(before[..before.len() - lexer.rest.len()].trim().to_string());
+        slot += 1;
     }
     out
+}
+
+/// Whether figure `slot` of an arc's repeating seven is one of its two flags.
+#[cfg(test)]
+fn matches_flag_slot(slot: usize) -> bool {
+    let within = slot % 7;
+    within == 3 || within == 4
 }
 
 #[cfg(test)]
@@ -630,6 +657,23 @@ mod tests {
         let apart = drawn("M2 2a5 5 0 0 1 4 4");
         assert!(apart.len() > 4);
         assert_eq!(drawn("M2 2a5 5 0 014 4"), apart);
+    }
+
+    /// The token scan reads an arc's flags one character each, as `path`
+    /// does, including on the second arc of a repeat.
+    #[test]
+    fn the_token_scan_reads_arc_flags_as_the_parser_does() {
+        assert_eq!(
+            number_tokens("a4 4 0 00-2.756-3.266"),
+            ["4", "4", "0", "0", "0", "-2.756", "-3.266"]
+        );
+        assert_eq!(
+            number_tokens("a1 1 0 011 1 1 1 0 102 2"),
+            ["1", "1", "0", "0", "1", "1", "1", "1", "1", "0", "1", "0", "2", "2"]
+        );
+        // A flag slot holding something that is not a flag is a token the
+        // guard can refuse, not one the scan quietly splits.
+        assert_eq!(number_tokens("a1 1 0 .5 1 2 2")[3], ".5");
     }
 
     /// A half circle by arc: the far side of a radius 6 circle centred at

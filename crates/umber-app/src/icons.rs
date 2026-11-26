@@ -1455,4 +1455,40 @@ mod tests {
             }
         }
     }
+
+    /// **`pen-tool` draws exactly what it would with every arc flag spaced
+    /// out.** The packed form (`00-2.756`) is how Lucide publishes it, and a
+    /// flag read as a number takes `00` whole and the sign of the next as a
+    /// fresh figure, which parses and lands inside the box: neither guard
+    /// above could see it. The spaced data is written out by hand, so this
+    /// compares the shipped icon against what its author drew, not against a
+    /// second reading by the same lexer.
+    #[test]
+    fn pen_tool_draws_what_its_flags_written_apart_would() {
+        let Art::Lucide(packed) = Icon::PenTool.art() else {
+            panic!("pen-tool is Lucide's");
+        };
+        let spaced = [
+            Node::Path(
+                "m18 13-.654-4.736a4 4 0 0 0-2.756-3.266l-9.163-2.9a2 2 0 0 0-2.017.493l-.82.819a2 2 0 0 0-.492 2.017l2.9 9.163a4 4 0 0 0 3.266 2.756L13 18",
+            ),
+            Node::Path(
+                "M18.648 12.352a1.205 1.205 0 0 1 1.704 0l1.296 1.296a1.205 1.205 0 0 1 0 1.704l-6.296 6.296a1.205 1.205 0 0 1-1.704 0l-1.296-1.296a1.205 1.205 0 0 1 0-1.704z",
+            ),
+            Node::Path("m3 3 6.586 6.586"),
+            Node::Circle {
+                cx: 11.0,
+                cy: 11.0,
+                r: 2.0,
+            },
+        ];
+        let shipped = crate::lucide::flatten(packed);
+        let apart = crate::lucide::flatten(&spaced);
+        assert_eq!(shipped.len(), apart.len(), "a different number of outlines");
+        for (index, (a, b)) in shipped.iter().zip(&apart).enumerate() {
+            assert_eq!(a.points, b.points, "outline {index} is drawn differently");
+            assert_eq!(a.closed, b.closed, "outline {index} closes differently");
+            assert_eq!(a.filled, b.filled, "outline {index} fills differently");
+        }
+    }
 }
