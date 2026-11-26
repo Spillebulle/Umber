@@ -12,19 +12,42 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
-## 0.1.7
+## 0.1.8
 
-Arch and CachyOS keep Umber up to date, and a second application from the same
-archive can be installed beside it.
+Print and cut with a Silhouette Portrait 3, and vector layers to draw the cut
+lines on.
 
 ### New
 
-- **The Arch package enrols your machine in Umber's package archive**, the way
-  the `.deb` and `.rpm` already do. After installing it once, `sudo pacman -Syu`
-  upgrades Umber with everything else, on Arch, CachyOS and the other Arch
-  distributions. When an update is out, Umber says that command; on an Arch
-  machine without the archive it names the exact file to fetch instead.
-
+- **Registration marks.** Switch them on with File, Registration marks. Umber
+  shows a square and two corner marks on the canvas, 10 mm in from the edges,
+  where a cutter looks for them on the printed sheet. The three corners drawn as
+  outlines are where the cutter's sensor reads, so keep artwork out of them.
+  The marks are saved with the document and never painted into the picture.
+- **Export print sheet**, on the File menu. It writes a PDF of the picture at
+  its real size on paper, with the registration marks on it, over white. Print
+  it at actual size (100%), with no fit to page, or the cuts will not line up.
+- **Send to cutter**, on the File menu, on Windows. It sends your Cut lines, or
+  your Plot lines for a pen, to a Silhouette Portrait 3 plugged in over USB.
+  Choose pressure, speed and how many passes, and whether the cutter reads the
+  registration marks first. The dialog says how many paths will go and how long
+  the cut is. Check connection asks the cutter who it is without moving
+  anything. Stop sends nothing more, and the cutter finishes what it was
+  already sent. Every message to and from the cutter goes in a log you can
+  copy.
+- **This is the first version, and it has not yet been run on a real
+  machine.** Start with Check connection. Then try a pen on plain paper before
+  a blade on sticker paper. If something goes wrong, copy the log and send it
+  in. Close Silhouette Studio while Umber uses the cutter, because only one
+  program can talk to it at a time. Umber does not replace any driver, so
+  Silhouette Studio keeps working as before.
+- **What a cut job can do so far.** One tool per job: Cut or Plot, not both.
+  A path that goes outside the area between the marks, or off the page without
+  them, refuses the whole job, so a sheet is never half cut by mistake. There
+  is one layout of marks, 10 mm in from the edges. The marks need at least
+  60 mm between them each way and can be at most 203 mm apart across, so A4
+  fits upright and not on its side. Do not close Umber while a job is running;
+  it does not yet warn you first.
 - **Vector layers.** A new kind of layer that holds lines instead of paint.
   Make one with the spline button beside Add on the Layers panel, or let the
   commands below make one for you. It keeps its lines when you save and reopen,
@@ -75,6 +98,19 @@ archive can be installed beside it.
 - **A document with lines from a newer Umber cannot be flipped or resized.**
   This version cannot read those lines, so it cannot move them with the
   picture. Flip canvas and the resize in Canvas settings say so instead.
+
+## 0.1.7
+
+Arch and CachyOS keep Umber up to date, and a second application from the same
+archive can be installed beside it.
+
+### New
+
+- **The Arch package enrols your machine in Umber's package archive**, the way
+  the `.deb` and `.rpm` already do. After installing it once, `sudo pacman -Syu`
+  upgrades Umber with everything else, on Arch, CachyOS and the other Arch
+  distributions. When an update is out, Umber says that command; on an Arch
+  machine without the archive it names the exact file to fetch instead.
 
 ### Fixed
 
