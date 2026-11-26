@@ -7607,18 +7607,24 @@ mod tests {
                 "There is nothing to trace on this layer.",
             ),
         ] {
-            let mut ed = a_small_editor();
-            ed.session.active_tab_mut().modified = false;
-            // Faint everywhere, under the threshold: present, and not artwork.
-            let alpha = vec![umber_core::trace::THRESHOLD - 1; 64 * 64];
-            let before = (stack_ids(&ed), ed.history.len());
-            let notice = ed
-                .plan_trace(&alpha, source, &settings)
-                .expect_err("nothing was planned");
-            assert_eq!(notice.title, "Nothing to trace");
-            assert_eq!(notice.lines, vec![line.to_string()], "{source:?}");
-            assert_eq!((stack_ids(&ed), ed.history.len()), before);
-            assert!(!ed.session.active_tab().modified);
+            // Faint everywhere, under the threshold, which `region` finds
+            // nothing in; and one opaque pixel, which it does find and `trace`
+            // removes as a speck. Both are the same nothing.
+            let faint = vec![umber_core::trace::THRESHOLD - 1; 64 * 64];
+            let mut speck = vec![0; 64 * 64];
+            speck[32 * 64 + 32] = 255;
+            for alpha in [faint, speck] {
+                let mut ed = a_small_editor();
+                ed.session.active_tab_mut().modified = false;
+                let before = (stack_ids(&ed), ed.history.len());
+                let notice = ed
+                    .plan_trace(&alpha, source, &settings)
+                    .expect_err("nothing was planned");
+                assert_eq!(notice.title, "Nothing to trace");
+                assert_eq!(notice.lines, vec![line.to_string()], "{source:?}");
+                assert_eq!((stack_ids(&ed), ed.history.len()), before);
+                assert!(!ed.session.active_tab().modified);
+            }
         }
     }
 
