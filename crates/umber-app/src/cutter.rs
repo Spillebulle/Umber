@@ -863,6 +863,91 @@ fn take_reply(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(pending.drain(..=end).collect())
 }
 
+/// One read kept outstanding against the machine, turned once.
+#[cfg(any(windows, test))]
+trait Pump {
+    /// Wait up to `wait` for the outstanding read, starting one first if
+    /// none is. `Ok(true)` when a read completed, its bytes (which may be
+    /// none) appended to `into`; `Ok(false)` when nothing arrived in `wait`,
+    /// with the read **left outstanding**, never cancelled.
+    fn pump(&mut self, wait: Duration, into: &mut Vec<u8>) -> Result<bool, LinkError>;
+}
+
+/// How long to wait before asking again after a read that completed with
+/// nothing in it, so such a driver costs a few wakes a poll rather than a
+/// spinning thread.
+#[cfg(any(windows, test))]
+const EMPTY_READ_PAUSE: Duration = Duration::from_millis(5);
+
+/// Replies and discards over a [`Pump`]: everything here is deadlines and a
+/// buffer, so it is tested against a scripted pump, and only the pump itself
+/// is the platform's.
+#[cfg(any(windows, test))]
+struct Reader<P: Pump> {
+    source: P,
+    /// What has arrived and not yet been handed out.
+    arrived: Vec<u8>,
+}
+
+#[cfg(any(windows, test))]
+impl<P: Pump> Reader<P> {
+    fn new(source: P) -> Self {
+        Reader {
+            source,
+            arrived: Vec::new(),
+        }
+    }
+
+    /// The next whole reply. One already buffered is answered without
+    /// asking; otherwise the pump is turned until an ETX has arrived or the
+    /// deadline passes. Whatever follows the ETX stays for the next reply, and
+    /// on a timeout whatever part of a reply did arrive stays too.
+    fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(reply) = take_reply(&mut self.arrived) {
+                return Ok(reply);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(LinkError::Timeout);
+            }
+            let before = self.arrived.len();
+            let completed = self.source.pump(deadline - now, &mut self.arrived)?;
+            if completed && self.arrived.len() == before {
+                let left = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(EMPTY_READ_PAUSE.min(left));
+            }
+        }
+    }
+
+    /// Everything buffered, and everything that goes on arriving until
+    /// `quiet` passes with nothing new, bounded overall by `limit`.
+    fn discard_within(&mut self, quiet: Duration, limit: Duration) -> Result<Vec<u8>, LinkError> {
+        let limit = Instant::now() + limit;
+        let mut last = Instant::now();
+        loop {
+            let now = Instant::now();
+            let quiet_left = quiet.saturating_sub(now.duration_since(last));
+            if quiet_left.is_zero() || now >= limit {
+                return Ok(std::mem::take(&mut self.arrived));
+            }
+            let wait = quiet_left.min(limit - now);
+            let before = self.arrived.len();
+            if !self.source.pump(wait, &mut self.arrived)? {
+                // Nothing arrived for the whole of what was left of `quiet`.
+                return Ok(std::mem::take(&mut self.arrived));
+            }
+            if self.arrived.len() > before {
+                last = Instant::now();
+            } else {
+                let left = limit.saturating_duration_since(Instant::now());
+                std::thread::sleep(EMPTY_READ_PAUSE.min(left).min(wait));
+            }
+        }
+    }
+}
+
 /// The machine on Windows' USB printing class driver, which is what a
 /// Silhouette enumerates as.
 ///
@@ -870,23 +955,32 @@ fn take_reply(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
 /// documentation says each call does, and every signature was read from the
 /// `windows-sys` source rather than remembered.
 ///
-/// **A known unknown: a cancel the driver never completes.** A read or a write
-/// that outlives its wait is cancelled with `CancelIoEx` and then waited for
-/// with `GetOverlappedResult(…, TRUE)`, which does not return until the
-/// operation has finished. A driver that never completes a cancelled request
-/// would therefore block the worker thread for good. There is no sound
+/// **One read is kept outstanding for the whole session, and is cancelled
+/// only when the link is closed.** That is what the one report of this route
+/// working (a Cameo 4 on the same driver) does. Starting a read for every
+/// status poll and cancelling it when the poll's short wait ran out, every
+/// quarter of a second for up to three quarters of an hour, is a pattern
+/// nobody has seen the driver survive, and a reply that lands just as a read
+/// is cancelled is a reply lost. So a wait that runs out leaves the read where
+/// it is, and the next wait, whether for a reply or for a discard, waits on
+/// the same one.
+///
+/// **A known unknown: a cancel the driver never completes.** On close, a read
+/// still outstanding is cancelled with `CancelIoEx` and then waited for with
+/// `GetOverlappedResult(…, TRUE)`, which does not return until it has
+/// finished; a write that outlives its own wait is cancelled and waited for the
+/// same way. A driver that never completes a cancelled request would block the
+/// thread closing the link, or the one writing, for good. There is no sound
 /// alternative: the buffer and the OVERLAPPED belong to the operation until it
 /// completes, so returning early would free memory the kernel may still write
 /// to. A bounded wait that then leaked both would be sound and would leave the
 /// handle unusable, which is no better for the artist. Whether the USB
 /// printing driver honours a cancel promptly is one of the things to find out
-/// on the machine.
+/// on the machine, and with this discipline it is asked once a session rather
+/// than once a poll.
 pub struct UsbPrint {
     #[cfg(windows)]
-    handle: win::Handle,
-    /// What has arrived and not yet been handed out as a reply.
-    #[cfg(windows)]
-    pending: Vec<u8>,
+    reader: Reader<win::Port>,
     /// There is no link off Windows, so no value of this type exists there.
     #[cfg(not(windows))]
     _none: std::convert::Infallible,
@@ -902,8 +996,7 @@ impl UsbPrint {
                 .find(|p| is_cutter(p, Some(product)))
                 .ok_or(LinkError::NotFound)?;
             Ok(UsbPrint {
-                handle: win::open(&path)?,
-                pending: Vec::new(),
+                reader: Reader::new(win::Port::open(&path)?),
             })
         }
         #[cfg(not(windows))]
@@ -933,7 +1026,7 @@ impl Link for UsbPrint {
     fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
         #[cfg(windows)]
         {
-            win::write(&self.handle, bytes)
+            self.reader.source.write(bytes)
         }
         #[cfg(not(windows))]
         {
@@ -945,25 +1038,7 @@ impl Link for UsbPrint {
     fn read_reply(&mut self, timeout: Duration) -> Result<Vec<u8>, LinkError> {
         #[cfg(windows)]
         {
-            let deadline = Instant::now() + timeout;
-            loop {
-                if let Some(reply) = take_reply(&mut self.pending) {
-                    return Ok(reply);
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    // Whatever part of a reply did arrive stays in `pending`.
-                    return Err(LinkError::Timeout);
-                }
-                let mut buf = [0u8; win::READ_BYTES];
-                let got = win::read(&self.handle, &mut buf, deadline - now)?;
-                self.pending.extend_from_slice(&buf[..got]);
-                if got == 0 {
-                    // A read that completes empty is not a reason to spin.
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    std::thread::sleep(Duration::from_millis(10).min(left));
-                }
-            }
+            self.reader.read_reply(timeout)
         }
         #[cfg(not(windows))]
         {
@@ -975,28 +1050,7 @@ impl Link for UsbPrint {
     fn discard(&mut self, quiet: Duration) -> Result<Vec<u8>, LinkError> {
         #[cfg(windows)]
         {
-            let mut thrown = std::mem::take(&mut self.pending);
-            let limit = Instant::now() + DISCARD_LIMIT;
-            let mut last = Instant::now();
-            loop {
-                let now = Instant::now();
-                let quiet_left = quiet.saturating_sub(now.duration_since(last));
-                if quiet_left.is_zero() || now >= limit {
-                    return Ok(thrown);
-                }
-                let wait = quiet_left.min(limit - now);
-                let mut buf = [0u8; win::READ_BYTES];
-                // A read that times out is cancelled and waited for inside
-                // `win::read`, exactly as for a reply, and answers what arrived.
-                let got = win::read(&self.handle, &mut buf, wait)?;
-                if got > 0 {
-                    thrown.extend_from_slice(&buf[..got]);
-                    last = Instant::now();
-                } else {
-                    let left = limit.saturating_duration_since(Instant::now());
-                    std::thread::sleep(Duration::from_millis(5).min(left).min(wait));
-                }
-            }
+            self.reader.discard_within(quiet, DISCARD_LIMIT)
         }
         #[cfg(not(windows))]
         {
@@ -1007,17 +1061,9 @@ impl Link for UsbPrint {
 }
 
 #[cfg(windows)]
-impl Drop for UsbPrint {
-    fn drop(&mut self) {
-        win::cancel_all(&self.handle);
-        // The handle itself is closed by its own drop, after this.
-    }
-}
-
-#[cfg(windows)]
 mod win {
     use std::cell::UnsafeCell;
-    use std::ptr::{null, null_mut};
+    use std::ptr::{NonNull, addr_of, addr_of_mut, null, null_mut};
     use std::time::Duration;
 
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -1026,19 +1072,20 @@ mod win {
         SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
-        ERROR_GEN_FAILURE, ERROR_IO_PENDING, ERROR_NO_SUCH_DEVICE, ERROR_OPERATION_ABORTED,
-        ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, FALSE, GENERIC_READ, GENERIC_WRITE,
-        GetLastError, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_DEVICE_NOT_CONNECTED,
+        ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
+        ERROR_NO_SUCH_DEVICE, ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND,
+        ERROR_SHARING_VIOLATION, FALSE, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
     use windows_sys::core::GUID;
 
-    use super::LinkError;
+    use super::{LinkError, Pump};
 
     /// `GUID_DEVINTERFACE_USBPRINT`.
     const USBPRINT: GUID = GUID::from_u128(0x28d78fad_5a12_11d1_ae5b_0000f803a8c2);
@@ -1070,17 +1117,6 @@ mod win {
             unsafe {
                 CloseHandle(self.0);
             }
-        }
-    }
-
-    /// Cancel every operation on the handle, before it is closed.
-    pub fn cancel_all(handle: &Handle) {
-        // SAFETY: a null OVERLAPPED asks for every outstanding operation on a
-        // valid handle to be cancelled. Every operation this module starts has
-        // already completed before its function returned, so this is a guard
-        // against nothing being left rather than a cancellation anything waits on.
-        unsafe {
-            CancelIoEx(handle.0, null());
         }
     }
 
@@ -1191,7 +1227,7 @@ mod win {
     }
 
     /// Open an interface for overlapped reads and writes, exclusively.
-    pub fn open(path: &str) -> Result<Handle, LinkError> {
+    fn open(path: &str) -> Result<Handle, LinkError> {
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: a NUL-terminated wide path, no sharing, no security
         // attributes, no template.
@@ -1217,7 +1253,7 @@ mod win {
     /// them is "not found" to the artist.
     pub fn open_error(code: u32) -> LinkError {
         match code {
-            ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED => LinkError::Busy,
+            ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED | ERROR_BUSY => LinkError::Busy,
             ERROR_FILE_NOT_FOUND
             | ERROR_PATH_NOT_FOUND
             | ERROR_DEVICE_NOT_CONNECTED
@@ -1302,36 +1338,200 @@ mod win {
         })
     }
 
-    /// One overlapped read of up to `buf.len()` bytes, waited for up to `wait`.
-    /// Answers how many arrived, which may be none.
-    pub fn read(handle: &Handle, buf: &mut [u8], wait: Duration) -> Result<usize, LinkError> {
-        let event = event()?;
-        let ov = overlapped(&event);
-        let len = buf.len().min(u32::MAX as usize) as u32;
-        // SAFETY: a valid handle opened for overlapped reads, `len` writable
-        // bytes at `buf`, no byte count pointer (an overlapped read reports it
-        // through GetOverlappedResult), and an OVERLAPPED with its own event.
-        // `buf` is borrowed for this whole function and `ov` and `event` are
-        // locals, so all three stay put until `settle` has seen the operation
-        // finish.
-        let ok = unsafe { ReadFile(handle.0, buf.as_mut_ptr(), len, null_mut(), ov.get()) };
-        if ok == FALSE {
-            let code = last_error();
-            if code != ERROR_IO_PENDING {
-                return Err(io("reading", code));
+    /// The one read kept outstanding: its OVERLAPPED, the buffer the kernel
+    /// fills, and the event it signals. It lives on the heap and is reached
+    /// only through a raw pointer, because the kernel writes to `ov` and `buf`
+    /// while a read is outstanding, so no Rust reference to either may be
+    /// alive over that time, and the address must not change while one is.
+    struct ReadOp {
+        ov: OVERLAPPED,
+        buf: [u8; READ_BYTES],
+        /// Manual reset, reset before each read is started.
+        event: Handle,
+        /// A read has been started and has not been seen to complete.
+        pending: bool,
+    }
+
+    /// The open machine: the handle, and the read kept outstanding on it.
+    pub struct Port {
+        /// Allocated in `open` by `Box::leak` and freed only in `drop`,
+        /// after any read on it has finished. Never moved in between.
+        op: NonNull<ReadOp>,
+        /// Declared after `op` so it is closed after `drop` has waited.
+        handle: Handle,
+    }
+
+    // SAFETY: a `Port` owns its handle and its read operation outright. It
+    // moves between threads whole and is used only by the thread that holds
+    // it, and nothing else holds the pointer. The kernel objects it names may
+    // be used from any thread, and an outstanding overlapped read is not tied
+    // to the thread that started it (only cancelling with `CancelIo` would
+    // be, which is why `drop` uses `CancelIoEx`).
+    unsafe impl Send for Port {}
+
+    impl Port {
+        pub fn open(path: &str) -> Result<Port, LinkError> {
+            let handle = open(path)?;
+            let event = event()?;
+            let op = Box::new(ReadOp {
+                ov: OVERLAPPED::default(),
+                buf: [0; READ_BYTES],
+                event,
+                pending: false,
+            });
+            Ok(Port {
+                op: NonNull::from(Box::leak(op)),
+                handle,
+            })
+        }
+
+        /// One overlapped write of all of `bytes`, with its own OVERLAPPED
+        /// and event; see [`write`].
+        pub fn write(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+            write(&self.handle, bytes)
+        }
+
+        /// The bytes a read that has completed moved, appended to `into`.
+        ///
+        /// # Safety
+        ///
+        /// `op` is this port's, and the read on it has completed, so the
+        /// kernel no longer writes to `ov` or `buf`.
+        unsafe fn collect(&mut self, op: *mut ReadOp, into: &mut Vec<u8>) -> Result<(), LinkError> {
+            let mut moved = 0u32;
+            // SAFETY: the read has completed (the caller's contract), so
+            // asking without waiting answers at once; `ov` is reached by raw
+            // pointer and is where it was when the read began.
+            let ok = unsafe {
+                GetOverlappedResult(self.handle.0, addr_of!((*op).ov), &mut moved, FALSE)
+            };
+            // SAFETY: plain field access through the port's own pointer.
+            unsafe {
+                (*op).pending = false;
+            }
+            if ok == FALSE {
+                return Err(io("reading", last_error()));
+            }
+            let got = (moved as usize).min(READ_BYTES);
+            // SAFETY: the read is over, so `buf` is ours again, and `got` is
+            // within it.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(addr_of!((*op).buf).cast::<u8>(), got) };
+            into.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    impl Pump for Port {
+        fn pump(&mut self, wait: Duration, into: &mut Vec<u8>) -> Result<bool, LinkError> {
+            let op = self.op.as_ptr();
+            // SAFETY: plain field read through the port's own pointer.
+            if !unsafe { (*op).pending } {
+                // SAFETY: the event is a valid handle the operation owns, and
+                // no read is outstanding to signal it, so resetting it here
+                // cannot lose a completion.
+                unsafe {
+                    ResetEvent((*op).event.0);
+                }
+                // SAFETY: no read is outstanding, so nothing else writes to
+                // `ov`; a fresh one is written in place, by raw pointer, at
+                // the address the read will be given.
+                unsafe {
+                    addr_of_mut!((*op).ov).write(OVERLAPPED {
+                        hEvent: (*op).event.0,
+                        ..Default::default()
+                    });
+                }
+                // SAFETY: a valid handle opened for overlapped reads;
+                // `READ_BYTES` writable bytes at `buf`; no byte count pointer
+                // (an overlapped read reports it through GetOverlappedResult);
+                // and the OVERLAPPED with its own event. Both `buf` and `ov`
+                // are in the heap allocation `op` points to, which is not
+                // moved and is not freed until `drop` has seen this read
+                // finish, so they outlive the operation whatever happens next.
+                let ok = unsafe {
+                    ReadFile(
+                        self.handle.0,
+                        addr_of_mut!((*op).buf).cast::<u8>(),
+                        READ_BYTES as u32,
+                        null_mut(),
+                        addr_of_mut!((*op).ov),
+                    )
+                };
+                if ok != FALSE {
+                    // Completed at once: the bytes are there now.
+                    // SAFETY: the read has completed.
+                    unsafe { self.collect(op, into)? };
+                    return Ok(true);
+                }
+                let code = last_error();
+                if code != ERROR_IO_PENDING {
+                    return Err(io("reading", code));
+                }
+                // SAFETY: plain field write through the port's own pointer.
+                unsafe {
+                    (*op).pending = true;
+                }
+            }
+            // SAFETY: the event is a valid handle the operation owns.
+            let woke = unsafe { WaitForSingleObject((*op).event.0, millis(wait)) };
+            if woke == WAIT_OBJECT_0 {
+                let mut moved = 0u32;
+                // SAFETY: `ov` belongs to the outstanding read on this
+                // handle, reached by raw pointer; not waiting, so this only
+                // asks whether it has finished.
+                let done = unsafe {
+                    GetOverlappedResult(self.handle.0, addr_of!((*op).ov), &mut moved, FALSE)
+                };
+                if done == FALSE && last_error() == ERROR_IO_INCOMPLETE {
+                    // Signalled and not finished is not something the event
+                    // should do; the read is left as it is.
+                    return Ok(false);
+                }
+                // SAFETY: it has finished, one way or the other, which
+                // `collect` asks again and reports.
+                unsafe { self.collect(op, into)? };
+                return Ok(true);
+            }
+            if woke == WAIT_TIMEOUT {
+                // Nothing yet. The read stays outstanding for the next wait:
+                // never cancelled here.
+                return Ok(false);
+            }
+            // The wait itself failed. The read is still outstanding, and is
+            // still the operation `drop` cancels and waits for.
+            Err(io("waiting for the cutter", last_error()))
+        }
+    }
+
+    impl Drop for Port {
+        fn drop(&mut self) {
+            let op = self.op.as_ptr();
+            // SAFETY: plain field read through the port's own pointer.
+            if unsafe { (*op).pending } {
+                let mut moved = 0u32;
+                // SAFETY: cancels only this read, which belongs to the handle,
+                // and then waits for it to finish, cancelled or not, so the
+                // kernel is done with `ov` and `buf` before they are freed.
+                // A driver that never completes the cancel blocks here: the
+                // documented known unknown, which is now met only on close.
+                unsafe {
+                    CancelIoEx(self.handle.0, addr_of!((*op).ov));
+                    GetOverlappedResult(self.handle.0, addr_of!((*op).ov), &mut moved, TRUE);
+                }
+            }
+            // SAFETY: `op` came from `Box::leak` in `open`, is freed only
+            // here, and no read on it is outstanding any more. The event is
+            // closed with it; the handle, a later field, after this.
+            unsafe {
+                drop(Box::from_raw(op));
             }
         }
-        // SAFETY: `ov` belongs to the read just started on `handle`, `event` is
-        // its event, and nothing here touches or releases `buf`, `ov` or
-        // `event` until this returns.
-        let (got, _) = unsafe { settle(handle, ov.get(), &event, wait) }
-            .map_err(|code| io("reading", code))?;
-        Ok((got as usize).min(buf.len()))
     }
 
     /// One overlapped write of all of `bytes`. Anything short of all of them is
     /// a failure, and the caller does not retry one.
-    pub fn write(handle: &Handle, bytes: &[u8]) -> Result<(), LinkError> {
+    fn write(handle: &Handle, bytes: &[u8]) -> Result<(), LinkError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -1969,7 +2169,7 @@ mod tests {
                 "{code}"
             );
         }
-        for code in [5, 32] {
+        for code in [5, 32, 170] {
             assert!(matches!(win::open_error(code), LinkError::Busy), "{code}");
         }
         assert!(matches!(win::open_error(87), LinkError::Io(_)));
@@ -2421,6 +2621,150 @@ mod tests {
         pending.extend_from_slice(b"EO\x03");
         assert_eq!(take_reply(&mut pending), Some(b"CAMEO\x03".to_vec()));
         assert!(pending.is_empty());
+    }
+
+    /// What a scripted pump does on each turn.
+    #[derive(Clone, Debug)]
+    enum Turn {
+        /// A read completed with these bytes.
+        Bytes(&'static [u8]),
+        /// A read completed with nothing in it.
+        Empty,
+        /// Nothing arrived in the wait.
+        Quiet,
+        /// The operating system refused.
+        Fail,
+    }
+
+    /// A pump that answers from a script and then goes quiet, and counts
+    /// how often it was asked. A quiet turn sleeps as a real wait would,
+    /// bounded so a test is quick.
+    struct Script {
+        turns: VecDeque<Turn>,
+        /// What every turn answers once the script is spent.
+        then: Turn,
+        asked: usize,
+    }
+
+    impl Script {
+        fn new(turns: &[Turn], then: Turn) -> Self {
+            Script {
+                turns: turns.iter().cloned().collect(),
+                then,
+                asked: 0,
+            }
+        }
+    }
+
+    impl Pump for Script {
+        fn pump(&mut self, wait: Duration, into: &mut Vec<u8>) -> Result<bool, LinkError> {
+            self.asked += 1;
+            let turn = self.turns.pop_front().unwrap_or(self.then.clone());
+            match turn {
+                Turn::Bytes(b) => {
+                    into.extend_from_slice(b);
+                    Ok(true)
+                }
+                Turn::Empty => Ok(true),
+                Turn::Quiet => {
+                    std::thread::sleep(wait.min(Duration::from_millis(20)));
+                    Ok(false)
+                }
+                Turn::Fail => Err(LinkError::Io("scripted".into())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_reply_is_gathered_across_reads_and_what_follows_it_is_kept() {
+        let mut r = Reader::new(Script::new(
+            &[
+                Turn::Bytes(b"CAM"),
+                Turn::Quiet,
+                Turn::Bytes(b"EO\x030\x03"),
+                Turn::Bytes(b"    "),
+            ],
+            Turn::Quiet,
+        ));
+        let t = Duration::from_millis(200);
+        assert_eq!(r.read_reply(t).unwrap(), b"CAMEO\x03");
+        // Already buffered: answered without asking the pump again.
+        let asked = r.source.asked;
+        assert_eq!(r.read_reply(t).unwrap(), b"0\x03");
+        assert_eq!(r.source.asked, asked);
+        // Part of a reply and then nothing: a timeout, and the part is kept.
+        assert!(matches!(
+            r.read_reply(Duration::from_millis(30)),
+            Err(LinkError::Timeout)
+        ));
+        assert_eq!(r.arrived, b"    ");
+    }
+
+    #[test]
+    fn a_read_that_completes_empty_does_not_spin() {
+        let mut r = Reader::new(Script::new(&[], Turn::Empty));
+        let started = Instant::now();
+        assert!(matches!(
+            r.read_reply(Duration::from_millis(60)),
+            Err(LinkError::Timeout)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        // A few milliseconds apart at the least, so well under one a
+        // millisecond.
+        assert!(r.source.asked < 40, "asked {} times", r.source.asked);
+
+        let mut r = Reader::new(Script::new(&[], Turn::Empty));
+        r.discard_within(Duration::from_millis(30), Duration::from_secs(1))
+            .unwrap();
+        assert!(r.source.asked < 20, "asked {} times", r.source.asked);
+    }
+
+    #[test]
+    fn a_discard_takes_what_is_buffered_and_what_arrives_until_it_is_quiet() {
+        let mut r = Reader::new(Script::new(
+            &[Turn::Bytes(b"0\x03CAM"), Turn::Bytes(b"EO\x03")],
+            Turn::Quiet,
+        ));
+        assert_eq!(r.read_reply(Duration::from_millis(50)).unwrap(), b"0\x03");
+        let thrown = r
+            .discard_within(Duration::from_millis(5), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(thrown, b"CAMEO\x03");
+        assert!(r.arrived.is_empty());
+        // Nothing at all is nothing, not an error.
+        assert_eq!(
+            r.discard_within(Duration::from_millis(5), Duration::from_secs(1))
+                .unwrap(),
+            b""
+        );
+    }
+
+    #[test]
+    fn a_discard_is_bounded_however_much_keeps_arriving() {
+        let mut r = Reader::new(Script::new(&[], Turn::Bytes(b"1\x03")));
+        let started = Instant::now();
+        let thrown = r
+            .discard_within(Duration::from_millis(10), Duration::from_millis(50))
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(thrown.len() >= 2 && thrown.ends_with(b"1\x03"));
+        // The real bound is this one.
+        assert_eq!(DISCARD_LIMIT, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_refusal_while_reading_is_that_refusal() {
+        let mut r = Reader::new(Script::new(&[Turn::Bytes(b"CA"), Turn::Fail], Turn::Quiet));
+        assert!(matches!(
+            r.read_reply(Duration::from_millis(50)),
+            Err(LinkError::Io(_))
+        ));
+        assert_eq!(r.arrived, b"CA");
+        let mut r = Reader::new(Script::new(&[Turn::Fail], Turn::Quiet));
+        assert!(matches!(
+            r.discard_within(Duration::from_millis(5), Duration::from_secs(1)),
+            Err(LinkError::Io(_))
+        ));
     }
 
     /// The worker the dialog sends a job from owns the link, so it must be

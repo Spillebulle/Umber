@@ -2347,14 +2347,22 @@ conversation is a rule about a scripted fake until somebody has.
   interface class `{28d78fad-5a12-11d1-ae5b-0000f803a8c2}` and takes the path whose second `#` field
   carries `vid_0b4d&pid_113a`, so no driver is replaced and Silhouette Studio
   keeps working. The open is exclusive (share 0), so Studio must be closed, and
-  a sharing violation or access denied is `Busy` with that sentence. **Every
-  operation is overlapped and is cancelled and then waited for before its
-  buffer or `OVERLAPPED` is freed**, with `GetOverlappedResult(…, TRUE)`; the
-  `OVERLAPPED` is reached only through a raw pointer while the kernel holds it.
-  **The known unknown** is in its docs: a cancel the driver never completes
-  blocks the worker for good, and there is no sound alternative, because
-  returning early frees memory the kernel may still write. Off Windows the
-  type holds an `Infallible` and every call is `Unsupported`.
+  a sharing violation, access denied or `ERROR_BUSY` is `Busy` with that
+  sentence. **One read is kept outstanding for the whole session and is
+  cancelled only on close**, which is what the one report of this route working
+  (a Cameo 4) does: starting and cancelling a read on every status poll, four a
+  second for up to 45 minutes, is a pattern nobody has seen the driver survive,
+  and a reply landing as a read is cancelled is lost. `win::Port` owns the read
+  in a heap allocation that never moves, reached only through a raw pointer,
+  and `Pump::pump` waits on it and leaves it outstanding when the wait runs
+  out. The deadlines and the buffer are `Reader`'s, which is pure and tested
+  against a scripted pump; the pump itself is not testable here. Writes keep
+  their own `OVERLAPPED` each, cancelled and waited for on a timeout. **The
+  known unknown** is in its docs: a cancel the driver never completes blocks the
+  thread for good, and there is no sound alternative, because returning early
+  frees memory the kernel may still write. For reads that is now met only when
+  the link is closed. Off Windows the type holds an `Infallible` and every call
+  is `Unsupported`.
 - **The worker is `loading::Finish`'s shape.** `poll` matches all three
   `try_recv` readings, so a death is one error event and never silence.
   `cutter::Finish` owns the only sender and its `Drop` drops it **before** the
@@ -2374,8 +2382,8 @@ conversation is a rule about a scripted fake until somebody has.
     and a 0.5 mm stroke;
   - whether the machine corrects for a print that came out slightly scaled;
   - the pressure and speed that suit sticker paper;
-  - whether the cancelled read every poll's drain makes behaves on the real
-    driver, and how long it costs;
+  - whether one read left outstanding across every poll behaves on the real
+    driver, and whether its cancel on close completes;
   - whether `ESC EOT` answers at all;
   - how many replies the marks search actually sends;
   - whether the tool is left down on the sheet after an error, since the end
