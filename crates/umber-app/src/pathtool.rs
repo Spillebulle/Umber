@@ -2441,6 +2441,12 @@ mod tests {
         let lighter = set_of(t.commit_smoothing(on(&smoothed)));
         t.applied(Ok(()));
         assert!(lighter.paths()[0].nodes.len() > smoothed.paths()[0].nodes.len());
+        // The node count alone holds for a refit of the refit too; this is
+        // what tells the two apart.
+        assert_eq!(
+            lighter.paths()[0],
+            pathedit::resmoothed(&rec.paths()[0], 1.0).unwrap()
+        );
         t.preview_smoothing(0.0, on(&lighter));
         let back = set_of(t.commit_smoothing(on(&lighter)));
         assert_eq!(back.paths()[0], rec.paths()[0]);
