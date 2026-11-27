@@ -3229,8 +3229,12 @@ mod strip_budget {
     /// [`PATH_ROLE`]. Passes at 78 and fails at 72; "Close path" is the wider
     /// of its two labels.
     pub const PATH_CLOSE: f32 = 83.0;
+    /// Its Smoothing rail and the divider before it, on top of [`PATH_CLOSE`]:
+    /// the label, a track and a field reserving "8.0 px". Passes at 215 and
+    /// fails at 210 against `the_path_strip_fits_its_row`.
+    pub const PATH_SMOOTHING: f32 = 220.0;
     /// Its Corner and Smooth pair and the divider before them, on top of
-    /// [`PATH_CLOSE`]. Passes at 120 and fails at 116.
+    /// [`PATH_SMOOTHING`]. Passes at 120 and fails at 116.
     pub const PATH_NODE: f32 = 126.0;
     // Pan's and Zoom's second sentence are budgeted per tool, on
     // `navigate_hint`'s own third field, because the two lines are a third
@@ -3694,11 +3698,14 @@ const PATH_OPEN_TIP: &str = "Take the closing line away.";
 const PATH_CORNER_TIP: &str = "Straighten this point into a corner.";
 const PATH_SMOOTH_TIP: &str = "Curve this point between its neighbours.";
 const PATH_SMOOTH_ENDS_TIP: &str = "An end of an open path has no curve to smooth.";
+const PATH_SMOOTHING_TIP: &str = "Fit the path again with fewer points. Higher follows it more \
+     loosely. Back to off puts the path back as it was when you started.";
 
 /// Every sentence the strip draws that is not one of [`path_hint`]'s refusals,
 /// for the guard that reads them all.
 #[cfg(test)]
-const PATH_STRIP_SENTENCES: [&str; 12] = [
+const PATH_STRIP_SENTENCES: [&str; 13] = [
+    PATH_SMOOTHING_TIP,
     PATH_HINT_ZOOM,
     PATH_HINT_DRAFT,
     PATH_HINT_DRAFT_EDIT,
@@ -3865,8 +3872,29 @@ fn path_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             press = Some(PathPress::ToggleClosed);
         }
     }
+    // The picked path's smoothing, after the whole-path button and before the
+    // node pair, because it acts on the whole path. Previewed while the rail
+    // is held and written once when it is let go, below.
+    let mut smoothing = None;
+    if reading.path.is_some()
+        && room >= strip_budget::PATH_ROLE + strip_budget::PATH_CLOSE + strip_budget::PATH_SMOOTHING
+    {
+        divider(ui, p);
+        let mut amount = ed.path_tool.smoothing_shown();
+        ui.scope(|ui| {
+            if widgets::inline_slider(ui, p, &mut amount, &path_smoothing_rail()) {
+                smoothing = Some(amount);
+            }
+        })
+        .response
+        .on_hover_text(PATH_SMOOTHING_TIP);
+    }
     if let Some(can_smooth) = reading.node
-        && room >= strip_budget::PATH_ROLE + strip_budget::PATH_CLOSE + strip_budget::PATH_NODE
+        && room
+            >= strip_budget::PATH_ROLE
+                + strip_budget::PATH_CLOSE
+                + strip_budget::PATH_SMOOTHING
+                + strip_budget::PATH_NODE
     {
         divider(ui, p);
         ui.scope(|ui| {
@@ -3924,6 +3952,34 @@ fn path_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         Some(PathPress::ToggleClosed) => ed.path_toggle_closed(),
         Some(PathPress::Corner) => ed.path_corner(),
         Some(PathPress::Smooth) => ed.path_smooth(),
+    }
+    if let Some(amount) = smoothing {
+        ed.path_preview_smoothing(amount);
+    }
+    // One undo entry per adjustment: the preview is written once the pointer
+    // is up, which is the frame after a drag ends and the same frame as a
+    // typed figure or a tap on the track.
+    if ed.path_tool.smoothing_pending() && !ui.input(|i| i.pointer.any_down()) {
+        ed.path_commit_smoothing();
+    }
+}
+
+/// The Path strip's Smoothing rail. Zero is the path as it was when the rail
+/// was first moved on it; above it the path is fitted again with that many
+/// document pixels of slack, the same figure Trace outline's Smoothing is.
+fn path_smoothing_rail() -> widgets::Rail<'static> {
+    let top = *umber_core::trace::SMOOTHING.end();
+    widgets::Rail {
+        label: "Smoothing",
+        span: 0.0..=top,
+        limit: 0.0..=top,
+        log: false,
+        snap: 0.0,
+        deferred: false,
+        figure: widgets::Figure {
+            zero: "off",
+            ..widgets::Figure::new(1.0, " px", 1)
+        },
     }
 }
 
@@ -9637,6 +9693,30 @@ mod tests {
         assert_eq!(ed.path_tool.mode, PathMode::Draw);
     }
 
+    /// The Smoothing rail writes nothing while it is held, and the release is
+    /// one entry in the history, through the editor's own doors.
+    #[test]
+    fn smoothing_the_picked_path_is_one_entry_and_only_on_release() {
+        let mut ed = picked_path(row_of_corners(300, 1.0));
+        let before = the_record(&ed);
+        let entries = ed.history.len();
+        ed.path_preview_smoothing(2.0);
+        ed.path_preview_smoothing(4.0);
+        assert_eq!(the_record(&ed), before, "a preview wrote the record");
+        assert_eq!(ed.history.len(), entries);
+        ed.path_commit_smoothing();
+        let after = the_record(&ed);
+        assert_eq!(after[0].nodes.len(), 2, "a straight row fits as one line");
+        assert_eq!(after[0].nodes[0].at, before[0].nodes[0].at);
+        assert_eq!(after[0].nodes[1].at, before[0].nodes[299].at);
+        assert_eq!(ed.history.len(), entries + 1);
+        assert!(
+            ed.path_tool.pick().is_some(),
+            "the pick survived its own edit"
+        );
+        assert_eq!(ed.path_tool.smoothing_shown(), 4.0);
+    }
+
     /// No two of the strip's buttons touch: the rectangles that were drawn are
     /// measured, because a guard that asserted the spacing it sets would agree
     /// with itself.
@@ -9670,7 +9750,7 @@ mod tests {
             ("a sentence said", said),
         ];
         for (name, ed) in &mut states {
-            let mut drew = [false; 4];
+            let mut drew = [false; 5];
             for step in 0..1400 {
                 let width = 200.0 + step as f32;
                 let shot = run.frame(ed, width, Vec::new());
@@ -9687,7 +9767,7 @@ mod tests {
                         rect.right()
                     );
                 }
-                for (i, label) in ["Plot", "Close path", "Corner", "Smooth"]
+                for (i, label) in ["Plot", "Close path", "Smoothing", "Corner", "Smooth"]
                     .iter()
                     .enumerate()
                 {
@@ -9696,9 +9776,9 @@ mod tests {
             }
             assert!(drew[0], "{name}: the role switch was never drawn");
             let wants = match *name {
-                "nothing picked" => [false; 3],
-                "a path" => [true, false, false],
-                _ => [true, true, true],
+                "nothing picked" => [false; 4],
+                "a path" => [true, true, false, false],
+                _ => [true, true, true, true],
             };
             assert_eq!(
                 &drew[1..],

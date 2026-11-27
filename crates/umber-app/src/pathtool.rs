@@ -171,7 +171,32 @@ pub struct PathTool {
     /// Moves whenever something the painter draws may have changed. See
     /// [`PathTool::generation`].
     generation: u64,
+    /// The Smoothing rail's reading for the picked path. See
+    /// [`PathTool::preview_smoothing`].
+    resmooth: Option<Resmooth>,
 }
+
+/// What the Smoothing rail is doing to one path.
+///
+/// **The refit is always from `source`**, the path as it stood when the rail
+/// was first moved on it, never from the last refit. Smoothing only takes
+/// detail away, so refitting a refit would ratchet: each drag would start from
+/// less than the last, and turning the figure back down could not give back
+/// what turning it up took. Kept across the rail's own commits for that reason,
+/// and dropped by every other edit, by a foreign change to the record and by
+/// letting go of the pick, after which the path as it then stands is the new
+/// source and the rail reads zero.
+#[derive(Clone, Debug)]
+struct Resmooth {
+    path: usize,
+    source: Path,
+    amount: f32,
+    /// A preview is up that the release has not committed yet.
+    pending: bool,
+}
+
+/// Said when the refit would leave less than a path.
+const TOO_SMALL_TO_SMOOTH: &str = "This path is too small to smooth.";
 
 impl Default for PathTool {
     fn default() -> Self {
@@ -190,6 +215,7 @@ impl Default for PathTool {
             dragged: None,
             alone: false,
             generation: 0,
+            resmooth: None,
         }
     }
 }
@@ -425,6 +451,7 @@ impl PathTool {
         self.pick = None;
         self.before = None;
         self.dragged = None;
+        self.resmooth = None;
         match self.held {
             Held::Nothing | Held::Placing { .. } | Held::Closing | Held::Continuing => {}
             Held::Picked | Held::Handle { .. } | Held::Node { .. } | Held::Segment { .. } => {
@@ -762,6 +789,9 @@ impl PathTool {
             Ok(()) => self.before = None,
             Err(why) => {
                 self.said = Some(why);
+                // The record is not what the rail thinks it installed, so
+                // whatever is there now is where the next drag starts from.
+                self.resmooth = None;
                 // Only a `Set` that is outstanding has a pick to put back.
                 if let Some(previous) = self.before.take() {
                     self.pick = previous;
@@ -856,6 +886,104 @@ impl PathTool {
             .is_some_and(|((_, path), n)| pathedit::smoothed(path, n).is_some())
     }
 
+    /// A Smoothing preview is up and waiting for the pointer to come up.
+    pub fn smoothing_pending(&self) -> bool {
+        self.resmooth.as_ref().is_some_and(|r| r.pending) && self.dragged.is_some()
+    }
+
+    /// What the Smoothing rail reads for the pick: the amount last asked of
+    /// this path, or zero, which is the path as it stands.
+    pub fn smoothing_shown(&self) -> f32 {
+        match (&self.resmooth, self.pick) {
+            (Some(r), Some(pick)) if r.path == pick.path => r.amount,
+            _ => 0.0,
+        }
+    }
+
+    /// The Smoothing rail moved to `amount`: the picked path fitted again from
+    /// its source at that tolerance, shown in place of the path as a drag is,
+    /// and not written until [`PathTool::commit_smoothing`]. Zero is the
+    /// source itself, so dragging back to the start puts the path back.
+    ///
+    /// The node pick is let go, because the refit's nodes are not the ones
+    /// that were picked and a handle drawn for the old index would sit on a
+    /// node that is not there.
+    pub fn preview_smoothing(&mut self, amount: f32, ground: Ground<'_>) {
+        self.touch();
+        self.sanitize(ground);
+        let Some((pick, path)) = self.picked(ground) else {
+            return;
+        };
+        let fresh = !matches!(&self.resmooth, Some(r) if r.path == pick.path);
+        if fresh {
+            self.resmooth = Some(Resmooth {
+                path: pick.path,
+                source: path.clone(),
+                amount: 0.0,
+                pending: false,
+            });
+        }
+        let Some(r) = self.resmooth.as_mut() else {
+            return;
+        };
+        let amount = amount.max(0.0);
+        let next = if amount > 0.0 {
+            let floor = *umber_core::trace::SMOOTHING.start();
+            match pathedit::resmoothed(&r.source, amount.max(floor)) {
+                Some(next) => next,
+                None => {
+                    self.said = Some(TOO_SMALL_TO_SMOOTH);
+                    return;
+                }
+            }
+        } else {
+            r.source.clone()
+        };
+        r.amount = amount;
+        r.pending = true;
+        self.said = None;
+        self.pick = Some(Pick {
+            path: pick.path,
+            node: None,
+        });
+        self.dragged = Some(next);
+    }
+
+    /// The pointer came off the Smoothing rail, or a figure was typed into it:
+    /// the preview becomes one `Set`. Nothing where no preview is waiting or
+    /// where it is the path already on the layer.
+    pub fn commit_smoothing(&mut self, ground: Ground<'_>) -> Commit {
+        self.touch();
+        let Some(mut r) = self.resmooth.take().filter(|r| r.pending) else {
+            return Commit::Nothing;
+        };
+        r.pending = false;
+        let next = self.dragged.take();
+        let (Some(record), Some(next)) = (ground.paths, next) else {
+            return Commit::Nothing;
+        };
+        if self.pick.map(|p| p.path) != Some(r.path) {
+            return Commit::Nothing;
+        }
+        let Some(current) = record.paths().get(r.path) else {
+            return Commit::Nothing;
+        };
+        if *current == next {
+            self.resmooth = Some(r);
+            return Commit::Nothing;
+        }
+        let path = r.path;
+        let commit = self.set(
+            record.with_path(path, next),
+            Some(Pick { path, node: None }),
+        );
+        // `set` drops the rail's state for every edit but this one.
+        if matches!(commit, Commit::Set(_)) {
+            self.resmooth = Some(r);
+        }
+        commit
+    }
+
     fn reshape_node(
         &mut self,
         ground: Ground<'_>,
@@ -918,6 +1046,10 @@ impl PathTool {
             Ok(record) => {
                 self.before = Some(self.pick);
                 self.pick = pick;
+                // Any other edit changes the path under the rail, so its
+                // source is no longer what is on the layer.
+                // `commit_smoothing` puts its own back after this.
+                self.resmooth = None;
                 Commit::Set(record)
             }
             Err(why) => {
@@ -2248,5 +2380,105 @@ mod tests {
                 | VectorRefusal::Opaque => assert_eq!(said, why.sentence()),
             }
         }
+    }
+
+    /// One closed Cut path: a circle of radius 100 about (200, 200) as 360
+    /// corner nodes, each pushed in or out by up to a pixel, as a lasso would
+    /// hand it. Irregular on purpose: a zigzag as regular as a saw reads as
+    /// real corners to the fitter, which keeps them at any tolerance.
+    fn wobbly_record() -> VectorObject {
+        let points: Vec<(f32, f32)> = (0..360)
+            .map(|i| {
+                let a = (i as f32).to_radians();
+                let r = 100.0 + ((i * 7919) % 13) as f32 / 6.0 - 1.0;
+                (200.0 + r * a.cos(), 200.0 + r * a.sin())
+            })
+            .collect();
+        VectorObject::Paths(vec![open(PathRole::Cut, &points, true)])
+    }
+
+    fn with_wobbly_picked(rec: &VectorObject) -> PathTool {
+        let mut t = PathTool::default();
+        let at = rec.paths()[0].nodes[0].at;
+        edit_tap(&mut t, at, on(rec));
+        edit_tap(&mut t, at, on(rec));
+        assert_eq!(t.pick().map(|p| p.path), Some(0));
+        t
+    }
+
+    #[test]
+    fn a_smoothing_preview_writes_nothing_and_the_release_writes_it_once() {
+        let rec = wobbly_record();
+        let mut t = with_wobbly_picked(&rec);
+        assert_eq!(t.smoothing_shown(), 0.0);
+        t.preview_smoothing(1.0, on(&rec));
+        t.preview_smoothing(4.0, on(&rec));
+        assert!(t.smoothing_pending());
+        let shown = t.dragged().expect("a preview").nodes.len();
+        assert!(shown < 30, "{shown} nodes from 360");
+        assert_eq!(t.pick().and_then(|p| p.node), None, "the node pick went");
+
+        let after = set_of(t.commit_smoothing(on(&rec)));
+        assert_eq!(after.paths()[0].nodes.len(), shown);
+        assert!(after.paths()[0].closed);
+        assert!(!t.smoothing_pending() && t.dragged().is_none());
+        t.applied(Ok(()));
+        assert_eq!(t.smoothing_shown(), 4.0);
+        // A second release with nothing moved writes nothing.
+        assert_eq!(t.commit_smoothing(on(&after)), Commit::Nothing);
+    }
+
+    #[test]
+    fn smoothing_back_to_off_puts_the_path_back_as_it_was() {
+        let rec = wobbly_record();
+        let mut t = with_wobbly_picked(&rec);
+        t.preview_smoothing(6.0, on(&rec));
+        let smoothed = set_of(t.commit_smoothing(on(&rec)));
+        t.applied(Ok(()));
+        // From the source, not from the refit: a lighter touch after a heavy
+        // one keeps more nodes than the heavy one did.
+        t.preview_smoothing(1.0, on(&smoothed));
+        let lighter = set_of(t.commit_smoothing(on(&smoothed)));
+        t.applied(Ok(()));
+        assert!(lighter.paths()[0].nodes.len() > smoothed.paths()[0].nodes.len());
+        t.preview_smoothing(0.0, on(&lighter));
+        let back = set_of(t.commit_smoothing(on(&lighter)));
+        assert_eq!(back.paths()[0], rec.paths()[0]);
+    }
+
+    #[test]
+    fn another_edit_makes_the_path_as_it_then_stands_the_source() {
+        let rec = wobbly_record();
+        let mut t = with_wobbly_picked(&rec);
+        t.preview_smoothing(6.0, on(&rec));
+        let smoothed = set_of(t.commit_smoothing(on(&rec)));
+        t.applied(Ok(()));
+        let opened = set_of(t.toggle_closed(on(&smoothed)));
+        t.applied(Ok(()));
+        assert_eq!(t.smoothing_shown(), 0.0);
+        // Off is now the opened, smoothed path, not the wobbly original.
+        t.preview_smoothing(0.0, on(&opened));
+        assert_eq!(t.dragged(), Some(&opened.paths()[0]));
+        assert_eq!(t.commit_smoothing(on(&opened)), Commit::Nothing);
+    }
+
+    #[test]
+    fn letting_go_of_the_pick_drops_the_preview_and_the_source() {
+        let rec = wobbly_record();
+        let mut t = with_wobbly_picked(&rec);
+        t.preview_smoothing(4.0, on(&rec));
+        t.let_go();
+        assert!(!t.smoothing_pending());
+        assert_eq!(t.smoothing_shown(), 0.0);
+        assert_eq!(t.commit_smoothing(on(&rec)), Commit::Nothing);
+    }
+
+    #[test]
+    fn smoothing_with_nothing_picked_does_nothing() {
+        let rec = wobbly_record();
+        let mut t = PathTool::default();
+        t.preview_smoothing(4.0, on(&rec));
+        assert!(t.dragged().is_none());
+        assert_eq!(t.commit_smoothing(on(&rec)), Commit::Nothing);
     }
 }

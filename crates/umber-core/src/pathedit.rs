@@ -286,6 +286,85 @@ pub fn reversed(path: &Path) -> Path {
     out
 }
 
+/// How closely a path is flattened before it is fitted again. Far finer than
+/// any smoothing the fitter is asked for, so the refit answers to the curve
+/// and not to the flattening.
+const RESMOOTH_FLATTEN: f32 = 0.05;
+/// The spacing the flattened line is resampled to, in document pixels. The
+/// fitter's corner and tangent reaches are stated in cells of the trace grid,
+/// about a pixel each, so this hands it the density it was written for: a
+/// straight run flattens to its two ends, and two points do not say where a
+/// corner four pixels along would be.
+const RESMOOTH_STEP: f32 = 1.0;
+/// The most points one refit is handed. A path many thousands of pixels long
+/// is resampled more coarsely instead, which keeps the fitter's work bounded
+/// on a control dragged a frame at a time.
+const RESMOOTH_MAX_POINTS: usize = 1 << 18;
+
+/// The same path fitted again with `tolerance` document pixels of slack, as
+/// Trace outline fits a traced edge: corners where the line turns sharply,
+/// as few smooth curves as stay within the tolerance between them. Role,
+/// closure and ink are carried across.
+///
+/// **It can only take detail away.** The input is the path itself, not the
+/// artwork it may have been traced from, so a tolerance tighter than the one
+/// the path was made at gives back roughly the same path with more nodes,
+/// never the edge it was smoothed off. A caller that lets somebody turn the
+/// figure back down has to keep the path it started from and refit from that.
+///
+/// `None` where the fit leaves fewer than two nodes, which is less than a path.
+pub fn resmoothed(path: &Path, tolerance: f32) -> Option<Path> {
+    let mut line = Vec::new();
+    path.flatten(RESMOOTH_FLATTEN, &mut line);
+    if path.closed && line.len() > 1 && line.first() == line.last() {
+        line.pop();
+    }
+    let points = resampled(&line, path.closed);
+    let nodes = if path.closed {
+        crate::trace::fit_closed(&points, tolerance)
+    } else {
+        crate::trace::fit_open(&points, tolerance)
+    };
+    // Two is enough for a closed path too: a circle fits as two smooth nodes,
+    // which is what Trace outline lands for one.
+    (nodes.len() >= 2).then(|| Path {
+        role: path.role,
+        closed: path.closed,
+        nodes,
+        ink: path.ink.clone(),
+    })
+}
+
+/// `line` with points added so none is further than the step from the next,
+/// every original vertex kept (a corner is a vertex, and losing one would
+/// round it off before the fitter could see it).
+fn resampled(line: &[Vec2], closed: bool) -> Vec<Vec2> {
+    let edge = |i: usize| (line[i], line[(i + 1) % line.len()]);
+    let edges = if closed {
+        line.len()
+    } else {
+        line.len().saturating_sub(1)
+    };
+    let length: f32 = (0..edges).map(|i| edge(i).0.distance(edge(i).1)).sum();
+    if !length.is_finite() {
+        return line.to_vec();
+    }
+    let step = RESMOOTH_STEP.max(length / RESMOOTH_MAX_POINTS as f32);
+    let mut out = Vec::with_capacity(line.len() + (length / step) as usize + 1);
+    for i in 0..edges {
+        let (a, b) = edge(i);
+        out.push(a);
+        let pieces = (a.distance(b) / step).ceil() as usize;
+        for k in 1..pieces {
+            out.push(a.lerp(b, k as f32 / pieces as f32));
+        }
+    }
+    if !closed && let Some(&last) = line.last() {
+        out.push(last);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +635,86 @@ mod tests {
         let dir = (next - prev).normalize();
         assert!((n.handle_out - dir * (next.length() / 3.0)).length() < 1e-4);
         assert!((n.handle_in + dir * (prev.length() / 3.0)).length() < 1e-4);
+    }
+
+    /// A circle of radius 100 drawn as many corner nodes, each pushed in or
+    /// out by up to `wobble`: the kind of line a lasso hands Trace outline.
+    fn wobbly_circle(wobble: f32) -> Path {
+        let points: Vec<(f32, f32)> = (0..360)
+            .map(|i| {
+                let a = (i as f32).to_radians();
+                let r = 100.0 + wobble * ((i * 7919) % 13) as f32 / 12.0 * 2.0 - wobble;
+                (200.0 + r * a.cos(), 200.0 + r * a.sin())
+            })
+            .collect();
+        path(&points, true)
+    }
+
+    #[test]
+    fn resmoothing_a_wobbly_line_gives_fewer_nodes_close_to_it() {
+        let before = wobbly_circle(1.0);
+        let after = resmoothed(&before, 3.0).expect("a circle fits");
+        assert!(after.closed);
+        assert!(
+            after.nodes.len() < 20,
+            "{} nodes from {}",
+            after.nodes.len(),
+            before.nodes.len()
+        );
+        // Close to the line it came from: within the tolerance and the
+        // flattening, measured from the new curve to the old one.
+        let old = polyline(&before);
+        let worst = polyline(&after)
+            .into_iter()
+            .map(|p| off(&old, p))
+            .fold(0.0, f32::max);
+        assert!(worst < 3.5, "strayed {worst} px");
+    }
+
+    #[test]
+    fn more_smoothing_never_keeps_more_nodes_on_a_wobbly_line() {
+        let before = wobbly_circle(2.0);
+        let counts: Vec<usize> = [0.5, 1.0, 2.0, 4.0, 8.0]
+            .iter()
+            .map(|&t| resmoothed(&before, t).unwrap().nodes.len())
+            .collect();
+        assert!(counts.windows(2).all(|w| w[1] <= w[0]), "{counts:?}");
+        assert!(counts[0] > counts[4], "{counts:?}");
+    }
+
+    #[test]
+    fn resmoothing_keeps_a_squares_corners() {
+        let square = path(
+            &[(0.0, 0.0), (200.0, 0.0), (200.0, 200.0), (0.0, 200.0)],
+            true,
+        );
+        let after = resmoothed(&square, 8.0).unwrap();
+        for corner in [v(0.0, 0.0), v(200.0, 0.0), v(200.0, 200.0), v(0.0, 200.0)] {
+            assert!(
+                after.nodes.iter().any(|n| n.at.distance(corner) < 0.5),
+                "lost the corner at {corner:?}: {:?}",
+                after.nodes
+            );
+        }
+    }
+
+    #[test]
+    fn resmoothing_an_open_line_keeps_its_ends_and_its_role() {
+        let mut line = path(
+            &[(0.0, 0.0), (50.0, 3.0), (100.0, -2.0), (150.0, 0.0)],
+            false,
+        );
+        line.role = PathRole::Plot;
+        let after = resmoothed(&line, 6.0).unwrap();
+        assert!(!after.closed);
+        assert_eq!(after.role, PathRole::Plot);
+        assert_eq!(after.nodes.first().unwrap().at, v(0.0, 0.0));
+        assert_eq!(after.nodes.last().unwrap().at, v(150.0, 0.0));
+    }
+
+    #[test]
+    fn a_path_too_small_to_fit_is_refused_rather_than_shrunk() {
+        let speck = path(&[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], true);
+        assert_eq!(resmoothed(&speck, 2.0), None);
     }
 }

@@ -2526,6 +2526,19 @@ impl Editor {
         self.path_command(|tool, ground| tool.smooth(ground));
     }
 
+    /// The strip's Smoothing rail moved: refit the picked path and show it,
+    /// writing nothing. [`Editor::path_commit_smoothing`] writes it.
+    pub fn path_preview_smoothing(&mut self, amount: f32) {
+        self.follow_path_ground();
+        self.with_path_tool(|tool, ground| tool.preview_smoothing(amount, ground));
+    }
+
+    /// The pointer left the Smoothing rail, or a figure was typed: the preview
+    /// becomes one undo entry.
+    pub fn path_commit_smoothing(&mut self) {
+        self.path_command(|tool, ground| tool.commit_smoothing(ground));
+    }
+
     /// Settle the Path tool before it, or the document under it, goes away: a
     /// draft of two or more nodes is put on a layer, a shorter one is dropped,
     /// and the pick is let go of. A draft that could not land is dropped too,
