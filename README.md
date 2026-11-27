@@ -26,22 +26,22 @@ Layers and History modules](docs/images/window.png)
 
 ## Install
 
-**Umber 0.1.8.** Take the file for your system, or browse the
+**Umber 0.1.9.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/umber/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-setup-0.1.8-x64.exe) | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-setup-0.1.8-arm64.exe) |
-| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber_0.1.8_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber_0.1.8_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-1.aarch64.rpm) |
-| Arch, CachyOS | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-bin-0.1.8-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.8/Umber-0.1.8-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.8/Umber-0.1.8-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x64.msi) | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.8/umber-0.1.8-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-setup-0.1.9-x64.exe) | [Installer](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-setup-0.1.9-arm64.exe) |
+| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber_0.1.9_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber_0.1.9_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-1.aarch64.rpm) |
+| Arch, CachyOS | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-bin-0.1.9-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.9/Umber-0.1.9-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.1.9/Umber-0.1.9-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-x64.msi) | [`.msi`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.1.9/umber-0.1.9-aarch64-unknown-linux-gnu.tar.gz) |
 
 The `.deb`, the `.rpm` and the Arch package add the
 [Spillebulle archive](https://spillebulle.github.io/packages/) as they install,
@@ -210,7 +210,8 @@ your exports. It saves with the document and undoes like anything else.
 The **Path tool** (`P`) draws those lines by hand. Click for a corner, drag for
 a curve, and click the first point to close the path. Switch to Edit to move
 points and handles, add a point on a line, or make a point a corner or smooth.
-Each path is either Cut or Plot, and you can switch it at any time.
+Each path is either Cut or Plot, and you can switch it at any time. Smoothing,
+on the strip at the top, fits a picked path again with fewer points.
 
 **Trace outline**, on the Edit menu, draws a smooth cut or plot line round
 everything you have painted, standing off by a margin you set in pixels or read

@@ -12,6 +12,26 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.9
+
+Smooth a path after you have made it.
+
+### New
+
+- **Smoothing for a picked path.** Pick a path with the Path tool and a
+  Smoothing slider appears on the strip at the top. Slide it up and the path is
+  fitted again with fewer points, following its shape more loosely the higher
+  you go. You see the change as you drag, and letting go makes it one step to
+  undo. You can also type a figure, up to 8 px.
+- **Back to off puts the path back as it was.** Every setting starts from the
+  path as it was when you picked it, so sliding up and down does not wear it
+  away. Another edit to the path, or picking a different one, starts afresh
+  from there.
+- **It works on any path**: traced, made from a selection, or drawn by hand.
+  Sharp corners are kept as corners, so a regular zigzag stays a zigzag. Unlike
+  Trace outline, it does not know how far the line stood off the artwork, so a
+  cut line can move in towards the ink by up to the smoothing amount.
+
 ## 0.1.8
 
 Print and cut with a Silhouette Portrait 3, and vector layers to draw the cut
